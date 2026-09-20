@@ -324,8 +324,10 @@ class TestSecurityConfiguration:
 
 class TestAccountSecurityMigration:
     def test_revision_creates_exactly_four_security_tables(self, tmp_path):
-        """upgrade → the four tables exist; downgrade -1 → they are gone;
-        upgrade again → they are back (clean up/down/upgrade cycle)."""
+        """upgrade → the four tables exist; downgrade to the parent revision
+        a3b4c5d6e7f8 (pinned explicitly so the cycle stays valid as later
+        migrations land on head) → they are gone; upgrade again → they are
+        back (clean up/down/upgrade cycle)."""
         import os
 
         from alembic import command
@@ -358,7 +360,7 @@ class TestAccountSecurityMigration:
             }
             assert expected <= tables, f"missing tables: {expected - tables}"
 
-            command.downgrade(cfg, "-1")
+            command.downgrade(cfg, "a3b4c5d6e7f8")
             with engine.connect() as conn:
                 tables_after = {
                     r[0]

@@ -934,3 +934,193 @@ class HistoricalGexSnapshot(Base):
             name="uq_historical_gex_identity",
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #17 — Overnight Gap Intelligence (research/backtest only)
+# ---------------------------------------------------------------------------
+# Persistence for the Phase-1 research pipeline defined by
+# docs/STRIKENOVA_OVERNIGHT_GAP_RESEARCH.md. Research-only: nothing here feeds
+# the production dashboard, paper execution, brokers, or auth. Raw source
+# snapshots are IMMUTABLE once written (append-only; no update path exists).
+# Missing data stays None (never silently zero) per the GEX missing-vs-zero
+# contract; completeness flags make gaps explicit and auditable.
+# ---------------------------------------------------------------------------
+
+
+class GapPredictionSession(Base):
+    """One research session: the EOD snapshot plus the realized next-open gap.
+
+    Predictor-side columns (cutoff snapshot, features, predictions) describe
+    session T; ``next_*`` / ``gap_*`` columns describe session T+1's open and
+    are attached in a separate, later step (target attachment) so no target
+    value can leak into feature generation or normalization.
+    """
+
+    __tablename__ = "gap_prediction_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(16), index=True, default="NIFTY")
+    session_date: Mapped[str] = mapped_column(String(10), index=True)  # YYYY-MM-DD (session T)
+    cutoff_timestamp: Mapped[datetime] = mapped_column(DateTime)
+    prior_close: Mapped[float] = mapped_column(Float)  # NIFTY close of session T
+
+    # Attached later (session T+1). None = target not yet attached.
+    next_session_date: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    next_open_timestamp: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    next_open: Mapped[float | None] = mapped_column(Float, nullable=True)
+    gap_points: Mapped[float | None] = mapped_column(Float, nullable=True)
+    gap_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    gap_class: Mapped[str | None] = mapped_column(String(12), nullable=True)  # GAP_UP | FLAT | GAP_DOWN | UNCLASSIFIED
+
+    # Data-completeness flags (explicit; missing is never silently zero).
+    completeness: Mapped[str] = mapped_column(String(16), default="UNKNOWN")  # COMPLETE | PARTIAL | UNAVAILABLE
+    completeness_detail: Mapped[str] = mapped_column(Text, default="{}")  # JSON
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "session_date", name="uq_gap_sessions_symbol_session"),
+    )
+
+
+class UnderlyingSnapshot(Base):
+    """Immutable spot/futures/VIX observation at the session-T research cutoff."""
+
+    __tablename__ = "gap_underlying_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(16), index=True)
+    session_date: Mapped[str] = mapped_column(String(10), index=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime)
+
+    spot_ltp: Mapped[float | None] = mapped_column(Float, nullable=True)
+    spot_open: Mapped[float | None] = mapped_column(Float, nullable=True)
+    spot_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    spot_low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    spot_close: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    futures_ltp: Mapped[float | None] = mapped_column(Float, nullable=True)
+    futures_oi: Mapped[float | None] = mapped_column(Float, nullable=True)  # contracts
+    futures_volume: Mapped[float | None] = mapped_column(Float, nullable=True)
+    futures_basis: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    india_vix: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # Raw strike-level option-chain snapshot preserved verbatim (JSON-in-Text,
+    # same SQLite-compatible pattern as gex_snapshots.strike_data). Immutable.
+    option_chain: Mapped[str] = mapped_column(Text, default="[]")
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "session_date", name="uq_gap_underlying_symbol_session"),
+    )
+
+
+class OptionChainSnapshot(Base):
+    """Immutable strike-level option-chain row (CE/PE) at the research cutoff."""
+
+    __tablename__ = "gap_option_chain_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(16), index=True)
+    session_date: Mapped[str] = mapped_column(String(10), index=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime)
+    expiry: Mapped[str] = mapped_column(String(10))  # YYYY-MM-DD
+    strike: Mapped[float] = mapped_column(Float)
+    option_type: Mapped[str] = mapped_column(String(8))  # CALL | PUT
+
+    ltp: Mapped[float | None] = mapped_column(Float, nullable=True)
+    bid: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ask: Mapped[float | None] = mapped_column(Float, nullable=True)
+    bid_qty: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ask_qty: Mapped[float | None] = mapped_column(Float, nullable=True)
+    volume: Mapped[float | None] = mapped_column(Float, nullable=True)
+    open_interest: Mapped[float | None] = mapped_column(Float, nullable=True)  # contracts
+    change_in_oi: Mapped[float | None] = mapped_column(Float, nullable=True)
+    iv: Mapped[float | None] = mapped_column(Float, nullable=True)  # canonical decimal fraction
+    delta: Mapped[float | None] = mapped_column(Float, nullable=True)
+    gamma: Mapped[float | None] = mapped_column(Float, nullable=True)
+    vega: Mapped[float | None] = mapped_column(Float, nullable=True)  # per 1.00 vol fraction
+    theta: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "symbol", "session_date", "expiry", "strike", "option_type",
+            name="uq_gap_chain_symbol_session_expiry_strike_type",
+        ),
+    )
+
+
+class GapFeatures(Base):
+    """Derived, timestamp-respecting research features for one session.
+
+    Stored separately from the immutable raw snapshots so feature definitions
+    can evolve without altering historical source observations. Feature JSON
+    carries NaN-safe floats; missing features are absent keys, never zeros.
+    """
+
+    __tablename__ = "gap_features"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_date: Mapped[str] = mapped_column(String(10), index=True)
+    feature_version: Mapped[str] = mapped_column(String(16), default="v1")
+    features: Mapped[str] = mapped_column(Text, default="{}")  # JSON
+    completeness: Mapped[str] = mapped_column(String(16), default="UNKNOWN")
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("session_date", "feature_version", name="uq_gap_features_session_version"),
+    )
+
+
+class GapPrediction(Base):
+    """One model's research prediction for one session (immutable once stored).
+
+    Realized outcomes attach later on the parent session, never here, so a
+    prediction row can never influence the features that produced it.
+    """
+
+    __tablename__ = "gap_predictions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_date: Mapped[str] = mapped_column(String(10), index=True)
+    model_name: Mapped[str] = mapped_column(String(32))  # baseline | pos_style | sos
+    model_version: Mapped[str] = mapped_column(String(16), default="v1")
+    direction_score: Mapped[float | None] = mapped_column(Float, nullable=True)  # [-1, +1]
+    agreement_score: Mapped[float | None] = mapped_column(Float, nullable=True)  # [0, 1]
+    dispersion: Mapped[float | None] = mapped_column(Float, nullable=True)  # >= 0
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)  # [0, 1]
+    state: Mapped[str] = mapped_column(String(16), default="PREDICTED")  # PREDICTED | NO_EDGE | ABSTAIN
+    component_scores: Mapped[str] = mapped_column(Text, default="{}")  # JSON, explainability
+    probabilities: Mapped[str] = mapped_column(Text, default="{}")  # JSON: p_up/p_flat/p_down, tails, expected gap
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "session_date", "model_name", "model_version",
+            name="uq_gap_predictions_session_model",
+        ),
+    )
+
+
+class GapBacktestResult(Base):
+    """Aggregate backtest evaluation by model, period and regime."""
+
+    __tablename__ = "gap_backtest_results"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    model_name: Mapped[str] = mapped_column(String(32), index=True)
+    model_version: Mapped[str] = mapped_column(String(16), default="v1")
+    period_start: Mapped[str] = mapped_column(String(10))
+    period_end: Mapped[str] = mapped_column(String(10))
+    regime: Mapped[str] = mapped_column(String(32), default="ALL")
+    metrics: Mapped[str] = mapped_column(Text, default="{}")  # JSON metrics dict
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "model_name", "model_version", "period_start", "period_end", "regime",
+            name="uq_gap_backtest_model_period_regime",
+        ),
+    )
