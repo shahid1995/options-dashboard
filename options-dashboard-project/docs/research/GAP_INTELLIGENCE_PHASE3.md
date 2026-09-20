@@ -176,8 +176,9 @@ value provenance (observed/reconstructed/unavailable + legacy NULL),
 missing ≠ zero, deterministic reconstruction, causal target ordering,
 no-look-ahead, and the three new merge tests: id-collision preservation,
 UTC→IST normalization with cross-source natural-key dedup, and refusal of
-unanchorable dates without guessing. Full backend suite: **5,949 passed,
-6 failed** — the 6 are the pre-existing failures verified on pristine base
+unanchorable dates without guessing. Full backend suite (run in four
+sequential chunks covering every test file exactly once): **5,953 passed,
+6 failed, 77 skipped** — the 6 are the pre-existing failures verified on pristine base
 `65022ea` during Phase 1 (live_verification, phase721, strategy_resolver ×2,
 naive-now in `trade_lifecycle/`, upstox adapter); zero new failures.
 
