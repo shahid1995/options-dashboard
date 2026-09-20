@@ -159,6 +159,10 @@ def ingest_session_snapshots(
             OptionChainSnapshot.session_date == session_date
         ).delete()
         db.delete(existing)
+        # Emit the DELETEs before the replacement INSERT: the unit of work
+        # executes table inserts before deletes, so without this flush the
+        # new GapPredictionSession collides on its natural key.
+        db.flush()
 
     def f(v: Any) -> float | None:
         try:
@@ -167,12 +171,17 @@ def ingest_session_snapshots(
             return None
         return x if math.isfinite(x) else None
 
-    spot_close = f(underlying.get("spot_close")) or f(underlying.get("spot_ltp"))
+    # The explicit ``prior_close`` argument is authoritative when supplied
+    # (Issue #80: a live capture's spot LTP is NOT the session close); only
+    # fall back to deriving it from the underlying snapshot.  The historical
+    # loader passes T's own cutoff close, so this is behavior-neutral there.
+    derived_prior_close = f(underlying.get("spot_close")) or f(underlying.get("spot_ltp"))
+    effective_prior_close = f(prior_close) if prior_close is not None else derived_prior_close
     session = GapPredictionSession(
         symbol="NIFTY",
         session_date=session_date,
         cutoff_timestamp=cutoff_timestamp,
-        prior_close=spot_close if spot_close is not None else 0.0,
+        prior_close=effective_prior_close if effective_prior_close is not None else 0.0,
         completeness="UNKNOWN",
     )
     db.add(session)

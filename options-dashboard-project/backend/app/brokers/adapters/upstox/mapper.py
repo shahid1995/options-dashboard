@@ -682,16 +682,34 @@ def _chain_leg_to_price_quote(side_key: str, item: dict) -> PriceQuote | None:
     nested objects. ``ltp`` is the required canonical price field, so a leg
     with no LTP is represented as absent (``None``) rather than fabricated
     with a zero price — the broker payload cannot be canonically priced.
+
+    Issue #80: best bid/ask + quantities (``market_data``) and broker-reported
+    IV/delta/gamma (``option_greeks``) are mapped when present. Broker IV is
+    reported as a percentage (e.g. 12.5 = 12.5%) and is stored canonically as
+    a decimal fraction (0.125); delta/gamma are dimensionless pass-through.
+    Vega/theta are deliberately NOT mapped (unverified broker unit
+    conventions — silently converting units would fabricate semantics).
+    Missing values stay ``None`` — never fabricated to 0.
     """
     side = item.get(side_key) or {}
     market = side.get("market_data") or {}
+    greeks = side.get("option_greeks") or {}
     ltp = market.get("ltp")
     if ltp is None:
         return None
+    iv = _optional_float(greeks.get("iv"))
     return PriceQuote(
         ltp=float(ltp),
         volume=_optional_float(market.get("volume")),
         oi=_optional_float(market.get("oi")),
+        bid=_optional_float(market.get("bid_price")),
+        ask=_optional_float(market.get("ask_price")),
+        bid_quantity=_optional_int(market.get("bid_qty")),
+        ask_quantity=_optional_int(market.get("ask_qty")),
+        # percentage -> decimal fraction (see docstring)
+        iv=(iv / 100.0) if iv is not None else None,
+        delta=_optional_float(greeks.get("delta")),
+        gamma=_optional_float(greeks.get("gamma")),
         source=SOURCE_LABEL,
     )
 
