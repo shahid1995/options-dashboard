@@ -500,8 +500,14 @@ NORMALIZATION_VERSION = "1.0.0"
 # Canonical label applied to every normalized price payload's ``source``.
 SOURCE_LABEL = "UPSTOX"
 
-# Upstox quote/chain timestamp keys, in preference order (first present wins).
+# Upstox quote timestamp keys, in preference order (first present wins).
 _QUOTE_MARKET_TS_KEYS = ("last_trade_time", "timestamp")
+
+# Upstox option-chain leg event-timestamp keys (Issue #80 cutoff integrity):
+# ``market_data.last_trade_time`` (epoch-ms) is the exchange event time of
+# the leg's quote state; ``last_update_time`` is the feed's last update.
+# First present wins; both normalize to UTC via ``upstox_timestamp_to_datetime``.
+_CHAIN_LEG_TS_KEYS = ("last_trade_time", "last_update_time")
 
 
 def instrument_identity_to_normalized(
@@ -690,6 +696,13 @@ def _chain_leg_to_price_quote(side_key: str, item: dict) -> PriceQuote | None:
     Vega/theta are deliberately NOT mapped (unverified broker unit
     conventions — silently converting units would fabricate semantics).
     Missing values stay ``None`` — never fabricated to 0.
+
+    The leg's exchange event timestamp (``market_data.last_trade_time``
+    epoch-ms, falling back to ``last_update_time``) maps to
+    ``event_timestamp`` — research capture refuses snapshots that cannot
+    prove their observation time, so a leg with no parseable event time
+    makes the whole chain observation ineligible for capture (see
+    ``upstox_chain_to_observation``).
     """
     side = item.get(side_key) or {}
     market = side.get("market_data") or {}
@@ -698,6 +711,11 @@ def _chain_leg_to_price_quote(side_key: str, item: dict) -> PriceQuote | None:
     if ltp is None:
         return None
     iv = _optional_float(greeks.get("iv"))
+    event_timestamp = None
+    for ts_key in _CHAIN_LEG_TS_KEYS:
+        event_timestamp = upstox_timestamp_to_datetime(market.get(ts_key))
+        if event_timestamp is not None:
+            break
     return PriceQuote(
         ltp=float(ltp),
         volume=_optional_float(market.get("volume")),
@@ -710,6 +728,7 @@ def _chain_leg_to_price_quote(side_key: str, item: dict) -> PriceQuote | None:
         iv=(iv / 100.0) if iv is not None else None,
         delta=_optional_float(greeks.get("delta")),
         gamma=_optional_float(greeks.get("gamma")),
+        event_timestamp=event_timestamp,
         source=SOURCE_LABEL,
     )
 
@@ -728,9 +747,19 @@ def upstox_chain_to_observation(
     the other ``None``. OI is preserved as reported (contracts, not lots).
     Rows without a ``strike_price`` are skipped (malformed row, not fatal).
     The chain is sorted by strike ascending.
+
+    Issue #80 cutoff integrity: the observation-level ``market_timestamp``
+    is the latest exchange event time actually carried by the payload's
+    legs (``market_data.last_trade_time`` / ``last_update_time``), NOT the
+    receive time.  When the payload carries no parseable event time the
+    observation is returned with ``market_timestamp=None`` and no leg
+    timestamps — research capture then refuses it, because receive time
+    cannot prove the observed state existed at or before a research
+    cutoff.
     """
     rows: list[OptionChainRow] = []
     underlying_spot = None
+    leg_event_times: list[datetime] = []
 
     for item in raw.get("data", []):
         if not isinstance(item, dict):
@@ -741,11 +770,16 @@ def upstox_chain_to_observation(
         if underlying_spot is None:
             spot = item.get("underlying_spot_price")
             underlying_spot = _optional_float(spot)
+        call_leg = _chain_leg_to_price_quote("call_options", item)
+        put_leg = _chain_leg_to_price_quote("put_options", item)
+        for leg in (call_leg, put_leg):
+            if leg is not None and leg.event_timestamp is not None:
+                leg_event_times.append(leg.event_timestamp)
         rows.append(
             OptionChainRow(
                 strike=float(strike),
-                call=_chain_leg_to_price_quote("call_options", item),
-                put=_chain_leg_to_price_quote("put_options", item),
+                call=call_leg,
+                put=put_leg,
             )
         )
 
@@ -756,6 +790,8 @@ def upstox_chain_to_observation(
         expiry_date=expiry_date,
         underlying_spot_price=underlying_spot,
         chain=rows,
+        # broker event time (max across legs) — never the receive time
+        market_timestamp=max(leg_event_times) if leg_event_times else None,
         received_timestamp=received_at,
         source=SOURCE_LABEL,
         data_mode=DataMode.BROKER_SNAPSHOT,

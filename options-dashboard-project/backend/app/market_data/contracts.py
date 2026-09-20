@@ -187,7 +187,11 @@ class PriceQuote:
     iv: float | None = None
     delta: float | None = None
     gamma: float | None = None
-    source: str | None = None
+    # Exchange/event time of this quote as reported by the source (Issue #80
+    # cutoff integrity).  None when the payload carries no event timestamp —
+    # NEVER synthesized from receive time; research capture refuses
+    # observations that cannot prove their observation time.
+    event_timestamp: datetime | None = None
 
 
 # ===========================================================================

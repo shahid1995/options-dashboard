@@ -34,7 +34,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime  # naive operator cutoffs are IST-pinned inside capture_session
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -242,8 +242,6 @@ def _cmd_capture(args) -> int:
 
     db = SessionLocal()
     try:
-        from datetime import timezone as _tz
-
         from app.brokers.domain.enums import BROKER_ID_UPSTOX
         from app.brokers.gateway import gateway
 

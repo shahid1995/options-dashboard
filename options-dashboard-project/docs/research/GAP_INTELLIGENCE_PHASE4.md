@@ -65,12 +65,30 @@ natural-key uniqueness, JSON raw-chain copy unchanged):
   (`analytics_token` / `broker_oauth`). Capture NEVER writes
   `reconstructed` — no Black-Scholes value can ever be labelled observed.
 
-### Cutoff integrity
+### Cutoff integrity (corrected post-review)
 
-The caller declares the end-of-session cutoff. `capture_session` rejects an
-observation whose **market/event timestamp** is after the cutoff (instant
-comparison: a 10:00 UTC observation equals a 15:30 IST cutoff — tested).
-Receive-time is recorded as-is (never back-dated to the cutoff).
+**Root cause found by review:** the original gate rejected only observations
+that *carried* a post-cutoff `market_timestamp` — and no chain mapper set
+one, so the real path could fetch after the cutoff and store a snapshot
+whose observation time was simply unproven.
+
+**Correction:** `capture_session` now requires a defensible observation-time
+basis and refuses otherwise. Upstox chain legs carry exchange event times
+(`market_data.last_trade_time` / `last_update_time`, mapped payload-tolerantly
+to `PriceQuote.event_timestamp`); the mapper derives the observation-level
+`market_timestamp` as the latest payload event time. Snapshots persist the
+payload's actual observation times as row `source_timestamp` — **receive
+time is never treated as evidence and never back-dated to the cutoff**.
+A naive operator cutoff is pinned to the documented IST exchange-wall-clock
+convention (single canonical `IST` from `app.utils.market_time`); naive
+broker event timestamps are refused. FYERS's chain payload exposes no event
+timestamp, so FYERS observations are **refused** until an authoritative
+broker-source timestamp exists — never fabricated.
+
+Tested: accepted at/before cutoff; rejected after cutoff with nothing
+persisted; refusal when no event timestamp exists; tz-equivalent cutoffs
+normalize; persisted stamps are the payload's own times; both real adapter
+paths (Upstox accepted/refused, FYERS refused) exercised end-to-end.
 
 ### Classification / expiry / DTE
 
@@ -133,7 +151,7 @@ out-of-sample analysis.
 
 ## 7. Tests
 
-10 new focused tests (all in `tests/test_gap_research.py`), covering:
+16 focused tests (all in `tests/test_gap_research.py`), covering:
 observed-provenance + missing≠zero; post-cutoff rejection (nothing
 persisted); cutoff timezone normalization (UTC vs IST instants); expiry/DTE
 classification from metadata; immutability + deterministic replace-replay;
@@ -141,7 +159,11 @@ derived change_in_oi only with prior; deterministic row conversion;
 compatibility with the existing causal pipeline (features → predictions →
 target attachment, gap = 115.0 from the explicit prior close); and both
 brokers' chain mappers (analytics mapped when present — IV % → decimal —
-missing stays missing when absent). Adapters' mapper/gateway/quality suites
+missing stays missing when absent). The cutoff-integrity correction added 6 further tests (refusal without an
+event timestamp; honest source-timestamp persistence; adapter event-time
+normalization; Upstox mapper→capture end-to-end accepted/refused; FYERS
+mapper→capture refused; `PriceQuote.source` single-declaration regression).
+Adapters' mapper/gateway/quality suites
 re-run green (291 passed; the one upstox failure is the pre-existing
 capabilities-matrix failure verified on the pristine Phase-1 base).
 

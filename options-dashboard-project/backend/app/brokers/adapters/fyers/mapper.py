@@ -554,6 +554,15 @@ def fyers_chain_to_observation(
     missing is never fabricated). CE and PE legs are independent: a leg
     without LTP is absent (``None``), never zero.
     Rows without a strike are skipped (malformed row, not fatal).
+
+    Issue #80 cutoff integrity: the FYERS options-chain-v3 payload exposes
+    NO exchange event or snapshot timestamp, so ``market_timestamp`` stays
+    ``None`` (mirroring the quote path above — never synthesized from
+    receive time).  Research capture therefore REFUSES FYERS chain
+    observations: receive time cannot prove the observed quote/book state
+    existed at or before a declared research cutoff.  Capturing from FYERS
+    requires an authoritative broker-source timestamp first — never a
+    fabricated or back-dated one.
     """
     rows: list[OptionChainRow] = []
     underlying_spot = None
