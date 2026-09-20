@@ -120,8 +120,9 @@ def test_init_db_uses_alembic(monkeypatch, temp_engine):
     # broker_sync expansions; 39 after Day41.2 (order_family_sync_lock +
     # broker_authorizations via the merge head); 43 since Auth account-security
     # c1d2e3f4a5b6 added email_verification_tokens, password_reset_tokens,
-    # pending_email_changes, security_events.
-    assert len(tables) == 43
+    # pending_email_changes, security_events; 49 since Issue #17 research
+    # schema e9f8a7b6c5d4 added the six gap_* research tables (research-only).
+    assert len(tables) == 49
 
 
 def test_init_db_creates_legacy_columns_via_baseline(monkeypatch, temp_engine):
