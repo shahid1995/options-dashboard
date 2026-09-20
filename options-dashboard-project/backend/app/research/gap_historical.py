@@ -42,7 +42,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Mapping, Sequence
 
 from sqlalchemy import func
@@ -72,6 +72,16 @@ MAX_CANDIDATE_GAP_DAYS = 12
 # source DB is an input, not an application database.
 REQUIRED_SOURCE_TABLES = ("nifty_candles", "option_candles", "contract_specs")
 
+# Candle-store timestamps are IST wall-clock; the canonical
+# HistoricalGreeksEngine expects UTC valuation timestamps. IST = UTC + 5:30.
+IST_TO_UTC = timedelta(hours=5, minutes=30)
+
+# Chain-row option types vs the engine's CE/PE convention.
+_TYPE_TO_ENGINE = {"CALL": "CE", "PUT": "PE"}
+
+# Enrichment provenance marker (recorded per session in completeness_detail).
+GREEKS_ENGINE_LABEL = "HISTORICAL_GREEKS_ENGINE"
+
 __all__ = [
     "HistoricalSession",
     "extract_historical_sessions",
@@ -91,6 +101,7 @@ class HistoricalSession:
     next_session_date: str | None = None
     next_open: float | None = None
     next_open_ts: datetime | None = None
+    enrichment: dict[str, Any] | None = None  # Phase-2 greeks metadata
 
 
 def _index_sessions(db: Session, symbol: str = "NIFTY") -> dict[str, list[NiftyCandle]]:
@@ -180,11 +191,95 @@ def _front_expiry_chain(
     return chain
 
 
+def _enrich_chain_with_greeks(
+    chain: list[dict[str, Any]],
+    spot: float,
+    cutoff_ist: datetime,
+) -> dict[str, Any]:
+    """Phase-2 enrichment: attach IV + Black-Scholes Greeks to chain rows.
+
+    Reuses the canonical Phase 7.19B engine (``HistoricalGreeksEngine``
+    math — ``calculate_greeks_for_candle`` / ``compute_time_to_expiry``)
+    WITHOUT duplicating or modifying it:
+
+    * valuation timestamp = the session's research cutoff, converted
+      IST→UTC (−5:30) per the engine's UTC contract;
+    * S = the index close aligned at the cutoff (same value as the
+      session's ``spot_close`` — no EOD value is ever used);
+    * market price = the cutoff candle close (LTP proxy);
+    * T is computed per row against that row's own expiry;
+    * rows where the IV solver fails (e.g. deep-ITM quotes below
+      intrinsic) keep ``iv``/Greeks = None — missing stays missing, and
+      the failure is counted, never patched.
+
+    Returns per-session enrichment metadata (provenance + coverage).
+    """
+    from app.services.historical_greeks import (
+        DEFAULT_CALC_VERSION,
+        calculate_greeks_for_candle,
+        compute_time_to_expiry,
+    )
+
+    cutoff_utc = cutoff_ist - IST_TO_UTC
+    iv_ok = delta_ok = gamma_ok = vega_ok = theta_ok = 0
+    t_expired = no_iv = 0
+    for row in chain:
+        strike = row.get("strike")
+        ltp = row.get("ltp")
+        expiry = row.get("expiry")
+        otype = _TYPE_TO_ENGINE.get(row.get("option_type") or "")
+        if otype is None or strike is None or ltp is None or expiry is None:
+            continue
+        t_years = compute_time_to_expiry(cutoff_utc, expiry)
+        result = calculate_greeks_for_candle(
+            option_type=otype,
+            S=float(spot),
+            K=float(strike),
+            T=t_years,
+            market_price=float(ltp),
+        )
+        row["iv"] = result.implied_volatility
+        row["delta"] = result.delta
+        row["gamma"] = result.gamma
+        row["vega"] = result.vega
+        row["theta"] = result.theta
+        if result.implied_volatility is not None:
+            iv_ok += 1
+        if result.delta is not None:
+            delta_ok += 1
+        if result.gamma is not None:
+            gamma_ok += 1
+        if result.vega is not None:
+            vega_ok += 1
+        if result.theta is not None:
+            theta_ok += 1
+        if t_years <= 0:
+            t_expired += 1
+        elif result.implied_volatility is None:
+            no_iv += 1
+    n = len(chain)
+    return {
+        "engine": GREEKS_ENGINE_LABEL,
+        "calc_version": DEFAULT_CALC_VERSION,
+        "tz_rule": "candle store holds IST wall-clock; converted IST→UTC (−5:30) for the canonical engine",
+        "valuation": "research cutoff candle only (no EOD alignment)",
+        "rows": n,
+        "iv_rows": iv_ok,
+        "delta_rows": delta_ok,
+        "gamma_rows": gamma_ok,
+        "vega_rows": vega_ok,
+        "theta_rows": theta_ok,
+        "expired_at_cutoff": t_expired,
+        "no_iv": no_iv,
+    }
+
+
 def extract_historical_sessions(
     store: Session,
     symbol: str = "NIFTY",
     start: str | None = None,
     end: str | None = None,
+    enrich_greeks: bool = False,
 ) -> list[HistoricalSession]:
     """Extract all eligible sessions (see module docstring rules)."""
     index = _index_sessions(store, symbol)
@@ -233,6 +328,11 @@ def extract_historical_sessions(
         chain = _front_expiry_chain(store, day, cutoff)
         if not chain:
             continue
+        enrichment: dict[str, Any] | None = None
+        if enrich_greeks:
+            enrichment = _enrich_chain_with_greeks(
+                chain, underlying["spot_close"], cutoff
+            )
         sessions.append(
             HistoricalSession(
                 session_date=day,
@@ -245,6 +345,7 @@ def extract_historical_sessions(
                 next_session_date=next_index_date,
                 next_open=float(next_candles[0].open) if (next_candles := index[next_index_date]) else None,
                 next_open_ts=next_candles[0].open_time if next_candles else None,
+                enrichment=enrichment,
             )
         )
     return sessions
@@ -258,7 +359,20 @@ def _completeness_summary(sessions: Sequence[HistoricalSession]) -> dict[str, An
     def frac(pred) -> float:
         return round(sum(1 for s in sessions if pred(s)) / n, 3)
 
-    return {
+    total_rows = sum(len(s.chain) for s in sessions)
+
+    def row_pct(field: str) -> float | None:
+        if total_rows == 0:
+            return None
+        have = sum(
+            1
+            for s in sessions
+            for r in s.chain
+            if r.get(field) is not None
+        )
+        return round(have / total_rows, 3)
+
+    summary: dict[str, Any] = {
         "sessions": n,
         "spot_ohlc_present": frac(lambda s: s.underlying["spot_close"] is not None),
         "chain_present": frac(lambda s: len(s.chain) > 0),
@@ -273,7 +387,30 @@ def _completeness_summary(sessions: Sequence[HistoricalSession]) -> dict[str, An
         "bid_ask_present": frac(lambda s: any(r["bid"] is not None for r in s.chain)),
         "futures_present": frac(lambda s: s.underlying["futures_ltp"] is not None),
         "india_vix_present": frac(lambda s: s.underlying["india_vix"] is not None),
+        "chain_rows": total_rows,
     }
+    # Per-row coverage percentages (Phase 2 completeness audit). A family
+    # that is present in zero rows reports 0.0 — present-but-empty is
+    # distinguishable from not-applicable only via the *_present flags.
+    for field in ("iv", "delta", "gamma", "vega", "theta"):
+        summary[f"{field}_rows_pct"] = row_pct(field)
+    # Eligibility profile from MEASURED data (never assumed):
+    #   CORE          — spot + chain OI/volume (Phase 1 candle-store baseline)
+    #   CORE+GREEKS   — CORE + IV/Greeks/GEX activatable from the same store
+    #   FULL          — additionally futures + India VIX + bid/ask (not
+    #                   available in any authorized historical source; kept
+    #                   for documentation, never claimed)
+    has_greeks = bool(summary["iv_present"])
+    has_fut = bool(summary["futures_present"])
+    has_vix = bool(summary["india_vix_present"])
+    has_ba = bool(summary["bid_ask_present"])
+    if has_fut and has_vix and has_ba and has_greeks:
+        summary["profile"] = "FULL"
+    elif has_greeks:
+        summary["profile"] = "CORE+GREEKS"
+    else:
+        summary["profile"] = "CORE"
+    return summary
 
 
 def run_historical_sample(
@@ -282,6 +419,7 @@ def run_historical_sample(
     start: str | None = None,
     end: str | None = None,
     flat_band_pct: float = 0.001,
+    enrich_greeks: bool = False,
 ) -> dict[str, Any]:
     """Full Phase-1 historical sample: ingest → per-session causal processing
     → deterministic backtests.
@@ -298,7 +436,9 @@ def run_historical_sample(
       realized target as historical information.
     * Pass 3 — deterministic chronological backtests per model, last.
     """
-    extracted = extract_historical_sessions(store, start=start, end=end)
+    extracted = extract_historical_sessions(
+        store, start=start, end=end, enrich_greeks=enrich_greeks
+    )
     if not extracted:
         return {"sessions": 0, "note": "no eligible sessions in the candle store"}
 
@@ -313,6 +453,42 @@ def run_historical_sample(
             chain=s.chain,
         )
     db.commit()
+
+    # Phase-2 separation: enriched sessions carry their provenance and
+    # measured eligibility profile ON the session row, so Phase 1 and
+    # Phase 2 samples are distinguishable inside any research DB.
+    if enrich_greeks:
+        from app.models import GapPredictionSession as _GPS
+
+        for s in extracted:
+            if s.enrichment is None:
+                continue
+            row = (
+                db.query(_GPS)
+                .filter(
+                    _GPS.symbol == "NIFTY",
+                    _GPS.session_date == s.session_date,
+                )
+                .one_or_none()
+            )
+            if row is not None:
+                rows = s.enrichment["rows"] or 1
+                row.completeness = "ENRICHED_GREEKS"
+                row.completeness_detail = json.dumps(
+                    {
+                        "profile": "CORE+GREEKS",
+                        "enrichment": s.enrichment,
+                        "coverage_pct": {
+                            "iv": round(s.enrichment["iv_rows"] / rows, 3),
+                            "delta": round(s.enrichment["delta_rows"] / rows, 3),
+                            "gamma": round(s.enrichment["gamma_rows"] / rows, 3),
+                            "vega": round(s.enrichment["vega_rows"] / rows, 3),
+                            "theta": round(s.enrichment["theta_rows"] / rows, 3),
+                        },
+                    },
+                    default=str,
+                )
+        db.commit()
 
     # Pass 2 — per-session features → predictions → realized target, in
     # chronological order. Causality: prediction T may only ever see targets
@@ -362,15 +538,36 @@ def run_historical_sample(
     ):
         dist[gc] = dist.get(gc, 0) + 1
 
+    summary_data_completeness = _completeness_summary(extracted)
     summary = {
         "sessions_extracted": len(extracted),
         "targets_attached": attached,
         "period_start": extracted[0].session_date,
         "period_end": extracted[-1].session_date,
-        "data_completeness": _completeness_summary(extracted),
+        "data_completeness": summary_data_completeness,
         "target_distribution": dist,
         "flat_band_pct": flat_band_pct,
         "no_edge_counts": no_edge,
+        "enrichment": enrich_greeks,
+        "enrichment_aggregate": (
+            {
+                "profile": summary_data_completeness.get("profile"),
+                "iv_rows_pct": summary_data_completeness.get("iv_rows_pct"),
+                "delta_rows_pct": summary_data_completeness.get("delta_rows_pct"),
+                "gamma_rows_pct": summary_data_completeness.get("gamma_rows_pct"),
+                "vega_rows_pct": summary_data_completeness.get("vega_rows_pct"),
+                "theta_rows_pct": summary_data_completeness.get("theta_rows_pct"),
+                "expired_at_cutoff_total": sum(
+                    (s.enrichment or {}).get("expired_at_cutoff", 0)
+                    for s in extracted
+                ),
+                "no_iv_total": sum(
+                    (s.enrichment or {}).get("no_iv", 0) for s in extracted
+                ),
+            }
+            if enrich_greeks
+            else None
+        ),
         "backtests": results,
     }
     logger.info(

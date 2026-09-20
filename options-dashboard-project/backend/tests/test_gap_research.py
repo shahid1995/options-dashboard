@@ -551,11 +551,22 @@ def test_no_lookahead_features_and_predictions(research_db):
 # ---------------------------------------------------------------------------
 
 
-def _seed_candle_store(tmp_path, dates: list[str], gap_day: str | None = None):
+def _seed_candle_store(
+    tmp_path,
+    dates: list[str],
+    gap_day: str | None = None,
+    expiry: str | None = None,
+    deep_itm: bool = False,
+    after_cutoff_index_candle: bool = False,
+):
     """Build a hermetic candle-store DB (nifty/option candles + specs).
 
     ``gap_day`` names a date that gets NO option candles (a data gap), so the
-    continuity rule can be tested.
+    continuity rule can be tested. ``expiry`` overrides the per-day front
+    expiry (needed so greeks enrichment has T > 0 at the cutoff).
+    ``deep_itm`` adds a strike whose quote is below intrinsic (engine NO_IV
+    case — missing stays missing). ``after_cutoff_index_candle`` adds an
+    index candle AFTER the option cutoff (cutoff-rejection test).
     """
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
@@ -571,16 +582,21 @@ def _seed_candle_store(tmp_path, dates: list[str], gap_day: str | None = None):
         base = datetime.fromisoformat(f"{day}T09:15:00")
         for k in (0, 1):
             s.add(NiftyCandle(symbol="NIFTY", interval="3min", open_time=base.replace(hour=9 + k), open=25000 + k, high=25010 + k, low=24990 + k, close=25005 + k, volume=1000))
+        if after_cutoff_index_candle:
+            s.add(NiftyCandle(symbol="NIFTY", interval="3min", open_time=datetime.fromisoformat(f"{day}T15:45:00"), open=26000.0, high=26100.0, low=25900.0, close=26000.0, volume=1000))
 
     def opts(day: str) -> None:
-        expiry = day  # front expiry == session date for the test
-        for token, (strike, otype) in {
-            "1": (25000, "CE"), "2": (25000, "PE"),
-            "3": (25050, "CE"), "4": (25050, "PE"),
-        }.items():
+        expiry_value = expiry or day  # front expiry == session date by default
+        contracts = {
+            "1": (25000, "CE", 105.0), "2": (25000, "PE", 105.0),
+            "3": (25050, "CE", 105.0), "4": (25050, "PE", 105.0),
+        }
+        if deep_itm:
+            contracts["9"] = (24000, "CE", 5.0)  # quote below intrinsic → NO_IV
+        for token, (strike, otype, close) in contracts.items():
             key = f"NSE_FO|{token}|{day}"
-            s.add(ContractSpec(instrument_key=key, underlying="NIFTY", underlying_key="NSE_INDEX|Nifty 50", expiry=expiry, strike_price=float(strike), instrument_type=otype, lot_size=25, minimum_lot=25, freeze_quantity=1800, tick_size=0.05, trading_symbol=f"NIFTY {strike} {otype}", segment="NSE_FO", exchange="NSE", weekly=True, source="TEST", source_reference="test", fetched_at=datetime(2026, 1, 1)))
-            s.add(OptionCandle(instrument_key=key, interval="3min", open_time=datetime.fromisoformat(f"{day}T15:27:00"), open=100.0, high=110.0, low=95.0, close=105.0, volume=500.0, open_interest=90000.0, source="TEST", fetched_at=datetime(2026, 1, 1)))
+            s.add(ContractSpec(instrument_key=key, underlying="NIFTY", underlying_key="NSE_INDEX|Nifty 50", expiry=expiry_value, strike_price=float(strike), instrument_type=otype, lot_size=25, minimum_lot=25, freeze_quantity=1800, tick_size=0.05, trading_symbol=f"NIFTY {strike} {otype}", segment="NSE_FO", exchange="NSE", weekly=True, source="TEST", source_reference="test", fetched_at=datetime(2026, 1, 1)))
+            s.add(OptionCandle(instrument_key=key, interval="3min", open_time=datetime.fromisoformat(f"{day}T15:27:00"), open=100.0, high=110.0, low=95.0, close=close, volume=500.0, open_interest=90000.0, source="TEST", fetched_at=datetime(2026, 1, 1)))
 
     for d in dates:
         idx(d)
@@ -630,6 +646,8 @@ def test_historical_loader_continuity_and_pass_order(tmp_path, research_db, cand
     # --- full sample run on a hermetic research DB.
     summary = run_historical_sample(research_db, store)
     assert summary["sessions_extracted"] >= 1
+    # Eligibility profile from measured data: candle-only store = CORE.
+    assert summary["data_completeness"]["profile"] == "CORE"
     assert summary["targets_attached"] == summary["sessions_extracted"]
     assert set(summary["backtests"]) == {"baseline", "pos_style", "sos"}
     for model, bt in summary["backtests"].items():
@@ -653,6 +671,25 @@ def test_historical_loader_continuity_and_pass_order(tmp_path, research_db, cand
     assert comp["greeks_present"] == 0.0
     assert comp["futures_present"] == 0.0
     assert comp["oi_present"] == 1.0
+
+
+def _fresh_research_db(path):
+    """Hermetic research-DB session generator (like research_db, but by path)."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.db import Base
+
+    import app.models  # noqa: F401 — register tables on Base
+
+    engine = create_engine(
+        f"sqlite:///{path}", connect_args={"check_same_thread": False}
+    )
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine, autocommit=False, autoflush=False)()
+    yield db
+    db.close()
+    engine.dispose()
 
 
 def _run_causal_three_sessions(db, days, gaps):
@@ -794,5 +831,171 @@ def test_historical_loader_gap_cap(tmp_path):
         stores.append(store)
         sessions = extract_historical_sessions(store)
         assert sessions == []  # 22-day gap exceeds MAX_CANDIDATE_GAP_DAYS
+    finally:
+        gen.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — data-enriched SOS validation (Issue #76)
+# ---------------------------------------------------------------------------
+
+
+def test_cutoff_rejects_after_cutoff_index_candles(tmp_path):
+    """Index candles AFTER the research cutoff (option terminal candle) must
+    never enter the underlying snapshot — no EOD leakage past the cutoff."""
+    from app.research.gap_historical import extract_historical_sessions
+
+    gen = _seed_candle_store(
+        tmp_path, ["2026-08-03", "2026-08-04", "2026-08-05", "2026-08-06"],
+        after_cutoff_index_candle=True,
+    )
+    try:
+        store = next(gen)
+        sessions = extract_historical_sessions(store)
+        assert sessions
+        for s in sessions:
+            # 15:45 index candle (close 26000) exists but is after the 15:27
+            # cutoff: spot_close must come from ≤-cutoff candles only.
+            assert s.underlying["spot_close"] == pytest.approx(25006.0)
+            assert s.underlying["spot_high"] <= 25011.0
+            assert s.underlying["spot_low"] >= 24990.0
+            # ...and the target open is still the next session's FIRST candle.
+            assert s.next_open == pytest.approx(25000.0)
+    finally:
+        gen.close()
+
+
+def test_enriched_chain_greeks_and_missing_ne_zero(tmp_path):
+    """Enrichment attaches canonical-engine IV/Greeks at the cutoff candle;
+    NO_IV rows keep None (missing ≠ zero); GEX features activate."""
+    from app.research.gap_historical import extract_historical_sessions
+    from app.research.gap_features import gex_features
+
+    gen = _seed_candle_store(
+        tmp_path, ["2026-08-03", "2026-08-04", "2026-08-05", "2026-08-06"],
+        expiry="2026-08-13",  # 7 days out → T > 0 at the cutoff
+        deep_itm=True,
+    )
+    try:
+        store = next(gen)
+        sessions = extract_historical_sessions(store, enrich_greeks=True)
+        assert sessions
+        s = sessions[0]
+        assert s.enrichment is not None
+        assert s.enrichment["engine"] == "HISTORICAL_GREEKS_ENGINE"
+        # 5 contracts: base 25000/25050 CE+PE plus the deep-ITM 24000 CE.
+        assert s.enrichment["rows"] == len(s.chain) == 5
+
+        by_type = {(r["strike"], r["option_type"]): r for r in s.chain}
+        atm = by_type[(25000.0, "CALL")]
+        # ATM contract: IV solved, delta/gamma/vega/theta populated.
+        assert 0.01 < atm["iv"] < 10.0
+        assert atm["delta"] is not None and 0.0 < atm["delta"] < 1.0
+        assert atm["gamma"] is not None and atm["vega"] is not None
+        # Deep-ITM quote below intrinsic: NO_IV — every value stays missing.
+        deep = by_type[(24000.0, "CALL")]
+        assert deep["iv"] is None and deep["delta"] is None and deep["gamma"] is None
+        assert s.enrichment["no_iv"] >= 1
+
+        # Canonical GEX activates from engine gamma (spot_to_flip/flip present).
+        gex = gex_features(s.chain, s.underlying["spot_close"], s.session_date, None)
+        assert gex.get("net_gex") is not None
+        assert gex.get("gamma_flip") is not None
+    finally:
+        gen.close()
+
+
+def test_enriched_run_profile_provenance_and_phase_separation(tmp_path):
+    """Enriched runs are marked ENRICHED_GREEKS with measured profile
+    CORE+GREEKS and full provenance; the control (enrich off) stays CORE —
+    Phase 1 and Phase 2 samples remain separately identifiable."""
+    import json as _json
+
+    from app.models import GapPredictionSession
+    from app.research.gap_historical import run_historical_sample
+
+    dates = ["2026-08-03", "2026-08-04", "2026-08-05", "2026-08-06"]
+
+    gen = _seed_candle_store(tmp_path, dates, expiry="2026-08-13", deep_itm=True)
+    try:
+        store = next(gen)
+
+        # --- control run (Phase 1 semantics).
+        control_db = next(
+            _fresh_research_db(tmp_path / "control")
+        )
+        control = run_historical_sample(control_db, store, enrich_greeks=False)
+        assert control["data_completeness"]["profile"] == "CORE"
+        assert control["data_completeness"]["iv_rows_pct"] == 0.0
+        c_row = control_db.query(GapPredictionSession).first()
+        assert c_row.completeness != "ENRICHED_GREEKS"
+
+        # --- enriched run (Phase 2).
+        enriched_db = next(_fresh_research_db(tmp_path / "enriched"))
+        summary = run_historical_sample(enriched_db, store, enrich_greeks=True)
+        comp = summary["data_completeness"]
+        assert comp["profile"] == "CORE+GREEKS"
+        assert comp["iv_rows_pct"] > 0 and comp["delta_rows_pct"] > 0
+        assert comp["gamma_rows_pct"] > 0
+        # futures / VIX / bid-ask remain genuinely absent.
+        assert comp["futures_present"] == 0.0
+        assert comp["india_vix_present"] == 0.0
+        assert comp["bid_ask_present"] == 0.0
+        assert summary["enrichment"] is True
+        assert summary["enrichment_aggregate"]["no_iv_total"] >= 1
+
+        rows = enriched_db.query(GapPredictionSession).all()
+        assert rows and all(r.completeness == "ENRICHED_GREEKS" for r in rows)
+        detail = _json.loads(rows[0].completeness_detail)
+        assert detail["profile"] == "CORE+GREEKS"
+        assert detail["enrichment"]["tz_rule"].startswith("candle store holds IST")
+        assert detail["enrichment"]["engine"] == "HISTORICAL_GREEKS_ENGINE"
+    finally:
+        gen.close()
+
+
+def test_enriched_run_deterministic(tmp_path):
+    """Two enriched runs from the same immutable store produce identical
+    predictions and metrics (determinism holds with the greeks path on)."""
+    import json as _json
+
+    from app.models import GapPrediction
+    from app.research.gap_historical import run_historical_sample
+
+    dates = ["2026-08-03", "2026-08-04", "2026-08-05", "2026-08-06"]
+    gen = _seed_candle_store(tmp_path, dates, expiry="2026-08-13", deep_itm=True)
+    try:
+        store = next(gen)
+        digests = []
+        for name in ("d1", "d2"):
+            rdb = next(_fresh_research_db(tmp_path / name))
+            run_historical_sample(rdb, store, enrich_greeks=True)
+            preds = sorted(
+                (p.model_name, p.session_date, p.direction_score, p.state, p.probabilities or "")
+                for p in rdb.query(GapPrediction).all()
+            )
+            digests.append(_json.dumps(preds, default=str, sort_keys=True))
+        assert digests[0] == digests[1]
+    finally:
+        gen.close()
+
+
+def test_regime_dims_report_only(tmp_path):
+    """Enriched backtests segment by feature-derived regimes (GEX/IV/DTE/
+    prior-day) without altering any prediction or headline metric."""
+    from app.research.gap_historical import run_historical_sample
+
+    dates = ["2026-08-03", "2026-08-04", "2026-08-05", "2026-08-06"]
+    gen = _seed_candle_store(tmp_path, dates, expiry="2026-08-13", deep_itm=True)
+    try:
+        store = next(gen)
+        rdb = next(_fresh_research_db(tmp_path / "regimes"))
+        summary = run_historical_sample(rdb, store, enrich_greeks=True)
+        for model, bt in summary["backtests"].items():
+            dims = bt.get("by_regime_dims") or {}
+            assert "ALL" in bt["by_regime"]  # Phase-1 shape preserved
+            for dim, buckets in dims.items():
+                assert len(buckets) >= 2  # a regime dim must actually split
+                assert dim in ("gex", "iv", "dte", "prevday")
     finally:
         gen.close()

@@ -1,6 +1,7 @@
 # StrikeNova Overnight Gap Intelligence — Phase 1 Implementation
 
 **Issue:** #17 — Research Phase 1 (POS Benchmark + SOS)
+**Phase 2 (data-enriched validation):** see `GAP_INTELLIGENCE_PHASE2.md`
 **Status:** Implemented (research/backtest only) — NOT a production signal
 **Specification:** `docs/STRIKENOVA_OVERNIGHT_GAP_RESEARCH.md` (2026-08-24)
 **Scope guard:** nothing in this module feeds the dashboard, paper execution,

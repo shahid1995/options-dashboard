@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import math
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Mapping, Sequence
 
 from sqlalchemy.orm import Session
@@ -34,7 +34,7 @@ from app.models import (
     OptionChainSnapshot,
     UnderlyingSnapshot,
 )
-from app.research.gap_backtest import run_backtest
+from app.research.gap_backtest import Observation, evaluate, run_backtest
 from app.research.gap_features import (
     FEATURE_VERSION,
     delta_features,
@@ -613,7 +613,122 @@ def run_comparison_backtest(
     # stored period metadata reflects the real sessions, never a placeholder.
     result["period_start"] = rows[0]["session_date"] if rows else None
     result["period_end"] = rows[-1]["session_date"] if rows else None
+
+    # Phase-2 regime segmentation (report-only — never a model input): when
+    # stored features exist, segment metrics by data-supported dimensions.
+    # VIX regime remains unavailable until VIX history exists; GEX/IV/DTE/
+    # prior-day-movement regimes activate when their features are present.
+    result["by_regime_dims"] = _regime_dimension_breakdown(db, rows)
     return result
+
+
+def _regime_dimension_breakdown(db: Session, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Segment metrics along feature-derived dimensions (report-only).
+
+    Segmentation uses stored, already-causal features. Cross-sectional
+    medians are computed over the evaluated sample for reporting only —
+    they never influence predictions, features, or normalization.
+    """
+    if not rows:
+        return {}
+    dates = [r["session_date"] for r in rows]
+    feat_rows = (
+        db.query(GapFeatures.session_date, GapFeatures.features)
+        .filter(
+            GapFeatures.session_date.in_(dates),
+            GapFeatures.feature_version == FEATURE_VERSION,
+        )
+        .all()
+    )
+    feats = {d: json.loads(f or "{}") for d, f in feat_rows}
+    expiry_rows = (
+        db.query(OptionChainSnapshot.session_date, OptionChainSnapshot.expiry)
+        .filter(OptionChainSnapshot.session_date.in_(dates))
+        .distinct()
+        .all()
+    )
+    expiry_by_session: dict[str, str] = dict(expiry_rows)
+
+    def dte_of(d: str) -> float | None:
+        e = expiry_by_session.get(d)
+        if not e:
+            return None
+        try:
+            return float((date.fromisoformat(e) - date.fromisoformat(d)).days)
+        except ValueError:
+            return None
+
+    def median(values: list[float]) -> float | None:
+        if not values:
+            return None
+        s = sorted(values)
+        m = len(s) // 2
+        return s[m] if len(s) % 2 else (s[m - 1] + s[m]) / 2.0
+
+    dims: dict[str, dict[str, Any]] = {}
+
+    def add_dim(name: str, label_of):
+        labels = {d: label_of(d) for d in dates}
+        if all(v is None for v in labels.values()):
+            return
+        buckets: dict[str, list[dict[str, Any]]] = {}
+        for r in rows:
+            lab = labels.get(r["session_date"])
+            if lab is None:
+                continue
+            buckets.setdefault(lab, []).append(r)
+        if len(buckets) < 2:
+            return
+        dims[name] = {
+            label: evaluate(
+                [
+                    Observation(
+                        session_date=r["session_date"],
+                        realized_gap_class=r["gap_class"],
+                        realized_gap_points=r["gap_points"],
+                        prediction=r["prediction"],
+                        regime=label,
+                        confidence=r["prediction"].get("confidence"),
+                    )
+                    for r in bucket
+                ]
+            ).as_dict()
+            for label, bucket in sorted(buckets.items())
+        }
+
+    # GEX regime: net dealer gamma positive (short-gamma below flip) vs negative.
+    add_dim(
+        "gex",
+        lambda d: ("NET_GEX_POS" if (feats.get(d, {}).get("net_gex") or 0) >= 0 else "NET_GEX_NEG")
+        if feats.get(d, {}).get("net_gex") is not None
+        else None,
+    )
+    # IV regime: ATM IV above/below the sample median.
+    iv_med = median(
+        [feats[d]["atm_iv"] for d in dates if feats.get(d, {}).get("atm_iv") is not None]
+    )
+    if iv_med is not None:
+        add_dim(
+            "iv",
+            lambda d: ("IV_HIGH" if feats[d]["atm_iv"] >= iv_med else "IV_LOW")
+            if feats.get(d, {}).get("atm_iv") is not None
+            else None,
+        )
+    # Expiry proximity: front expiry within 2 trading-agnostic calendar days.
+    add_dim(
+        "dte",
+        lambda d: ("DTE_NEAR" if (dte_of(d) or 99) <= 2 else "DTE_FAR")
+        if dte_of(d) is not None
+        else None,
+    )
+    # Prior-day movement regime.
+    add_dim(
+        "prevday",
+        lambda d: ("PREV_UP" if feats[d]["prev_day_change_pct"] > 0 else "PREV_DOWN")
+        if feats.get(d, {}).get("prev_day_change_pct") is not None
+        else None,
+    )
+    return dims
 
 
 def store_backtest_result(
