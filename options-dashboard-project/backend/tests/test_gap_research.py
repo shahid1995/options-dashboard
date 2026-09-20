@@ -655,6 +655,132 @@ def test_historical_loader_continuity_and_pass_order(tmp_path, research_db, cand
     assert comp["oi_present"] == 1.0
 
 
+def _run_causal_three_sessions(db, days, gaps):
+    """Orchestrate sessions exactly as run_historical_sample does (per-session
+    features → predictions → realized target), returning stored predictions.
+    Used by the causal-history and CLI-period tests."""
+    from app.research.gap_pipeline import (
+        attach_realized_target,
+        build_and_store_features,
+        generate_and_store_predictions,
+        ingest_session_snapshots,
+    )
+
+    stored: dict[str, dict] = {}
+    for d in days:  # Pass 1 — immutable snapshots.
+        u, chain = _session_payload(d, 0.1)
+        ingest_session_snapshots(
+            db, d, datetime.fromisoformat(f"{d}T15:30:00"), 25000.0, u, chain
+        )
+    for i, d in enumerate(days):  # Pass 2 — per session, chronological.
+        build_and_store_features(db, d)
+        stored[d] = generate_and_store_predictions(db, d)
+        nxt = days[i + 1] if i + 1 < len(days) else "2026-08-06"
+        attach_realized_target(
+            db, d, nxt, 25000.0 + gaps[d], datetime.fromisoformat(f"{nxt}T09:15:00")
+        )
+    return stored
+
+
+DAYS3 = ["2026-08-03", "2026-08-04", "2026-08-05"]
+GAPS3 = {"2026-08-03": 120.0, "2026-08-04": -80.0, "2026-08-05": 40.0}
+
+
+def test_historical_causal_target_history_accumulates(research_db):
+    """Per-session causal ordering: T1's prediction cannot see T1's target;
+    T2's prediction may use T1's realized target; T3's may use T1+T2's —
+    never their own future target.
+
+    Fails under the old batch implementation (all predictions before any
+    target), where T2/T3 would have no gap history at all.
+    """
+    from app.research.gap_pipeline import BASELINE, SOS
+
+    stored = _run_causal_three_sessions(research_db, DAYS3, GAPS3)
+
+    b1 = stored[DAYS3[0]][BASELINE]["component_scores"]
+    # T1: no prior realized targets exist — no distribution, no expected gap.
+    assert "expected_gap_points" not in b1
+    assert "unconditional_distribution" not in b1
+
+    b2 = stored[DAYS3[1]][BASELINE]["component_scores"]
+    # T2: exactly T1's realized gap is available as history.
+    assert b2.get("expected_gap_points") == pytest.approx(120.0)
+    assert b2.get("unconditional_distribution")["n"] == 1.0
+    assert b2.get("unconditional_distribution")["p_up"] == 1.0
+
+    b3 = stored[DAYS3[2]][BASELINE]["component_scores"]
+    # T3: both earlier targets available (mean of 120 and -80).
+    assert b3.get("expected_gap_points") == pytest.approx(20.0)
+    d3 = b3.get("unconditional_distribution")
+    assert d3["n"] == 2.0
+    assert d3["p_up"] == 0.5 and d3["p_down"] == 0.5 and d3["p_flat"] == 0.0
+
+    # Later-session SOS gains usable probability outputs from the accumulated
+    # history (typical-gap scaling), while T1's SOS stays abstention-honest.
+    assert stored[DAYS3[1]][SOS]["probabilities"].get("p_up") is not None
+    assert stored[DAYS3[2]][SOS]["probabilities"].get("p_up") is not None
+
+
+def test_cli_backtest_persists_real_period(tmp_path, monkeypatch):
+    """Regression: the standalone `backtest` CLI must persist the ACTUAL
+    evaluated date range, not the model name, into period_start/period_end.
+    Fails against the old implementation that stored the model name as dates."""
+    import run_gap_research as cli
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker as sm
+
+    from app.db import Base
+    from app.models import GapBacktestResult
+
+    import app.models  # noqa: F401 — register tables on Base
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path}/cli_bt.db", connect_args={"check_same_thread": False}
+    )
+    Base.metadata.create_all(engine)
+    db = sm(bind=engine, autocommit=False, autoflush=False)()
+    monkeypatch.setattr(cli, "SessionLocal", sm(bind=engine))
+
+    try:
+        _run_causal_three_sessions(db, DAYS3, GAPS3)
+        rc = cli.main(["backtest", "--model", "sos"])
+        assert rc == 0
+        rows = db.query(GapBacktestResult).filter_by(model_name="sos").all()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.period_start == DAYS3[0]
+        assert row.period_end == DAYS3[-1]
+        assert row.period_start != "sos" and row.period_end != "sos"
+        assert row.regime == "ALL"
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_cli_historical_sample_rejects_empty_store(tmp_path, monkeypatch, capsys):
+    """The candle store is an INPUT database: an empty/invalid store must
+    fail clearly, create NO application or research tables, and leave the
+    source byte-unchanged."""
+    import run_gap_research as cli
+    from sqlalchemy import create_engine, inspect
+
+    empty = tmp_path / "empty_store.db"
+    create_engine(f"sqlite:///{empty.as_posix()}").dispose()  # exists, zero tables
+
+    def _forbidden():
+        raise AssertionError("SessionLocal must not be used when store validation fails")
+
+    monkeypatch.setattr(cli, "SessionLocal", _forbidden)
+    rc = cli.main(["historical-sample", "--store-url", f"sqlite:///{empty.as_posix()}"])
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "missing required source tables" in out
+    assert "nifty_candles" in out  # names what is absent
+    # Source untouched: still zero tables of any kind.
+    assert inspect(create_engine(f"sqlite:///{empty.as_posix()}")).get_table_names() == []
+
+
 def test_historical_loader_gap_cap(tmp_path):
     """Sessions whose previous captured session is beyond the gap cap are
     skipped — a 'change' feature must never silently span weeks of missing

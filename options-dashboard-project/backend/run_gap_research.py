@@ -127,15 +127,26 @@ def _cmd_backtest(args) -> int:
     db = SessionLocal()
     try:
         result = run_comparison_backtest(db, args.model)
+        if not result.get("n_observations"):
+            print(f"no evaluated sessions for model={args.model}; nothing stored")
+            return 1
         metrics = result["metrics"]
         print(json.dumps(metrics, indent=2, default=str))
         if result["by_regime"]:
             print("by regime:")
             print(json.dumps(result["by_regime"], indent=2, default=str))
+        # Persist the ACTUAL evaluated date range — never a placeholder.
         store_backtest_result(
-            db, args.model, args.model, args.model, result["metrics"]
+            db,
+            args.model,
+            result["period_start"],
+            result["period_end"],
+            result["metrics"],
         )
-        print(f"backtest result stored for model={args.model}")
+        print(
+            f"backtest result stored for model={args.model} "
+            f"period={result['period_start']}..{result['period_end']}"
+        )
         return 0
     finally:
         db.close()
@@ -157,18 +168,29 @@ def _cmd_status(_args) -> int:
 
 
 def _cmd_historical_sample(args) -> int:
-    """Run the full Phase-1 sample from the authorized local candle store."""
-    from app.db import Base
-    from app.models import ContractSpec, NiftyCandle, OptionCandle  # noqa: F401 — register tables on Base
-    from app.research.gap_historical import run_historical_sample
-    from sqlalchemy import create_engine
+    """Run the full Phase-1 sample from the authorized local candle store.
+
+    The store is an INPUT database: this command never creates or modifies
+    tables in it — it only validates the required source tables exist.
+    """
+    from app.research.gap_historical import REQUIRED_SOURCE_TABLES, run_historical_sample
+    from sqlalchemy import create_engine, inspect
 
     store_url = args.store_url or os.environ.get("DATABASE_URL")
     if not store_url:
         print("error: --store-url or DATABASE_URL required (candle store DB)")
         return 2
     store_engine = create_engine(store_url)
-    Base.metadata.create_all(bind=store_engine)  # ensure candle tables exist
+    existing = set(inspect(store_engine).get_table_names())
+    missing = [t for t in REQUIRED_SOURCE_TABLES if t not in existing]
+    if missing:
+        print(
+            "error: candle store is missing required source tables: "
+            f"{', '.join(missing)}. The source DB is read-only for this "
+            "command — no tables were created."
+        )
+        store_engine.dispose()
+        return 2
     store = sessionmaker(bind=store_engine)()
     db = SessionLocal()
     try:

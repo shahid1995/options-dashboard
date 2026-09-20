@@ -28,11 +28,13 @@ Extraction rules (documented, deterministic):
 * Futures and India VIX tables do not exist in the candle store; those
   underlying fields stay None and their features degrade explicitly.
 
-Target construction stays in the pipeline (``attach_realized_target``): the
-loader only supplies the next session's first index-candle open and its
-timestamp.  Nothing here can leak a target into feature generation because
-features are built (second pass) strictly before targets are attached
-(third pass).
+Target construction stays in the pipeline (``attach_realized_target``).
+Processing is strictly chronological **per session**: features(T) →
+predictions(T) → attach realized target(T).  Predictions for T query only
+sessions strictly earlier with attached targets, so T's own target never
+exists at prediction time, while T+1's prediction may legitimately use
+T's realized target as historical information.  Nothing here can leak a
+target into feature generation.
 """
 
 from __future__ import annotations
@@ -64,6 +66,11 @@ logger = logging.getLogger(__name__)
 # Maximum calendar distance between consecutive captured sessions for
 # change-style features to remain meaningful (weekly expiry cadence ≈ 7d).
 MAX_CANDIDATE_GAP_DAYS = 12
+
+# Source tables the historical loader requires in the candle store. The
+# CLI validates these via schema inspection and NEVER creates them — the
+# source DB is an input, not an application database.
+REQUIRED_SOURCE_TABLES = ("nifty_candles", "option_candles", "contract_specs")
 
 __all__ = [
     "HistoricalSession",
@@ -276,12 +283,20 @@ def run_historical_sample(
     end: str | None = None,
     flat_band_pct: float = 0.001,
 ) -> dict[str, Any]:
-    """Full Phase-1 historical sample: ingest -> features -> predictions ->
-    attach realized targets -> deterministic backtests.
+    """Full Phase-1 historical sample: ingest → per-session causal processing
+    → deterministic backtests.
 
-    Pass separation is load-bearing and ordered: every session's snapshots
-    are ingested first, features/predictions are computed strictly before
-    any target is attached, and the backtest runs last.
+    Ordering (load-bearing):
+
+    * Pass 1 — all immutable source snapshots are ingested first (raw data
+      never depends on derived state).
+    * Pass 2 — each session T, chronologically: build features(T) (uses only
+      information available by T's cutoff), generate predictions(T) (uses
+      only sessions strictly earlier **with attached targets**), then attach
+      T's realized T+1 target.  Consequence: T's own target never exists when
+      T is predicted, while T+1's prediction may legitimately use T's
+      realized target as historical information.
+    * Pass 3 — deterministic chronological backtests per model, last.
     """
     extracted = extract_historical_sessions(store, start=start, end=end)
     if not extracted:
@@ -299,29 +314,25 @@ def run_historical_sample(
         )
     db.commit()
 
-    # Pass 2 — features then predictions (causal, pre-target).
-    for s in extracted:
-        build_and_store_features(db, s.session_date)
-    db.commit()
-    for s in extracted:
-        generate_and_store_predictions(db, s.session_date)
-    db.commit()
-
-    # Pass 3 — realized targets, strictly after predictions exist.
+    # Pass 2 — per-session features → predictions → realized target, in
+    # chronological order. Causality: prediction T may only ever see targets
+    # of sessions strictly earlier than T, which is exactly the pipeline's
+    # own query; T's target is created only after T has been predicted.
     attached = 0
     for s in extracted:
-        if s.next_open is None or s.next_session_date is None:
-            continue
-        row = attach_realized_target(
-            db,
-            s.session_date,
-            s.next_session_date,
-            s.next_open,
-            s.next_open_ts,
-            flat_band_pct=flat_band_pct,
-        )
-        if row is not None:
-            attached += 1
+        build_and_store_features(db, s.session_date)
+        generate_and_store_predictions(db, s.session_date)
+        if s.next_open is not None and s.next_session_date is not None:
+            row = attach_realized_target(
+                db,
+                s.session_date,
+                s.next_session_date,
+                s.next_open,
+                s.next_open_ts,
+                flat_band_pct=flat_band_pct,
+            )
+            if row is not None:
+                attached += 1
     db.commit()
 
     # Pass 4 — deterministic chronological backtests per model.

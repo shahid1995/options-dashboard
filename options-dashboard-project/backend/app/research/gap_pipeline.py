@@ -603,12 +603,17 @@ def run_comparison_backtest(
         )
     if regime_fn is None:
         regime_fn = lambda row: "ALL"  # noqa: E731 — Phase-1 default; regime enrichment lands with realized VIX storage
-    return run_backtest(
+    result = run_backtest(
         rows,
         predict=lambda row: row["prediction"],
         regime_of=regime_fn,
         confidence_of=lambda row: row["prediction"].get("confidence"),
     )
+    # Actual evaluated range — consumed by persistence (CLI backtest) so the
+    # stored period metadata reflects the real sessions, never a placeholder.
+    result["period_start"] = rows[0]["session_date"] if rows else None
+    result["period_end"] = rows[-1]["session_date"] if rows else None
+    return result
 
 
 def store_backtest_result(

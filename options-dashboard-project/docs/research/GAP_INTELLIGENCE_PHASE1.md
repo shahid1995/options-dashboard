@@ -193,8 +193,11 @@ Extraction rules (enforced in `app/research/gap_historical.py`):
 * cutoff = that date's last option candle (typically 15:27 IST);
 * chain = NIFTY CE/PE of the front expiry, last candle at-or-before cutoff;
 * `prior_close` = the session's OWN close (base of the predicted T+1 gap);
-* passes run strictly in order: snapshots → features → predictions →
-  realized targets → backtests (targets can never enter features).
+* Pass 1 ingests all immutable snapshots; then each session T is processed
+  chronologically: features(T) → predictions(T) → attach realized target(T).
+  Predictions for T see only sessions strictly earlier **with attached
+  targets**, so T's own target never exists at prediction time while T+1's
+  prediction may legitimately use T's realized target. Backtests run last.
 
 ### 10.2 Actual sample result (2024-10-10 → 2026-08-18, 93 sessions)
 
