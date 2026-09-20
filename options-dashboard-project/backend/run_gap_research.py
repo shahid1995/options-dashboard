@@ -200,6 +200,7 @@ def _cmd_historical_sample(args) -> int:
             start=args.start,
             end=args.end,
             flat_band_pct=args.flat_band_pct,
+            enrich_greeks=args.enrich_greeks,
         )
     finally:
         db.close()
@@ -260,6 +261,14 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=0.001,
         help="flat-gap band (fraction of prior close)",
+    )
+    p_hs.add_argument(
+        "--enrich-greeks",
+        action="store_true",
+        help=(
+            "Phase 2: attach IV/Greeks via the canonical HistoricalGreeksEngine "
+            "(cutoff candle only; IST→UTC per engine contract)"
+        ),
     )
     p_hs.set_defaults(func=_cmd_historical_sample)
 
