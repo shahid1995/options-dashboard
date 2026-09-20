@@ -79,6 +79,44 @@ IST_TO_UTC = timedelta(hours=5, minutes=30)
 # Chain-row option types vs the engine's CE/PE convention.
 _TYPE_TO_ENGINE = {"CALL": "CE", "PUT": "PE"}
 
+# Phase-3 DTE buckets (reported as measured; never forced).
+DTE_BUCKETS = ((0, "DTE0"), (2, "DTE1-2"), (7, "DTE3-7"))
+
+
+def dte_bucket(dte: int | None) -> str:
+    """Assign the measured DTE bucket (DTE>7 is the residual)."""
+    if dte is None:
+        return "unknown"
+    for upper, label in DTE_BUCKETS:
+        if dte <= upper:
+            return label
+    return "DTE>7"
+
+
+def chain_value_provenance(enriched: bool) -> dict[str, str]:
+    """Per-value provenance for one enriched/candle-only session (Phase 3).
+
+    The candle store carries observed LTP/volume/OI; IV/Greeks are always
+    engine-reconstructed (never observed); bid/ask are unavailable; OI
+    change is causally derived from the prior session's stored snapshot.
+    """
+    greeks_class = "reconstructed" if enriched else "unavailable"
+    return {
+        "ltp": "observed",
+        "volume": "observed",
+        "open_interest": "observed",
+        "change_in_oi": "derived",
+        "bid": "unavailable",
+        "ask": "unavailable",
+        "bid_qty": "unavailable",
+        "ask_qty": "unavailable",
+        "iv": greeks_class,
+        "delta": greeks_class,
+        "gamma": greeks_class,
+        "vega": greeks_class,
+        "theta": greeks_class,
+    }
+
 # Enrichment provenance marker (recorded per session in completeness_detail).
 GREEKS_ENGINE_LABEL = "HISTORICAL_GREEKS_ENGINE"
 
@@ -86,7 +124,233 @@ __all__ = [
     "HistoricalSession",
     "extract_historical_sessions",
     "run_historical_sample",
+    "build_merged_store",
 ]
+
+
+def build_merged_store(
+    output_path: str,
+    source_paths: Sequence[str],
+) -> dict[str, Any]:
+    """Build a Phase-3 working candle store by unioning authorized local
+    backups (Issue #78).
+
+    Precedence: the FIRST source wins — rows are copied with
+    ``INSERT OR IGNORE`` against the natural unique keys, so where two
+    sources contain the same (instrument, interval, open_time) candle the
+    earlier-listed source's value is kept and later duplicates are skipped.
+    Source ``id`` columns are deliberately NOT copied: two backups reuse
+    overlapping ``id`` ranges, and copying them would silently drop source-2
+    rows on primary-key collisions instead of deduping on the natural key.
+
+    Timestamp normalization: the authorized backups store ``open_time`` in
+    different conventions (the Oct–Nov 2024 daily option backfill is UTC;
+    the 2026 captures are IST wall-clock; the 2024-11-01 Muhurat evening
+    session is UTC in the older backup).  Each (table, date) is classified
+    by evidence, not table-level guessing: both hypotheses (no shift, and
+    +330 minutes UTC→IST) are tested against the authoritative IST session
+    window for that date taken from the accumulated index candles, and the
+    hypothesis that places strictly more of the date's candle opens inside
+    the window wins.  A date whose convention cannot be resolved (no index
+    anchor, or no separating evidence) is REFUSED — its rows are not copied
+    and the refusal is recorded in provenance; nothing is silently guessed.
+    Sources are opened read-only; the output is a NEW research working copy
+    (never an application database, never one of the sources).
+
+    A ``_store_provenance`` table records, per source: absolute path,
+    SHA-256, row counts, and the per-date normalization decisions — making
+    the merged dataset's composition auditable and reproducible.
+    """
+    import hashlib
+    import sqlite3
+    from pathlib import Path
+
+    def _uri(p: str, mode: str) -> str:
+        return f"file:///{Path(p).resolve().as_posix()}?{mode}"
+
+    CANDLE_TABLES = ("nifty_candles", "option_candles")
+    IST_SHIFT = "+330 minutes"  # UTC -> IST (IST = UTC+05:30)
+    ZERO_FRACTION = ".000000"  # every source open_time carries a zero fraction
+
+    out = sqlite3.connect(_uri(output_path, "mode=rwc"), uri=True)
+    try:
+        out.execute(
+            "CREATE TABLE IF NOT EXISTS _store_provenance ("
+            "source_path TEXT PRIMARY KEY, sha256 TEXT, dates TEXT)"
+        )
+        # Create the three source tables from the first source's schema.
+        src0 = sqlite3.connect(_uri(source_paths[0], "mode=ro"), uri=True)
+        for t in REQUIRED_SOURCE_TABLES:
+            ddl = src0.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                (t,),
+            ).fetchone()
+            if ddl is None:
+                raise RuntimeError(f"source {source_paths[0]} lacks table {t}")
+            out.execute(ddl[0])
+        src0.close()
+
+        def _session_window(d: str, attached_as: str) -> tuple[str, str] | None:
+            """Authoritative IST session window (HH:MM:SS bounds) for date
+            ``d`` from accumulated index candles (main first, then the
+            source's own nifty_candles). None when nothing anchors the date."""
+            for db in ("main", attached_as):
+                row = out.execute(
+                    f"SELECT MIN(substr(open_time,12,8)), MAX(substr(open_time,12,8)) "
+                    f"FROM {db}.nifty_candles WHERE substr(open_time,1,10)=?",
+                    (d,),
+                ).fetchone()
+                if row and row[0] and row[1]:
+                    return (row[0], row[1])
+            return None
+
+        def _in_window_frac(
+            attached_as: str, table: str, d: str, shifted: bool, w: tuple[str, str]
+        ) -> float:
+            """Fraction of the date's rows whose (possibly shifted) time of
+            day falls inside the session window. Both sides compare as
+            uniform HH:MM:SS strings."""
+            total = out.execute(
+                f"SELECT COUNT(*) FROM {attached_as}.{table} "
+                f"WHERE substr(open_time,1,10)=?",
+                (d,),
+            ).fetchone()[0]
+            if total == 0:
+                return 0.0
+            if shifted:
+                expr = f"substr(datetime(substr(open_time,1,19), '{IST_SHIFT}'),12,8)"
+            else:
+                expr = "substr(open_time,12,8)"
+            inside = out.execute(
+                f"SELECT COUNT(*) FROM {attached_as}.{table} "
+                f"WHERE substr(open_time,1,10)=? AND ? <= {expr} AND {expr} <= ?",
+                (d, w[0], w[1]),
+            ).fetchone()[0]
+            return inside / total
+
+        for i, sp in enumerate(source_paths):
+            sha = hashlib.sha256(open(sp, "rb").read()).hexdigest()
+            out.execute("ATTACH DATABASE ? AS src", (_uri(sp, "mode=ro"),))
+            before = {
+                t: out.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                for t in REQUIRED_SOURCE_TABLES
+            }
+            tz_decisions: dict[str, list[str]] = {
+                "shifted_utc_to_ist": [],
+                "kept_ist": [],
+                "refused": [],
+            }
+            for t in CANDLE_TABLES:
+                cols = [
+                    r[1] for r in out.execute(f"PRAGMA main.table_info({t})")
+                    if r[1] != "id"  # never copy source ids (see docstring)
+                ]
+                dates = [
+                    r[0]
+                    for r in out.execute(
+                        f"SELECT DISTINCT substr(open_time,1,10) FROM src.{t} ORDER BY 1"
+                    )
+                ]
+                for d in dates:
+                    w = _session_window(d, "src")
+                    if w is None:
+                        tz_decisions["refused"].append(f"{t}:{d}:no_index_anchor")
+                        continue
+                    f0 = _in_window_frac("src", t, d, False, w)
+                    f330 = _in_window_frac("src", t, d, True, w)
+                    if f0 == 0.0 and f330 == 0.0:
+                        tz_decisions["refused"].append(f"{t}:{d}:ambiguous")
+                        continue
+                    if f330 > f0:
+                        shift = True
+                        tz_decisions["shifted_utc_to_ist"].append(f"{t}:{d}")
+                    elif f0 > f330:
+                        shift = False
+                        tz_decisions["kept_ist"].append(f"{t}:{d}")
+                    else:
+                        tz_decisions["refused"].append(f"{t}:{d}:ambiguous")
+                        continue
+                    sel = []
+                    for c in cols:
+                        if c == "open_time" and shift:
+                            sel.append(
+                                f"datetime(substr(open_time,1,19), '{IST_SHIFT}')"
+                                f" || '{ZERO_FRACTION}'"
+                            )
+                        else:
+                            sel.append(c)
+                    out.execute(
+                        f"INSERT OR IGNORE INTO main.{t} ({','.join(cols)}) "
+                        f"SELECT {', '.join(sel)} FROM src.{t} "
+                        f"WHERE substr(open_time,1,10)=?",
+                        (d,),
+                    )
+            # contract_specs carries no candle timestamps; copy by natural key.
+            cols_specs = [
+                r[1] for r in out.execute("PRAGMA main.table_info(contract_specs)")
+                if r[1] != "id"
+            ]
+            out.execute(
+                f"INSERT OR IGNORE INTO main.contract_specs "
+                f"({','.join(cols_specs)}) SELECT {','.join(cols_specs)} "
+                f"FROM src.contract_specs"
+            )
+            after = {
+                t: out.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                for t in REQUIRED_SOURCE_TABLES
+            }
+            dates = [
+                r[0]
+                for r in out.execute(
+                    "SELECT DISTINCT substr(open_time,1,10) FROM option_candles "
+                    "ORDER BY 1"
+                )
+            ]
+            prov = {
+                "priority": i,
+                "row_counts": {
+                    t: {"before": before[t], "after": after[t]}
+                    for t in REQUIRED_SOURCE_TABLES
+                },
+                "tz_decisions": tz_decisions,
+            }
+            out.execute(
+                "INSERT OR REPLACE INTO _store_provenance VALUES (?,?,?)",
+                (sp, sha, json.dumps({"option_dates": dates, **prov})),
+            )
+            out.commit()  # release the write lock before DETACH
+            out.execute("DETACH DATABASE src")
+            logger.info(
+                "merged %s (priority %d): added %d nifty, %d option, %d spec rows; "
+                "tz: %d shifted, %d kept, %d refused",
+                sp,
+                i,
+                after["nifty_candles"] - before["nifty_candles"],
+                after["option_candles"] - before["option_candles"],
+                after["contract_specs"] - before["contract_specs"],
+                len(tz_decisions["shifted_utc_to_ist"]),
+                len(tz_decisions["kept_ist"]),
+                len(tz_decisions["refused"]),
+            )
+        out.commit()
+        counts = {
+            t: out.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            for t in REQUIRED_SOURCE_TABLES
+        }
+        dates = [
+            r[0]
+            for r in out.execute(
+                "SELECT DISTINCT substr(open_time,1,10) FROM option_candles ORDER BY 1"
+            )
+        ]
+        return {
+            "output": output_path,
+            "sources": list(source_paths),
+            "row_counts": counts,
+            "option_dates": len(dates),
+        }
+    finally:
+        out.close()
 
 
 @dataclass
@@ -102,6 +366,11 @@ class HistoricalSession:
     next_open: float | None = None
     next_open_ts: datetime | None = None
     enrichment: dict[str, Any] | None = None  # Phase-2 greeks metadata
+    # Phase-3 (#78) classification — from actual contract metadata, never
+    # from data absence:
+    dte_days: int | None = None            # front expiry − session date (days)
+    is_expiry_session: bool | None = None  # dte_days == 0
+    cutoff_kind: str | None = None         # "end_of_session" | "intraday"
 
 
 def _index_sessions(db: Session, symbol: str = "NIFTY") -> dict[str, list[NiftyCandle]]:
@@ -333,6 +602,15 @@ def extract_historical_sessions(
             enrichment = _enrich_chain_with_greeks(
                 chain, underlying["spot_close"], cutoff
             )
+        # Phase-3 classification from contract metadata: the chain rows all
+        # carry the front expiry, so DTE = front_expiry − session_date.
+        front_expiry = chain[0].get("expiry")
+        try:
+            dte_days = (
+                date.fromisoformat(str(front_expiry)) - date.fromisoformat(day)
+            ).days
+        except (TypeError, ValueError):
+            dte_days = None
         sessions.append(
             HistoricalSession(
                 session_date=day,
@@ -346,6 +624,13 @@ def extract_historical_sessions(
                 next_open=float(next_candles[0].open) if (next_candles := index[next_index_date]) else None,
                 next_open_ts=next_candles[0].open_time if next_candles else None,
                 enrichment=enrichment,
+                dte_days=dte_days,
+                is_expiry_session=(dte_days == 0) if dte_days is not None else None,
+                cutoff_kind=(
+                    "end_of_session"
+                    if cutoff.hour >= 15
+                    else "intraday"
+                ),
             )
         )
     return sessions
@@ -442,7 +727,9 @@ def run_historical_sample(
     if not extracted:
         return {"sessions": 0, "note": "no eligible sessions in the candle store"}
 
-    # Pass 1 — immutable snapshots (ingest).
+    # Pass 1 — immutable snapshots (ingest), with per-value provenance
+    # (Phase 3 #78): the distinction is recorded ON the research dataset.
+    provenance = chain_value_provenance(enrich_greeks)
     for s in extracted:
         ingest_session_snapshots(
             db,
@@ -451,6 +738,7 @@ def run_historical_sample(
             prior_close=s.prior_close,
             underlying=s.underlying,
             chain=s.chain,
+            chain_value_provenance=provenance,
         )
     db.commit()
 
@@ -485,6 +773,10 @@ def run_historical_sample(
                             "vega": round(s.enrichment["vega_rows"] / rows, 3),
                             "theta": round(s.enrichment["theta_rows"] / rows, 3),
                         },
+                        "dte_days": s.dte_days,
+                        "is_expiry_session": s.is_expiry_session,
+                        "cutoff_kind": s.cutoff_kind,
+                        "value_provenance": provenance,
                     },
                     default=str,
                 )
@@ -548,6 +840,24 @@ def run_historical_sample(
         "target_distribution": dist,
         "flat_band_pct": flat_band_pct,
         "no_edge_counts": no_edge,
+        "phase3_classification": {
+            "sessions": len(extracted),
+            "expiry_sessions": sum(
+                1 for s in extracted if s.is_expiry_session
+            ),
+            "non_expiry_sessions": sum(
+                1 for s in extracted if s.is_expiry_session is False
+            ),
+            "dte_distribution": {
+                b: sum(1 for s in extracted if dte_bucket(s.dte_days) == b)
+                for b in ([label for _, label in DTE_BUCKETS] + ["DTE>7", "unknown"])
+            },
+            "cutoff_kinds": {
+                k: sum(1 for s in extracted if s.cutoff_kind == k)
+                for k in ("end_of_session", "intraday")
+            },
+            "value_provenance": provenance,
+        },
         "enrichment": enrich_greeks,
         "enrichment_aggregate": (
             {

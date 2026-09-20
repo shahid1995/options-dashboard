@@ -128,12 +128,19 @@ def ingest_session_snapshots(
     underlying: Mapping[str, Any],
     chain: Sequence[Mapping[str, Any]],
     replace: bool = False,
+    chain_value_provenance: Mapping[str, str] | None = None,
 ) -> GapPredictionSession:
     """Step 1 — persist immutable raw snapshots for one research session.
 
     ``underlying`` keys: spot_ltp/open/high/low/close, futures_ltp/oi/volume,
     india_vix. ``chain`` rows: the raw strike observations (strike, option_type
     CALL|PUT, expiry, ltp/bid/ask/qty/volume/OI/change_in_oi/iv/greeks…).
+
+    ``chain_value_provenance`` (Phase 3, #78): optional per-value-class map
+    (e.g. {"ltp": "observed", "iv": "reconstructed", "bid": "unavailable"})
+    persisted verbatim on every chain row of this session.  The Phase 3 hard
+    contract: reconstructed (e.g. Black-Scholes) values must never be
+    reported as observed; absent provenance persists as NULL (pre-Phase-3).
     """
     existing = (
         db.query(GapPredictionSession)
@@ -189,6 +196,11 @@ def ingest_session_snapshots(
         )
     )
 
+    provenance_json = (
+        json.dumps(_json_sanitize(dict(chain_value_provenance)), default=str)
+        if chain_value_provenance
+        else None
+    )
     for row in chain:
         strike = f(row.get("strike"))
         otype = row.get("option_type")
@@ -216,6 +228,7 @@ def ingest_session_snapshots(
                 gamma=f(row.get("gamma")),
                 vega=f(row.get("vega")),
                 theta=f(row.get("theta")),
+                value_provenance=provenance_json,
             )
         )
     db.commit()

@@ -1043,6 +1043,17 @@ class OptionChainSnapshot(Base):
     vega: Mapped[float | None] = mapped_column(Float, nullable=True)  # per 1.00 vol fraction
     theta: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # Phase 3 (#78) — per-value provenance for this row: a JSON object
+    # mapping each value field (ltp, volume, open_interest, change_in_oi,
+    # bid, ask, iv, delta, gamma, vega, theta) to one of
+    #   "observed"       — the value existed in the historical source
+    #   "reconstructed"  — computed by StrikeNova (e.g. Black-Scholes)
+    #   "derived"        — computed from stored snapshots (causal OI change)
+    #   "unavailable"    — the source cannot support the value
+    # NULL means pre-Phase-3 row (provenance not recorded; see migration
+    # f4a9b8c2d1e7). Never interpret missing values as zero.
+    value_provenance: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     __table_args__ = (
         UniqueConstraint(
             "symbol", "session_date", "expiry", "strike", "option_type",
