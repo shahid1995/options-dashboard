@@ -1342,3 +1342,616 @@ def test_merge_refuses_unanchorable_dates_without_guessing(tmp_path):
     prov = json.loads(con.execute("SELECT dates FROM _store_provenance").fetchall()[1][0])
     assert "option_candles:2026-08-06:no_index_anchor" in prov["tz_decisions"]["refused"]
     con.close()
+
+
+# ---------------------------------------------------------------------------
+# Issue #80 — prospective end-of-session capture (research-only)
+# ---------------------------------------------------------------------------
+
+
+def _capture_observation(
+    *,
+    expiry_date: str = "2026-09-24",
+    market_ts: datetime | None = datetime(2026, 9, 18, 15, 25),
+    received_ts: datetime | None = None,
+    with_analytics: bool = True,
+):
+    """Build a canonical OptionChainObservation as a broker would deliver.
+
+    Default ``market_ts`` is a broker event time 5 minutes before the
+    tests' 15:30 cutoff (capture refuses observations that cannot prove
+    their observation time — pass ``market_ts=None`` for that case).
+
+    Legs deliberately vary: full quote+analytics, quote without book/IV,
+    and a one-sided row — so provenance/missing rules are exercised on
+    real shapes, not a uniform fixture.
+    """
+    from app.market_data.contracts import (
+        DataMode,
+        OptionChainObservation,
+        OptionChainRow,
+        PriceQuote,
+    )
+
+    full = PriceQuote(
+        ltp=160.0,
+        volume=500.0,
+        oi=1200.0,
+        bid=158.5,
+        ask=161.0,
+        bid_quantity=50,
+        ask_quantity=75,
+        iv=0.12 if with_analytics else None,
+        delta=0.42 if with_analytics else None,
+        gamma=0.0008 if with_analytics else None,
+        source="FYERS",
+    )
+    bare = PriceQuote(ltp=90.0, volume=300.0, oi=900.0, source="FYERS")
+    rows = [
+        OptionChainRow(
+            strike=25050.0,
+            call=PriceQuote(ltp=105.0, oi=800.0, source="FYERS"),
+            put=None,
+        ),
+        OptionChainRow(strike=25000.0, call=full, put=bare),
+    ]
+    return OptionChainObservation(
+        symbol="NIFTY",
+        expiry_date=expiry_date,
+        underlying_spot_price=25120.0,
+        chain=rows,
+        market_timestamp=market_ts,
+        received_timestamp=received_ts or datetime(2026, 9, 18, 15, 30, 10),
+        source="FYERS",
+        data_mode=DataMode.BROKER_SNAPSHOT,
+    )
+
+
+def test_capture_observed_provenance_and_missing_ne_zero(research_db):
+    """Observed values persist with provenance; absent broker fields stay
+    NULL (never 0); vega/theta are recorded unavailable."""
+    from app.models import OptionChainSnapshot
+    from app.research.gap_capture import capture_session
+
+    capture_session(
+        research_db,
+        _capture_observation(),
+        session_date="2026-09-18",
+        cutoff_timestamp=datetime(2026, 9, 18, 15, 30),
+        prior_close=25005.0,
+    )
+    rows = {
+        (r.strike, r.option_type): r
+        for r in research_db.query(OptionChainSnapshot).filter(
+            OptionChainSnapshot.session_date == "2026-09-18"
+        )
+    }
+    full = rows[(25000.0, "CALL")]
+    bare = rows[(25000.0, "PUT")]
+    # observed values persist
+    assert full.ltp == 160.0 and full.bid == 158.5 and full.ask == 161.0
+    assert full.iv == 0.12 and full.delta == 0.42 and full.gamma == 0.0008
+    # missing stays missing — never zero
+    assert bare.bid is None and bare.iv is None and bare.delta is None
+    assert bare.volume == 300.0  # fields the leg DID carry still persist
+    # one-sided chain row: no PUT leg fabricated for strike 25050
+    assert (25050.0, "PUT") not in rows
+    # vega/theta are unavailable at the canonical chain contract
+    assert full.vega is None and full.theta is None
+    # provenance labels
+    prov = json.loads(full.value_provenance)
+    assert prov["ltp"] == "observed" and prov["iv"] == "observed"
+    assert prov["vega"] == "unavailable" and prov["theta"] == "unavailable"
+    assert prov["change_in_oi"] == "derived"
+
+
+def test_capture_rejects_post_cutoff_observation(research_db):
+    """An observation whose market timestamp is after the research cutoff
+    is refused outright — nothing is persisted."""
+    from app.models import GapPredictionSession
+    from app.research.gap_capture import capture_session
+
+    obs = _capture_observation(market_ts=datetime(2026, 9, 18, 15, 35))
+    try:
+        capture_session(
+            research_db,
+            obs,
+            session_date="2026-09-18",
+            cutoff_timestamp=datetime(2026, 9, 18, 15, 30),
+            prior_close=25005.0,
+        )
+        raise AssertionError("post-cutoff observation must be rejected")
+    except ValueError as exc:
+        assert "cutoff" in str(exc)
+    assert (
+        research_db.query(GapPredictionSession)
+        .filter(GapPredictionSession.session_date == "2026-09-18")
+        .count()
+        == 0
+    )
+
+
+def test_capture_cutoff_timezone_normalization(research_db):
+    """Cutoff comparisons are instant-based: an observation at 10:00 UTC
+    equals a 15:30 IST cutoff (accepted); one second later is refused."""
+    from datetime import timedelta, timezone as _tz
+
+    from app.research.gap_capture import capture_session
+
+    ist = _tz(timedelta(hours=5, minutes=30))
+    cutoff_ist = datetime(2026, 9, 18, 15, 30, tzinfo=ist)
+    at_cutoff_utc = datetime(2026, 9, 18, 10, 0, tzinfo=_tz.utc)
+    after_utc = datetime(2026, 9, 18, 10, 0, 1, tzinfo=_tz.utc)
+
+    capture_session(
+        research_db,
+        _capture_observation(market_ts=at_cutoff_utc),
+        session_date="2026-09-18",
+        cutoff_timestamp=cutoff_ist,
+        prior_close=25005.0,
+    )
+    try:
+        capture_session(
+            research_db,
+            _capture_observation(market_ts=after_utc),
+            session_date="2026-09-19",
+            cutoff_timestamp=cutoff_ist,
+            prior_close=25005.0,
+            replace=True,
+        )
+        raise AssertionError("post-cutoff (UTC) observation must be rejected")
+    except ValueError:
+        pass
+
+
+def test_capture_classification_expiry_and_dte(research_db):
+    """Front-expiry classification comes from contract metadata: DTE 0 is
+    an expiry session; DTE>0 is non-expiry."""
+    from app.research.gap_capture import capture_session, classify_session
+
+    capture_session(
+        research_db,
+        _capture_observation(expiry_date="2026-09-18"),
+        session_date="2026-09-18",
+        cutoff_timestamp=datetime(2026, 9, 18, 15, 30),
+        prior_close=25005.0,
+    )
+    summary_non_expiry = capture_session(
+        research_db,
+        _capture_observation(expiry_date="2026-09-24"),
+        session_date="2026-09-19",
+        cutoff_timestamp=datetime(2026, 9, 19, 15, 30),
+        prior_close=25005.0,
+    )
+    assert classify_session("2026-09-18", "2026-09-18") == {
+        "expiry": "2026-09-18",
+        "dte": 0,
+        "kind": "expiry",
+    }
+    assert summary_non_expiry["classification"] == {
+        "expiry": "2026-09-24",
+        "dte": 5,
+        "kind": "non_expiry",
+    }
+
+
+def test_capture_immutability_and_deterministic_replace(research_db):
+    """Re-capture refuses (immutability); explicit replace replays to the
+    byte-identical row set (deterministic normalization)."""
+    from app.models import OptionChainSnapshot
+    from app.research.gap_capture import capture_session
+    from app.research.gap_pipeline import SessionExistsError
+
+    def _rows():
+        return [
+            (r.strike, r.option_type, r.ltp, r.bid, r.iv, r.delta, r.open_interest)
+            for r in research_db.query(OptionChainSnapshot)
+            .filter(OptionChainSnapshot.session_date == "2026-09-18")
+            .order_by(OptionChainSnapshot.strike, OptionChainSnapshot.option_type)
+        ]
+
+    kwargs = dict(
+        session_date="2026-09-18",
+        cutoff_timestamp=datetime(2026, 9, 18, 15, 30),
+        prior_close=25005.0,
+    )
+    capture_session(research_db, _capture_observation(), **kwargs)
+    first = _rows()
+    try:
+        capture_session(research_db, _capture_observation(), **kwargs)
+        raise AssertionError("duplicate capture must raise SessionExistsError")
+    except SessionExistsError:
+        pass
+    # replay with explicit replace → identical content
+    capture_session(research_db, _capture_observation(), **kwargs, replace=True)
+    assert _rows() == first
+
+
+def test_capture_change_in_oi_only_with_prior(research_db):
+    """change_in_oi is derived ONLY where prior OI exists for the same
+    contract; absent prior stays missing (never zero)."""
+    from app.models import OptionChainSnapshot
+    from app.research.gap_capture import capture_session
+
+    prior = {("2026-09-24", 25000.0, "CALL"): 1000.0}
+    capture_session(
+        research_db,
+        _capture_observation(),
+        session_date="2026-09-18",
+        cutoff_timestamp=datetime(2026, 9, 18, 15, 30),
+        prior_close=25005.0,
+        prior_oi=prior,
+    )
+    rows = {
+        (r.strike, r.option_type): r
+        for r in research_db.query(OptionChainSnapshot).filter(
+            OptionChainSnapshot.session_date == "2026-09-18"
+        )
+    }
+    assert rows[(25000.0, "CALL")].change_in_oi == 200.0  # 1200 - 1000
+    assert rows[(25000.0, "PUT")].change_in_oi is None  # no prior → missing
+    assert rows[(25050.0, "CALL")].change_in_oi is None
+
+
+def test_capture_rows_are_deterministically_normalized():
+    """Identical observations produce identical research rows (pure
+    conversion; no wall-clock inside row content)."""
+    from app.research.gap_capture import observation_to_research_rows
+
+    ua, ca = observation_to_research_rows(
+        _capture_observation(), session_date="2026-09-18"
+    )
+    ub, cb = observation_to_research_rows(
+        _capture_observation(), session_date="2026-09-18"
+    )
+    assert ua == ub
+    assert ca == cb
+    # honest about the underlying gaps (Phase 3 finding, unchanged)
+    assert ua["futures_ltp"] is None and ua["india_vix"] is None
+
+
+def test_capture_feeds_existing_causal_pipeline(research_db):
+    """A captured session is a first-class Phase-1 session: features,
+    predictions, and target attachment run on it unchanged."""
+    from app.models import GapPrediction
+    from app.research.gap_capture import capture_session
+    from app.research.gap_pipeline import (
+        attach_realized_target,
+        build_and_store_features,
+        generate_and_store_predictions,
+    )
+
+    capture_session(
+        research_db,
+        _capture_observation(expiry_date="2026-09-18"),
+        session_date="2026-09-18",
+        cutoff_timestamp=datetime(2026, 9, 18, 15, 30),
+        prior_close=25005.0,
+    )
+    build_and_store_features(research_db, "2026-09-18")
+    generate_and_store_predictions(research_db, "2026-09-18")
+    session = attach_realized_target(
+        research_db, "2026-09-18", "2026-09-22", 25120.0, datetime(2026, 9, 22, 9, 15)
+    )
+    assert session.gap_points == 115.0  # 25120 - 25005
+    preds = research_db.query(GapPrediction).filter(
+        GapPrediction.session_date == "2026-09-18"
+    ).count()
+    assert preds == 3  # baseline, pos_style, sos
+
+
+def test_fyers_chain_mapper_maps_broker_analytics_when_present():
+    """FYERS chain payloads carry bid/ask/qty and IV/Greeks when the broker
+    includes them; the mapper maps them (IV % → decimal) and leaves absent
+    fields missing — never fabricated."""
+    from app.brokers.adapters.fyers.mapper import fyers_chain_to_observation as map_option_chain
+
+    raw = {
+        "s": "ok",
+        "data": {
+            "callputltp": [
+                {
+                    "strike_price": 25000.0,
+                    "callLtp": 160.0,
+                    "putLtp": 90.0,
+                    "callOICoynt": 1200,
+                    "putOICoynt": 900,
+                    "callVolume": 500,
+                    "putVolume": 300,
+                    "callBidPrice": 158.5,
+                    "callAskPrice": 161.0,
+                    "callBidQty": 50,
+                    "callAskQty": 75,
+                    "callIV": 12.0,
+                    "putIV": 13.5,
+                    "callDelta": 0.42,
+                    "putDelta": -0.58,
+                    "callGamma": 0.0008,
+                    "putGamma": 0.0008,
+                },
+            ],
+            "underlying": 25120.0,
+        },
+    }
+    obs = map_option_chain(
+        "NIFTY", "2026-09-24", raw, received_at=datetime(2026, 9, 18, 15, 30)
+    )
+    call = obs.chain[0].call
+    put = obs.chain[0].put
+    assert call.bid == 158.5 and call.ask == 161.0
+    assert call.bid_quantity == 50 and call.ask_quantity == 75
+    assert call.iv == 0.12  # percentage → decimal fraction
+    assert put.iv == 0.135
+    assert call.delta == 0.42 and put.delta == -0.58
+    assert call.gamma == 0.0008
+    # payload without analytics → missing stays missing (payload-tolerant)
+    raw2 = {
+        "s": "ok",
+        "data": {
+            "callputltp": [{"strike_price": 25000.0, "callLtp": 160.0}],
+            "underlying": 25120.0,
+        },
+    }
+    obs2 = map_option_chain(
+        "NIFTY", "2026-09-24", raw2, received_at=datetime(2026, 9, 18, 15, 30)
+    )
+    q = obs2.chain[0].call
+    assert q.bid is None and q.iv is None and q.delta is None and q.ask is None
+
+
+def test_upstox_chain_mapper_maps_broker_analytics_when_present():
+    """Upstox legs: best bid/ask from market_data, IV/Greeks from
+    option_greeks, IV % → decimal; absent fields stay missing."""
+    from app.brokers.adapters.upstox.mapper import upstox_chain_to_observation
+
+    raw = {
+        "data": [
+            {
+                "strike_price": 25000.0,
+                "call_options": {
+                    "market_data": {
+                        "ltp": 160.0,
+                        "volume": 500,
+                        "oi": 1200,
+                        "bid_price": 158.5,
+                        "ask_price": 161.0,
+                        "bid_qty": 50,
+                        "ask_qty": 75,
+                    },
+                    "option_greeks": {"iv": 12.0, "delta": 0.42, "gamma": 0.0008},
+                },
+                "put_options": {"market_data": {"ltp": 90.0}},
+            },
+        ],
+    }
+    obs = upstox_chain_to_observation(
+        "NIFTY", "2026-09-24", raw, received_at=datetime(2026, 9, 18, 15, 30)
+    )
+    call = obs.chain[0].call
+    put = obs.chain[0].put
+    assert call.bid == 158.5 and call.ask == 161.0
+    assert call.bid_quantity == 50 and call.ask_quantity == 75
+    assert call.iv == 0.12 and call.delta == 0.42
+    assert put.iv is None and put.bid is None  # absent → missing, never 0
+
+# ---------------------------------------------------------------------------
+# Issue #80 correction — cutoff-integrity gate (provable observation time)
+# ---------------------------------------------------------------------------
+
+
+def test_capture_refuses_observation_without_event_timestamp(research_db):
+    """No trustworthy observation timestamp -> refused with NOTHING
+    persisted: receive time cannot prove the snapshot existed at/before
+    the cutoff."""
+    from app.models import GapPredictionSession
+    from app.research.gap_capture import capture_session
+
+    obs = _capture_observation(market_ts=None)
+    with pytest.raises(ValueError, match="no trustworthy"):
+        capture_session(
+            research_db,
+            obs,
+            session_date="2026-09-18",
+            cutoff_timestamp=datetime(2026, 9, 18, 15, 30),
+            prior_close=25005.0,
+        )
+    assert (
+        research_db.query(GapPredictionSession)
+        .filter(GapPredictionSession.session_date == "2026-09-18")
+        .count()
+        == 0
+    )
+
+
+def test_capture_persists_real_source_timestamp_never_backdated(research_db):
+    """Persisted source_timestamp is the payload's actual observation time
+    (15:25), never the capture receive time (15:30:10) and never back-dated
+    to the cutoff (15:30)."""
+    import json as _json
+
+    from app.models import UnderlyingSnapshot
+    from app.research.gap_capture import capture_session
+
+    capture_session(
+        research_db,
+        _capture_observation(received_ts=datetime(2026, 9, 18, 15, 30, 10)),
+        session_date="2026-09-18",
+        cutoff_timestamp=datetime(2026, 9, 18, 15, 30),
+        prior_close=25005.0,
+    )
+    us = (
+        research_db.query(UnderlyingSnapshot)
+        .filter(UnderlyingSnapshot.session_date == "2026-09-18")
+        .one()
+    )
+    stamps = {row["source_timestamp"] for row in _json.loads(us.option_chain)}
+    assert stamps == {"2026-09-18 15:25:00"}  # payload time, space-format serialization
+    # the structured column remains the declared cutoff (Phase-1 convention)
+    assert us.timestamp == datetime(2026, 9, 18, 15, 30)
+
+
+def test_upstox_adapter_chain_carries_event_timestamps():
+    """Real path: a raw Upstox chain payload normalizes through the actual
+    mapper into observations with provable event times (ISO + epoch-ms
+    normalizing to the same UTC instant)."""
+    from datetime import timezone as _tz
+
+    from app.brokers.adapters.upstox.mapper import upstox_chain_to_observation
+
+    raw = {
+        "data": [
+            {
+                "strike_price": 25000.0,
+                "call_options": {
+                    "market_data": {
+                        "ltp": 160.0,
+                        "last_update_time": "2026-09-18T15:25:00+05:30",
+                    },
+                    "option_greeks": {"iv": 12.0},
+                },
+                "put_options": {
+                    "market_data": {"ltp": 90.0, "last_trade_time": "1789725300000"}
+                },
+            },
+        ],
+    }
+    obs = upstox_chain_to_observation(
+        "NIFTY", "2026-09-24", raw, received_at=datetime(2026, 9, 18, 15, 30)
+    )
+    expected = datetime(2026, 9, 18, 9, 55, tzinfo=_tz.utc)
+    assert obs.market_timestamp == expected
+    call, put = obs.chain[0].call, obs.chain[0].put
+    assert call.event_timestamp == expected
+    assert put.event_timestamp == expected
+
+
+def test_upstox_adapter_capture_path_end_to_end(research_db):
+    """Real path E2E: raw Upstox payload -> actual adapter mapper ->
+    actual capture_session against the real cutoff gate.  Before cutoff:
+    accepted; after: refused with nothing persisted."""
+    from app.brokers.adapters.upstox.mapper import upstox_chain_to_observation
+    from app.models import GapPredictionSession
+    from app.research.gap_capture import capture_session
+
+    raw = {
+        "data": [
+            {
+                "strike_price": 25000.0,
+                "call_options": {
+                    "market_data": {
+                        "ltp": 160.0,
+                        "volume": 500,
+                        "oi": 1200,
+                        "last_update_time": "2026-09-18T15:29:59+05:30",
+                    },
+                    "option_greeks": {"iv": 12.0},
+                },
+                "put_options": {
+                    "market_data": {"ltp": 90.0, "last_trade_time": "1789725599000"}
+                },
+            },
+        ],
+    }
+    obs = upstox_chain_to_observation(
+        "NIFTY", "2026-09-24", raw, received_at=datetime(2026, 9, 18, 15, 30)
+    )
+    summary = capture_session(
+        research_db,
+        obs,
+        session_date="2026-09-18",
+        cutoff_timestamp=datetime(2026, 9, 18, 15, 30),
+        prior_close=25005.0,
+    )
+    assert summary["rows_captured"] == 2
+    from datetime import timezone as _tz2
+    assert summary["source_timestamp"] == datetime(2026, 9, 18, 9, 59, 59, tzinfo=_tz2.utc)
+
+    raw_after = {
+        "data": [
+            {
+                "strike_price": 25000.0,
+                "call_options": {
+                    "market_data": {
+                        "ltp": 161.0,
+                        "last_update_time": "2026-09-18T15:30:01+05:30",
+                    },
+                },
+                "put_options": {
+                    "market_data": {"ltp": 91.0, "last_trade_time": "1789725601000"}
+                },
+            },
+        ],
+    }
+    obs_after = upstox_chain_to_observation(
+        "NIFTY", "2026-09-24", raw_after, received_at=datetime(2026, 9, 18, 15, 30)
+    )
+    with pytest.raises(ValueError, match="after the research cutoff"):
+        capture_session(
+            research_db,
+            obs_after,
+            session_date="2026-09-19",
+            cutoff_timestamp=datetime(2026, 9, 18, 15, 30),
+            prior_close=25005.0,
+            replace=True,
+        )
+    # the refused observation persisted NOTHING
+    assert (
+        research_db.query(GapPredictionSession)
+        .filter(GapPredictionSession.session_date == "2026-09-19")
+        .count()
+        == 0
+    )
+
+
+def test_fyers_adapter_chain_is_uncapturable_without_timestamp(research_db):
+    """Real path, refusal direction: the FYERS chain payload carries no
+    event timestamp, the mapper does not fabricate one, and capture
+    refuses — receive time is never treated as proof."""
+    from app.brokers.adapters.fyers.mapper import fyers_chain_to_observation
+    from app.models import GapPredictionSession
+    from app.research.gap_capture import capture_session
+
+    raw = {
+        "s": "ok",
+        "data": {
+            "callputltp": [
+                {
+                    "strike_price": 25000.0,
+                    "callLtp": 160.0,
+                    "putLtp": 90.0,
+                    "callOICoynt": 1200,
+                }
+            ],
+            "underlying": 25120.0,
+        },
+    }
+    obs = fyers_chain_to_observation(
+        "NIFTY", "2026-09-24", raw, received_at=datetime(2026, 9, 18, 15, 30)
+    )
+    assert obs.market_timestamp is None  # never synthesized from receive time
+    with pytest.raises(ValueError, match="no trustworthy"):
+        capture_session(
+            research_db,
+            obs,
+            session_date="2026-09-18",
+            cutoff_timestamp=datetime(2026, 9, 18, 15, 30),
+            prior_close=25005.0,
+        )
+    assert (
+        research_db.query(GapPredictionSession)
+        .filter(GapPredictionSession.session_date == "2026-09-18")
+        .count()
+        == 0
+    )
+
+
+def test_price_quote_contract_has_single_canonical_source():
+    """Regression: PriceQuote declares ``source`` exactly once (the Phase-4
+    duplicate declaration is gone) and keyword construction still binds it."""
+    import dataclasses
+
+    from app.market_data.contracts import PriceQuote
+
+    fields = [f.name for f in dataclasses.fields(PriceQuote)]
+    assert fields.count("source") == 1
+    assert PriceQuote(ltp=1.0, source="FYERS").source == "FYERS"

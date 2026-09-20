@@ -173,6 +173,25 @@ class PriceQuote:
     volume: float | None = None
     oi: float | None = None  # Open Interest (contracts, not lots)
     source: str | None = None
+    # Observed option analytics (Issue #80 prospective research capture).
+    # Populated ONLY from broker-reported values (never computed here);
+    # unit conventions are documented per adapter mapper:
+    #   iv    — canonical decimal fraction (0.18 = 18%), converted from the
+    #           broker's percentage convention at the mapper boundary.
+    #   delta — dimensionless, pass-through.
+    #   gamma — dimensionless (per point), pass-through.
+    # vega/theta are deliberately NOT mapped: their broker unit conventions
+    # (per-day vs annualized, per-point vs per-vol-point) are not verified,
+    # and silently converting units would fabricate semantics. Raw broker
+    # values remain available in the adapter payload for audited extraction.
+    iv: float | None = None
+    delta: float | None = None
+    gamma: float | None = None
+    # Exchange/event time of this quote as reported by the source (Issue #80
+    # cutoff integrity).  None when the payload carries no event timestamp —
+    # NEVER synthesized from receive time; research capture refuses
+    # observations that cannot prove their observation time.
+    event_timestamp: datetime | None = None
 
 
 # ===========================================================================

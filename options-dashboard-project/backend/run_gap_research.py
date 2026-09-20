@@ -13,11 +13,19 @@ Usage::
     python run_gap_research.py backtest  --model sos
     python run_gap_research.py status
     python run_gap_research.py historical-sample --store-url sqlite:///store.db
+    python run_gap_research.py capture --user-id <id> --connection-id <id> \
+        --session 2026-09-18 --cutoff "2026-09-18T15:30:00" --prior-close 25000.0
 
 ``ingest`` expects a JSON underlying snapshot (spot/futures/VIX keys) and a
 JSON option-chain array (strike/option_type/expiry/quote+greeks keys). Data
 must come from the project's authorized free/broker data paths — no paid
 vendor and no restricted-exchange scraping is implemented or permitted here.
+
+``capture`` (Issue #80, research-only) fetches ONE front-expiry end-of-session
+chain snapshot through the customer's OWN authorized broker session (existing
+gateway + adapter path; same token-resolution rules as GEX capture) and
+persists it into the Phase-1 research schema with observed-value provenance.
+It is operator-invoked; nothing here schedules, signals, or serves users.
 """
 
 from __future__ import annotations
@@ -26,7 +34,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime  # naive operator cutoffs are IST-pinned inside capture_session
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -210,6 +218,104 @@ def _cmd_historical_sample(args) -> int:
     return 0
 
 
+def _cmd_capture(args) -> int:
+    """Issue #80 — capture ONE prospective end-of-session research snapshot.
+
+    Research-only. Uses the customer's own authorized broker session via the
+    existing Day-11 gateway (UPSTOX analytics/OAuth token priority identical
+    to the GEX capture loop) and persists through the Phase-1 research
+    pipeline with observed-value provenance. Operator-invoked: no scheduling,
+    no UI, no signal, no production impact.
+    """
+    import asyncio
+    from datetime import date as _date
+    from app.research.gap_capture import (
+        capture_session,
+        observed_iv_coverage,
+        resolve_capture_token,
+    )
+
+    cutoff = datetime.fromisoformat(args.cutoff)
+    session_date = args.session
+    # session date must be a real calendar date (classification depends on it)
+    _date.fromisoformat(session_date)
+
+    db = SessionLocal()
+    try:
+        from app.brokers.domain.enums import BROKER_ID_UPSTOX
+        from app.brokers.gateway import gateway
+
+        # Token resolution: same ownership rules as the GEX capture loop
+        # (analytics token on the explicitly-default connection, OAuth
+        # fallback) - implemented in the research module so this CLI never
+        # imports the FastAPI app.
+        token, connection_id, token_source = resolve_capture_token(
+            args.user_id, args.connection_id
+        )
+
+        adapter = gateway.create(BROKER_ID_UPSTOX, access_token=token)
+
+        async def _fetch() -> tuple:
+            contracts = await adapter.get_option_contracts("NIFTY")
+            expiries = contracts.get("expiries", [])
+            if not expiries:
+                raise RuntimeError("broker returned no option expiries")
+            expiry_date = expiries[0]  # front expiry from broker metadata
+            observation = await adapter.get_option_chain("NIFTY", expiry_date)
+            return expiry_date, observation
+
+        expiry_date, observation = asyncio.run(_fetch())
+
+        if observation.underlying_spot_price is None:
+            print("error: broker chain observation carries no underlying spot")
+            return 2
+
+        # prior OI map for the derived change_in_oi (from the previously
+        # captured research session, when one exists for the same expiry).
+        from app.models import OptionChainSnapshot
+
+        prev = (
+            db.query(OptionChainSnapshot)
+            .filter(
+                OptionChainSnapshot.symbol == "NIFTY",
+                OptionChainSnapshot.expiry == expiry_date,
+                OptionChainSnapshot.session_date < session_date,
+            )
+            .order_by(OptionChainSnapshot.session_date.desc())
+            .first()
+        )
+        prior_oi = {}
+        if prev is not None:
+            for row in db.query(OptionChainSnapshot).filter(
+                OptionChainSnapshot.symbol == "NIFTY",
+                OptionChainSnapshot.session_date == prev.session_date,
+                OptionChainSnapshot.expiry == expiry_date,
+            ):
+                if row.open_interest is not None:
+                    prior_oi[(row.expiry, float(row.strike), row.option_type)] = float(
+                        row.open_interest
+                    )
+
+        summary = capture_session(
+            db,
+            observation,
+            session_date=session_date,
+            cutoff_timestamp=cutoff,
+            prior_close=args.prior_close,
+            prior_oi=prior_oi,
+            replace=args.replace,
+        )
+        summary["observed_iv_coverage"] = observed_iv_coverage(db, session_date)
+        summary["token_source"] = token_source
+        print(json.dumps(summary, indent=2, default=str))
+        return 0
+    except SessionExistsError as exc:
+        print(f"error: {exc}")
+        return 2
+    finally:
+        db.close()
+
+
 def _cmd_merge_stores(args) -> int:
     """Build a Phase-3 working candle store from authorized local backups."""
     from app.research.gap_historical import build_merged_store
@@ -283,6 +389,33 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     p_hs.set_defaults(func=_cmd_historical_sample)
+
+    p_cap = sub.add_parser(
+        "capture",
+        help="Issue #80 (research-only): capture one end-of-session chain snapshot"
+    )
+    p_cap.add_argument("--user-id", required=True, help="StrikeNova user owning the broker session")
+    p_cap.add_argument(
+        "--connection-id",
+        default=None,
+        help="explicit BrokerConnection id (default: the user's default UPSTOX connection)",
+    )
+    p_cap.add_argument("--session", required=True, help="trading date YYYY-MM-DD")
+    p_cap.add_argument(
+        "--cutoff", required=True, help="research cutoff ISO datetime (end of session)"
+    )
+    p_cap.add_argument(
+        "--prior-close",
+        type=float,
+        default=None,
+        help="session close (reference for the next-session gap target)",
+    )
+    p_cap.add_argument(
+        "--replace",
+        action="store_true",
+        help="replace an already-captured session (default: refuse, immutable)",
+    )
+    p_cap.set_defaults(func=_cmd_capture)
 
     p_ms = sub.add_parser(
         "merge-stores",

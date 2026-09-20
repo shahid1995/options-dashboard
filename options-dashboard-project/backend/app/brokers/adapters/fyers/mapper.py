@@ -544,10 +544,25 @@ def fyers_chain_to_observation(
 
     Row keys: ``strike_price``, ``callLtp``/``putLtp``, volume/OI pairs
     (``callVolume``/``putVolume``, ``callOICoynt``/``putOICoynt`` —
-    contracts, never converted to lots), Greek pairs
-    (``callIV``/``putIV`` ... — IV as reported). CE and PE legs are
-    independent: a leg without LTP is absent (``None``), never zero.
+    contracts, never converted to lots), best-quote pairs
+    (``callBidPrice``/``callAskPrice``, ``callBidQty``/``callAskQty"",
+    and the ``put`` equivalents) and analytics pairs
+    (``callIV``/``putIV``, ``callDelta``/``putDelta``,
+    ``callGamma``/``putGamma`` — mapped when the payload carries them;
+    FYERS has shipped chain payloads both with and without these fields,
+    so every analytics field is optional and stays ``None`` when absent —
+    missing is never fabricated). CE and PE legs are independent: a leg
+    without LTP is absent (``None``), never zero.
     Rows without a strike are skipped (malformed row, not fatal).
+
+    Issue #80 cutoff integrity: the FYERS options-chain-v3 payload exposes
+    NO exchange event or snapshot timestamp, so ``market_timestamp`` stays
+    ``None`` (mirroring the quote path above — never synthesized from
+    receive time).  Research capture therefore REFUSES FYERS chain
+    observations: receive time cannot prove the observed quote/book state
+    existed at or before a declared research cutoff.  Capturing from FYERS
+    requires an authoritative broker-source timestamp first — never a
+    fabricated or back-dated one.
     """
     rows: list[OptionChainRow] = []
     underlying_spot = None
@@ -566,10 +581,20 @@ def fyers_chain_to_observation(
         ltp = item.get(f"{prefix}Ltp")
         if ltp is None:
             return None
+        iv = _optional_float(item.get(f"{prefix}IV"))
         return PriceQuote(
             ltp=float(ltp),
             volume=_optional_float(item.get(f"{prefix}Volume")),
             oi=_optional_float(item.get(f"{prefix}OICoynt")),
+            bid=_optional_float(item.get(f"{prefix}BidPrice")),
+            ask=_optional_float(item.get(f"{prefix}AskPrice")),
+            bid_quantity=_optional_int(item.get(f"{prefix}BidQty")),
+            ask_quantity=_optional_int(item.get(f"{prefix}AskQty")),
+            # Broker IV is reported as a percentage (e.g. 12.5 = 12.5%);
+            # the canonical contract stores a decimal fraction (0.125).
+            iv=(iv / 100.0) if iv is not None else None,
+            delta=_optional_float(item.get(f"{prefix}Delta")),
+            gamma=_optional_float(item.get(f"{prefix}Gamma")),
             source=SOURCE_LABEL,
         )
 
