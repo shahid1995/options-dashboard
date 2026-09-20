@@ -210,6 +210,18 @@ def _cmd_historical_sample(args) -> int:
     return 0
 
 
+def _cmd_merge_stores(args) -> int:
+    """Build a Phase-3 working candle store from authorized local backups."""
+    from app.research.gap_historical import build_merged_store
+
+    if os.path.exists(args.output):
+        print(f"error: output {args.output} already exists (refusing to overwrite)")
+        return 2
+    summary = build_merged_store(args.output, args.source)
+    print(json.dumps(summary, indent=2, default=str))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -271,6 +283,19 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     p_hs.set_defaults(func=_cmd_historical_sample)
+
+    p_ms = sub.add_parser(
+        "merge-stores",
+        help="union authorized candle-store backups into a Phase-3 working store",
+    )
+    p_ms.add_argument("--output", required=True, help="new working-store DB path")
+    p_ms.add_argument(
+        "--source",
+        action="append",
+        required=True,
+        help="source backup DB (repeatable; first source wins on conflicts)",
+    )
+    p_ms.set_defaults(func=_cmd_merge_stores)
 
     args = parser.parse_args(argv)
     return args.func(args)

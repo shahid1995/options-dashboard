@@ -586,7 +586,9 @@ def _seed_candle_store(
             s.add(NiftyCandle(symbol="NIFTY", interval="3min", open_time=datetime.fromisoformat(f"{day}T15:45:00"), open=26000.0, high=26100.0, low=25900.0, close=26000.0, volume=1000))
 
     def opts(day: str) -> None:
-        expiry_value = expiry or day  # front expiry == session date by default
+        expiry_value = (
+            expiry.get(day, day) if isinstance(expiry, dict) else (expiry or day)
+        )  # front expiry == session date by default
         contracts = {
             "1": (25000, "CE", 105.0), "2": (25000, "PE", 105.0),
             "3": (25050, "CE", 105.0), "4": (25050, "PE", 105.0),
@@ -999,3 +1001,344 @@ def test_regime_dims_report_only(tmp_path):
                 assert dim in ("gex", "iv", "dte", "prevday")
     finally:
         gen.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 (#78) — non-expiry snapshot expansion
+# ---------------------------------------------------------------------------
+
+
+def test_dte_bucket_assignment():
+    """Bucket boundaries are exact: 0 / 1-2 / 3-7 / >7 / unknown."""
+    from app.research.gap_historical import dte_bucket
+
+    assert dte_bucket(0) == "DTE0"
+    assert dte_bucket(1) == "DTE1-2"
+    assert dte_bucket(2) == "DTE1-2"
+    assert dte_bucket(3) == "DTE3-7"
+    assert dte_bucket(7) == "DTE3-7"
+    assert dte_bucket(8) == "DTE>7"
+    assert dte_bucket(30) == "DTE>7"
+    assert dte_bucket(None) == "unknown"
+
+
+def test_non_expiry_identification_expiry_selection_and_cutoff_kind(tmp_path):
+    """Non-expiry classification comes from contract metadata: the 08-06
+    session (front expiry = same day) is DTE0/expiry; 08-07 (front expiry
+    08-13) is DTE6/non-expiry; a past-dated spec is never selected as front
+    expiry; a 09:57-style terminal candle classifies the cutoff as intraday."""
+    from app.research.gap_historical import dte_bucket, extract_historical_sessions
+
+    gen = _seed_candle_store(
+        tmp_path,
+        ["2026-08-03", "2026-08-04", "2026-08-06", "2026-08-07", "2026-08-08"],
+        gap_day="2026-08-04",
+        expiry={
+            "2026-08-03": "2026-08-03",
+            "2026-08-06": "2026-08-06",  # expiry day
+            "2026-08-07": "2026-08-13",  # non-expiry, DTE 6
+        },
+    )
+    try:
+        store = next(gen)
+        sessions = extract_historical_sessions(store)
+        by_date = {s.session_date: s for s in sessions}
+        assert set(by_date) == {"2026-08-06", "2026-08-07"}
+
+        s_exp, s_non = by_date["2026-08-06"], by_date["2026-08-07"]
+        assert s_exp.is_expiry_session is True and s_exp.dte_days == 0
+        assert s_non.is_expiry_session is False and s_non.dte_days == 6
+        # correct front expiry — the 08-06-dated spec is never chosen for 08-07
+        assert {r["expiry"] for r in s_non.chain} == {"2026-08-13"}
+        assert {r["expiry"] for r in s_exp.chain} == {"2026-08-06"}
+        # both seeds end at 15:27 → end-of-session cutoffs
+        assert s_exp.cutoff_kind == "end_of_session"
+        assert s_non.cutoff_kind == "end_of_session"
+        assert dte_bucket(s_exp.dte_days) == "DTE0"
+        assert dte_bucket(s_non.dte_days) == "DTE3-7"
+    finally:
+        gen.close()
+
+
+def test_intraday_cutoff_detected_for_morning_only_store(tmp_path):
+    """A store whose option data ends in the morning (2024-10-style daily
+    backfill) classifies honestly as an intraday cutoff — never disguised as
+    an end-of-session snapshot."""
+    from datetime import datetime as dt
+
+    from app.models import OptionCandle
+    from app.research.gap_historical import extract_historical_sessions
+
+    gen = _seed_candle_store(
+        tmp_path,
+        ["2026-08-03", "2026-08-04", "2026-08-05", "2026-08-06", "2026-08-07"],
+        expiry="2026-08-13",
+    )
+    try:
+        store = next(gen)
+        # Replace the 15:27 terminal candles with morning-only data (09:57)
+        # on 08-03 and 08-06; 08-07 stays index-only (target session).
+        store.query(OptionCandle).delete()
+        for day in ("2026-08-03", "2026-08-06"):
+            for token in ("1", "2", "3", "4"):
+                key = f"NSE_FO|{token}|{day}"
+                store.add(
+                    OptionCandle(
+                        instrument_key=key, interval="3min",
+                        open_time=dt.fromisoformat(f"{day}T09:57:00"),
+                        open=100.0, high=110.0, low=95.0, close=105.0,
+                        volume=500.0, open_interest=90000.0,
+                        source="TEST", fetched_at=dt(2026, 1, 1),
+                    )
+                )
+        store.commit()
+        sessions = extract_historical_sessions(store)
+        assert [s.session_date for s in sessions] == ["2026-08-06"]
+        assert sessions[0].cutoff_kind == "intraday"
+        assert sessions[0].cutoff.hour == 9  # 09:57, not end-of-session
+    finally:
+        gen.close()
+
+
+def test_value_provenance_observed_reconstructed_unavailable(tmp_path):
+    """The Phase 3 hard contract, enforced on the persisted dataset: observed
+    (ltp/volume/OI) vs reconstructed (IV/Greeks — never labelled observed) vs
+    unavailable (bid/ask) vs derived (OI change). A session ingested without
+    provenance keeps NULL (pre-Phase-3 marker)."""
+    import json as _json
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker as sm
+
+    from app.db import Base
+    from app.models import OptionChainSnapshot
+    from app.research.gap_historical import (
+        chain_value_provenance,
+        extract_historical_sessions,
+    )
+    from app.research.gap_pipeline import ingest_session_snapshots
+
+    import app.models  # noqa: F401 — register tables on Base
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path}/prov.db", connect_args={"check_same_thread": False}
+    )
+    Base.metadata.create_all(engine)
+    db = sm(bind=engine)()
+    gen = _seed_candle_store(
+        tmp_path, ["2026-08-03", "2026-08-04", "2026-08-05", "2026-08-06"],
+        expiry="2026-08-13", deep_itm=True,
+    )
+    try:
+        store = next(gen)
+        sessions = extract_historical_sessions(store, enrich_greeks=True)
+        s = sessions[0]
+        prov = chain_value_provenance(enriched=True)
+        ingest_session_snapshots(
+            db,
+            session_date=s.session_date,
+            cutoff_timestamp=s.cutoff,
+            prior_close=s.prior_close,
+            underlying=s.underlying,
+            chain=s.chain,
+            chain_value_provenance=prov,
+        )
+        row = (
+            db.query(OptionChainSnapshot)
+            .filter_by(session_date=s.session_date)
+            .first()
+        )
+        stored = _json.loads(row.value_provenance)
+        assert stored["ltp"] == "observed"
+        assert stored["open_interest"] == "observed"
+        assert stored["iv"] == "reconstructed"  # engine-derived, never observed
+        assert stored["delta"] == "reconstructed"
+        assert stored["bid"] == "unavailable" and stored["ask"] == "unavailable"
+        assert stored["change_in_oi"] == "derived"
+        # the deep-ITM row's iv is genuinely None (missing ≠ zero) while its
+        # provenance still says "reconstructed" (method, not availability)
+        deep = (
+            db.query(OptionChainSnapshot)
+            .filter_by(session_date=s.session_date, strike=24000.0)
+            .first()
+        )
+        assert deep.iv is None
+
+        # candle-only provenance: greeks classes flip to unavailable
+        prov_core = chain_value_provenance(enriched=False)
+        assert prov_core["iv"] == "unavailable"
+        assert prov_core["ltp"] == "observed"
+
+        # legacy behaviour: no provenance argument → NULL on the row
+        u, chain = _session_payload("2026-09-01", 0.1)
+        ingest_session_snapshots(
+            db, "2026-09-01", datetime(2026, 9, 1, 15, 30), 25000.0, u, chain
+        )
+        legacy = (
+            db.query(OptionChainSnapshot)
+            .filter_by(session_date="2026-09-01")
+            .first()
+        )
+        assert legacy.value_provenance is None
+    finally:
+        db.close()
+        engine.dispose()
+        gen.close()
+
+
+# ---------------------------------------------------------------------------
+# Issue #78 — merged-store construction (id-collision safety, tz normalization)
+# ---------------------------------------------------------------------------
+
+
+def _mk_source_db(path, nifty_rows=(), option_rows=(), spec_rows=()):
+    """Create a minimal candle-store DB from explicit row tuples.
+
+    nifty_rows:  (date, "HH:MM", close)
+    option_rows: (key, date, "HH:MM", close, oi)
+    spec_rows:   (key, expiry, strike, otype)
+    Each DB numbers its own ids from 1, so two such DBs collide on ids by
+    construction (exactly like the two authorized backups).
+    """
+    import sqlite3
+
+    from app.db import Base
+    from app.models import ContractSpec, NiftyCandle, OptionCandle
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    engine = create_engine(f"sqlite:///{path}")
+    Base.metadata.create_all(engine)
+    s = sessionmaker(bind=engine)()
+    for date, hm, close in nifty_rows:
+        s.add(
+            NiftyCandle(
+                symbol="NIFTY", interval="3min",
+                open_time=datetime.fromisoformat(f"{date}T{hm}:00"),
+                open=close, high=close, low=close, close=close, volume=1000.0,
+            )
+        )
+    for key, date, hm, close, oi in option_rows:
+        s.add(
+            OptionCandle(
+                instrument_key=key, interval="3min",
+                open_time=datetime.fromisoformat(f"{date}T{hm}:00"),
+                open=close, high=close, low=close, close=close,
+                volume=500.0, open_interest=oi, source="TEST",
+                fetched_at=datetime(2026, 1, 1),
+            )
+        )
+    for key, expiry, strike, otype in spec_rows:
+        s.add(
+            ContractSpec(
+                instrument_key=key, underlying="NIFTY",
+                underlying_key="NSE_INDEX|Nifty 50", expiry=expiry,
+                strike_price=strike, instrument_type=otype, lot_size=25,
+                minimum_lot=25, freeze_quantity=1800, tick_size=0.05,
+                trading_symbol=f"NIFTY {strike} {otype}", segment="NSE_FO",
+                exchange="NSE", weekly=True, source="TEST",
+                source_reference="test", fetched_at=datetime(2026, 1, 1),
+            )
+        )
+    s.commit()
+    s.close()
+    engine.dispose()
+    return str(path)
+
+
+def test_merge_preserves_rows_across_id_collisions(tmp_path):
+    """Two sources reuse overlapping id ranges; merging must dedupe on the
+    natural unique key, never drop source-2 rows on id collisions."""
+    from app.research.gap_historical import build_merged_store
+    import sqlite3
+
+    p1 = _mk_source_db(
+        str(tmp_path / "s1.db"),
+        nifty_rows=[("2026-08-05", "09:15", 25000.0), ("2026-08-05", "15:27", 25005.0)],
+        option_rows=[("NSE_FO|1|d1", "2026-08-05", "15:27", 105.0, 90000.0)],
+        spec_rows=[("NSE_FO|1|d1", "2026-08-05", 25000.0, "CE")],
+    )
+    p2 = _mk_source_db(
+        str(tmp_path / "s2.db"),
+        option_rows=[("NSE_FO|2|d1", "2026-08-05", "15:27", 95.0, 80000.0)],
+        spec_rows=[("NSE_FO|2|d1", "2026-08-05", 25000.0, "PE")],
+    )
+    out = str(tmp_path / "merged.db")
+    build_merged_store(out, [p1, p2])
+    con = sqlite3.connect(f"file:{out}?mode=ro", uri=True)
+    keys = sorted(r[0] for r in con.execute("SELECT instrument_key FROM option_candles"))
+    assert keys == ["NSE_FO|1|d1", "NSE_FO|2|d1"]  # both survive
+    assert con.execute("SELECT COUNT(*) FROM contract_specs").fetchone()[0] == 2
+    con.close()
+
+
+def test_merge_normalizes_utc_source_against_index_anchor(tmp_path):
+    """A UTC-stamped source date is shifted +330 min when (and only when)
+    that hypothesis fits the authoritative index session window; shifted
+    rows dedupe against IST rows of the first source on the natural key."""
+    from app.research.gap_historical import build_merged_store
+    import sqlite3
+
+    # Source 1 (priority 0, IST): index window 09:15–15:27, one 15:27 option.
+    p1 = _mk_source_db(
+        str(tmp_path / "s1.db"),
+        nifty_rows=[("2026-08-05", "09:15", 25000.0), ("2026-08-05", "15:27", 25005.0)],
+        option_rows=[("NSE_FO|1|d1", "2026-08-05", "15:27", 105.0, 90000.0)],
+        spec_rows=[("NSE_FO|1|d1", "2026-08-05", 25000.0, "CE")],
+    )
+    # Source 2 (UTC-stamped): 03:45 UTC == 09:15 IST (new key), and
+    # 09:57 UTC == 15:27 IST (collides with source 1's row after shift).
+    p2 = _mk_source_db(
+        str(tmp_path / "s2.db"),
+        option_rows=[
+            ("NSE_FO|2|d1", "2026-08-05", "03:45", 95.0, 80000.0),
+            ("NSE_FO|1|d1", "2026-08-05", "09:57", 999.0, 1.0),
+        ],
+        spec_rows=[("NSE_FO|2|d1", "2026-08-05", 25000.0, "PE")],
+    )
+    out = str(tmp_path / "merged.db")
+    build_merged_store(out, [p1, p2])
+    con = sqlite3.connect(f"file:{out}?mode=ro", uri=True)
+    rows = con.execute(
+        "SELECT instrument_key, open_time, close FROM option_candles ORDER BY instrument_key"
+    ).fetchall()
+    # shifted 03:45 → 09:15 IST (kept); 09:57 UTC → 15:27 IST duplicate of
+    # priority-0's row → dropped, and the priority-0 close wins.
+    assert rows == [
+        ("NSE_FO|1|d1", "2026-08-05 15:27:00.000000", 105.0),
+        ("NSE_FO|2|d1", "2026-08-05 09:15:00.000000", 95.0),
+    ]
+    prov = json.loads(con.execute("SELECT dates FROM _store_provenance").fetchall()[1][0])
+    assert "option_candles:2026-08-05" in prov["tz_decisions"]["shifted_utc_to_ist"]
+    con.close()
+
+
+def test_merge_refuses_unanchorable_dates_without_guessing(tmp_path):
+    """An option date with no index anchor in any source is REFUSED: its rows
+    are not copied and the refusal is recorded — never silently normalized."""
+    from app.research.gap_historical import build_merged_store
+    import sqlite3
+
+    p1 = _mk_source_db(
+        str(tmp_path / "s1.db"),
+        nifty_rows=[("2026-08-05", "09:15", 25000.0)],
+        option_rows=[("NSE_FO|1|d1", "2026-08-05", "15:27", 105.0, 90000.0)],
+        spec_rows=[("NSE_FO|1|d1", "2026-08-05", 25000.0, "CE")],
+    )
+    p2 = _mk_source_db(
+        str(tmp_path / "s2.db"),
+        option_rows=[("NSE_FO|2|d2", "2026-08-06", "15:27", 95.0, 80000.0)],
+        spec_rows=[("NSE_FO|2|d2", "2026-08-06", 25000.0, "PE")],
+    )
+    out = str(tmp_path / "merged.db")
+    build_merged_store(out, [p1, p2])
+    con = sqlite3.connect(f"file:{out}?mode=ro", uri=True)
+    dates = [r[0] for r in con.execute("SELECT DISTINCT substr(open_time,1,10) FROM option_candles")]
+    assert "2026-08-06" not in dates  # refused, not copied
+    # its spec still merges (specs carry no candle timestamps)
+    assert con.execute(
+        "SELECT COUNT(*) FROM contract_specs WHERE instrument_key='NSE_FO|2|d2'"
+    ).fetchone()[0] == 1
+    prov = json.loads(con.execute("SELECT dates FROM _store_provenance").fetchall()[1][0])
+    assert "option_candles:2026-08-06:no_index_anchor" in prov["tz_decisions"]["refused"]
+    con.close()
