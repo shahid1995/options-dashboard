@@ -41,7 +41,20 @@ class BrokerSyncIdempotency(Base):
     source_mode: Mapped[str] = mapped_column(String(32), nullable=False)
     provider_event_id: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Day41.2 — durable S2 evidence (frozen r2 design §12): the provider/
+    # exchange event timestamp, populated STRICTLY from ``event.event_timestamp``.
+    # NULL means S2 evidence is unavailable (structurally distinct from any
+    # timestamp value).  ``received_at`` remains provenance only and must never
+    # substitute for S2 authority.
+    event_timestamp: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Day41.2 — UNRESOLVED resolution evidence (frozen r2 design §13):
+    # NULL until an S3/S4 resolution occurs; then e.g. "S3:<canonical_id>"
+    # or "S4:<operator evidence reference>".  UNRESOLVED is transient —
+    # resolvable through S3/S4; STALE and APPLIED are terminal.
+    resolution_evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
         default=lambda: datetime.now(timezone.utc),
@@ -86,6 +99,14 @@ class BrokerOrderProjection(Base):
     occurred_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
+    # Day41.2 — durable S2 evidence (frozen r2 design §12): the provider/
+    # exchange event timestamp, populated STRICTLY from ``event.event_timestamp``.
+    # NULL means S2 evidence is unavailable.  ``occurred_at`` (and its
+    # event_timestamp-or-received_at fallback) remain display/derived only and
+    # must never become S2 authority.
+    event_timestamp: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
@@ -123,3 +144,32 @@ class BrokerSyncSequenceAnchor(Base):
             name="uq_broker_sync_sequence_anchor_identity",
         ),
     )
+
+
+class OrderFamilySyncLock(Base):
+    """D-1 dedicated order-family synchronization lock (Day41.2).
+
+    Per the authoritative human architecture decision
+    (``2026-09-12-strikenova-cross-d1-locking-human-architecture-decision.md``):
+    a dedicated durable row keyed ``(tenant_id, broker, broker_order_id)``
+    exists **solely** to serialize synchronization decisions for one broker
+    order family.  It is a mutex/serialization record, NOT a state record.
+
+    Non-purpose (decision memo): it must never represent or store provider
+    sequence/S1 state, lifecycle state, projection state, D1, CEID, FPv2, or
+    any semantic ordering evidence.  ``broker_sync_sequence_anchor`` remains
+    strictly the S1/provider-sequence authority; sequence-less observations
+    may acquire this lock but never mutate anchor state because of it.
+
+    Concurrency contract (frozen r2 design §7): created via atomic
+    ``INSERT … ON CONFLICT DO NOTHING`` (unique-key insert is the
+    first-observer arbitration), then re-selected ``FOR UPDATE`` inside the
+    Task2 transaction and held until commit/rollback.  Acquisition order
+    confers no semantic meaning.
+    """
+
+    __tablename__ = "order_family_sync_lock"
+
+    tenant_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    broker: Mapped[str] = mapped_column(String(64), primary_key=True)
+    broker_order_id: Mapped[str] = mapped_column(String(128), primary_key=True)

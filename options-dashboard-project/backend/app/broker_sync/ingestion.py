@@ -34,16 +34,19 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError as SAIntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
+from app.utils.db_dialect import dialect_insert
 from app.utils.retry import is_serialization_failure, retry_on_serialization
 
 from app.broker_sync import (
+    BrokerEventSourceMode,
     BrokerEventType,
     BrokerSyncEvent,
     CanonicalOrderState,
@@ -51,7 +54,12 @@ from app.broker_sync import (
     OrderFacts,
     compute_ceid,
 )
-from app.broker_sync.models import BrokerOrderProjection, BrokerSyncIdempotency, BrokerSyncSequenceAnchor
+from app.broker_sync.models import (
+    BrokerOrderProjection,
+    BrokerSyncIdempotency,
+    BrokerSyncSequenceAnchor,
+    OrderFamilySyncLock,
+)
 from app.trade_lifecycle.persistence import append_lifecycle_event, next_event_sequence
 
 logger = logging.getLogger(__name__)
@@ -606,6 +614,11 @@ def _build_projection(
         last_fill_id=last_fill_id,
         canonical_sequence=canonical_sequence,
         occurred_at=occurred_at,
+        # Day41.2 — durable S2 evidence (frozen r2 design §12): STRICTLY the
+        # provider/exchange event timestamp.  Never the ``occurred_at``
+        # fallback, never ``received_at`` — missing evidence stays NULL so it
+        # remains structurally distinct from any timestamp value.
+        event_timestamp=event.event_timestamp,
         received_at=event.received_at,
     )
 
@@ -853,7 +866,8 @@ def ingest_canonical_event(
     Returns:
         A result dictionary with:
         - ``canonical_id`` (str)
-        - ``action``: ``APPLIED``, ``DUPLICATE_NOOP``, ``REJECTED``, ``CONFLICT``
+        - ``action``: ``APPLIED``, ``DUPLICATE_NOOP``, ``REJECTED``, ``CONFLICT``,
+          ``STALE`` (preserved, not applied), or ``UNRESOLVED`` (quarantined)
         - ``normalized_state``: projected state dict when applied, else ``None``
         - ``reason``: explanation (None when action is APPLIED)
     """
@@ -868,10 +882,531 @@ def ingest_canonical_event(
         }
 
 
+# ---------------------------------------------------------------------------
+# Day41.2 — Cross-D1 S1/S2 ordering (frozen r2 design §6/§7/§13)
+# ---------------------------------------------------------------------------
+
+# Quarantine status domain (design §13): APPLIED and STALE are terminal;
+# UNRESOLVED is transient and resolvable through S3/S4.
+_STATUS_QUARANTINE = ("STALE", "UNRESOLVED")
+
+
+@dataclass(frozen=True)
+class _CrossD1Classification:
+    """Pure classification outcome (design §6 contract).
+
+    ``outcome`` ∈ {FIRST, AUTHORIZED, STALE, UNRESOLVED}; ``reason`` carries
+    the approved-evidence explanation (S1/S2/S3 authority reference, scope
+    guard, or mixed-authority flag).  Consumes ONLY approved evidence: S1
+    ``canonical_sequence``, S2 ``event_timestamp``, S3 ``source_mode``
+    RECOVERY, and D1-scope identity (event_type).  Never compares state
+    names, event-type ordering, receipt time, or row ids.
+    """
+
+    outcome: str
+    reason: str
+
+
+def _as_utc(ts: datetime | None) -> datetime | None:
+    """Normalize an S2 timestamp to timezone-aware UTC (comparison only).
+
+    Naive datetimes (SQLite test round-trips) are interpreted as UTC,
+    matching PostgreSQL ``TIMESTAMPTZ`` storage semantics; aware values are
+    converted to UTC.  Pure normalization — introduces no ordering authority
+    and consumes no evidence beyond the approved S2 timestamp itself.
+    """
+    if ts is None:
+        return None
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
+
+
+def _classify_cross_d1(
+    event: BrokerSyncEvent,
+    previous: Any,
+) -> _CrossD1Classification:
+    """Classify an incoming observation against the previous family state.
+
+    Pure function — no database access, no mutation, deterministic.
+
+    Scope guards (steps 1–4) route everything that is NOT a sequence-less
+    cross-D1 pair to the existing architecture unchanged; only step 5
+    applies the human-approved cross-D1 S2 rule (decision memo
+    ``2026-09-12-strikenova-cross-d1-regression-human-architecture-decision.md``):
+
+        T_in > T_prev   → AUTHORIZED (supersession)
+        T_in < T_prev   → STALE (preserved, never applied)
+        T_in == T_prev  → UNRESOLVED (quarantine)
+        missing (either) → UNRESOLVED (quarantine)
+
+    S1 (provider sequence) strictly outranks S2.  S3 (history-sourced
+    RECOVERY observation) is consulted exactly when S2 cannot decide —
+    ladder rank 3 above the quarantine fallback.  No lifecycle-state
+    ranking is created or consulted (Invariant: no invented ordering).
+    """
+    # 1. No previous observation exists ≠ "timestamp missing" (§16):
+    #    the lone-observation application path (Day40.3 §5.3 single-observation
+    #    note) applies even when the event's own S2 evidence is absent.
+    if previous is None:
+        return _CrossD1Classification(
+            "FIRST",
+            "no previous observation exists for the order family (first application)",
+        )
+
+    # 2. Incoming sequence-bearing → existing S1 machinery governs
+    #    (anchor validation / CAS).  Behavior byte-identical to pre-Day41.2.
+    if event.canonical_sequence is not None:
+        return _CrossD1Classification(
+            "AUTHORIZED",
+            "S1 scope: provider sequence present — existing sequence machinery governs",
+        )
+
+    # 3. Previous sequence-bearing + incoming sequence-less: MIXED pair.
+    #    OUT OF SCOPE — HUMAN DECISION REQUIRED (design §18): behavior is
+    #    unchanged (applies through the existing path); the reason flags the
+    #    mixed-authority boundary.  No new semantics are invented here.
+    if previous.canonical_sequence is not None:
+        return _CrossD1Classification(
+            "AUTHORIZED",
+            "mixed authority pair (previous sequence-bearing, incoming sequence-less) "
+            "— behavior unchanged; OUT OF SCOPE — HUMAN DECISION REQUIRED",
+        )
+
+    # 4. Same D1 scope (same family + same event_type — D1 includes
+    #    event_type per Day40 §2.2): PR-8 / Day40.3 §5.3 same-D1 behavior
+    #    remains authoritative.  Never routed through the cross-D1 rule.
+    if previous.event_type == event.event_type:
+        return _CrossD1Classification(
+            "AUTHORIZED",
+            "same D1 scope (same event_type) — existing Day40.3 §5.3 same-D1 "
+            "correction behavior governs; cross-D1 rule not applied",
+        )
+
+    # 5. Both sequence-less, different D1, same family: the approved S2 rule.
+    #    Timezone-normalize for comparison only (engine-neutral strictness):
+    #    SQLite round-trips return naive UTC while events carry aware UTC;
+    #    PostgreSQL TIMESTAMPTZ always returns aware.  No new authority.
+    t_in = _as_utc(event.event_timestamp)
+    t_prev = _as_utc(previous.event_timestamp)
+    if t_in is not None and t_prev is not None:
+        # Second precision (decision memo: Upstox exchange timestamps are
+        # second-precision; sub-second noise must not create a false strict
+        # ordering).  "Equal at second precision" is UNRESOLVED, not a tie
+        # to be broken by anything unapproved.
+        t_in_s = t_in.replace(microsecond=0)
+        t_prev_s = t_prev.replace(microsecond=0)
+        if t_in_s > t_prev_s:
+            return _CrossD1Classification(
+                "AUTHORIZED",
+                f"S2: incoming exchange_timestamp {t_in_s.isoformat()} is newer than "
+                f"previous {t_prev_s.isoformat()} — authorized supersession",
+            )
+        if t_in_s < t_prev_s:
+            return _CrossD1Classification(
+                "STALE",
+                f"S2: incoming exchange_timestamp {t_in_s.isoformat()} is older than "
+                f"previous {t_prev_s.isoformat()} — STALE, preserved and not applied",
+            )
+        # Equal at second precision → S3 fallback (design §6 step 5b).
+        if event.source_mode == BrokerEventSourceMode.RECOVERY:
+            return _CrossD1Classification(
+                "AUTHORIZED",
+                "S3: history-sourced observation resolves the family "
+                "(authoritative order-history ordering, ladder rank 3)",
+            )
+        return _CrossD1Classification(
+            "UNRESOLVED",
+            "S2 equal at second precision — unresolved, quarantined for S3/S4",
+        )
+
+    # Missing S2 evidence on either side → S3 fallback, else UNRESOLVED.
+    if event.source_mode == BrokerEventSourceMode.RECOVERY:
+        return _CrossD1Classification(
+            "AUTHORIZED",
+            "S3: history-sourced observation resolves the family "
+            "(authoritative order-history ordering, ladder rank 3)",
+        )
+    if t_in is None:
+        return _CrossD1Classification(
+            "UNRESOLVED",
+            "incoming S2 evidence missing — unresolved, quarantined for S3/S4",
+        )
+    return _CrossD1Classification(
+        "UNRESOLVED",
+        "previous S2 evidence missing — unresolved, quarantined for S3/S4",
+    )
+
+
+def _settled_idempotency_outcome(
+    existing_idem: BrokerSyncIdempotency | None,
+    fingerprint: str,
+    canonical_id: str,
+) -> dict[str, Any] | None:
+    """Durable outcome for a settled idempotency record, or None to proceed.
+
+    Day41.2 replay semantics (frozen r2 design §15 replay matrix): an
+    identical replay re-emits the DURABLE outcome already recorded —
+    APPLIED → DUPLICATE_NOOP (existing invariant); STALE/UNRESOLVED → their
+    own status, because a preserved-but-unapplied observation must never
+    convert to APPLIED by replaying and no duplicate idempotency record may
+    be created.  Same identity with different content → CONFLICT.
+
+    Called twice on the application path: once before the D-1 family lock
+    (lock-free fast path for already-settled replays) and once after the
+    lock is held (authoritative re-check — a concurrent identical replay
+    that committed while this worker waited for the lock is then visible,
+    restoring the DUPLICATE_NOOP contract under true concurrency).
+    """
+    if existing_idem is None:
+        return None
+    if existing_idem.content_fingerprint == fingerprint:
+        if existing_idem.status in _STATUS_QUARANTINE:
+            return {
+                "canonical_id": canonical_id,
+                "action": existing_idem.status,
+                "normalized_state": None,
+                "reason": (
+                    f"replay of {existing_idem.status} observation "
+                    f"(preserved, not applied)"
+                ),
+            }
+        # Identical duplicate — no-op
+        return {
+            "canonical_id": canonical_id,
+            "action": "DUPLICATE_NOOP",
+            "normalized_state": None,
+            "reason": "already applied (durable)",
+        }
+    # Same identity, different content — conflict
+    return {
+        "canonical_id": canonical_id,
+        "action": "CONFLICT",
+        "normalized_state": None,
+        "reason": (
+            f"canonical_id {canonical_id} exists with different content "
+            f"(stored={existing_idem.content_fingerprint[:16]}..., "
+            f"incoming={fingerprint[:16]}...)"
+        ),
+    }
+
+
+def _lock_order_family(
+    db: Session,
+    *,
+    tenant_id: str,
+    broker: str,
+    broker_order_id: str,
+) -> None:
+    """Acquire the D-1 order-family synchronization lock (frozen r2 design §7).
+
+    First-row creation is atomic: ``INSERT … ON CONFLICT DO NOTHING`` — the
+    unique-key insert is the first-observer arbitration (the Day41.1-proven
+    Lane-B pattern).  Check-then-insert is deliberately NOT used: two
+    concurrent first observers could both see "missing" and proceed
+    unserialized.  The follow-up ``SELECT … FOR UPDATE`` grants exclusive
+    transaction ownership: a concurrent worker blocks here until this
+    transaction commits or rolls back.  The lock is held by the caller's
+    transaction until commit/rollback — never released early — and confers
+    no semantic meaning by acquisition order.
+
+    The lock row stores NO semantic data (no sequence, lifecycle, identity,
+    or timestamp fields) and acquiring it never touches the S1 sequence
+    anchor.
+    """
+    db.execute(
+        dialect_insert(db.get_bind(), OrderFamilySyncLock.__table__)
+        .values(
+            tenant_id=tenant_id,
+            broker=broker,
+            broker_order_id=broker_order_id,
+        )
+        .on_conflict_do_nothing()
+    )
+    db.execute(
+        select(OrderFamilySyncLock)
+        .where(
+            OrderFamilySyncLock.tenant_id == tenant_id,
+            OrderFamilySyncLock.broker == broker,
+            OrderFamilySyncLock.broker_order_id == broker_order_id,
+        )
+        .with_for_update()
+    ).scalar_one_or_none()
+
+
+def _resolve_family_unresolved(
+    db: Session,
+    *,
+    tenant_id: str,
+    broker: str,
+    broker_order_id: str,
+    evidence: str,
+) -> int:
+    """Transition family UNRESOLVED records → STALE with resolution evidence.
+
+    Used by the S3 same-transaction hook (history-sourced application) and
+    the S4 REJECT adjudication.  One-way: only rows currently in the
+    UNRESOLVED (transient) state transition; APPLIED/STALE rows are never
+    touched, so resolution is idempotent.  Returns the number of rows
+    resolved.
+    """
+    result = db.execute(
+        update(BrokerSyncIdempotency)
+        .where(
+            BrokerSyncIdempotency.tenant_id == tenant_id,
+            BrokerSyncIdempotency.broker == broker,
+            BrokerSyncIdempotency.broker_order_id == broker_order_id,
+            BrokerSyncIdempotency.status == "UNRESOLVED",
+        )
+        .values(status="STALE", resolution_evidence=evidence)
+    )
+    return int(result.rowcount or 0)
+
+
+def _record_quarantine(
+    db: Session,
+    *,
+    event: BrokerSyncEvent,
+    canonical_id: str,
+    fingerprint: str,
+    validated_sequence: int | None,
+    status: str,
+) -> dict[str, Any] | None:
+    """Persist a STALE/UNRESOLVED quarantine record (frozen r2 design §10).
+
+    Only the idempotency row is written, inside a SAVEPOINT: the observation
+    is preserved with its S2 evidence, but no projection row, no lifecycle
+    effect, and no anchor mutation occur.  ``event_timestamp`` is persisted
+    STRICTLY from the event (missing stays NULL).
+
+    Returns a reclassification result dict when a concurrent duplicate is
+    detected (caller must return it verbatim), else None.
+    """
+    try:
+        with db.begin_nested():
+            db.add(
+                BrokerSyncIdempotency(
+                    canonical_id=canonical_id,
+                    tenant_id=event.tenant_id,
+                    broker=event.broker,
+                    broker_order_id=event.broker_order_id,
+                    canonical_sequence=validated_sequence,
+                    event_type=event.event_type,
+                    event_version=event.event_version,
+                    content_fingerprint=fingerprint,
+                    source_mode=event.source_mode.value,
+                    provider_event_id=event.provider_event_id,
+                    received_at=event.received_at,
+                    event_timestamp=event.event_timestamp,
+                    status=status,
+                    resolution_evidence=None,
+                )
+            )
+            db.flush()
+    except SAIntegrityError:
+        # Concurrent worker recorded the same canonical_id first — re-classify
+        # through the committed record (same durable-arbitration pattern as
+        # the application SAVEPOINT below).
+        concurrent_idem = db.execute(
+            select(BrokerSyncIdempotency).where(
+                BrokerSyncIdempotency.canonical_id == canonical_id
+            )
+        ).scalar_one_or_none()
+        if concurrent_idem is not None and concurrent_idem.content_fingerprint == fingerprint:
+            return {
+                "canonical_id": canonical_id,
+                "action": (
+                    concurrent_idem.status
+                    if concurrent_idem.status in _STATUS_QUARANTINE
+                    else "DUPLICATE_NOOP"
+                ),
+                "normalized_state": None,
+                "reason": "concurrent worker recorded identical observation (durable)",
+            }
+        return {
+            "canonical_id": canonical_id,
+            "action": "CONFLICT",
+            "normalized_state": None,
+            "reason": (
+                f"concurrent write conflict on canonical_id {canonical_id} "
+                f"(quarantine record)"
+            ),
+        }
+    return None
+
+
+def resolve_unresolved_for_family(
+    db: Session,
+    *,
+    tenant_id: str,
+    broker: str,
+    broker_order_id: str,
+    decision: str,
+    evidence_reference: str,
+    event: BrokerSyncEvent | None = None,
+) -> dict[str, Any]:
+    """S4 operator adjudication for a family's UNRESOLVED records (design §13).
+
+    Contract (frozen r2 design §13 — no invented workflow):
+    - requires a documented operator decision (``AUTHORIZE`` | ``REJECT``)
+      and a non-empty evidence reference (durable, ``S4:<reference>``);
+    - ``REJECT``  → family UNRESOLVED records transition to STALE (one-way,
+      idempotent — only UNRESOLVED rows are touched);
+    - ``AUTHORIZE`` → the ORIGINAL observation is applied through the normal
+      Task2 path; S4 is ladder rank-4 authority, so the operator decision
+      overrides the UNRESOLVED S2 classification for exactly this
+      observation;
+    - one-way and idempotent: already-APPLIED → DUPLICATE_NOOP,
+      already-STALE → STALE (no re-adjudication), non-UNRESOLVED states are
+      rejected fail-closed;
+    - resolution and its effects share the caller's single transaction — the
+      D-1 family lock serializes adjudication with concurrent family
+      synchronization decisions, and a rollback restores the UNRESOLVED
+      quarantine exactly (no partial semantic effect).
+    """
+    if decision not in ("AUTHORIZE", "REJECT"):
+        raise IngestionError(
+            f"invalid S4 decision '{decision}' (expected AUTHORIZE or REJECT)",
+            action="REJECTED",
+        )
+    if not evidence_reference or not evidence_reference.strip():
+        raise IngestionError(
+            "S4 adjudication requires a non-empty operator evidence reference",
+            action="REJECTED",
+        )
+    evidence = f"S4:{evidence_reference.strip()}"
+
+    # D-1: same serialization domain as classification/application.
+    _lock_order_family(
+        db,
+        tenant_id=tenant_id,
+        broker=broker,
+        broker_order_id=broker_order_id,
+    )
+
+    if decision == "REJECT":
+        resolved = _resolve_family_unresolved(
+            db,
+            tenant_id=tenant_id,
+            broker=broker,
+            broker_order_id=broker_order_id,
+            evidence=evidence,
+        )
+        db.flush()
+        return {
+            "action": "REJECTED",
+            "resolved": resolved,
+            "reason": (
+                f"S4 adjudication REJECT (evidence: {evidence_reference.strip()}) — "
+                f"family UNRESOLVED records transitioned to STALE"
+            ),
+        }
+
+    # --- AUTHORIZE: apply the original observation through the normal path ---
+    if event is None:
+        raise IngestionError(
+            "S4 AUTHORIZE requires the original observation to apply",
+            action="REJECTED",
+        )
+    if (event.tenant_id, event.broker, event.broker_order_id or "") != (
+        tenant_id,
+        broker,
+        broker_order_id,
+    ):
+        raise IngestionError(
+            "S4 AUTHORIZE event does not belong to the adjudicated order family",
+            action="REJECTED",
+        )
+
+    canonical_id = event.canonical_id
+    fingerprint = _content_fingerprint(event)
+    row = db.execute(
+        select(BrokerSyncIdempotency).where(
+            BrokerSyncIdempotency.canonical_id == canonical_id
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise IngestionError(
+            "S4 AUTHORIZE precondition failed: no quarantined record exists "
+            "for this observation",
+            action="REJECTED",
+        )
+    if row.status == "APPLIED":
+        return {
+            "action": "DUPLICATE_NOOP",
+            "resolved": 0,
+            "reason": "S4 AUTHORIZE no-op: observation already applied",
+        }
+    if row.status == "STALE":
+        return {
+            "action": "STALE",
+            "resolved": 0,
+            "reason": (
+                "S4 AUTHORIZE no-op: observation already resolved (STALE) — "
+                "one-way transition"
+            ),
+        }
+    if row.status != "UNRESOLVED":
+        raise IngestionError(
+            f"S4 AUTHORIZE precondition failed: record status is {row.status}, "
+            f"expected UNRESOLVED",
+            action="REJECTED",
+        )
+    if row.content_fingerprint != fingerprint:
+        raise IngestionError(
+            f"S4 AUTHORIZE content mismatch for canonical_id {canonical_id[:16]}... "
+            f"— conflict, not adjudication",
+            action="CONFLICT",
+        )
+
+    # Remove the quarantine record within THIS transaction; the fresh
+    # application recreates it with the adjudicated outcome and evidence.
+    # On any failure below, the whole transaction (including this delete)
+    # rolls back — the UNRESOLVED quarantine survives intact.
+    db.delete(row)
+    db.flush()
+    result = _do_ingest(event, db, tenant_id, s4_authorized=True)
+    if result["action"] == "APPLIED":
+        db.execute(
+            update(BrokerSyncIdempotency)
+            .where(BrokerSyncIdempotency.canonical_id == canonical_id)
+            .values(resolution_evidence=evidence)
+        )
+        db.flush()
+        return result
+
+    # Re-apply did not produce an applied record — restore the UNRESOLVED
+    # quarantine in the same transaction (the observation is never lost).
+    db.add(
+        BrokerSyncIdempotency(
+            canonical_id=canonical_id,
+            tenant_id=event.tenant_id,
+            broker=event.broker,
+            broker_order_id=event.broker_order_id,
+            canonical_sequence=event.canonical_sequence,
+            event_type=event.event_type,
+            event_version=event.event_version,
+            content_fingerprint=fingerprint,
+            source_mode=event.source_mode.value,
+            provider_event_id=event.provider_event_id,
+            received_at=event.received_at,
+            event_timestamp=event.event_timestamp,
+            status="UNRESOLVED",
+            resolution_evidence=None,
+        )
+    )
+    db.flush()
+    raise IngestionError(
+        f"S4 AUTHORIZE could not apply the observation ({result.get('reason')})",
+        action="REJECTED",
+    )
+
+
 def _do_ingest(
     event: BrokerSyncEvent,
     db: Session,
     tenant_id: str | None = None,
+    s4_authorized: bool = False,
 ) -> dict[str, Any]:
     canonical_id = event.canonical_id
 
@@ -927,38 +1462,54 @@ def _do_ingest(
     # sequence validation below (duplicate / gap / stale / out-of-order),
     # so stale detection for new events is NOT weakened.
     #
-    # Concurrency: this read-only pre-check is advisory.  Concurrent
-    # duplicate/conflicting ingestion is still arbitrated durably inside
-    # the SAVEPOINT — the BrokerSyncIdempotency primary-key (canonical_id)
-    # insert conflict re-classifies losers through the committed record
-    # (DUPLICATE_NOOP / CONFLICT), and the anchor CAS (UPDATE ... WHERE
-    # last_sequence = expected) serializes sequence advancement.
+    # Concurrency: this pre-lock read is a FAST PATH for already-settled
+    # replays (no D-1 lock needed to re-emit a committed decision).  The
+    # authoritative arbitration happens AFTER the D-1 family lock below —
+    # the settled outcome is re-checked under the lock, so a concurrent
+    # identical replay that committed while this worker waited is classified
+    # DUPLICATE_NOOP and never reaches sequence validation.  Concurrent
+    # NEW-event ingestion is additionally arbitrated durably inside the
+    # SAVEPOINT (idempotency PK insert conflict) and by the anchor CAS.
     existing_idem = db.execute(
         select(BrokerSyncIdempotency).where(
             BrokerSyncIdempotency.canonical_id == canonical_id
         )
     ).scalar_one_or_none()
 
-    if existing_idem is not None:
-        if existing_idem.content_fingerprint == fingerprint:
-            # Identical duplicate — no-op
-            return {
-                "canonical_id": canonical_id,
-                "action": "DUPLICATE_NOOP",
-                "normalized_state": None,
-                "reason": "already applied (durable)",
-            }
-        # Same identity, different content — conflict
-        return {
-            "canonical_id": canonical_id,
-            "action": "CONFLICT",
-            "normalized_state": None,
-            "reason": (
-                f"canonical_id {canonical_id} exists with different content "
-                f"(stored={existing_idem.content_fingerprint[:16]}..., "
-                f"incoming={fingerprint[:16]}...)"
-            ),
-        }
+    settled = _settled_idempotency_outcome(existing_idem, fingerprint, canonical_id)
+    if settled is not None:
+        return settled
+
+    # --- Day41.2 D-1 order-family lock (frozen r2 design §7/§11) ---
+    # Acquired BEFORE any locked-variant read (sequence anchor, authoritative
+    # previous state) so the READ → CLASSIFY → WRITE sequence is serialized
+    # per order family; holding it to commit/rollback is what makes the final
+    # state S2-authoritative rather than arrival-order.  It must precede
+    # sequence validation: a concurrent duplicate replay that lost the lock
+    # must re-observe the winner's committed idempotency record above
+    # (DUPLICATE_NOOP), never fail stale-detection against the winner's
+    # advanced anchor.  Acquisition is semantically pure: it never mutates
+    # the S1 sequence anchor and stores no state (D-1 decision memo).  The
+    # lock row is a pure mutex keyed (tenant_id, broker, broker_order_id);
+    # creating one for an event that is subsequently rejected fail-closed
+    # stores no semantic state.
+    _lock_order_family(
+        db,
+        tenant_id=event.tenant_id,
+        broker=event.broker,
+        broker_order_id=event.broker_order_id or "",
+    )
+
+    # Authoritative re-check under the family lock (see above): restores the
+    # §15 replay matrix under true concurrency.
+    existing_idem = db.execute(
+        select(BrokerSyncIdempotency).where(
+            BrokerSyncIdempotency.canonical_id == canonical_id
+        )
+    ).scalar_one_or_none()
+    settled = _settled_idempotency_outcome(existing_idem, fingerprint, canonical_id)
+    if settled is not None:
+        return settled
 
     # --- Broker sequence position validation (new events only) ---
     # Validates ordering without advancing the anchor.  Advancement happens
@@ -1036,6 +1587,7 @@ def _do_ingest(
         }
 
     # --- Find previous projection (deterministic: ordered by canonical_sequence) ---
+    # (Read INSIDE the D-1 family lock acquired above.)
     # FIX 4: canonical_sequence is the primary ordering key; id is a deterministic
     # tiebreaker only (not a causal ordering mechanism) for events where
     # canonical_sequence is NULL.  The id column is stable within a database
@@ -1055,6 +1607,63 @@ def _do_ingest(
             )
             .limit(1)
         ).scalar_one_or_none()
+
+    # --- Day41.2 cross-D1 S1/S2 classification (frozen r2 design §6) ---
+    # Pure classification against the authoritative previous state, inside
+    # the family lock.  FIRST/AUTHORIZED continue through the EXISTING
+    # guards and application path unchanged; STALE/UNRESOLVED quarantine
+    # below — after the existing terminal/quantity guards, which are never
+    # weakened (a terminal order still rejects; guards keep precedence).
+    classification = _classify_cross_d1(event, previous)
+
+    # --- Day41.2 quarantine outcomes (frozen r2 design §10/§12/§13) ---
+    # Branch off BEFORE the terminal/quantity guards — exactly the frozen
+    # §11 integration order (classification → guards → fold): a STALE
+    # observation is preserved, never applied, so terminal enforcement has
+    # nothing to protect against it (no projection row, no lifecycle effect,
+    # no anchor mutation — only the durable quarantine record).  An event
+    # that would APPLY against terminal state is still rejected below,
+    # unchanged.  UNRESOLVED: quarantined for S3/S4, resolvable, never a
+    # dead end.  S4 AUTHORIZE (rank-4 authority) bypasses the UNRESOLVED
+    # quarantine for exactly this adjudicated re-application
+    # (s4_authorized); it never bypasses STALE (an operator cannot make an
+    # older observation newer).  The quarantine write is a single
+    # idempotency row inside its own SAVEPOINT — atomic and
+    # concurrent-duplicate safe.
+    if classification.outcome == "STALE":
+        reclass = _record_quarantine(
+            db,
+            event=event,
+            canonical_id=canonical_id,
+            fingerprint=fingerprint,
+            validated_sequence=validated_sequence,
+            status="STALE",
+        )
+        if reclass is not None:
+            return reclass
+        return {
+            "canonical_id": canonical_id,
+            "action": "STALE",
+            "normalized_state": None,
+            "reason": classification.reason,
+        }
+    if classification.outcome == "UNRESOLVED" and not s4_authorized:
+        reclass = _record_quarantine(
+            db,
+            event=event,
+            canonical_id=canonical_id,
+            fingerprint=fingerprint,
+            validated_sequence=validated_sequence,
+            status="UNRESOLVED",
+        )
+        if reclass is not None:
+            return reclass
+        return {
+            "canonical_id": canonical_id,
+            "action": "UNRESOLVED",
+            "normalized_state": None,
+            "reason": classification.reason,
+        }
 
     # --- Terminal-state enforcement (before quantity validation) ---
     new_state = _event_canonical_state(event)
@@ -1123,10 +1732,26 @@ def _do_ingest(
                 source_mode=event.source_mode.value,
                 provider_event_id=event.provider_event_id,
                 received_at=event.received_at,
+                event_timestamp=event.event_timestamp,
                 status="APPLIED",
             )
             db.add(idem)
             db.flush()
+
+            # Day41.2 §13 S3 hook: a history-sourced (RECOVERY) application
+            # resolves the family's UNRESOLVED quarantine rows → STALE with
+            # durable S3 evidence, in THIS same transaction.  One-way and
+            # idempotent (only UNRESOLVED rows transition); this event's own
+            # APPLIED row is never touched.  A rollback removes both the
+            # application and the resolution together.
+            if event.source_mode == BrokerEventSourceMode.RECOVERY:
+                _resolve_family_unresolved(
+                    db,
+                    tenant_id=event.tenant_id,
+                    broker=event.broker,
+                    broker_order_id=event.broker_order_id,
+                    evidence=f"S3:{canonical_id}",
+                )
 
             # Day38 lifecycle integration (against the ACTUAL execution).
             # Skipped for projection-only broker events (design §13/§14):
