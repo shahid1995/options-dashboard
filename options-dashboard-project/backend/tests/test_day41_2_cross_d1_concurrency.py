@@ -93,17 +93,30 @@ def wrap_operation_with_serialization(operation, *, fail_on_calls):
     """Wrap an ingest operation so that the given call numbers (1-based)
     raise the SQLSTATE-40001 probe AFTER the inner operation has executed
     (i.e. after projection writes, before the abstraction's commit) —
-    mirroring where a serialization failure surfaces in production."""
-    calls = {"n": 0}
+    mirroring where a serialization failure surfaces in production.
+
+    Returns ``(wrapped, attempt_log)``.  ``attempt_log`` records per-call
+    telemetry so the test can PROVE the wrapper executed and which
+    attempts were injected — a green result with an un-executed wrapper
+    proves nothing:
+
+    * ``calls``   — total invocations of the wrapped operation;
+    * ``executed``— one entry per invocation that ran the real ingest;
+    * ``injected``— the exact exception objects raised by the seam.
+    """
+    attempt_log = {"calls": 0, "executed": [], "injected": []}
 
     def wrapped(db, *args, **kwargs):
-        calls["n"] += 1
+        attempt_log["calls"] += 1
         result = operation(db, *args, **kwargs)
-        if calls["n"] in fail_on_calls:
-            raise _serialization_failure_probe()
+        attempt_log["executed"].append(attempt_log["calls"])
+        if attempt_log["calls"] in fail_on_calls:
+            failure = _serialization_failure_probe()
+            attempt_log["injected"].append(failure)
+            raise failure
         return result
 
-    return wrapped
+    return wrapped, attempt_log
 from app.broker_sync.models import (
     BrokerOrderProjection,
     BrokerSyncIdempotency,
@@ -998,6 +1011,16 @@ class TestDay41_2ConcurrencyMatrixPG:
         surfaces in production, so the first attempt's transaction is
         genuinely rolled back by the abstraction with every in-transaction
         effect discarded.
+
+        Symbol alignment (review finding): the retry operation invokes
+        ``_ing_mod.ingest_canonical_event`` — the exact attribute patched
+        via ``patch.object(_ing_mod, ...)`` — so the wrapper provably
+        executes.  Instrumentation asserts the wrapper ran exactly twice
+        (attempt 1 = real ingest executed, controlled 40001 raised;
+        attempt 2 = real ingest executed successfully) and that the
+        exception the abstraction encountered classifies as a
+        serialization failure — the injection can no longer silently
+        not-execute.
         """
         submit = _seqless(
             broker_order_id="ORD-C1",
@@ -1028,7 +1051,6 @@ class TestDay41_2ConcurrencyMatrixPG:
         )
 
         pg_engine = pg_db.get_bind()
-        from app.utils.retry import retry_on_serialization
 
         # Probe the real SQLSTATE-40001 shape before wrapping, so the
         # classification assertion below proves the *predicate* contract,
@@ -1036,23 +1058,45 @@ class TestDay41_2ConcurrencyMatrixPG:
         probe = _serialization_failure_probe()
         assert is_serialization_failure(probe)
 
+        # SYMBOL-ALIGNMENT CONTRACT: the patch target and the invoked
+        # callable must be the SAME symbol.  The retry operation calls
+        # ``_ing_mod.ingest_canonical_event`` — the module attribute that
+        # patch.object replaces — so the wrapper provably executes (a
+        # lambda over this test module's imported binding would bypass
+        # the patch entirely and make the test vacuous).
+        wrapped, attempt_log = wrap_operation_with_serialization(
+            ingest_canonical_event,
+            fail_on_calls={1},
+        )
         with patch.object(
             _ing_mod, "ingest_canonical_event",
-            side_effect=wrap_operation_with_serialization(
-                ingest_canonical_event,
-                fail_on_calls={1},
-            ),
+            side_effect=wrapped,
         ):
             # max_attempts=2 + base_delay=0 → deterministic single retry,
             # no wall-clock delay in the test.
             result = retry_on_serialization(
-                lambda db: ingest_canonical_event(fill, db),
+                lambda db: _ing_mod.ingest_canonical_event(fill, db),
                 session_factory=lambda: sessionmaker(
                     bind=pg_engine, expire_on_commit=False
                 )(),
                 max_attempts=2,
                 base_delay=0,
             )
+
+        # --- Injection definitely happened (not inferred from DB state) ---
+        # The wrapper executed exactly twice: attempt 1 = real ingest
+        # executed then the controlled 40001 raised; attempt 2 = real
+        # ingest executed successfully through a FRESH session created by
+        # the production session_factory.
+        assert attempt_log["calls"] == 2, attempt_log
+        assert attempt_log["executed"] == [1, 2], attempt_log
+        assert len(attempt_log["injected"]) == 1, attempt_log
+        injected = attempt_log["injected"][0]
+        assert is_serialization_failure(injected), (
+            "the exception the retry abstraction actually encountered must "
+            "classify as SQLSTATE-40001 serialization failure"
+        )
+        assert isinstance(injected, SAOperationalError)
 
         assert result["action"] == "APPLIED"
 
