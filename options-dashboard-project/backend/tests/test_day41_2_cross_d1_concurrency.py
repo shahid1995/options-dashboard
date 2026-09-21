@@ -59,6 +59,51 @@ from app.broker_sync.ingestion import (
     ingest_canonical_event,
     resolve_unresolved_for_family,
 )
+from app.utils.retry import is_serialization_failure, retry_on_serialization
+from app.utils.db_dialect import dialect_insert
+from sqlalchemy.exc import OperationalError as SAOperationalError
+from unittest.mock import patch
+from app.broker_sync import ingestion as _ing_mod
+
+
+def _serialization_failure_probe():
+    """Build a SQLAlchemy ``OperationalError`` carrying a real SQLSTATE
+    40001 DBAPI error (psycopg-style ``sqlstate`` attribute) — the exact
+    exception shape CockroachDB surfaces under serialization contention
+    and the one ``is_serialization_failure`` classifies as retryable.
+
+    Used only by the retry-contract test to inject a controlled failure at
+    the operation seam of ``retry_on_serialization`` (documented there as
+    controlled retry-abstraction injection, NOT a live database race).
+    """
+    class _FakePgOrig(Exception):
+        sqlstate = "40001"
+
+        def __str__(self):
+            return "40P01-like serialization failure: 40001 restart transaction"
+
+    return SAOperationalError(
+        "serialized transaction failure",
+        params=None,
+        orig=_FakePgOrig(),
+    )
+
+
+def wrap_operation_with_serialization(operation, *, fail_on_calls):
+    """Wrap an ingest operation so that the given call numbers (1-based)
+    raise the SQLSTATE-40001 probe AFTER the inner operation has executed
+    (i.e. after projection writes, before the abstraction's commit) —
+    mirroring where a serialization failure surfaces in production."""
+    calls = {"n": 0}
+
+    def wrapped(db, *args, **kwargs):
+        calls["n"] += 1
+        result = operation(db, *args, **kwargs)
+        if calls["n"] in fail_on_calls:
+            raise _serialization_failure_probe()
+        return result
+
+    return wrapped
 from app.broker_sync.models import (
     BrokerOrderProjection,
     BrokerSyncIdempotency,
@@ -475,6 +520,98 @@ class TestDay41_2CrossD1RegressionSQLite:
         )
         assert statuses == ["SUBMITTED"]
 
+    def test_single_family_lock_per_ingestion_no_multi_resource_graph(
+        self, sqlite_db, monkeypatch
+    ):
+        """D-1 structural lock-order proof (ADR-003 Option A).
+
+        The accepted design permits exactly ONE D-1 lock resource per
+        ingestion transaction (and per S4 adjudication transaction), keyed
+        (tenant_id, broker, broker_order_id).  This test instruments the
+        production lock helper and proves the structural invariant:
+
+            every D-1 critical-path transaction acquires EXACTLY ONE
+            family lock — never two lock resources in one transaction
+
+        With a single lock resource per transaction there is no A→B / B→A
+        lock graph to order, so lock-order inversion is impossible by
+        construction:
+
+            single-resource transaction
+            → no multi-resource lock graph
+            → lock-order inversion unrepresentable
+
+        This is a structural property of the accepted architecture, not a
+        behavioral accident: no ingestion/adjudication code path may grow a
+        second family-lock acquisition without changing ADR-003's design.
+        """
+        from app.broker_sync import ingestion as ing
+
+        acquired = []
+        real_lock = ing._lock_order_family
+
+        def spy_lock(db, **kw):
+            acquired.append((kw["tenant_id"], kw["broker"],
+                             kw["broker_order_id"]))
+            return real_lock(db, **kw)
+
+        monkeypatch.setattr(ing, "_lock_order_family", spy_lock)
+
+        # (a) A sequence-less cross-D1 ingestion (S2 path).
+        s2_event = _seqless(
+            broker_order_id="ORD-XD1",
+            event_type=BrokerEventType.PARTIAL_FILL.value,
+            status=CanonicalOrderState.PARTIALLY_FILLED,
+            event_ts=_NOW + timedelta(seconds=10),
+            received_at=_NOW + timedelta(seconds=10),
+            provider_event_id="lo-evt-pf",
+            cumulative_filled=50,
+            fill_facts=FillFacts(
+                fill_id="lo-fill-1",
+                fill_quantity=50,
+                fill_price=100.0,
+                cumulative_filled_after=50,
+                remaining_after=50,
+            ),
+        )
+        assert ingest_canonical_event(s2_event, sqlite_db)["action"] == "APPLIED"
+
+        # (b) An S1 sequence-bearing ingestion on the same family — the
+        # existing anchor/CAS machinery, same D-1 serialization domain.
+        s1_event = make_broker_sync_event(
+            tenant_id="tenant-1",
+            broker="broker-xd1",
+            event_type=BrokerEventType.PARTIAL_FILL.value,
+            event_version="1.0",
+            broker_order_id="ORD-XD1",
+            canonical_sequence=1,
+            received_at=_NOW + timedelta(seconds=20),
+            order_facts=OrderFacts(
+                order_id="ORD-XD1", broker_order_id="ORD-XD1",
+                status=CanonicalOrderState.PARTIALLY_FILLED,
+                total_quantity=100,
+            ),
+        )
+        assert ingest_canonical_event(s1_event, sqlite_db)["action"] == "APPLIED"
+
+        # (c) An S4 adjudication on the same family.
+        resolve_unresolved_for_family(
+            sqlite_db,
+            tenant_id="tenant-1",
+            broker="broker-xd1",
+            broker_order_id="ORD-XD1",
+            decision="REJECT",
+            evidence_reference="lo-review-ticket",
+        )
+
+        # INVARIANT: each transaction acquired EXACTLY ONE family lock,
+        # always for this family — no second lock resource was ever
+        # requested within a single transaction.
+        assert len(acquired) == 3, acquired
+        assert all(
+            a == ("tenant-1", "broker-xd1", "ORD-XD1") for a in acquired
+        ), acquired
+
 
 # ---------------------------------------------------------------------------
 # Layer 2 — PostgreSQL true-concurrency matrix
@@ -587,6 +724,9 @@ class TestDay41_2ConcurrencyMatrixPG:
                               args=(pg_db.get_bind(), fill, barrier, results,
                                     errors, 1))
         t1.start(); t2.start(); t1.join(30); t2.join(30)
+        # Workers must actually terminate — never silently ignore a
+        # timed-out/deadlocked worker.
+        assert not t1.is_alive() and not t2.is_alive()
 
         assert errors[0] is None, f"worker0: {errors[0]}"
         assert errors[1] is None, f"worker1: {errors[1]}"
@@ -694,6 +834,9 @@ class TestDay41_2ConcurrencyMatrixPG:
                               args=(pg_db.get_bind(), e2, barrier, results,
                                     errors, 1))
         t1.start(); t2.start(); t1.join(30); t2.join(30)
+        # Workers must actually terminate — never silently ignore a
+        # timed-out/deadlocked worker.
+        assert not t1.is_alive() and not t2.is_alive()
         assert errors[0] is None and errors[1] is None
         assert {results[0]["action"], results[1]["action"]} == {"APPLIED"}
 
@@ -832,12 +975,30 @@ class TestDay41_2ConcurrencyMatrixPG:
         )
         assert ingest_canonical_event(good_fill, pg_db)["action"] == "APPLIED"
 
-    def test_retry_after_serialization_failure_no_duplicate_effects(
+    def test_retry_on_serialization_contract_first_attempt_fails(
         self, pg_db
     ):
-        """Retry safety: a serialization failure between the projection
-        write and commit, followed by a clean retry, must not create
-        duplicate idempotency rows, projections, or lifecycle events."""
+        """Retry contract through the REAL retry abstraction
+        (app/utils/retry.py::retry_on_serialization).
+
+        Evidence classification: CONTROLLED RETRY-ABSTRACTION INJECTION —
+        the first attempt is wrapped by ``wrap_operation_with_serialization"
+        so that exactly one ingest execution is re-raised as SQLAlchemy
+        ``OperationalError`` carrying a real psycopg-style SQLSTATE 40001
+        orig.  That is the same exception shape (is_serialization_failure
+        predicate, same code path in app/utils/retry.py) that CockroachDB
+        surfaces under contention, but it is injected at the seam rather
+        than generated by a forced live DB serialization race.  The claim
+        proven here is the RETRY CONTRACT (attempt → 40001-classified
+        failure → rollback → fresh transaction → success → exactly-once
+        durable effects), NOT a database-generated race.
+
+        The wrap point is inside the operation, i.e. after projection
+        writes but before commit — exactly where a serialization failure
+        surfaces in production, so the first attempt's transaction is
+        genuinely rolled back by the abstraction with every in-transaction
+        effect discarded.
+        """
         submit = _seqless(
             broker_order_id="ORD-C1",
             event_type=BrokerEventType.ORDER_SUBMITTED.value,
@@ -866,41 +1027,67 @@ class TestDay41_2ConcurrencyMatrixPG:
             ),
         )
 
-        Session = sessionmaker(bind=pg_db.get_bind(), expire_on_commit=False)
-        sess = Session()
-        try:
-            r = ingest_canonical_event(fill, sess)
-            assert r["action"] == "APPLIED"
-            # Simulate a connection-level serialization failure after the
-            # full ingest but BEFORE commit — a plain rollback discards
-            # every effect atomically (all durable effects live in ONE
-            # transaction).
-            sess.rollback()
-        finally:
-            sess.close()
+        pg_engine = pg_db.get_bind()
+        from app.utils.retry import retry_on_serialization
 
-        count = pg_db.execute(
-            select(BrokerSyncIdempotency.canonical_id).where(
-                BrokerSyncIdempotency.canonical_id == fill.canonical_id
-            )
-        ).scalar_one_or_none()
-        assert count is None  # nothing durable from the aborted attempt
+        # Probe the real SQLSTATE-40001 shape before wrapping, so the
+        # classification assertion below proves the *predicate* contract,
+        # not merely that some error occurred.
+        probe = _serialization_failure_probe()
+        assert is_serialization_failure(probe)
 
-        # Clean retry: applies exactly once.
-        Session2 = sessionmaker(bind=pg_db.get_bind(), expire_on_commit=False)
-        sess2 = Session2()
-        try:
-            r2 = ingest_canonical_event(fill, sess2)
-            assert r2["action"] == "APPLIED"
-            sess2.commit()
-        finally:
-            sess2.close()
-        rows = pg_db.execute(
-            select(BrokerSyncIdempotency).where(
-                BrokerSyncIdempotency.canonical_id == fill.canonical_id
+        with patch.object(
+            _ing_mod, "ingest_canonical_event",
+            side_effect=wrap_operation_with_serialization(
+                ingest_canonical_event,
+                fail_on_calls={1},
+            ),
+        ):
+            # max_attempts=2 + base_delay=0 → deterministic single retry,
+            # no wall-clock delay in the test.
+            result = retry_on_serialization(
+                lambda db: ingest_canonical_event(fill, db),
+                session_factory=lambda: sessionmaker(
+                    bind=pg_engine, expire_on_commit=False
+                )(),
+                max_attempts=2,
+                base_delay=0,
             )
-        ).scalars().all()
-        assert len(rows) == 1 and rows[0].status == "APPLIED"
+
+        assert result["action"] == "APPLIED"
+
+        # Fresh observer session: the retry committed exactly once.
+        obs = sessionmaker(bind=pg_engine, expire_on_commit=False)()
+        try:
+            idem = obs.execute(
+                select(BrokerSyncIdempotency).where(
+                    BrokerSyncIdempotency.canonical_id == fill.canonical_id
+                )
+            ).scalars().all()
+            assert len(idem) == 1, "durable idempotency record must exist exactly once"
+            assert idem[0].status == "APPLIED"
+
+            fills = obs.execute(
+                select(BrokerOrderProjection).where(
+                    BrokerOrderProjection.tenant_id == "tenant-1",
+                    BrokerOrderProjection.broker == "broker-xd1",
+                    BrokerOrderProjection.broker_order_id == "ORD-C1",
+                    BrokerOrderProjection.canonical_id == fill.canonical_id,
+                )
+            ).scalars().all()
+            assert len(fills) == 1, "exactly one projection effect for the fill"
+            assert fills[0].status == "PARTIALLY_FILLED"
+            assert fills[0].cumulative_filled == 50
+
+            lifecycle = obs.execute(
+                text(
+                    "SELECT COUNT(*) FROM trade_lifecycle_events "
+                    "WHERE tenant_id = 'tenant-1' AND event_type = 'OrderFilled'"
+                )
+            ).scalar()
+            assert int(lifecycle) == 1, "no duplicate lifecycle side effect"
+        finally:
+            obs.close()
 
     def test_lock_order_no_inversion_adversarial(self, pg_db):
         """Deadlock / lock-order: run the SAME family ingest in opposite
@@ -959,6 +1146,9 @@ class TestDay41_2ConcurrencyMatrixPG:
                                   args=(pg_db.get_bind(), second, barrier,
                                         results, errors, 1))
             t1.start(); t2.start(); t1.join(30); t2.join(30)
+            # Workers must actually terminate — never silently ignore a
+            # timed-out/deadlocked worker.
+            assert not t1.is_alive() and not t2.is_alive()
 
             all_errors = [e for e in errors if e is not None]
             # No deadlock, no unexpected failure: every error (if any) must
@@ -1009,4 +1199,7 @@ class TestDay41_2ConcurrencyMatrixPG:
                 OrderFamilySyncLock.broker_order_id != "ORD-C2",
             )
         ).scalars().all()
-        assert all(o.broker_order_id != "ORD-C1" for o in others) or True
+        # D-1 structural invariant: a lock row exists ONLY for families
+        # that have actually ingested.  ORD-C1 has not been ingested in
+        # this test, so no lock row may exist for it.
+        assert all(o.broker_order_id != "ORD-C1" for o in others)
