@@ -39,7 +39,9 @@ if not DB_URL or not DB_URL.startswith(("postgresql+psycopg://", "postgresql://"
 ENGINE = create_engine(DB_URL, pool_pre_ping=True)
 TestSession = sessionmaker(bind=ENGINE, expire_on_commit=False)
 
-DAY41_HEAD = "b3e5f8a1c7d2"
+# Tracks the ACTUAL current chain head.  Day41.2 (cross-D1 family lock +
+# S2 evidence) extended the chain: b3e5f8a1c7d2 (Day41.1) is now an ancestor.
+DAY41_HEAD = "e2b4c6d8f0a1"
 PRE_DAY41_BASE = "f7aa24156f6d"  # revision the Day41 chain extends
 
 DAY41_TABLES = (

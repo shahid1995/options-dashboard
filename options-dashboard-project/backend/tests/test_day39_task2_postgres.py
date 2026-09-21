@@ -374,6 +374,9 @@ class TestPostgresOrdering:
         assert "stale" in result["reason"].lower()
 
     def test_missing_sequence_no_fabrication(self, pg_db):
+        # Day41.2 reconciliation: sequence-less cross-D1 observations carry
+        # provider event_timestamp S2 evidence — the approved rule classifies
+        # by S2 (missing ⇒ UNRESOLVED), never by arrival order.
         ev1 = make_broker_sync_event(
             tenant_id="tenant-pg-1",
             broker="broker-pg",
@@ -382,6 +385,7 @@ class TestPostgresOrdering:
             broker_order_id="ORD-PG-NOSEQ",
             canonical_sequence=None,
             provider_event_id="pg-evt-001",
+            event_timestamp=_NOW + timedelta(seconds=1),
             received_at=_NOW + timedelta(seconds=1),
             order_facts=OrderFacts(order_id="ORD-PG-NOSEQ", 
                 broker_order_id="ORD-PG-NOSEQ",
@@ -400,6 +404,7 @@ class TestPostgresOrdering:
             broker_order_id="ORD-PG-NOSEQ",
             canonical_sequence=None,
             provider_event_id="pg-evt-002",
+            event_timestamp=_NOW + timedelta(seconds=2),
             received_at=_NOW + timedelta(seconds=2),
             order_facts=OrderFacts(order_id="ORD-PG-NOSEQ", 
                 broker_order_id="ORD-PG-NOSEQ",
@@ -783,6 +788,8 @@ class TestPostgresDay38:
         assert row.sequence >= 1
 
     def test_day38_sequence_independent_of_broker_sequence(self, pg_db):
+        # Day41.2 reconciliation: provider event_timestamp S2 evidence —
+        # sequence-less cross-D1 classification never uses arrival order.
         submit = make_broker_sync_event(
             tenant_id="tenant-pg-1",
             broker="broker-pg",
@@ -791,6 +798,7 @@ class TestPostgresDay38:
             broker_order_id="ORD-PG-SEQ-IND",
             canonical_sequence=None,
             provider_event_id="pg-seq-ind-001",
+            event_timestamp=_NOW + timedelta(seconds=1),
             received_at=_NOW + timedelta(seconds=1),
             order_facts=OrderFacts(order_id="ORD-PG-SEQ-IND", 
                 broker_order_id="ORD-PG-SEQ-IND",
@@ -808,6 +816,7 @@ class TestPostgresDay38:
             broker_order_id="ORD-PG-SEQ-IND",
             canonical_sequence=None,
             provider_event_id="pg-seq-ind-002",
+            event_timestamp=_NOW + timedelta(seconds=2),
             received_at=_NOW + timedelta(seconds=2),
             order_facts=OrderFacts(order_id="ORD-PG-SEQ-IND", 
                 broker_order_id="ORD-PG-SEQ-IND",

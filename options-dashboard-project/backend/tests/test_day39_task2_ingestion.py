@@ -185,6 +185,7 @@ def _make_full_fill_event(
     total_quantity: int = 100,
     fill_quantity: int | None = None,
     received_at: datetime | None = None,
+    event_timestamp: datetime | None = None,
 ) -> BrokerSyncEvent:
     # fill_quantity defaults to cumulative_filled_after (correct for first fill)
     # but should be overridden to the incremental amount when there's a prior fill
@@ -196,6 +197,10 @@ def _make_full_fill_event(
         event_version="1.0",
         broker_order_id=broker_order_id,
         canonical_sequence=canonical_sequence,
+        # Day41.2: durable S2 evidence — sequence-less cross-D1 observations
+        # are classified by provider event_timestamp (missing ⇒ UNRESOLVED),
+        # never by arrival order.
+        event_timestamp=event_timestamp,
         order_facts=OrderFacts(
             broker_order_id=broker_order_id,
             order_id=broker_order_id,
@@ -750,12 +755,16 @@ class TestDay38Integration:
             event_type=BrokerEventType.ORDER_SUBMITTED.value, event_version="1.0",
             broker_order_id="ORD-1", canonical_sequence=None,
             provider_event_id="evt-001",
+            event_timestamp=_NOW + timedelta(seconds=1),  # Day41.2 S2 evidence
             order_facts=OrderFacts(broker_order_id="ORD-1", order_id="ORD-1", status=CanonicalOrderState.SUBMITTED, total_quantity=100),
             received_at=_NOW + timedelta(seconds=1),
         )
         ingest_canonical_event(submit, db)
 
-        fill = _make_full_fill_event(canonical_sequence=None)
+        fill = _make_full_fill_event(
+            canonical_sequence=None,
+            event_timestamp=_NOW + timedelta(seconds=2),  # Day41.2 S2 evidence
+        )
         ingest_canonical_event(fill, db)
 
         rows = db.execute(
@@ -926,12 +935,16 @@ class TestBrokerSequence:
         Events without canonical_sequence are processed without
         sequence validation; Day38 sequence is independently allocated.
         """
-        # Event without canonical_sequence but with fill_facts for identity
+        # Event without canonical_sequence but with fill_facts for identity.
+        # Day41.2 reconciliation: sequence-less cross-D1 observations carry
+        # provider event_timestamp S2 evidence (the old arrival-order
+        # application assumption is superseded by the approved rule).
         ev1 = make_broker_sync_event(
             tenant_id="tenant-1", broker="broker-test",
             event_type=BrokerEventType.ORDER_SUBMITTED, event_version="1.0",
             broker_order_id="ORD-1", canonical_sequence=None,
             provider_event_id="evt-001",  # provides identity
+            event_timestamp=_NOW + timedelta(seconds=1),
             order_facts=OrderFacts(broker_order_id="ORD-1", order_id="ORD-1",
                 status=CanonicalOrderState.SUBMITTED, total_quantity=100),
             received_at=_NOW + timedelta(seconds=1),
@@ -945,6 +958,7 @@ class TestBrokerSequence:
             event_type=BrokerEventType.PARTIAL_FILL, event_version="1.0",
             broker_order_id="ORD-1", canonical_sequence=None,
             provider_event_id="evt-002",
+            event_timestamp=_NOW + timedelta(seconds=2),
             order_facts=OrderFacts(broker_order_id="ORD-1", order_id="ORD-1",
                 status=CanonicalOrderState.PARTIALLY_FILLED,
                 total_quantity=100, cumulative_filled=50),
@@ -1647,12 +1661,14 @@ class TestSequenceLessOrdering:
         """Multiple sequence-less events for same order are all processed.
         Each is an independent observation; ordering is not inferred.
         """
-        # Event 1: submit (no sequence)
+        # Event 1: submit (no sequence).  Day41.2 reconciliation: provider
+        # event_timestamp S2 evidence governs cross-D1 ordering (never arrival).
         ev1 = make_broker_sync_event(
             tenant_id="tenant-1", broker="broker-test",
             event_type=BrokerEventType.ORDER_SUBMITTED, event_version="1.0",
             broker_order_id="ORD-SEQLESS", canonical_sequence=None,
             provider_event_id="evt-001",
+            event_timestamp=_NOW + timedelta(seconds=1),
             order_facts=OrderFacts(broker_order_id="ORD-SEQLESS", order_id="ORD-SEQLESS",
                 status=CanonicalOrderState.SUBMITTED, total_quantity=100),
             received_at=_NOW + timedelta(seconds=1),
@@ -1660,12 +1676,13 @@ class TestSequenceLessOrdering:
         r1 = ingest_canonical_event(ev1, db)
         assert r1["action"] == "APPLIED"
 
-        # Event 2: partial fill (no sequence)
+        # Event 2: partial fill (no sequence) — newer S2 evidence ⇒ applies
         ev2 = make_broker_sync_event(
             tenant_id="tenant-1", broker="broker-test",
             event_type=BrokerEventType.PARTIAL_FILL, event_version="1.0",
             broker_order_id="ORD-SEQLESS", canonical_sequence=None,
             provider_event_id="evt-002",
+            event_timestamp=_NOW + timedelta(seconds=2),
             order_facts=OrderFacts(broker_order_id="ORD-SEQLESS", order_id="ORD-SEQLESS",
                 status=CanonicalOrderState.PARTIALLY_FILLED,
                 total_quantity=100, cumulative_filled=50),
@@ -1676,12 +1693,13 @@ class TestSequenceLessOrdering:
         r2 = ingest_canonical_event(ev2, db)
         assert r2["action"] == "APPLIED"
 
-        # Event 3: full fill (no sequence)
+        # Event 3: full fill (no sequence) — newest S2 evidence ⇒ applies
         ev3 = make_broker_sync_event(
             tenant_id="tenant-1", broker="broker-test",
             event_type=BrokerEventType.FULL_FILL, event_version="1.0",
             broker_order_id="ORD-SEQLESS", canonical_sequence=None,
             provider_event_id="evt-003",
+            event_timestamp=_NOW + timedelta(seconds=3),
             order_facts=OrderFacts(broker_order_id="ORD-SEQLESS", order_id="ORD-SEQLESS",
                 status=CanonicalOrderState.FILLED,
                 total_quantity=100, cumulative_filled=100, is_terminal=True),
