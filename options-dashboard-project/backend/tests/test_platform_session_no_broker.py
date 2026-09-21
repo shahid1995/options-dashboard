@@ -125,7 +125,8 @@ class TestEmailPlatformSessionSurvivesBrokerRequest:
             headers={"X-Session-Id": session_id},
         )
         assert resp.status_code == 403
-        assert "No broker token" in resp.json()["detail"]
+        # Analytics-Token era: 403 = no active market-data authorization.
+        assert "Market data is not connected" in resp.json()["detail"]
 
     def test_chains_get_returns_403(self, client, email_session):
         """Chain endpoint returns 403 for email-only session."""
@@ -136,7 +137,7 @@ class TestEmailPlatformSessionSurvivesBrokerRequest:
             headers={"X-Session-Id": session_id},
         )
         assert resp.status_code == 403
-        assert "No broker token" in resp.json()["detail"]
+        assert "Market data is not connected" in resp.json()["detail"]
 
     def test_auth_status_still_logged_in(self, client, email_session):
         """After chains 403, /auth/status still shows logged in."""
@@ -225,7 +226,7 @@ class TestGooglePlatformSessionSurvivesBrokerRequest:
             headers={"X-Session-Id": session_id},
         )
         assert resp.status_code == 403
-        assert "No broker token" in resp.json()["detail"]
+        assert "Market data is not connected" in resp.json()["detail"]
 
     def test_auth_status_still_logged_in(self, client, google_session):
         session_id, _ = google_session
@@ -258,7 +259,7 @@ class TestBrokerAuthRequiredNotTokenExpired:
             headers={"X-Session-Id": session_id},
         )
         assert resp.status_code == 403
-        assert "broker" in resp.json()["detail"].lower()
+        assert "Market data is not connected" in resp.json()["detail"]
 
     def test_chains_chain_403_not_401(self, client, email_session):
         session_id, _ = email_session

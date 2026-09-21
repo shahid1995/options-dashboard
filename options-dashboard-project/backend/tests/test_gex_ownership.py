@@ -301,15 +301,15 @@ class TestWebSocketIntegration:
         assert _require_token(sid) == "live-gex-tok"
 
     def test_ws_chains_platform_session_rejected(self, db_session):
-        """chains.require_token must reject platform-only sessions."""
-        from app.routers.chains import require_token
+        """chains market-data resolution must reject platform-only sessions."""
+        from app.routers.chains import require_market_data_token
         uid = _create_user(db_session)
         sid = secrets.token_urlsafe(32)
         create_session_record(db_session, uid, sid)
         db_session.commit()
         token_store._sessions.pop(sid, None)
         with pytest.raises(Exception) as exc_info:
-            require_token(sid)
+            require_market_data_token(sid)
         assert exc_info.value.status_code == 403
 
 

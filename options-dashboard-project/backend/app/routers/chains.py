@@ -4,6 +4,7 @@ import time
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
+
 from app.brokers.adapters.upstox.mapper import (
     UPSTOX_INSTRUMENT_KEYS as INSTRUMENT_KEYS,  # compat re-export (adapter mapping)
 )
@@ -11,8 +12,16 @@ from app.brokers.adapters.upstox.mapper import transform_chain  # compat re-expo
 from app.brokers.domain.enums import BROKER_ID_UPSTOX
 from app.brokers.domain.errors import BrokerError, BrokerErrorCode
 from app.brokers.gateway import gateway
+from app.db import SessionLocal
 from app.routers.deps import get_session_id
 from app.services import token_store
+from app.services.market_data_authorization import (
+    ANALYTICS_SOURCE,
+    LEGACY_SESSION_SOURCE,
+    OAUTH_SOURCE,
+    MarketDataCredential,
+    resolve_market_data_token,
+)
 from app.services.platform_session import is_platform_session_token
 
 logger = logging.getLogger(__name__)
@@ -33,41 +42,87 @@ def ws_session(websocket: WebSocket) -> tuple[str | None, str | None]:
     """Resolve the platform session from the canonical HttpOnly cookie only."""
     return websocket.cookies.get("strikenova_session"), None
 
-def require_token(session_id: str | None) -> str:
-    """Return the broker access token for the session.
 
-    Raises 401 if session is invalid/expired (not logged in).
-    Raises 403 if session is valid but no broker token is available
-    (Google/email session without broker connection).
+_NOT_CONNECTED_DETAIL = (
+    "Market data is not connected. Add your Upstox Analytics Token in "
+    "Settings to view market data."
+)
+
+
+def _platform_user_id(session_id: str | None) -> str | None:
+    """Return the durable user_id for a valid platform session, else None.
+
+    Any platform-session lookup failure (no DB row, or the session store
+    being unavailable) degrades to ``None`` so resolution continues on the
+    legacy path — the same graceful behavior the pre-Analytics flow had.
+    """
+    from app.identity import get_active_session
+
+    try:
+        db = SessionLocal()
+        try:
+            session = get_active_session(db, session_id)
+            return session.user_id if session is not None else None
+        finally:
+            db.close()
+    except Exception:
+        return None
+
+
+def _not_connected() -> HTTPException:
+    return HTTPException(status_code=403, detail=_NOT_CONNECTED_DETAIL)
+
+
+def require_market_data_token(session_id: str | None) -> tuple[MarketDataCredential, str | None]:
+    """Resolve the caller's read-only market-data credential.
+
+    Priority (the Analytics Token is the authorized market-data
+    credential; OAuth and legacy session tokens remain compatibility
+    fallbacks):
+
+      1. The valid platform session's stored Analytics Token.
+      2. The valid platform session's default OAuth BrokerAuthorization.
+      3. Legacy session-scoped broker token (pre-architecture rows and
+         compatibility sessions).
+
+    Raises 401 when the caller has no valid session at all, and 403 for
+    a valid session with no active market-data authorization — the two
+    states the UI distinguishes.
 
     Platform session tokens (email:..., google:...) are NEVER returned
-    as broker credentials — they are identified and rejected with 403
-    before they can be passed to any broker adapter.
+    as broker credentials — they are rejected before any credential is
+    handed to a broker adapter.
     """
-    token = token_store.get_token(session_id)
+    user_id = _platform_user_id(session_id)
 
-    # DEFENSIVE: detect platform session tokens that the token store
-    # returns from its in-memory cache.  These are NOT broker tokens
-    # and must NEVER be passed to Upstox.
-    if is_platform_session_token(token):
-        raise HTTPException(
-            status_code=403,
-            detail="No broker token available. Connect your broker to view market data.",
+    if user_id is not None:
+        db = SessionLocal()
+        try:
+            credential = resolve_market_data_token(db, user_id, BROKER_ID_UPSTOX.value)
+        finally:
+            db.close()
+        if credential is not None:
+            return credential, user_id
+
+    # Legacy compatibility: session-scoped broker tokens (in-memory cache
+    # or pre-architecture DB rows). Platform session identifiers are
+    # never accepted here.
+    legacy_token = token_store.get_token(session_id)
+    if legacy_token and not is_platform_session_token(legacy_token):
+        return (
+            MarketDataCredential(
+                token=legacy_token,
+                source=LEGACY_SESSION_SOURCE,
+                connection_id=None,
+                broker=BROKER_ID_UPSTOX.value,
+            ),
+            user_id,
         )
 
-    if token:
-        return token
+    if user_id is not None:
+        # Valid platform session, but no market-data authorization.
+        raise _not_connected()
 
-    # No broker token in memory or DB. Check if the session itself is valid.
-    from app.services.token_store import has_platform_session
-    if has_platform_session(session_id):
-        # Valid session exists but no broker token — platform-only user
-        raise HTTPException(
-            status_code=403,
-            detail="No broker token available. Connect your broker to view market data.",
-        )
-
-    # No valid session at all
     raise HTTPException(status_code=401, detail="Not logged in. Visit /auth/login first.")
 
 
@@ -86,23 +141,29 @@ def validate_expiry_date(expiry_date: str) -> str:
     return expiry_date
 
 
-async def call_upstox(coro, *, session_id: str | None = None):
-    """Awaits a broker-gateway call, translating session failures into a 401
-    that also clears the stored token (broker tokens expire daily at 3:30 AM).
+async def call_upstox(coro, *, source: str | None = None, session_id: str | None = None):
+    """Awaits a broker-gateway call, translating broker failures into HTTP.
 
     The coroutine comes from a broker ADAPTER, so failures arrive as
     canonical BrokerError — never a provider exception.
 
-    DEFENSIVE: Only clears tokens that are real broker credentials.
-    Platform session tokens (email:..., google:...) are never cleared
-    by broker error handling — clearing a platform token would destroy
-    the user's StrikeNova authentication.
+    Analytics-Token credentials are NOT invalidated on an upstream auth
+    failure: a rejected Analytics Token means the stored credential is
+    invalid/expired — the user must refresh it in Settings (the stored
+    token is never cleared server-side), not log in again. Legacy
+    session-scoped tokens keep the original behavior: a session-code
+    failure clears the stored token (broker tokens expire daily).
     """
     try:
         return await coro
     except BrokerError as e:
         if e.code in BrokerErrorCode.SESSION_CODES:
-            if session_id:
+            if source == ANALYTICS_SOURCE:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Upstox market-data authorization was rejected. Your Analytics Token is invalid or expired — update it in Settings.",
+                ) from e
+            if source == LEGACY_SESSION_SOURCE and session_id:
                 # Defense-in-depth: only clear REAL broker tokens.
                 # Platform session tokens must survive broker failures.
                 existing_token = token_store.get_token(session_id)
@@ -115,9 +176,13 @@ async def call_upstox(coro, *, session_id: str | None = None):
 @router.get("/{symbol}/expiries")
 async def list_expiries(symbol: str, session_id: str | None = Depends(get_session_id)):
     symbol = resolve_symbol(symbol)
-    token = require_token(session_id)
-    adapter = gateway.create(BROKER_ID_UPSTOX, access_token=token)
-    return await call_upstox(adapter.get_option_contracts(symbol), session_id=session_id)
+    credential, _user_id = require_market_data_token(session_id)
+    adapter = gateway.create(BROKER_ID_UPSTOX, access_token=credential.token)
+    return await call_upstox(
+        adapter.get_option_contracts(symbol),
+        source=credential.source,
+        session_id=session_id,
+    )
 
 
 @router.get("/{symbol}")
@@ -128,9 +193,13 @@ async def get_chain(
 ):
     symbol = resolve_symbol(symbol)
     expiry_date = validate_expiry_date(expiry_date)
-    token = require_token(session_id)
-    adapter = gateway.create(BROKER_ID_UPSTOX, access_token=token)
-    return await call_upstox(adapter.get_option_chain(symbol, expiry_date), session_id=session_id)
+    credential, _user_id = require_market_data_token(session_id)
+    adapter = gateway.create(BROKER_ID_UPSTOX, access_token=credential.token)
+    return await call_upstox(
+        adapter.get_option_chain(symbol, expiry_date),
+        source=credential.source,
+        session_id=session_id,
+    )
 
 
 @router.websocket("/ws/{symbol}")
@@ -146,7 +215,9 @@ async def chain_ws(websocket: WebSocket, symbol: str, expiry_date: str = Query(.
     HTTP polling or WebSocket.
 
     Close codes:
-      4401 — auth issues (token expired)
+      4401 — auth issues (no valid platform session, no active
+             market-data authorization, or a rejected credential —
+             the client's HTTP fallback distinguishes 401 vs 403)
       4404 — unknown symbol
       4422 — malformed expiry date
       4502 — broker/API error
@@ -165,20 +236,16 @@ async def chain_ws(websocket: WebSocket, symbol: str, expiry_date: str = Query(.
         await websocket.close(code=4422)
         return
 
-    # Get the broker token
-    # get_token() returns None for platform-only sessions (Google/email)
-    # and real broker tokens for broker sessions.
-    token = token_store.get_token(session_id)
-
-    # Platform session tokens (email:..., google:...) are NOT broker tokens.
-    # Reject with 4401 — the same code used for expired broker sessions.
-    if is_platform_session_token(token):
+    # Resolve the read-only market-data credential from the platform
+    # session: Analytics Token preferred, OAuth fallback. 4401 closes so
+    # the client falls back to HTTP polling, which distinguishes 401 (no
+    # platform session) from 403 (market data not connected).
+    try:
+        credential, _user_id = require_market_data_token(session_id)
+    except HTTPException:
         await websocket.close(code=4401)
         return
-
-    if not token:
-        await websocket.close(code=4401)
-        return
+    token = credential.token
 
     # Phase 8C: Try Upstox V3 WebSocket feed first
     feed = None
@@ -257,11 +324,16 @@ async def chain_ws(websocket: WebSocket, symbol: str, expiry_date: str = Query(.
                 except Exception:
                     break
 
-                # Check token validity periodically
-                current_token = token_store.get_token(session_id)
-                if is_platform_session_token(current_token) or not current_token:
-                    await websocket.close(code=4401)
-                    return
+                # Legacy session credentials: keep the original mid-stream
+                # validity check. Durable credentials (Analytics Token /
+                # OAuth authorization) are validated at connect time; their
+                # failures surface through the adapter calls below.
+                if credential.source == LEGACY_SESSION_SOURCE:
+                    current_token = token_store.get_token(session_id)
+                    if is_platform_session_token(current_token) or not current_token:
+                        await websocket.close(code=4401)
+                        return
+                    token = current_token
 
                 # Push chain data at configured interval
                 now = time.time()
@@ -285,18 +357,21 @@ async def chain_ws(websocket: WebSocket, symbol: str, expiry_date: str = Query(.
                     )
                     # Try HTTP fallback for this push
                     try:
-                        adapter = gateway.create(BROKER_ID_UPSTOX, access_token=current_token)
+                        adapter = gateway.create(BROKER_ID_UPSTOX, access_token=token)
                         chain = await adapter.get_option_chain(symbol, expiry_date)
                         await websocket.send_json(chain)
                         last_push = time.time()
                     except BrokerError as e:
                         if e.code in BrokerErrorCode.SESSION_CODES:
-                            # Defense-in-depth: only clear real broker tokens
-                            existing = token_store.get_token(session_id)
-                            if not is_platform_session_token(existing):
-                                token_store.clear_token(session_id)
+                            # Defense-in-depth: only clear real broker tokens.
+                            if credential.source == LEGACY_SESSION_SOURCE:
+                                existing = token_store.get_token(session_id)
+                                if not is_platform_session_token(existing):
+                                    token_store.clear_token(session_id)
                             await websocket.close(code=4401)
                             return
+                        # Transient upstream failure during recovery: keep
+                        # the session alive (original behavior).
 
                 await asyncio.sleep(0.1)  # Small sleep to prevent busy-waiting
 
@@ -307,22 +382,31 @@ async def chain_ws(websocket: WebSocket, symbol: str, expiry_date: str = Query(.
                 extra={"symbol": symbol, "expiry": expiry_date},
             )
             while True:
-                token = token_store.get_token(session_id)
-                if is_platform_session_token(token) or not token:
-                    await websocket.close(code=4401)
-                    return
+                if credential.source == LEGACY_SESSION_SOURCE:
+                    token = token_store.get_token(session_id)
+                    if is_platform_session_token(token) or not token:
+                        await websocket.close(code=4401)
+                        return
                 try:
                     adapter = gateway.create(BROKER_ID_UPSTOX, access_token=token)
                     chain = await adapter.get_option_chain(symbol, expiry_date)
                 except BrokerError as e:
                     if e.code in BrokerErrorCode.SESSION_CODES:
-                        # Defense-in-depth: only clear real broker tokens
-                        existing = token_store.get_token(session_id)
-                        if not is_platform_session_token(existing):
-                            token_store.clear_token(session_id)
-                        await websocket.close(code=4401)
-                    else:
-                        await websocket.close(code=4502)
+                        if credential.source == ANALYTICS_SOURCE:
+                            # Invalid/expired Analytics Token: the stored
+                            # credential must be refreshed in Settings —
+                            # never destroy unrelated session state.
+                            await websocket.close(code=4401)
+                        elif credential.source == LEGACY_SESSION_SOURCE:
+                            # Defense-in-depth: only clear real broker tokens.
+                            existing = token_store.get_token(session_id)
+                            if not is_platform_session_token(existing):
+                                token_store.clear_token(session_id)
+                            await websocket.close(code=4401)
+                        else:
+                            await websocket.close(code=4401)
+                        return
+                    await websocket.close(code=4502)
                     return
                 await websocket.send_json(chain)
                 await asyncio.sleep(WS_PUSH_INTERVAL_SECONDS)
