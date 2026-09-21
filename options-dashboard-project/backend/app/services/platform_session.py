@@ -7,7 +7,7 @@ as a real access token.
 
 This module provides a single authoritative check used by:
 
-- chains.py: require_token(), call_upstox(), chain_ws()
+- chains.py: require_market_data_token(), call_upstox(), chain_ws()
 - live_gex.py: _fetch_chain()
 - gex.py: trigger_capture()
 - broker_profile.py: get_broker_profile_summary() (Phase P fix)

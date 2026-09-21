@@ -91,6 +91,34 @@ Verified on scratch SQLite: parent schema → seed legacy rows → upgrade → a
 ## 6. Follow-up tasks (explicitly NOT in this change)
 
 1. **SECURITY (next isolated task):** FYERS `/auth/callback` query strings — including the `auth_code` JWT and signed state — are currently present in Uvicorn/Render access logs. Redact callback query strings at the access-log layer. The auth codes are single-use and short-lived, but the log surface should not persist them. (Task rule L: kept separate from this architecture change.)
-2. Migrate remaining direct `token_store.get_token(sid)` call sites (chains/candles/gex/live_gex currently resolve via `deps._resolve_user` and keep working through the shared re-wired fallback) to explicit `resolve_broker_authorization` calls with a broker parameter.
+2. Migrate remaining direct `token_store.get_token(sid)` call sites (candles/live_gex currently resolve via `deps._resolve_user` and keep working through the shared re-wired fallback) to explicit `resolve_broker_authorization` calls with a broker parameter. **DONE for chains (2026-09):** the option-chain router now resolves through the canonical market-data credential resolver (see §7).
 3. Remove the legacy `BrokerToken` dual-write and legacy fallback path after one release.
 4. Frontend broker cards phase: individual broker cards, logos, Add buttons, broker-specific modals (Upstox Analytics Token form; FYERS App ID + Secret form; FYERS Connect action; persistent Connected state).
+
+## 7. Market-data credential resolution (Analytics Token era)
+
+Read-only market data (option-chain expiries, option chain, WebSocket chain feed) resolves through ONE canonical path — `app/services/market_data_authorization.resolve_market_data_token`:
+
+```
+platform session (HttpOnly cookie → users.id)
+    → 1. stored Upstox Analytics Token (preferred; requires BrokerConnection
+         status='connected' AND data_status='active' — the same authority,
+         identity.get_analytics_token, that background GEX capture uses)
+    → 2. OAuth fallback: default connection's active BrokerAuthorization
+    → 3. legacy session-scoped broker token (compatibility: pre-architecture
+         rows and in-memory compatibility sessions)
+```
+
+Capability separation is unchanged: the Analytics Token is a DATA credential
+(read-only market data only, never trading); the platform session proves WHO
+the user is; OAuth broker authorization remains required for trading/account
+capabilities. A platform session identifier is never usable as a broker
+credential; token material is decrypted server-side only and never logged,
+returned by an API, or exposed to the browser.
+
+Error semantics: 401 = no valid platform session; 403 = valid session with NO
+active market-data authorization ("Market data is not connected..." — the UI
+points at Settings → Analytics Token). A rejected Analytics Token surfaces as
+401 "update it in Settings" and the stored token is never cleared server-side
+(the user refreshes it deliberately); only legacy session-scoped tokens are
+cleared on session-code broker failures.

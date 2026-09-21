@@ -117,20 +117,20 @@ class TestPlatformSessionNotBrokerToken:
         assert token_store.has_platform_session(None) is False
 
     def test_require_token_returns_403_for_platform_session(self, db_session):
-        """chains.require_token() must raise 403 for platform-only sessions."""
-        from app.routers.chains import require_token
+        """chains market-data resolution must raise 403 for platform-only sessions."""
+        from app.routers.chains import require_market_data_token
 
         sid, _ = _create_platform_session(db_session)
         with pytest.raises(Exception) as exc_info:
-            require_token(sid)
+            require_market_data_token(sid)
         assert exc_info.value.status_code == 403
 
     def test_require_token_returns_401_for_missing_session(self):
-        """chains.require_token() must raise 401 for non-existent sessions."""
-        from app.routers.chains import require_token
+        """chains market-data resolution must raise 401 for non-existent sessions."""
+        from app.routers.chains import require_market_data_token
 
         with pytest.raises(Exception) as exc_info:
-            require_token("totally-fake-session-id")
+            require_market_data_token("totally-fake-session-id")
         assert exc_info.value.status_code == 401
 
     def test_broker_token_still_works(self, db_session):
