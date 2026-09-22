@@ -5,19 +5,26 @@ One machine-readable error shape for every failure class on ``/api/v1``:
     {"error": {"code": <stable token>, "message": <human diagnostic>,
                "status": <http status>, "details": [...] (optional)}}
 
-The envelope applies ONLY to the versioned surface (``/api/v1/...``);
-unversioned routes keep FastAPI's native error shape so existing
-consumers are unaffected (backward compatibility).
+The envelope applies ONLY to the versioned surface (``/api/v1/...``).
+Requests outside ``/api/v1`` are delegated to FastAPI's NATIVE handlers
+(``http_exception_handler`` / ``request_validation_exception_handler``),
+and unhandled exceptions on unversioned routes are RE-RAISED so
+Starlette's ServerErrorMiddleware handles them exactly as before Day 43
+— the unversioned error contract is untouched.
 
 Sensitive internals (exception text, stack traces, upstream secrets) are
-never included; the full exception is logged server-side only.
+never included on the versioned surface; the full exception is logged
+server-side only.
 """
 from __future__ import annotations
 
-import json
 import logging
 
 from fastapi import FastAPI, Request, status
+from fastapi.exception_handlers import (
+    http_exception_handler,
+    request_validation_exception_handler,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -44,26 +51,6 @@ _STATUS_TO_CODE = {
     503: UPSTREAM_ERROR,
     504: UPSTREAM_ERROR,
 }
-
-
-def _json_safe_errors(errors: list) -> list:
-    """Make FastAPI validation errors JSON-serializable for the native
-    (unversioned) response shape — pydantic v2 puts non-serializable
-    objects (e.g. ValueError) into ``ctx``."""
-    safe: list = []
-    for err in errors:
-        if isinstance(err, dict):
-            clean = {}
-            for key, value in err.items():
-                try:
-                    json.dumps(value)
-                    clean[key] = value
-                except (TypeError, ValueError):
-                    clean[key] = str(value)
-            safe.append(clean)
-        else:
-            safe.append(str(err))
-    return safe
 
 
 def error_envelope(
@@ -94,12 +81,9 @@ def install_v1_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(StarletteHTTPException)
     async def _http_exception_handler(request: Request, exc: StarletteHTTPException):
         if not _is_v1(request):
-            # Native shape for unversioned routes (backward compatibility).
-            return JSONResponse(
-                status_code=exc.status_code,
-                content={"detail": exc.detail},
-                headers=getattr(exc, "headers", None),
-            )
+            # Native FastAPI handling for unversioned routes — delegated,
+            # not reconstructed (remediation contract #1).
+            return await http_exception_handler(request, exc)
         detail = exc.detail if isinstance(exc.detail, str) else "Request failed."
         code = getattr(exc, "error_code", None) or _STATUS_TO_CODE.get(
             exc.status_code,
@@ -115,11 +99,9 @@ def install_v1_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(RequestValidationError)
     async def _validation_handler(request: Request, exc: RequestValidationError):
         if not _is_v1(request):
-            # Native FastAPI shape for unversioned routes (compatibility).
-            return JSONResponse(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                content={"detail": _json_safe_errors(exc.errors())},
-            )
+            # Native FastAPI validation contract for unversioned routes —
+            # delegated, not replaced (remediation contract #2).
+            return await request_validation_exception_handler(request, exc)
         details = [
             {
                 "loc": [str(x) for x in err.get("loc", [])],
@@ -139,14 +121,15 @@ def install_v1_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(Exception)
     async def _unhandled_handler(request: Request, exc: Exception):
+        if not _is_v1(request):
+            # Preserve the application's NATIVE unhandled-exception path
+            # (Starlette ServerErrorMiddleware → plain-text 500) for
+            # unversioned routes (remediation contract #3): re-raise so
+            # the normal server handling takes over.
+            raise exc
         logger.exception(
             "Unhandled API error on %s %s", request.method, request.url.path
         )
-        if not _is_v1(request):
-            return JSONResponse(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                content={"detail": "Internal Server Error"},
-            )
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content=error_envelope(

@@ -38,6 +38,18 @@ from app.services import token_store
 from app.api.v1 import API_VERSION_PREFIX
 
 
+# ---------------------------------------------------------------------------
+# Remediation probe: an unversioned route that raises an unexpected
+# exception, used to prove the Day 43 envelope does NOT reach the
+# unversioned surface (native server handling preserved).
+# ---------------------------------------------------------------------------
+
+
+@app.get("/_probe/day43-unhandled")
+def _probe_unhandled():
+    raise RuntimeError("SECRET-PROBE-XYZ")
+
+
 @pytest.fixture
 def client():
     # raise_server_exceptions=False: boundary tests assert the RESPONSE
@@ -320,21 +332,41 @@ class TestAuthorizationBoundary:
     def test_tenant_isolation_session_cannot_mint_foreign_credential(
         self, client, monkeypatch,
     ):
-        """Each session resolves only its OWN market-data credential: a
-        session's calls run under that session's token, and a user with
-        no credential cannot borrow another identity's."""
+        """Tenant isolation (public behavior): platform user A holds
+        credential A; platform user B holds credential B. Invoking the
+        API with B's platform session forwards ONLY B's credential to the
+        broker adapter — A's credential is never resolvable or forwardable
+        under B's session."""
         from app.services import upstox
 
-        session_a = token_store.set_token("tok-xyz")  # A's own credential
-        _seed_platform_identity(client)  # user B exists with NO credential
+        # User A: platform identity + credential A (legacy session token).
+        session_a = token_store.set_token("tok-user-A")
+        # User B: platform identity + credential B.
+        session_b = token_store.set_token("tok-user-B")
+
         mock = AsyncMock(return_value={"data": []})
         monkeypatch.setattr(upstox, "get_option_contracts", mock)
-        client.cookies.set("strikenova_session", session_a)
 
+        # Invoke with B's platform session.
+        client.cookies.set("strikenova_session", session_b)
         resp = client.get("/api/v1/chains/NIFTY/expiries")
         assert resp.status_code == 200
-        # The credential forwarded to the broker was THIS session's own.
-        mock.assert_awaited_once_with("tok-xyz", INSTRUMENT_KEYS["NIFTY"])
+        # Only B's credential was forwarded — exactly once.
+        mock.assert_awaited_once_with("tok-user-B", INSTRUMENT_KEYS["NIFTY"])
+        assert mock.await_args_list == [
+            (("tok-user-B", INSTRUMENT_KEYS["NIFTY"]),)
+        ]
+
+        # The same check under A's session forwards only A's credential.
+        client.cookies.clear()
+        client.cookies.set("strikenova_session", session_a)
+        resp2 = client.get("/api/v1/chains/NIFTY/expiries")
+        assert resp2.status_code == 200
+        assert [c.args[0] for c in mock.await_args_list] == [
+            "tok-user-B", "tok-user-A",
+        ]
+        # A's credential was never forwarded under B's session (the first
+        # call above), and B's never under A's.
 
     def test_platform_session_token_never_used_as_broker_credential(
         self, client, monkeypatch,
@@ -376,3 +408,57 @@ class TestBackwardCompatibility:
         assert resp.status_code == 422
         assert "detail" in resp.json()
         assert "error" not in resp.json()
+
+    def test_unversioned_unhandled_exception_keeps_native_path(self, client):
+        """Remediation contract #3: an unexpected exception on an
+        UNVERSIONED route is handled by the normal server path — NOT
+        converted into the Day 43 envelope. (The exact native bytes are
+        Starlette-version-specific; the contract is: 500, no envelope,
+        no internals in the body.)"""
+        resp = client.get("/_probe/day43-unhandled")
+        assert resp.status_code == 500
+        assert "error" not in resp.text  # no Day 43 envelope
+        assert "INTERNAL_ERROR" not in resp.text
+        assert "SECRET-PROBE-XYZ" not in resp.text
+
+    def test_unversioned_http_exception_keeps_native_shape(self, client):
+        """Remediation contract #4: unversioned HTTPException responses
+        keep the native {"detail": ...} contract."""
+        resp = client.get("/chains/NIFTY/expiries")
+        assert resp.status_code == 401
+        body = resp.json()
+        assert set(body.keys()) == {"detail"}
+        assert "error" not in body
+
+    def test_unversioned_validation_keeps_native_shape(self, client, platform_session):
+        """Remediation contract #2: unversioned VALIDATION errors (true
+        RequestValidationError — a missing required query param) keep the
+        native FastAPI contract (detail list), not the envelope."""
+        client.cookies.set("strikenova_session", platform_session)
+        resp = client.get("/chains/NIFTY")  # expiry_date omitted entirely
+        assert resp.status_code == 422
+        body = resp.json()
+        assert "detail" in body and isinstance(body["detail"], list)
+        assert "error" not in body
+
+    def test_v1_unhandled_exception_gets_canonical_envelope(self, client, monkeypatch):
+        """Remediation contract #1: an unexpected exception on the
+        VERSIONED surface produces the canonical INTERNAL_ERROR envelope."""
+        from app.api.v1 import chains as v1_chains
+
+        session_id = token_store.set_token("tok-xyz")
+        client.cookies.set("strikenova_session", session_id)
+        monkeypatch.setattr(v1_chains, "gateway", type("G", (), {
+            "create": staticmethod(lambda *a, **k: (_ for _ in ()).throw(
+                RuntimeError("SECRET-DB-DNS-xyz"))),
+        })())
+        resp = client.get("/api/v1/chains/NIFTY/expiries")
+        assert resp.status_code == 500
+        assert resp.json() == {
+            "error": {
+                "code": "INTERNAL_ERROR",
+                "message": "An internal error occurred.",
+                "status": 500,
+            }
+        }
+        assert "SECRET-DB-DNS-xyz" not in resp.text
