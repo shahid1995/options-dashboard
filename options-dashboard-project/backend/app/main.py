@@ -365,6 +365,17 @@ app.add_middleware(
     allow_headers=["Content-Type", "X-Session-Id"],
 )
 
+# Day 43 — canonical versioned API surface (design spec §28): one
+# versioning convention ("/api/v1"), explicit domain schemas, and the
+# canonical error envelope (scoped to /api/v1 so unversioned consumers
+# are unaffected).
+from app.api.v1 import API_VERSION_PREFIX  # noqa: E402  (after app creation)
+from app.api.v1.chains import chains_v1_router  # noqa: E402  (after app creation)
+from app.api.v1.errors import install_v1_error_handlers  # noqa: E402
+
+install_v1_error_handlers(app)
+app.include_router(chains_v1_router, prefix=API_VERSION_PREFIX, tags=["chains-v1"])
+
 app.include_router(auth.router, prefix="/auth", tags=["auth"])
 from app.routers import broker_diagnostics  # noqa: E402  (after app creation)
 

@@ -70,7 +70,12 @@ def _platform_user_id(session_id: str | None) -> str | None:
 
 
 def _not_connected() -> HTTPException:
-    return HTTPException(status_code=403, detail=_NOT_CONNECTED_DETAIL)
+    # Day 43: the stable machine-readable token rides the exception as an
+    # additive attribute — the versioned error envelope reads it; the
+    # unversioned HTTP contract (status 403 + detail) is unchanged.
+    exc = HTTPException(status_code=403, detail=_NOT_CONNECTED_DETAIL)
+    exc.error_code = "MARKET_DATA_NOT_CONNECTED"
+    return exc
 
 
 def require_market_data_token(session_id: str | None) -> tuple[MarketDataCredential, str | None]:
