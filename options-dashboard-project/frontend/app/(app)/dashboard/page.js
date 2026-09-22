@@ -10,6 +10,8 @@ import { MetricCard } from "@/components/app/styles";
 import { loadJSON, saveJSON } from "@/lib/storage";
 import { useGexCapture } from "@/lib/useGexCapture";
 import GexProfileChart from "@/components/GexProfileChart";
+// Day 44: shared data-state classification (loading/current/stale/empty/auth-failure).
+import { chainState } from "@/lib/chainState";
 
 const WATCHLIST_KEY = "options_dashboard_watchlist_v1";
 const ALERTS_KEY = "options_dashboard_alerts_v1";
@@ -69,6 +71,22 @@ export default function Dashboard() {
   }, [loggedIn, symbol]);
 
   const { chain, lastUpdated, error, mode, sessionExpired, noBrokerToken } = useChainFeed(symbol, expiry, !!loggedIn);
+
+  // Day 44: classify the chain data state (deterministic; re-evaluated on a
+  // periodic tick so a silently stalled feed is reclassified as stale).
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNowTick(Date.now()), 5000);
+    return () => clearInterval(t);
+  }, []);
+  const chainSt = chainState({
+    chain,
+    lastUpdated: lastUpdated ? lastUpdated.getTime() : null,
+    feedError: error || null,
+    noBrokerToken,
+    sessionExpired,
+    nowMs: nowTick,
+  });
 
   // Phase 7.6: GEX snapshot capture with sweep enrichment for gamma flip / walls
   const { analytics: gexAnalytics, captureCount: gexCaptureCount, latestSnapshot: gexSnapshot } = useGexCapture(chain, {
@@ -220,9 +238,12 @@ export default function Dashboard() {
     <div style={{ padding: isMobile ? 10 : 20 }}>
       <TopNav active="chain" />
 
-      {error && (
-        <div style={{ marginBottom: 12, padding: "8px 12px", borderRadius: 6, border: `1px solid ${C.red}`, background: "rgba(225,82,82,0.08)", color: C.red, fontSize: 12 }}>
-          Live update failed: {error} — showing the last loaded data.
+      {/* Day 44: successful-but-stale states — with or without a feed error. */}
+      {(chainSt.key === "stale" || chainSt.key === "stale-with-error") && (
+        <div style={{ marginBottom: 12, padding: "8px 12px", borderRadius: 6, border: `1px solid ${C.gold}`, background: "rgba(201,161,90,0.08)", color: C.gold, fontSize: 12 }}>
+          {chainSt.key === "stale-with-error"
+            ? `Live update failed: ${chainSt.detail} — showing the last loaded data.`
+            : "Live data is delayed — the feed has not updated recently. Showing the last received snapshot."}
         </div>
       )}
 
@@ -263,8 +284,8 @@ export default function Dashboard() {
         )}
         {lastUpdated && (
           <span style={{ color: C.muted, fontSize: 11, marginLeft: "auto" }}>
-            <span style={{ display: "inline-block", width: 6, height: 6, borderRadius: 3, background: mode === "live" ? C.green : C.gold, marginRight: 6 }} />
-            {mode === "live" ? "Live" : "Polling"} · {lastUpdated.toLocaleTimeString("en-IN")}
+            <span style={{ display: "inline-block", width: 6, height: 6, borderRadius: 3, background: chainSt.key === "current" ? C.green : C.gold, marginRight: 6 }} />
+            {chainSt.key === "stale" || chainSt.key === "stale-with-error" ? "Stale" : mode === "live" ? "Live" : "Polling"} · {lastUpdated.toLocaleTimeString("en-IN")}
           </span>
         )}
       </div>
