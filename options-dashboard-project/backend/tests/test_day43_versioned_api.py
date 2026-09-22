@@ -31,7 +31,22 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.routers.chains import INSTRUMENT_KEYS
+from app.routers.deps import SESSION_COOKIE_NAME
 from app.services import token_store
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _ensure_tables_exist_on_shared_engine():
+    """Create all tables on the conftest-swapped shared engine (idempotent).
+
+    The durable platform-user path (User → UserSession →
+    BrokerConnection) is read by the router through ``app.db.SessionLocal``,
+    so the identity tables must exist on THAT engine — the same pattern
+    as tests/test_analytics_token.py.
+    """
+    import app.db as _db
+
+    _db.Base.metadata.create_all(_db.engine)
 
 # The single canonical version prefix (design spec §28). Imported so a
 # future rename breaks THIS test loudly rather than drifting silently.
@@ -329,44 +344,82 @@ class TestAuthorizationBoundary:
         assert resp.status_code == 403
         mock.assert_not_awaited()
 
-    def test_tenant_isolation_session_cannot_mint_foreign_credential(
+    def test_tenant_isolation_platform_users_resolve_only_their_own_credential(
         self, client, monkeypatch,
     ):
-        """Tenant isolation (public behavior): platform user A holds
-        credential A; platform user B holds credential B. Invoking the
-        API with B's platform session forwards ONLY B's credential to the
-        broker adapter — A's credential is never resolvable or forwardable
-        under B's session."""
-        from app.services import upstox
+        """Tenant isolation through the REAL durable path (public
+        behavior; stable seam = the broker HTTP client):
 
-        # User A: platform identity + credential A (legacy session token).
-        session_a = token_store.set_token("tok-user-A")
-        # User B: platform identity + credential B.
-        session_b = token_store.set_token("tok-user-B")
+            User A → UserSession A → BrokerConnection A (encrypted
+            Analytics Token "tok-user-A")
+            User B → UserSession B → BrokerConnection B (encrypted
+            Analytics Token "tok-user-B")
+
+        Invoking ``GET /api/v1/chains/NIFTY/expiries`` with B's durable
+        platform session forwards ONLY ``tok-user-B`` to the broker
+        adapter; A's session forwards ONLY ``tok-user-A``.
+
+        The legacy session-token fallback is NOT involved: neither
+        session id nor credential value is ever placed in the in-memory
+        token store — the credential values exist ONLY inside each
+        user's encrypted ``BrokerConnection`` row, so a successful call
+        can only have traversed
+
+            platform session → user_id → resolve_market_data_token(
+            user_id) → user-owned BrokerConnection → broker adapter.
+        """
+        import secrets
+        from uuid import uuid4
+
+        from app.db import SessionLocal
+        from app.identity import User, create_session_record, store_analytics_token
+        from app.services import upstox
 
         mock = AsyncMock(return_value={"data": []})
         monkeypatch.setattr(upstox, "get_option_contracts", mock)
 
-        # Invoke with B's platform session.
-        client.cookies.set("strikenova_session", session_b)
-        resp = client.get("/api/v1/chains/NIFTY/expiries")
-        assert resp.status_code == 200
-        # Only B's credential was forwarded — exactly once.
-        mock.assert_awaited_once_with("tok-user-B", INSTRUMENT_KEYS["NIFTY"])
-        assert mock.await_args_list == [
-            (("tok-user-B", INSTRUMENT_KEYS["NIFTY"]),)
-        ]
+        def _mk_platform_user(label: str, analytics_token: str) -> str:
+            """Durable User + user-owned BrokerConnection (encrypted
+            Analytics Token) + durable active UserSession."""
+            db = SessionLocal()
+            try:
+                user_id = str(uuid4())
+                db.add(User(
+                    id=user_id, status="active", identity_source="upstox",
+                    broker_provider="UPSTOX",
+                    broker_user_id=f"d43-{label}-{user_id[:8]}",
+                ))
+                db.flush()
+                # User-owned durable connection with the encrypted token.
+                store_analytics_token(db, user_id, "UPSTOX", analytics_token)
+                # Durable active platform session for this user.
+                session_id = secrets.token_urlsafe(32)
+                create_session_record(db, user_id, session_id)
+                db.commit()
+                return session_id
+            finally:
+                db.close()
 
-        # The same check under A's session forwards only A's credential.
+        session_a = _mk_platform_user("A", "tok-user-A")
+        session_b = _mk_platform_user("B", "tok-user-B")
+
+        # --- B's platform session: only B's credential reaches the adapter
+        client.cookies.set(SESSION_COOKIE_NAME, session_b)
+        resp_b = client.get("/api/v1/chains/NIFTY/expiries")
+        assert resp_b.status_code == 200
+        mock.assert_awaited_once_with("tok-user-B", INSTRUMENT_KEYS["NIFTY"])
+
+        # --- A's platform session: only A's credential
         client.cookies.clear()
-        client.cookies.set("strikenova_session", session_a)
-        resp2 = client.get("/api/v1/chains/NIFTY/expiries")
-        assert resp2.status_code == 200
+        client.cookies.set(SESSION_COOKIE_NAME, session_a)
+        resp_a = client.get("/api/v1/chains/NIFTY/expiries")
+        assert resp_a.status_code == 200
+        # Exact call ledger across BOTH requests: no cross-user
+        # credential substitution ever occurred.
         assert [c.args[0] for c in mock.await_args_list] == [
             "tok-user-B", "tok-user-A",
         ]
-        # A's credential was never forwarded under B's session (the first
-        # call above), and B's never under A's.
+        assert "tok-user-A" not in str(resp_b.content)
 
     def test_platform_session_token_never_used_as_broker_credential(
         self, client, monkeypatch,
