@@ -1238,13 +1238,16 @@ class TestDay41InvariantsAndLiveBoundary:
         ).scalar_one_or_none()
         assert lock_row is not None
 
-    def test_day41_2_concurrency_matrix_invariants_hold_inline(self, db_session):
-        """Deterministic in-module re-check of the Day41.2 invariants this
-        gate owns: after ingestion each family holds exactly one durable
-        ``order_family_sync_lock`` row and a duplicate replay serializes
-        onto the winner's committed outcome (DUPLICATE_NOOP, no second
-        row or lock).  The full PostgreSQL concurrency matrix remains an
-        external verification command
+    def test_d1_single_node_lock_and_replay_invariants_hold_inline(
+        self, db_session,
+    ):
+        """Deterministic SEQUENTIAL in-module re-check of the Day41.2
+        invariants this gate owns: after ingestion each family holds
+        exactly one durable ``order_family_sync_lock`` row and a
+        duplicate replay serializes onto the winner's committed outcome
+        (DUPLICATE_NOOP, no second row or lock).  No multi-worker
+        execution is claimed here — the full PostgreSQL true-concurrency
+        matrix remains an external verification command
         (tests/test_day41_2_cross_d1_concurrency.py)."""
         from app.broker_sync.models import OrderFamilySyncLock
         submit = _seqless(
