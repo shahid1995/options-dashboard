@@ -38,7 +38,8 @@ from app.services.admin_controls import (
     CONTROL_DOMAINS,
     UnknownControlDomain,
     list_controls,
-    set_control,
+    require_platform_admin,
+    set_control_and_audit,
 )
 
 router = APIRouter()
@@ -165,6 +166,21 @@ def _result_shape(r) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _authorize_acquisition_principal(db: Session, user_id: str) -> None:
+    """Domain-level backstop for historical acquisition (PR #91 F4).
+
+    Re-derives admin authority from the DURABLE ``users.is_admin`` flag
+    for the authenticated principal's user_id and refuses non-admins at
+    the domain boundary — so the production path enforces authorization
+    even if HTTP routing were misconfigured or bypassed. The decision is
+    never hard-coded and never inferred from tenant ownership.
+    """
+    from app.identity import User
+
+    row = db.query(User).filter(User.id == user_id).one_or_none()
+    require_platform_admin(is_admin=bool(row.is_admin) if row is not None else False)
+
+
 @router.post("/acquisition/run")
 async def run_acquisition(
     body: AcquisitionRunIn,
@@ -174,19 +190,39 @@ async def run_acquisition(
 ):
     """Admin-controlled historical-data acquisition trigger.
 
+    Authorization is enforced twice: 403 at the ``AdminUser`` HTTP
+    boundary, then again at the acquisition DOMAIN boundary via
+    ``require_platform_admin`` backed by the persisted admin state.
     The orchestrator is constructed with the PLATFORM token bridge
     (``UpstoxTokenManager`` persistent cache), never the caller's broker
-    connection or the caller's session token. Non-admin attempts never
-    reach this handler (403 at the dependency) and are audited as denied
-    by the acquisition attempt recorder used in tests/production paths.
+    connection or the caller's session token. Both dry-run forms
+    (``dry_run: true`` and ``operation: "dry_run"``) require no platform
+    credential; a real acquisition without one is refused with 503.
     """
     from app.services.backfill_orchestrator import BackfillOrchestrator, TokenBridge
     from app.services.upstox_client import UpstoxClient
     from app.services.upstox_token_manager import UpstoxTokenManager
 
+    # --- Domain-level authorization backstop (before any admin work) ---
+    try:
+        _authorize_acquisition_principal(db, user.user_id)
+    except PermissionError:
+        record_admin_action(
+            db,
+            actor_user_id=user.user_id,
+            action="acquisition.run",
+            target={"operation": body.operation},
+            result="denied",
+            detail={"reason": "admin_required"},
+        )
+        raise HTTPException(status_code=403, detail="Admin privileges required.")
+
+    # Both dry-run forms are credential-free (PR #91 F1).
+    is_dry_run = bool(body.dry_run) or body.operation == "dry_run"
+
     # Platform-owned credential source ONLY (never a customer connection).
     platform_bridge = TokenBridge()
-    if platform_bridge.get_token() is None and not body.dry_run:
+    if platform_bridge.get_token() is None and not is_dry_run:
         record_admin_action(
             db,
             actor_user_id=user.user_id,
@@ -201,10 +237,10 @@ async def run_acquisition(
         )
 
     client = UpstoxClient(token_provider=platform_bridge)
-    orchestrator = BackfillOrchestrator(db, client, dry_run=body.dry_run)
+    orchestrator = BackfillOrchestrator(db, client, dry_run=is_dry_run)
 
     try:
-        if body.operation == "dry_run" or body.dry_run:
+        if is_dry_run:
             result = await orchestrator.run_dry_run()
             payload = {"operation": body.operation, "status": "DRY_RUN", "result": result}
         else:
@@ -252,24 +288,19 @@ def create_or_update_control(
     db: Session = Depends(get_db),
 ):
     """Set (or version-bump) one admin control. Audited with the actor."""
+    # Control mutation + audit record commit ATOMICALLY (PR #91 F2): the
+    # material mutation can never become durable without its audit entry.
     try:
-        row = set_control(
+        row = set_control_and_audit(
             db,
             domain=body.domain,
             key=body.key,
             value=body.value,
             updated_by=user.user_id,
+            audit_action="controls.set",
         )
     except UnknownControlDomain as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    record_admin_action(
-        db,
-        actor_user_id=user.user_id,
-        action="controls.set",
-        target={"domain": body.domain, "key": body.key},
-        result="success",
-        detail={"version": row["version"]},
-    )
     return {"status": "ok", "control": row}
 
 

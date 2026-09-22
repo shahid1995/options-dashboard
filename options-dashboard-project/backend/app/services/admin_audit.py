@@ -68,8 +68,15 @@ def record_admin_action(
     target: dict | None = None,
     result: str = "success",
     detail: dict | None = None,
+    commit: bool = True,
 ) -> AdminAuditEvent:
-    """Append one sanitized audit record for a material admin action."""
+    """Append one sanitized audit record for a material admin action.
+
+    ``commit=False`` stages the record in the caller's transaction so a
+    related mutation and its audit record can be committed ATOMICALLY
+    (PR #91 F2: a control mutation must never become durable without its
+    audit record). The caller then owns the single commit/rollback.
+    """
     event = AdminAuditEvent(
         id=str(uuid4()),
         actor_user_id=actor_user_id,
@@ -80,7 +87,8 @@ def record_admin_action(
         occurred_at=datetime.now(timezone.utc).replace(tzinfo=None),
     )
     db.add(event)
-    db.commit()
+    if commit:
+        db.commit()
     return event
 
 

@@ -20,7 +20,7 @@ from uuid import uuid4
 from sqlalchemy.orm import Session
 
 from app.identity import AdminControl
-from app.services.admin_audit import _sanitize
+from app.services.admin_audit import _sanitize, record_admin_action
 
 # Closed control domains (Day 45 §3). Unknown domains are rejected (422).
 CONTROL_DOMAINS = ("instrument", "configuration", "retention", "feature_flags")
@@ -46,7 +46,7 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def set_control(
+def _stage_control(
     db: Session,
     *,
     domain: str,
@@ -54,7 +54,11 @@ def set_control(
     value,
     updated_by: str | None,
 ) -> dict:
-    """Create or version-bump one control. Returns its display shape."""
+    """Build (or version-bump) one control WITHOUT committing.
+
+    The caller owns the transaction boundary — this exists so the control
+    mutation and its audit record can be committed atomically.
+    """
     if domain not in CONTROL_DOMAINS:
         raise UnknownControlDomain(f"Unknown control domain: {domain!r}")
     clean_value = _sanitize(value)
@@ -86,9 +90,60 @@ def set_control(
         history.append(
             {"version": row.version, "value": clean_value, "by": updated_by, "at": now.isoformat()}
         )
-        row.history = history[-50:]
-    db.commit()
+        # Append-only ledger (PR #91 F3): recorded versions are never
+        # truncated away — history grows with every update.
+        row.history = history
     return _display(row)
+
+
+def set_control(
+    db: Session,
+    *,
+    domain: str,
+    key: str,
+    value,
+    updated_by: str | None,
+) -> dict:
+    """Create or version-bump one control. Returns its display shape."""
+    display = _stage_control(db, domain=domain, key=key, value=value, updated_by=updated_by)
+    db.commit()
+    return display
+
+
+def set_control_and_audit(
+    db: Session,
+    *,
+    domain: str,
+    key: str,
+    value,
+    updated_by: str | None,
+    audit_action: str = "controls.set",
+    audit_result: str = "success",
+    audit_detail: dict | None = None,
+) -> dict:
+    """Control mutation + its audit record in ONE transaction (PR #91 F2).
+
+    A material control mutation must never become durable without its
+    required audit record: both are staged, then a single commit makes
+    them durable together. Any failure (including an audit-write failure)
+    rolls the whole transaction back — neither record survives alone.
+    """
+    try:
+        display = _stage_control(db, domain=domain, key=key, value=value, updated_by=updated_by)
+        record_admin_action(
+            db,
+            actor_user_id=updated_by,
+            action=audit_action,
+            target={"domain": domain, "key": key},
+            result=audit_result,
+            detail=audit_detail if audit_detail is not None else {"version": display["version"]},
+            commit=False,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return display
 
 
 def list_controls(db: Session, domain: str) -> dict:

@@ -1,7 +1,8 @@
 "use client";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { C } from "@/lib/ui";
 import { LoadingState, ErrorState, Table, Badge } from "@/components/app/core";
+import { createRequestSequence } from "@/lib/requestSequence";
 import {
   getAdminAudit,
   getAdapters,
@@ -55,8 +56,12 @@ export default function AdminPage() {
   const [error, setError] = useState(null);
   const [notAuthorized, setNotAuthorized] = useState(false);
   const [loading, setLoading] = useState(true);
+  // F5: a generation guard so a slow response from a previously active tab
+  // can never overwrite (or terminate) a newer tab's request lifecycle.
+  const seqRef = useRef(createRequestSequence());
 
   const load = useCallback(async () => {
+    const isCurrent = seqRef.current.begin();
     setLoading(true);
     setError(null);
     setNotAuthorized(false);
@@ -67,8 +72,10 @@ export default function AdminPage() {
       else if (tab === "flags") payload = await getFeatureFlags();
       else if (tab === "models") payload = await getModelMetadata();
       else payload = await getAdminAudit();
+      if (!isCurrent()) return; // superseded by a newer tab request
       setData(payload);
     } catch (e) {
+      if (!isCurrent()) return; // stale failure never surfaces
       if (isAuthError(e)) {
         setNotAuthorized(true);
       } else if (e?.response?.status === 403) {
@@ -77,7 +84,9 @@ export default function AdminPage() {
         setError(e.message || "Failed to load admin data.");
       }
     } finally {
-      setLoading(false);
+      // Only the newest request may clear loading — an old request
+      // finishing late cannot terminate a newer in-flight one.
+      if (isCurrent()) setLoading(false);
     }
   }, [tab]);
 
