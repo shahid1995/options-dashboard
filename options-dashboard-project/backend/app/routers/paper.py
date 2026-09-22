@@ -220,8 +220,9 @@ async def resolve_market_prices(access_token: str, symbol: str, legs) -> dict:
                 # crosses the fill boundary tick-aligned.
                 prices[(expiry, leg.strike_price, leg.option_type)] = round_option_price(ltp)
     except BrokerError as exc:
+        logger.error("Market data load failed: %s — %s", exc.code.value, exc.message)
         raise PaperExecutionError(
-            "EXECUTION_FAILED", f"Could not load market data for {symbol}: {exc.message}"
+            "EXECUTION_FAILED", "Could not load market data. Please try again."
         ) from exc
     return prices
 
@@ -263,8 +264,9 @@ async def resolve_bulk_market_prices(access_token: str, positions) -> dict:
                 # the single-position exit boundary exactly.
                 prices[(symbol, p.expiry, p.strike, p.option_type)] = round_option_price(ltp)
     except BrokerError as exc:
+        logger.error("Market data load failed: %s — %s", exc.code.value, exc.message)
         raise PaperExecutionError(
-            "EXECUTION_FAILED", f"Could not load market data: {exc.message}"
+            "EXECUTION_FAILED", "Could not load market data. Please try again."
         ) from exc
     return prices
 

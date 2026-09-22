@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from app.brokers.domain.enums import BROKER_ID_UPSTOX
-from app.brokers.domain.errors import BrokerError
+from app.brokers.domain.errors import BrokerError, PUBLIC_BROKER_ERROR_MESSAGE
 from app.brokers.gateway import gateway
 from app.config import settings
 from app.db import SessionLocal, get_db
@@ -340,10 +340,10 @@ async def callback(
             broker_id, access_token=access_token, **user_credentials
         ).get_profile()
     except BrokerError as e:
-        logger.error("Token/profile exchange failed: %s", e)
+        logger.error("Token/profile exchange failed: %s — %s", e.code.value, e.message)
         if popup:
-            return _popup_error_response(e.message)
-        return RedirectResponse(f"{settings.FRONTEND_ORIGIN}?login_error={quote(e.message)}")
+            return _popup_error_response(PUBLIC_BROKER_ERROR_MESSAGE)
+        return RedirectResponse(f"{settings.FRONTEND_ORIGIN}?login_error={quote(PUBLIC_BROKER_ERROR_MESSAGE)}")
 
     # Session-bound linking (UPSTOX_IDENTITY_LINKING_DESIGN.md §7/§17):
     # the state-bound initiating session's user is the ONLY platform
@@ -1747,6 +1747,9 @@ def account_change_password(
             session_id=other.session_hash,
             metadata={"scope": "password_change"},
         )
+    # Revoke all OTHER sessions in the in-memory cache so cached broker
+    # tokens become immediately unusable.
+    token_store.mark_all_sessions_revoked_except(session_id)
     account_security.record_security_event(
         db,
         user_id=user.id,

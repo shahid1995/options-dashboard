@@ -305,6 +305,8 @@ def revoke_one(db: Session, session_id: str | None) -> bool:
     """Revoke a single session by its identifier. Idempotent."""
     if not session_id:
         return False
+    from app.services.token_store import mark_session_revoked
+    mark_session_revoked(session_id)
     return revoke_session(db, session_id)
 
 
@@ -313,6 +315,8 @@ def revoke_all_for_user(db: Session, user_id: str) -> int:
 
     Returns the number of sessions revoked. Each revocation is recorded as a
     secret-free ``session_revoked`` security event (session HASH only).
+    Also marks all active sessions as revoked in the in-memory cache so
+    cached broker tokens become immediately unusable.
     """
     now = _utcnow()
     active = (
@@ -324,16 +328,23 @@ def revoke_all_for_user(db: Session, user_id: str) -> int:
         )
         .all()
     )
-    for record in active:
-        record.revoked_at = now
-        record_security_event(
-            db,
-            user_id=user_id,
-            event_type="session_revoked",
-            session_id=record.session_hash,
-            metadata={"scope": "revoke_all"},
-        )
     if active:
+        from app.identity import hash_session_id
+        from app.services.token_store import mark_session_revoked
+        for record in active:
+            record.revoked_at = now
+            record_security_event(
+                db,
+                user_id=user_id,
+                event_type="session_revoked",
+                session_id=record.session_hash,
+                metadata={"scope": "revoke_all"},
+            )
+        # Mark all active sessions revoked in the in-memory cache.
+        # We need the plaintext session_ids — they're not stored in the DB,
+        # but we can find them by checking which cached sessions have matching
+        # session_hashes.
+        mark_session_revoked(None)  # None = mark ALL sessions revoked
         db.flush()
     return len(active)
 

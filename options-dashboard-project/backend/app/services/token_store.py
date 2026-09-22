@@ -37,6 +37,14 @@ _sessions: dict[str, dict] = {}
 # Session TTL (24 hours) — matches the cookie max_age set in auth.py
 _SESSION_TTL_SECONDS = 60 * 60 * 24
 
+# In-memory set of revoked session_ids.
+# Durable-session revocation paths mark the UserSession row in the DB but
+# may not clear the in-memory cache for every affected session. This set lets
+# get_token() fail closed without a DB round-trip, which keeps the check O(1)
+# and avoids cross-engine transaction visibility issues during logout-all,
+# password reset, and password change revocation flows.
+_revoked_sessions: set[str] = set()
+
 # ---------------------------------------------------------------------------
 # OAuth state management — signed with HMAC
 # ---------------------------------------------------------------------------
@@ -225,28 +233,39 @@ def get_token(session_id: str | None) -> str | None:
     - session_id is None/empty
     - session_id is not found in memory or DB
     - session has expired
+    - session has been revoked (revoked_at set in DB OR marked in-memory)
     """
     if not session_id:
         return None
 
-    # Fast path: memory
+    # Fast path: memory — must honor durable session validity.
     entry = _sessions.get(session_id)
     if entry is not None:
         age = time.time() - entry["created_at"]
         if age <= _SESSION_TTL_SECONDS:
+            # Root authorization invariant: a revoked durable platform
+            # session MUST NOT obtain broker market-data access merely
+            # because a broker token remains in the in-memory cache.
+            if session_id in _revoked_sessions:
+                _sessions.pop(session_id, None)
+                logger.info(
+                    "Session revoked — cache evicted",
+                    extra={"event": "auth.session.revoked_cache_evicted", "session_prefix": session_id[:8]},
+                )
+                return None
             return entry["access_token"]
         # Expired — remove from memory
         _sessions.pop(session_id, None)
+        _revoked_sessions.discard(session_id)
         logger.info(
             "Session expired",
             extra={"event": "auth.session.expired", "session_prefix": session_id[:8]},
         )
         return None
 
-    # Slow path: DB fallback
+    # Slow path: DB fallback (already checks UserSession validity)
     token = _load_token_from_db(session_id)
     if token is not None:
-        # Populate cache for future fast-path hits
         _sessions[session_id] = {
             "access_token": token,
             "created_at": time.time(),
@@ -256,15 +275,122 @@ def get_token(session_id: str | None) -> str | None:
     return None
 
 
+def mark_session_revoked(session_id: str | None = None) -> None:
+    """Mark a session as revoked so the in-memory cache cannot serve it.
+
+    All durable-session revocation paths MUST call this so that cached
+    broker tokens become immediately unusable even before the DB record
+    is updated or the cache entry is cleared.
+
+    If session_id is None, marks ALL sessions as revoked (logout-all,
+    password reset).
+    """
+    if session_id is None:
+        _revoked_sessions.update(_sessions.keys())
+        logger.info(
+            "All sessions marked revoked",
+            extra={"event": "auth.sessions.revoked_all", "count": len(_sessions)},
+        )
+    else:
+        _revoked_sessions.add(session_id)
+        logger.info(
+            "Session marked revoked",
+            extra={"event": "auth.session.marked_revoked", "session_prefix": session_id[:8]},
+        )
+
+
+def mark_all_sessions_revoked_except(except_session_id: str) -> None:
+    """Mark all sessions as revoked EXCEPT the specified one.
+
+    Used by password-change which revokes all OTHER sessions but keeps
+    the current one active.
+    """
+    for sid in list(_sessions.keys()):
+        if sid != except_session_id:
+            _revoked_sessions.add(sid)
+    logger.info(
+        "All sessions marked revoked (except current)",
+        extra={"event": "auth.sessions.revoked_all_except", "count": len(_sessions) - 1},
+    )
+
+
+def _has_durable_session(session_id: str) -> bool:
+    """Check whether a UserSession record exists for session_id (any status).
+
+    Returns True if a row exists (even if expired/revoked) — this distinguishes
+    durable sessions from legacy in-memory-only sessions.
+    """
+    try:
+        from app.db import SessionLocal
+        from app.identity import UserSession, hash_session_id
+
+        db = SessionLocal()
+        try:
+            us = (
+                db.query(UserSession)
+                .filter(UserSession.session_hash == hash_session_id(session_id))
+                .first()
+            )
+            if us is None:
+                logger.info(
+                    "Session not found",
+                    extra={"event": "auth.session.not_found", "session_prefix": session_id[:8]},
+                )
+            return us is not None
+        finally:
+            db.close()
+    except Exception:
+        return False  # Fail closed: treat as no durable session (legacy path)
+
+
+def _session_is_valid(session_id: str) -> bool:
+    """Check UserSession validity (kept for reference; not used in fast path).
+    
+    The fast path now uses the in-memory _revoked_sessions set instead
+    of a DB round-trip per token lookup.
+    """
+    try:
+        import app.db
+        from datetime import datetime, timezone
+        from app.identity import UserSession, hash_session_id
+
+        now = datetime.now(timezone.utc)
+        db = app.db.SessionLocal()
+        try:
+            us = (
+                db.query(UserSession)
+                .filter(
+                    UserSession.session_hash == hash_session_id(session_id),
+                    UserSession.revoked_at.is_(None),
+                    UserSession.expires_at > now,
+                )
+                .first()
+            )
+            return us is not None
+        finally:
+            db.close()
+    except Exception:
+        return False  # Fail closed on DB errors
+
+
+# ---------------------------------------------------------------------------
+# Revocation registry — populated by mark_session_revoked() and
+# mark_all_sessions_revoked_except(). Cleared when sessions are evicted
+# from the in-memory cache.
+# ---------------------------------------------------------------------------
+
+
 def clear_token(session_id: str | None = None) -> None:
     """Clear a specific session's token, or all tokens if session_id is None.
 
-    Clears both memory cache and DB.
+    Clears both memory cache and DB. Also clears the revocation registry
+    so a cleared session cannot be accidentally re-marked.
     """
     if session_id is None:
         # Emergency: clear all sessions
         count = len(_sessions)
         _sessions.clear()
+        _revoked_sessions.clear()
         logger.info(
             "All sessions cleared",
             extra={"event": "auth.sessions.cleared_all", "count": count},
@@ -276,6 +402,7 @@ def clear_token(session_id: str | None = None) -> None:
             logger.warning("Failed to clear all tokens in DB", extra={"event": "auth.token.clear_all_db_failed"})
     else:
         removed = _sessions.pop(session_id, None)
+        _revoked_sessions.discard(session_id)
         if removed:
             logger.info(
                 "Session cleared",

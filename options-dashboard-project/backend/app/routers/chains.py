@@ -9,7 +9,7 @@ from app.brokers.adapters.upstox.mapper import (
 )
 from app.brokers.adapters.upstox.mapper import transform_chain  # compat re-export
 from app.brokers.domain.enums import BROKER_ID_UPSTOX
-from app.brokers.domain.errors import BrokerError, BrokerErrorCode
+from app.brokers.domain.errors import BrokerError, BrokerErrorCode, PUBLIC_BROKER_ERROR_MESSAGE
 from app.brokers.gateway import gateway
 from app.routers.deps import get_session_id
 from app.services import token_store
@@ -109,7 +109,9 @@ async def call_upstox(coro, *, session_id: str | None = None):
                 if not is_platform_session_token(existing_token):
                     token_store.clear_token(session_id)
             raise HTTPException(status_code=401, detail="Upstox session expired. Please log in again.") from e
-        raise HTTPException(status_code=502, detail=f"Upstox API error ({e.status_code}): {e.message}") from e
+        # Sanitize: never expose raw upstream error message to clients
+        logger.warning("Broker error: %s — %s", e.code.value, e.message)
+        raise HTTPException(status_code=502, detail=PUBLIC_BROKER_ERROR_MESSAGE) from e
 
 
 @router.get("/{symbol}/expiries")

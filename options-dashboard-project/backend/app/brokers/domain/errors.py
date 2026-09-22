@@ -89,3 +89,26 @@ class BrokerError(Exception):
 def is_session_code(code: BrokerErrorCode | str) -> bool:
     """True when the code means the broker session must be re-established."""
     return BrokerErrorCode(code) in BrokerErrorCode.SESSION_CODES
+
+
+# ---------------------------------------------------------------------------
+# Public error boundary — sanitize broker error messages for API responses.
+#
+# BrokerError.message can contain raw upstream data (e.g. portions of
+# Upstox response bodies, network exception details with URLs). The public
+# API must NEVER expose these details to clients.
+# ---------------------------------------------------------------------------
+
+# Stable generic public message for broker/upstream failures.
+# Used by all router error handlers to sanitize the public error detail.
+PUBLIC_BROKER_ERROR_MESSAGE = "Upstream market-data provider request failed."
+
+
+def sanitize_broker_error_message(exc: BrokerError) -> str:
+    """Return a safe, stable public message for a BrokerError.
+
+    The detailed message is preserved in server-side logs; the public
+    response gets a generic message that reveals nothing about the upstream
+    provider, internal URLs, or raw response bodies.
+    """
+    return PUBLIC_BROKER_ERROR_MESSAGE

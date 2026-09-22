@@ -45,8 +45,10 @@ if "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules:
 
 @pytest.fixture(autouse=True)
 def reset_token_store():
+    token_store._revoked_sessions.clear()
     token_store.clear_token()
     yield
+    token_store._revoked_sessions.clear()
     token_store.clear_token()
 
 

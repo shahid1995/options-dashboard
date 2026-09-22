@@ -240,7 +240,9 @@ def test_chain_upstox_server_error_returns_502(client, logged_in, monkeypatch):
     resp = client.get("/chains/NIFTY", params={"expiry_date": "2026-08-28"})
 
     assert resp.status_code == 502
-    assert "Upstox API error (500)" in resp.json()["detail"]
+    # Finding 2 fix: upstream error messages must be sanitized
+    assert resp.json()["detail"] == "Upstream market-data provider request failed."
+    assert "500" not in resp.json()["detail"]
     assert token_store.get_token(logged_in) == "tok-xyz"
 
 

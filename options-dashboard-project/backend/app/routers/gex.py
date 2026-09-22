@@ -249,7 +249,7 @@ async def trigger_capture(
 
     from app.brokers.adapters.upstox.mapper import UPSTOX_INSTRUMENT_KEYS as INSTRUMENT_KEYS
     from app.brokers.domain.enums import BROKER_ID_UPSTOX
-    from app.brokers.domain.errors import BrokerError, BrokerErrorCode
+    from app.brokers.domain.errors import BrokerError, BrokerErrorCode, PUBLIC_BROKER_ERROR_MESSAGE
     from app.brokers.gateway import gateway
     from app.services.gex_capture import GexCaptureService
 
@@ -274,7 +274,7 @@ async def trigger_capture(
             if not is_platform_session_token(existing):
                 token_store.clear_token(session_id)
             raise HTTPException(status_code=401, detail="Upstox session expired.") from e
-        raise HTTPException(status_code=502, detail=f"Upstox API error: {e.message}") from e
+        raise HTTPException(status_code=502, detail=PUBLIC_BROKER_ERROR_MESSAGE) from e
 
     # Capture and persist — scoped to this user
     capture_service = GexCaptureService()

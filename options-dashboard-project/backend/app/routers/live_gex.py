@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 
 from app.brokers.adapters.upstox.mapper import UPSTOX_INSTRUMENT_KEYS as INSTRUMENT_KEYS
 from app.brokers.domain.enums import BROKER_ID_UPSTOX
-from app.brokers.domain.errors import BrokerError, BrokerErrorCode
+from app.brokers.domain.errors import BrokerError, BrokerErrorCode, PUBLIC_BROKER_ERROR_MESSAGE
 from app.brokers.gateway import gateway
 from app.routers.deps import get_session_id
 from app.services import token_store
@@ -96,7 +96,7 @@ async def _fetch_chain(symbol: str, expiry_date: str, token: str, session_id: st
             ) from e
         raise HTTPException(
             status_code=502,
-            detail=f"Upstox API error ({e.status_code}): {e.message}",
+            detail=PUBLIC_BROKER_ERROR_MESSAGE,
         ) from e
 
 
