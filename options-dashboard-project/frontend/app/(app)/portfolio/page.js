@@ -152,6 +152,11 @@ export default function PortfolioPage() {
         >
           {loading ? "Refreshing…" : "↻ Refresh Portfolio"}
         </button>
+        {dataState.key === "stale-with-error" && (
+          <span style={{ fontSize: 11, color: C.red }}>
+            ⚠ Refresh failed ({dataState.detail}) — showing values from the last successful load. You can refresh again.
+          </span>
+        )}
         {dataState.key === "stale" && (
           <span style={{ fontSize: 11, color: C.gold }}>
             ⚠ Data is stale — refresh to update.

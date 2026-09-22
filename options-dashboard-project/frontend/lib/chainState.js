@@ -63,15 +63,18 @@ export function chainState({
     }
     return { key: "loading", showData: false, detail: null };
   }
+  if (feedError) {
+    // The latest update failed over RETAINED data: what is shown is stale
+    // by definition, regardless of age or row count (an empty retained
+    // chain with a failed refresh is still stale-with-error, not a
+    // successful empty). This must precede the successful-empty branch
+    // below.
+    return { key: "stale-with-error", showData: true, detail: feedError };
+  }
   if (!chain.chain || chain.chain.length === 0) {
     // Empty is a successful state (a fresh chain with no rows), shown as
     // such rather than as an error.
     return { key: "empty", showData: true, detail: null };
-  }
-  if (feedError) {
-    // The latest update failed over existing data: what is shown is stale
-    // by definition, regardless of age.
-    return { key: "stale-with-error", showData: true, detail: feedError };
   }
   if (lastUpdated == null) {
     // Data exists but its freshness cannot be proven: stale, never current.

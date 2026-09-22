@@ -102,6 +102,23 @@ describe("chainState — live chain data-state classification", () => {
     expect(s.showData).toBe(true);
   });
 
+  it("classifies a failed refresh over a retained EMPTY chain as stale-with-error, not empty", () => {
+    // Day 44 remediation: a retained chain (even with zero rows) plus a
+    // failed latest update means what is shown is stale with an error — the
+    // successful-empty state applies only when there is no feed failure.
+    const s = chainState({
+      chain: { chain: [] },
+      lastUpdated: T0 - 1000,
+      feedError: "Live update failed",
+      noBrokerToken: false,
+      sessionExpired: false,
+      nowMs: T0,
+    });
+    expect(s.key).toBe("stale-with-error");
+    expect(s.showData).toBe(true);
+    expect(s.detail).toBe("Live update failed");
+  });
+
   it("classifies silent staleness once the feed age exceeds the threshold (boundary: exact age is still current)", () => {
     const chain = { chain: [{ strike: 25000 }] };
     const atThreshold = chainState({
@@ -245,6 +262,22 @@ describe("portfolioState — portfolio data-state classification", () => {
     expect(s.key).toBe("current");
     expect(s.refreshing).toBe(true);
   });
+
+  it("classifies a failed refresh over retained portfolio data as stale-with-error", () => {
+    // Day 44 remediation contract: retained analytics+capital after a failed
+    // refresh must classify as stale-with-error with the error as detail.
+    const s = portfolioState({
+      analytics: { summary: {} },
+      capital: { status: "available" },
+      loading: false,
+      error: "refresh failed",
+      lastLoadedAt: T0 - 1000,
+      nowMs: T0,
+    });
+    expect(s.key).toBe("stale-with-error");
+    expect(s.showData).toBe(true);
+    expect(s.detail).toBe("refresh failed");
+  });
 });
 
 describe("Day 44 feature-ownership wiring", () => {
@@ -265,6 +298,21 @@ describe("Day 44 feature-ownership wiring", () => {
     // their own stale cutoffs.
     expect(dashboard).not.toMatch(/\b15_?000\b/);
     expect(portfolio).not.toMatch(/2\s*\*\s*60_?000/);
+  });
+
+  it("renders the stale-with-error warning on the portfolio page", () => {
+    // Day 44 remediation wiring: the page must render an explicit warning
+    // when retained portfolio data survives a failed refresh (the
+    // classifier already produces stale-with-error; the page must surface
+    // it alongside the retained data).
+    const portfolio = read("app/(app)/portfolio/page.js");
+    expect(portfolio).toContain('dataState.key === "stale-with-error"');
+    expect(portfolio).toContain("dataState.detail");
+    // The warning coexists with retained data: it is additive UI, not a
+    // replacement of the panels (no early return for that state).
+    expect(portfolio).not.toMatch(
+      /dataState\.key === "stale-with-error"[\s\S]{0,80}return\s*\(/
+    );
   });
 
   it("keeps presentation helpers frontend-owned and untouched", () => {
