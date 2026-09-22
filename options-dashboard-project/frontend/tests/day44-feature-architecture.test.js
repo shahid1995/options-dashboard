@@ -315,6 +315,27 @@ describe("Day 44 feature-ownership wiring", () => {
     );
   });
 
+  it("clears retained request errors when a retry starts, before loading flips", () => {
+    // Day 44 retry remediation (wiring level): pressing Refresh after a
+    // failure starts a NEW request — the old failure must not keep being
+    // presented as the status of the in-flight one. The page clears the
+    // retained errors BEFORE setLoading(true); existing data is untouched,
+    // so with loading=true and no current error the classifier already
+    // returns current/refreshing (proven by the in-flight test above).
+    const portfolio = read("app/(app)/portfolio/page.js");
+    const loadFn = portfolio.match(/const loadPortfolio = useCallback[\s\S]*?^  }, \[\]\);/m)?.[0] ?? "";
+    expect(loadFn).not.toBe("");
+    const setErr = loadFn.indexOf("setCapitalError(null)");
+    const setLoading = loadFn.indexOf("setLoading(true)");
+    expect(setErr).toBeGreaterThanOrEqual(0);
+    expect(setLoading).toBeGreaterThan(setErr);
+    // Both retained error slots are cleared, and no data setter runs
+    // before the retry begins (data preservation is implicit — clearing
+    // errors only touches error state).
+    expect(loadFn.indexOf("setAnalyticsError(null)")).toBeGreaterThan(-1);
+    expect(loadFn.slice(0, setLoading)).not.toMatch(/set(Analytics|Capital|PositionsLtp|LastLoadedAt)\(/);
+  });
+
   it("keeps presentation helpers frontend-owned and untouched", () => {
     // The audit retained the pure presentation/domain-helper modules in
     // place; Day 44 added no duplicate of them.

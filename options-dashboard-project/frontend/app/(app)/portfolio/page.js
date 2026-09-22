@@ -49,6 +49,11 @@ export default function PortfolioPage() {
   }, []);
 
   const loadPortfolio = useCallback(async () => {
+    // A retry must not keep presenting the previous failure as the status of
+    // the request now starting: clear retained errors up front. Existing
+    // data is untouched — the panels keep rendering while loading is true.
+    setCapitalError(null);
+    setAnalyticsError(null);
     setLoading(true);
     try {
       const [analyticsData, capitalData, positionsData] = await Promise.all([
