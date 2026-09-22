@@ -11,6 +11,8 @@ import {
 import { getStatus } from "@/lib/api";
 import CapitalPanel from "../paper/CapitalPanel";
 import PortfolioAnalyticsPanel from "../paper/PortfolioAnalyticsPanel";
+// Day 44: shared data-state classification (loading/current/aged/stale/empty/failure).
+import { portfolioState } from "@/lib/chainState";
 
 /**
  * Phase 2.1b — Portfolio page
@@ -32,6 +34,9 @@ export default function PortfolioPage() {
   const [positions, setPositions] = useState([]);
   const [positionsLtp, setPositionsLtp] = useState([]);
   const [loading, setLoading] = useState(true);
+  // Day 44: freshness evidence for the data-state classification (epoch ms of
+  // the last fully successful load).
+  const [lastLoadedAt, setLastLoadedAt] = useState(null);
 
   // Auth check
   useEffect(() => {
@@ -56,6 +61,7 @@ export default function PortfolioPage() {
       setPositionsLtp(positionsData);
       setCapitalError(null);
       setAnalyticsError(null);
+      setLastLoadedAt(Date.now());
     } catch (e) {
       if (isAuthError(e)) {
         setSessionExpired(true);
@@ -72,6 +78,22 @@ export default function PortfolioPage() {
     if (!loggedIn) return;
     loadPortfolio();
   }, [loggedIn, loadPortfolio]);
+
+  // Day 44: classify the portfolio data state (deterministic; re-evaluated on
+  // a periodic tick so aged data is reclassified without a reload).
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNowTick(Date.now()), 30000);
+    return () => clearInterval(t);
+  }, []);
+  const dataState = portfolioState({
+    analytics,
+    capital,
+    loading,
+    error: capitalError || analyticsError,
+    lastLoadedAt,
+    nowMs: nowTick,
+  });
 
   if (loggedIn === null) {
     return <Centered>Checking login…</Centered>;
@@ -112,7 +134,7 @@ export default function PortfolioPage() {
       />
 
       {/* Refresh button */}
-      <div style={{ marginTop: 16 }}>
+      <div style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 12 }}>
         <button
           onClick={loadPortfolio}
           disabled={loading}
@@ -130,6 +152,16 @@ export default function PortfolioPage() {
         >
           {loading ? "Refreshing…" : "↻ Refresh Portfolio"}
         </button>
+        {dataState.key === "stale" && (
+          <span style={{ fontSize: 11, color: C.gold }}>
+            ⚠ Data is stale — refresh to update.
+          </span>
+        )}
+        {dataState.key === "aged" && (
+          <span style={{ fontSize: 11, color: C.muted }}>
+            Showing data loaded {lastLoadedAt ? new Date(lastLoadedAt).toLocaleTimeString("en-IN") : ""}.
+          </span>
+        )}
       </div>
     </div>
   );
