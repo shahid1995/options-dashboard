@@ -145,6 +145,14 @@ class AdminUser:
     transport — only the explicit flag grants the control plane. Raises
     401 (anonymous), 403 (authenticated non-admin / disabled account).
 
+    Privileged-transport restriction (PR #91 F6): the admin control plane
+    authenticates ONLY through the canonical HttpOnly
+    ``strikenova_session`` cookie. ``X-Session-Id`` — intentionally
+    tolerated for non-privileged server-side/test clients — is NOT an
+    accepted admin authorization mechanism: a header-only request is
+    401-denied before any admin work, and the cookie is authoritative
+    when both transports are present.
+
     Usage::
 
         user: AuthenticatedUser = Depends(AdminUser())
@@ -156,7 +164,9 @@ class AdminUser:
         x_session_id: str | None = Header(default=None),
         session_id_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
     ) -> AuthenticatedUser:
-        sid = _extract_session_id(x_session_id, session_id_cookie)
+        # Privileged boundary is cookie-only: the legacy header transport is
+        # never consulted for admin authorization (F6).
+        sid = _extract_session_id(None, session_id_cookie)
         user = _resolve_user(db, sid)
         from app.identity import User as UserModel
 

@@ -74,7 +74,7 @@ class TestF1DryRunForms:
         resp = client.post(
             "/api/v1/admin/acquisition/run",
             json={"operation": "dry_run"},
-            headers=_hdr(sid),
+            cookies=_cookie(sid),
         )
         assert resp.status_code in (200, 202)
         assert resp.json()["status"] == "DRY_RUN"
@@ -87,7 +87,7 @@ class TestF1DryRunForms:
         resp = client.post(
             "/api/v1/admin/acquisition/run",
             json={"operation": "contracts", "dry_run": True},
-            headers=_hdr(sid),
+            cookies=_cookie(sid),
         )
         assert resp.status_code in (200, 202)
         assert resp.json()["status"] == "DRY_RUN"
@@ -102,7 +102,7 @@ class TestF1DryRunForms:
         resp = client.post(
             "/api/v1/admin/acquisition/run",
             json={"operation": "contracts"},
-            headers=_hdr(sid),
+            cookies=_cookie(sid),
         )
         assert resp.status_code == 503
 
@@ -113,7 +113,7 @@ class TestF1DryRunForms:
         resp = client.post(
             "/api/v1/admin/acquisition/run",
             json={"operation": "dry_run", "dry_run": False},
-            headers=_hdr(sid),
+            cookies=_cookie(sid),
         )
         assert resp.status_code in (200, 202)
         assert resp.json()["status"] == "DRY_RUN"
@@ -173,7 +173,7 @@ class TestF2AtomicControlAudit:
         resp = client.post(
             "/api/v1/admin/controls",
             json={"domain": "retention", "key": "atomic_api_probe", "value": 7},
-            headers=_hdr(sid),
+            cookies=_cookie(sid),
         )
         assert resp.status_code in (200, 201)
         assert resp.json()["control"]["version"] == 1
@@ -242,6 +242,14 @@ class TestF3AppendOnlyHistory:
 
 def _fake_request() -> SimpleNamespace:
     return SimpleNamespace(headers={}, cookies={})
+
+
+def _cookie(session_id: str) -> dict:
+    """Admin requests authenticate via the canonical HttpOnly cookie only
+    (PR #91 F6: X-Session-Id is not an admin authorization transport)."""
+    from app.routers.deps import SESSION_COOKIE_NAME
+
+    return {SESSION_COOKIE_NAME: session_id}
 
 
 class TestF4DomainBackstop:
@@ -343,3 +351,106 @@ class TestF4DomainBackstop:
                 )
             )
         assert excinfo.value.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# F6 — privileged admin authorization accepts ONLY the canonical cookie
+# transport (HttpOnly strikenova_session), never X-Session-Id.
+# ---------------------------------------------------------------------------
+
+
+class TestF6CookieOnlyAdminAuth:
+    def test_admin_denies_header_only_session_id(self, client, admin_session):
+        """X-Session-Id alone must NEVER authorize the admin control plane
+        (browser-readable session credentials are prohibited for the
+        privileged boundary)."""
+        sid, _uid = admin_session
+        resp = client.get("/api/v1/admin/audit", headers={"X-Session-Id": sid})
+        assert resp.status_code == 401
+
+    def test_admin_accepts_canonical_cookie(self, client, admin_session):
+        """The HttpOnly strikenova_session cookie remains the working admin
+        transport."""
+        from app.routers.deps import SESSION_COOKIE_NAME
+
+        sid, _uid = admin_session
+        resp = client.get(
+            "/api/v1/admin/audit", cookies={SESSION_COOKIE_NAME: sid}
+        )
+        assert resp.status_code == 200
+        assert "events" in resp.json()
+
+    def test_admin_cookie_authoritative_over_bogus_header(
+        self, client, admin_session
+    ):
+        """With both transports present, only the cookie may authorize: a
+        bogus header cannot smuggle a different (or any) session in."""
+        from app.routers.deps import SESSION_COOKIE_NAME
+
+        sid, _uid = admin_session
+        resp = client.get(
+            "/api/v1/admin/audit",
+            headers={"X-Session-Id": "forged-or-stale-header-sid"},
+            cookies={SESSION_COOKIE_NAME: sid},
+        )
+        assert resp.status_code == 200
+
+    def test_sensitive_admin_action_rejects_header_only_without_mutation(
+        self, client, admin_session, db_session
+    ):
+        """Header-only attempts at a sensitive mutation are refused AND
+        leave no control mutation behind."""
+        from app.routers.deps import SESSION_COOKIE_NAME
+        from app.services import admin_controls
+
+        sid, _uid = admin_session
+        resp = client.post(
+            "/api/v1/admin/controls",
+            json={"domain": "retention", "key": "f6_probe", "value": 1},
+            headers={"X-Session-Id": sid},
+        )
+        assert resp.status_code == 401
+        row = (
+            db_session.query(admin_controls.AdminControl)
+            .filter(
+                admin_controls.AdminControl.domain == "retention",
+                admin_controls.AdminControl.key == "f6_probe",
+            )
+            .one_or_none()
+        )
+        assert row is None
+        # The canonical cookie transport succeeds for the same mutation.
+        ok = client.post(
+            "/api/v1/admin/controls",
+            json={"domain": "retention", "key": "f6_probe", "value": 1},
+            cookies={SESSION_COOKIE_NAME: sid},
+        )
+        assert ok.status_code in (200, 201)
+
+    def test_header_only_acquisition_attempt_is_audited_denied(
+        self, client, admin_session, db_session
+    ):
+        """The sensitive-action rejection audit still fires for header-only
+        attempts (recorded as an anonymous denial — no actor identity is
+        derived from the prohibited transport)."""
+        from app.services.admin_audit import list_admin_audit
+
+        sid, _uid = admin_session
+        resp = client.post(
+            "/api/v1/admin/acquisition/run",
+            json={"operation": "dry_run"},
+            headers={"X-Session-Id": sid},
+        )
+        assert resp.status_code == 401
+        events = list_admin_audit(db_session)
+        assert any(
+            e["action"] == "acquisition.run" and e["result"] == "denied"
+            for e in events
+        )
+
+    def test_non_admin_paths_keep_header_compat(self, client, admin_session):
+        """Outside the admin boundary the intentional legacy/test header
+        compatibility remains unchanged (non-admin auth behavior preserved)."""
+        sid, _uid = admin_session
+        resp = client.get("/auth/status", headers={"X-Session-Id": sid})
+        assert resp.status_code == 200

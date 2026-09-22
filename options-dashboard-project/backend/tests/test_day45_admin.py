@@ -129,6 +129,13 @@ ADMIN_COOKIE = {"X-Session-Id": None}  # placeholder, headers built inline
 def _hdr(session_id: str) -> dict:
     return {"X-Session-Id": session_id}
 
+def _cookie(session_id: str) -> dict:
+    """Admin requests authenticate via the canonical HttpOnly cookie only
+    (PR #91 F6: X-Session-Id is not an admin authorization transport)."""
+    from app.routers.deps import SESSION_COOKIE_NAME
+
+    return {SESSION_COOKIE_NAME: session_id}
+
 
 # ---------------------------------------------------------------------------
 # 1. Admin authorization boundary
@@ -151,13 +158,13 @@ class TestAdminAuthorizationBoundary:
 
     def test_admin_endpoint_rejects_ordinary_user(self, client, user_session):
         sid, _uid = user_session
-        resp = client.get("/api/v1/admin/audit", headers=_hdr(sid))
+        resp = client.get("/api/v1/admin/audit", cookies=_cookie(sid))
         assert resp.status_code == 403
         assert _admin_denied_body(resp)["detail"] == "Admin privileges required."
 
     def test_admin_endpoint_accepts_admin(self, client, admin_session):
         sid, _uid = admin_session
-        resp = client.get("/api/v1/admin/audit", headers=_hdr(sid))
+        resp = client.get("/api/v1/admin/audit", cookies=_cookie(sid))
         assert resp.status_code == 200
 
     def test_tenant_ownership_cannot_confer_admin(self, db_session, client, user_session):
@@ -174,14 +181,14 @@ class TestAdminAuthorizationBoundary:
             select(BrokerConnection).where(BrokerConnection.user_id == uid)
         ).scalars().one()
         assert conn is not None  # genuinely owns a connection
-        resp = client.get("/api/v1/admin/audit", headers=_hdr(sid))
+        resp = client.get("/api/v1/admin/audit", cookies=_cookie(sid))
         assert resp.status_code == 403
 
     def test_disabled_admin_account_loses_admin_access(self, db_session, client, admin_session):
         sid, user = admin_session
         user.status = "suspended"
         db_session.commit()
-        resp = client.get("/api/v1/admin/audit", headers=_hdr(sid))
+        resp = client.get("/api/v1/admin/audit", cookies=_cookie(sid))
         assert resp.status_code == 403
 
     def test_no_api_path_grants_admin(self, client, user_session):
@@ -195,9 +202,9 @@ class TestAdminAuthorizationBoundary:
             ("get", "/api/v1/admin/whoami", None),
         ]:
             if method == "post":
-                resp = client.post(path, headers=_hdr(sid), json=payload)
+                resp = client.post(path, cookies=_cookie(sid), json=payload)
             else:
-                resp = client.get(path, headers=_hdr(sid))
+                resp = client.get(path, cookies=_cookie(sid))
             assert resp.status_code in (403, 404, 405), (path, resp.status_code)
 
 
@@ -212,7 +219,7 @@ class TestHistoricalAcquisitionControls:
         resp = client.post(
             "/api/v1/admin/acquisition/run",
             json={"operation": "contracts"},
-            headers=_hdr(sid),
+            cookies=_cookie(sid),
         )
         assert resp.status_code == 403
         body = _admin_denied_body(resp)
@@ -247,13 +254,13 @@ class TestHistoricalAcquisitionControls:
         resp = client.post(
             "/api/v1/admin/acquisition/run",
             json={"operation": "contracts", "connection_id": conn.id},
-            headers=_hdr(sid),
+            cookies=_cookie(sid),
         )
         assert resp.status_code == 403
         resp = client.post(
             "/api/v1/admin/acquisition/run",
             json={"operation": "contracts", "connection_id": uid},
-            headers=_hdr(sid),
+            cookies=_cookie(sid),
         )
         assert resp.status_code == 403
 
@@ -262,7 +269,7 @@ class TestHistoricalAcquisitionControls:
         resp = client.post(
             "/api/v1/admin/acquisition/run",
             json={"operation": "contracts", "dry_run": True},
-            headers=_hdr(sid),
+            cookies=_cookie(sid),
         )
         assert resp.status_code in (200, 202)
 
@@ -278,7 +285,7 @@ class TestAdminControls:
         resp = client.post(
             "/api/v1/admin/controls",
             json={"domain": "retention", "key": "chain_snapshots_days", "value": 90},
-            headers=_hdr(sid),
+            cookies=_cookie(sid),
         )
         assert resp.status_code == 403
 
@@ -287,11 +294,11 @@ class TestAdminControls:
         set_resp = client.post(
             "/api/v1/admin/controls",
             json={"domain": "retention", "key": "chain_snapshots_days", "value": 90},
-            headers=_hdr(sid),
+            cookies=_cookie(sid),
         )
         assert set_resp.status_code in (200, 201)
         get_resp = client.get(
-            "/api/v1/admin/controls/retention", headers=_hdr(sid)
+            "/api/v1/admin/controls/retention", cookies=_cookie(sid)
         )
         assert get_resp.status_code == 200
         values = {c["key"]: c["value"] for c in get_resp.json()["controls"]}
@@ -302,7 +309,7 @@ class TestAdminControls:
         resp = client.post(
             "/api/v1/admin/controls",
             json={"domain": "not_a_domain", "key": "x", "value": 1},
-            headers=_hdr(sid),
+            cookies=_cookie(sid),
         )
         assert resp.status_code == 422
 
@@ -311,15 +318,15 @@ class TestAdminControls:
         client.post(
             "/api/v1/admin/controls",
             json={"domain": "configuration", "key": "capture_interval_ms", "value": 3000},
-            headers=_hdr(sid),
+            cookies=_cookie(sid),
         )
         again = client.post(
             "/api/v1/admin/controls",
             json={"domain": "configuration", "key": "capture_interval_ms", "value": 5000},
-            headers=_hdr(sid),
+            cookies=_cookie(sid),
         )
         assert again.status_code in (200, 201)
-        listing = client.get("/api/v1/admin/controls/configuration", headers=_hdr(sid))
+        listing = client.get("/api/v1/admin/controls/configuration", cookies=_cookie(sid))
         row = next(c for c in listing.json()["controls"] if c["key"] == "capture_interval_ms")
         assert row["value"] == 5000
 
@@ -333,20 +340,20 @@ class TestOperationalViews:
     def test_ingestion_health_admin_only(self, client, admin_session, user_session):
         a_sid, _ = admin_session
         u_sid, _ = user_session
-        ok = client.get("/api/v1/admin/ingestion-health", headers=_hdr(a_sid))
+        ok = client.get("/api/v1/admin/ingestion-health", cookies=_cookie(a_sid))
         assert ok.status_code == 200
         assert "runs" in ok.json()
-        denied = client.get("/api/v1/admin/ingestion-health", headers=_hdr(u_sid))
+        denied = client.get("/api/v1/admin/ingestion-health", cookies=_cookie(u_sid))
         assert denied.status_code == 403
 
     def test_adapters_view_admin_only(self, client, admin_session, user_session):
         a_sid, _ = admin_session
         u_sid, _ = user_session
-        ok = client.get("/api/v1/admin/adapters", headers=_hdr(a_sid))
+        ok = client.get("/api/v1/admin/adapters", cookies=_cookie(a_sid))
         assert ok.status_code == 200
         brokers = ok.json()["adapters"]
         assert any(b["broker"] == "UPSTOX" for b in brokers)
-        denied = client.get("/api/v1/admin/adapters", headers=_hdr(u_sid))
+        denied = client.get("/api/v1/admin/adapters", cookies=_cookie(u_sid))
         assert denied.status_code == 403
 
     def test_feature_flags_roundtrip_admin_only(self, client, admin_session, user_session):
@@ -355,32 +362,32 @@ class TestOperationalViews:
         resp = client.post(
             "/api/v1/admin/controls",
             json={"domain": "feature_flags", "key": "admin_views_v1", "value": True},
-            headers=_hdr(a_sid),
+            cookies=_cookie(a_sid),
         )
         assert resp.status_code in (200, 201)
-        ok = client.get("/api/v1/admin/feature-flags", headers=_hdr(a_sid))
+        ok = client.get("/api/v1/admin/feature-flags", cookies=_cookie(a_sid))
         assert ok.status_code == 200
         flags = {f["key"]: f["value"] for f in ok.json()["controls"]}
         assert flags.get("admin_views_v1") is True
-        denied = client.get("/api/v1/admin/feature-flags", headers=_hdr(u_sid))
+        denied = client.get("/api/v1/admin/feature-flags", cookies=_cookie(u_sid))
         assert denied.status_code == 403
 
     def test_model_metadata_admin_only(self, client, admin_session, user_session):
         a_sid, _ = admin_session
         u_sid, _ = user_session
-        ok = client.get("/api/v1/admin/model-metadata", headers=_hdr(a_sid))
+        ok = client.get("/api/v1/admin/model-metadata", cookies=_cookie(a_sid))
         assert ok.status_code == 200
         assert "models" in ok.json()
-        denied = client.get("/api/v1/admin/model-metadata", headers=_hdr(u_sid))
+        denied = client.get("/api/v1/admin/model-metadata", cookies=_cookie(u_sid))
         assert denied.status_code == 403
 
     def test_audit_view_admin_only(self, client, admin_session, user_session):
         a_sid, _ = admin_session
         u_sid, _ = user_session
-        ok = client.get("/api/v1/admin/audit", headers=_hdr(a_sid))
+        ok = client.get("/api/v1/admin/audit", cookies=_cookie(a_sid))
         assert ok.status_code == 200
         assert "events" in ok.json()
-        denied = client.get("/api/v1/admin/audit", headers=_hdr(u_sid))
+        denied = client.get("/api/v1/admin/audit", cookies=_cookie(u_sid))
         assert denied.status_code == 403
 
 
@@ -397,7 +404,7 @@ class TestAdminAudit:
         client.post(
             "/api/v1/admin/controls",
             json={"domain": "retention", "key": "audit_probe", "value": 7},
-            headers=_hdr(sid),
+            cookies=_cookie(sid),
         )
         events = list_admin_audit(db_session)
         assert any(
@@ -444,7 +451,7 @@ class TestAdminAudit:
                 "key": "probe-key",
                 "value": {"note": secret_like},
             },
-            headers=_hdr(sid),
+            cookies=_cookie(sid),
         )
         blob = repr(list_admin_audit(db_session))
         assert secret_like not in blob
@@ -457,7 +464,7 @@ class TestAdminAudit:
         client.post(
             "/api/v1/admin/acquisition/run",
             json={"operation": "contracts"},
-            headers=_hdr(sid),
+            cookies=_cookie(sid),
         )
         events = list_admin_audit(db_session)
         assert any(

@@ -164,7 +164,14 @@ export default function AdminPage() {
           <Row label="Failures" value={data?.failed ?? 0} />
           <div style={{ marginTop: 10 }}>
             <Table
-              columns={["Run", "Operation", "Instrument", "Started", "Status", "Rows"]}
+              columns={[
+                { header: "Run", key: "run" },
+                { header: "Operation", key: "operation" },
+                { header: "Instrument", key: "instrument" },
+                { header: "Started", key: "started" },
+                { header: "Status", key: "status" },
+                { header: "Rows", key: "rows" },
+              ]}
               data={(data?.runs ?? []).map((r) => ({
                 id: `${r.run_id}-${r.instrument_key ?? ""}`,
                 run: r.run_id,
@@ -222,7 +229,12 @@ export default function AdminPage() {
         <div style={panel}>
           <div style={sectionTitle}>AUDIT ACTIVITY</div>
           <Table
-            columns={["Time", "Actor", "Action", "Result"]}
+            columns={[
+              { header: "Time", key: "time" },
+              { header: "Actor", key: "actor" },
+              { header: "Action", key: "action" },
+              { header: "Result", key: "result" },
+            ]}
             data={(data?.events ?? []).map((e) => ({
               id: e.id,
               time: e.occurred_at ?? "—",

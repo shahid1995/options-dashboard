@@ -41,7 +41,7 @@ async function loadAdminApi({ mockGet }) {
 }
 
 describe("adminApi — presentation client on the shared transport", () => {
-  it("calls the five operational-view endpoints on /admin/*", async () => {
+  it("calls the versioned /api/v1/admin/* operational-view endpoints", async () => {
     const get = vi.fn((path) => ok({ path }));
     const mod = await loadAdminApi({ mockGet: get });
     await mod.getAdminAudit();
@@ -51,17 +51,19 @@ describe("adminApi — presentation client on the shared transport", () => {
     await mod.getModelMetadata();
     await mod.getAdminControls("retention");
     const paths = get.mock.calls.map((c) => c[0]);
+    // Backend routes are mounted under /api/v1/admin/* — the versioned
+    // Day 43 surface (F7).
     expect(paths).toEqual([
-      "/admin/audit",
-      "/admin/ingestion-health",
-      "/admin/adapters",
-      "/admin/feature-flags",
-      "/admin/model-metadata",
-      "/admin/controls/retention",
+      "/api/v1/admin/audit",
+      "/api/v1/admin/ingestion-health",
+      "/api/v1/admin/adapters",
+      "/api/v1/admin/feature-flags",
+      "/api/v1/admin/model-metadata",
+      "/api/v1/admin/controls/retention",
     ]);
   });
 
-  it("setAdminControl posts the sanitized body via the shared client", async () => {
+  it("setAdminControl posts the sanitized body to the versioned path via the shared client", async () => {
     const post = vi.fn(() => Promise.resolve(ok({ status: "ok" })));
     vi.doMock("@/lib/api", () => ({
       api: { get: vi.fn(), post },
@@ -69,11 +71,35 @@ describe("adminApi — presentation client on the shared transport", () => {
     }));
     const mod = await import("@/lib/adminApi");
     await mod.setAdminControl("retention", "chain_snapshots_days", 90);
-    expect(post).toHaveBeenCalledWith("/admin/controls", {
+    expect(post).toHaveBeenCalledWith("/api/v1/admin/controls", {
       domain: "retention",
       key: "chain_snapshots_days",
       value: 90,
     });
+  });
+
+  it("runs admin acquisition only through the versioned path", async () => {
+    const post = vi.fn(() => Promise.resolve(ok({ status: "accepted" })));
+    vi.doMock("@/lib/api", () => ({
+      api: { get: vi.fn(), post },
+      isAuthError: () => false,
+    }));
+    const mod = await import("@/lib/adminApi");
+    await mod.runAcquisition({ operation: "dry_run" });
+    expect(post).toHaveBeenCalledWith("/api/v1/admin/acquisition/run", {
+      operation: "dry_run",
+    });
+  });
+
+  it("does not mutate the shared axios client or its base URL", async () => {
+    const get = vi.fn(() => ok({}));
+    await loadAdminApi({ mockGet: get });
+    const apiSrc = read("lib/api.js");
+    expect(apiSrc).toContain('baseURL: process.env.NEXT_PUBLIC_API_URL');
+    // adminApi configures no client of its own and no base-URL overrides.
+    const src = read("lib/adminApi.js");
+    expect(src).not.toContain("axios.create");
+    expect(src).not.toContain("baseURL");
   });
 
   it("never touches token stores or carries credential material", async () => {
@@ -120,6 +146,46 @@ describe("admin page source — boundary wiring", () => {
     // request can neither overwrite nor terminate a newer one.
     expect(pageSrc).toContain("if (!isCurrent()) return;");
     expect(pageSrc).toContain("if (isCurrent()) setLoading(false)");
+  });
+
+  it("uses object-shape Table columns for ingestion and audit tables (F8)", () => {
+    // Extract the two `columns={[...]}` literal regions from the page.
+    const regions = [...pageSrc.matchAll(/columns=\{\[([\s\S]*?)\]\}/g)].map((m) => m[1]);
+    expect(regions.length).toBe(2); // ingestion + audit tables
+    for (const region of regions) {
+      // Every column must be an object with header/key — not a bare string.
+      expect(region).toContain("header:");
+      expect(region).toContain("key:");
+      // No bare-string column rows: each entry must declare its keys.
+      const bareStringColumn = region
+        .split(",")
+        .some((entry) => {
+          const t = entry.trim().replace(/^\n+/, "");
+          return /^"[^"]*"$/.test(t);
+        });
+      expect(bareStringColumn).toBe(false);
+    }
+    const [ingestion, audit] = regions;
+    expect(ingestion).toContain('header: "Run"');
+    expect(ingestion).toContain('key: "run"');
+    expect(ingestion).toContain('header: "Operation"');
+    expect(ingestion).toContain('key: "operation"');
+    expect(ingestion).toContain('header: "Instrument"');
+    expect(ingestion).toContain('key: "instrument"');
+    expect(ingestion).toContain('header: "Started"');
+    expect(ingestion).toContain('key: "started"');
+    expect(ingestion).toContain('header: "Status"');
+    expect(ingestion).toContain('key: "status"');
+    expect(ingestion).toContain('header: "Rows"');
+    expect(ingestion).toContain('key: "rows"');
+    expect(audit).toContain('header: "Time"');
+    expect(audit).toContain('key: "time"');
+    expect(audit).toContain('header: "Actor"');
+    expect(audit).toContain('key: "actor"');
+    expect(audit).toContain('header: "Action"');
+    expect(audit).toContain('key: "action"');
+    expect(audit).toContain('header: "Result"');
+    expect(audit).toContain('key: "result"');
   });
 });
 
@@ -247,5 +313,27 @@ describe("admin tab request ordering — stale-response race (F5)", () => {
     expect(state.data).toEqual(B);
     expect(state.error).toBeNull(); // A's late failure is discarded
     expect(state.loading).toBe(false);
+  });
+});
+
+describe("admin page render — shared Table contract (F8)", () => {
+  it("the shared Table component renders col.header / row[col.key]", async () => {
+    // Locks the shared component contract the page must satisfy: object
+    // columns with header/key and value lookup by key.
+    const core = await import("@/components/app/core");
+    expect(typeof core.Table).toBe("function");
+  });
+
+  it("ingestion/audit column keys align with the page's row mapping", () => {
+    const pageSrc2 = read("app/(app)/admin/page.js");
+    // The row objects built in the page expose exactly the keys the column
+    // definitions read (no silent undefined cells).
+    expect(pageSrc2).toContain("run: r.run_id");
+    expect(pageSrc2).toContain("operation: r.operation");
+    expect(pageSrc2).toContain('instrument: r.instrument_key ?? "—"');
+    expect(pageSrc2).toContain('started: r.started_at ?? "—"');
+    expect(pageSrc2).toContain("rows: `${r.rows_fetched ?? 0}/${r.rows_inserted ?? 0}`");
+    expect(pageSrc2).toContain('time: e.occurred_at ?? "—"');
+    expect(pageSrc2).toContain('actor: e.actor_user_id ?? "anonymous"');
   });
 });

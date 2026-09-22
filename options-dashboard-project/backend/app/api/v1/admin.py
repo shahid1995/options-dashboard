@@ -61,9 +61,9 @@ def _audit_denied_admin_attempt(
     from app.routers.deps import SESSION_COOKIE_NAME, _canonical_session_id
     from app.identity import get_active_session, User
 
-    sid = _canonical_session_id(
-        request.headers.get("x-session-id"), request.cookies.get(SESSION_COOKIE_NAME)
-    )
+    # F6: the privileged admin boundary is cookie-only — the prohibited
+    # header transport never identifies an actor for admin actions.
+    sid = request.cookies.get(SESSION_COOKIE_NAME)
     actor = None
     if sid:
         session = get_active_session(db, sid)
@@ -100,7 +100,7 @@ def _admin_guarded(action: str):
         try:
             principal = AdminUser()(
                 db=db,
-                x_session_id=request.headers.get("x-session-id"),
+                x_session_id=None,  # F6: admin is cookie-only — never the header
                 session_id_cookie=request.cookies.get(SESSION_COOKIE_NAME),
             )
         except HTTPException:
