@@ -115,6 +115,10 @@ def test_init_db_uses_alembic(monkeypatch, temp_engine):
     assert "order_family_sync_lock" in tables
     assert "broker_authorizations" in tables
 
+    # Day 45 admin control plane (Issue #90) adds its two tables.
+    assert "admin_controls" in tables
+    assert "admin_audit_events" in tables
+
     # 42 application tables + alembic_version.
     # History: 24 app tables at the Phase 10.1B Alembic cutover; 37 after the
     # broker_sync expansions; 39 after Day41.2 (order_family_sync_lock +
@@ -122,7 +126,7 @@ def test_init_db_uses_alembic(monkeypatch, temp_engine):
     # c1d2e3f4a5b6 added email_verification_tokens, password_reset_tokens,
     # pending_email_changes, security_events; 49 since Issue #17 research
     # schema e9f8a7b6c5d4 added the six gap_* research tables (research-only).
-    assert len(tables) == 49
+    assert len(tables) ==  51
 
 
 def test_init_db_creates_legacy_columns_via_baseline(monkeypatch, temp_engine):

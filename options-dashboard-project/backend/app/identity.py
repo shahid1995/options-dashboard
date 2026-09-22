@@ -15,7 +15,8 @@ import os
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, UniqueConstraint, event
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, event
+from sqlalchemy import false as sa_false
 from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 from sqlalchemy.types import TypeDecorator
 
@@ -74,6 +75,12 @@ class User(Base):
     broker_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     broker_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     google_sub: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    # Day 45 admin principal: EXPLICIT platform-admin flag, set only through
+    # the durable DB column (Founder/ops bootstrap — no API, OAuth flow, or
+    # broker linkage can grant it). Admin authority is never inferred from
+    # tenant ownership (a user's own BrokerConnection/authorization is not
+    # an admin credential). Default False for every existing user.
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, server_default=sa_false(), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -201,6 +208,74 @@ def _security_events_are_immutable(mapper, connection, target):
     """Fail closed: security-event rows are never updated in place."""
     raise RuntimeError(
         "security_events rows are append-only; update attempts are rejected"
+    )
+
+
+class AdminControl(Base):
+    """Day 45 — admin-owned platform control (instrument/configuration/
+    retention/feature-flag) with versioning.
+
+    One row per (domain, key). Each admin write bumps ``version`` and
+    records who changed it; ``history`` is the append-only change ledger
+    (entries are sanitized before storage — no secret material is ever
+    accepted). Domains are a closed set validated by the service layer.
+    Ordinary users have no read or write path to these rows.
+    """
+
+    __tablename__ = "admin_controls"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    domain: Mapped[str] = mapped_column(String(32), index=True)
+    key: Mapped[str] = mapped_column(String(128), index=True)
+    value: Mapped[dict] = mapped_column(JSONText, default=dict)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    updated_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    # Append-only change ledger: [{version, value, by, at}]
+    history: Mapped[list] = mapped_column(JSONText, default=list)
+
+    __table_args__ = (
+        UniqueConstraint("domain", "key", name="uq_admin_controls_domain_key"),
+    )
+
+
+class AdminAuditEvent(Base):
+    """Day 45 — durable audit record for material admin actions.
+
+    Append-only (same immutability posture as SecurityEvent). Stores actor
+    (users.id), action, structured target, result, and time. NEVER stores
+    credential material: values are sanitized through the same redaction
+    rules as the secret-free SecurityEvent metadata (keys that look like
+    tokens/secrets are dropped, string values shaped like credentials are
+    replaced with a placeholder) — see app/services/admin_audit.py.
+    """
+
+    __tablename__ = "admin_audit_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    actor_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    action: Mapped[str] = mapped_column(String(64), index=True)
+    target: Mapped[dict] = mapped_column(JSONText, default=dict)
+    result: Mapped[str] = mapped_column(String(16), default="success", index=True)
+    detail: Mapped[dict] = mapped_column(JSONText, default=dict)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial
+        return (
+            f"AdminAuditEvent(id={self.id!r}, action={self.action!r}, "
+            f"result={self.result!r}, occurred_at={self.occurred_at!r})"
+        )
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return repr(self)
+
+
+@event.listens_for(AdminAuditEvent, "before_update")
+def _admin_audit_events_are_immutable(mapper, connection, target):
+    """Fail closed: admin-audit rows are never updated in place."""
+    raise RuntimeError(
+        "admin_audit_events rows are append-only; update attempts are rejected"
     )
 
 

@@ -376,6 +376,12 @@ from app.api.v1.errors import install_v1_error_handlers  # noqa: E402
 install_v1_error_handlers(app)
 app.include_router(chains_v1_router, prefix=API_VERSION_PREFIX, tags=["chains-v1"])
 
+# Day 45: admin control plane (Issue #90) — every route enforces the
+# server-side AdminUser boundary; operational views are admin-scoped.
+from app.api.v1.admin import router as admin_v1_router  # noqa: E402  (after app creation)
+
+app.include_router(admin_v1_router, prefix=API_VERSION_PREFIX + "/admin", tags=["admin"])
+
 app.include_router(auth.router, prefix="/auth", tags=["auth"])
 from app.routers import broker_diagnostics  # noqa: E402  (after app creation)
 

@@ -133,3 +133,34 @@ class CurrentUser:
     ) -> AuthenticatedUser:
         sid = _extract_session_id(x_session_id, session_id_cookie)
         return _resolve_user(db, sid)
+
+
+class AdminUser:
+    """Day 45 — explicit admin authorization boundary (server-enforced).
+
+    Resolves the SAME authenticated principal as ``CurrentUser`` and then
+    additionally requires the durable ``users.is_admin`` flag BEFORE any
+    admin work runs. Admin authority is never inferred from tenant
+    ownership (BrokerConnection/authorization), broker linkage, or session
+    transport — only the explicit flag grants the control plane. Raises
+    401 (anonymous), 403 (authenticated non-admin / disabled account).
+
+    Usage::
+
+        user: AuthenticatedUser = Depends(AdminUser())
+    """
+
+    def __call__(
+        self,
+        db: Session = Depends(get_db),
+        x_session_id: str | None = Header(default=None),
+        session_id_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
+    ) -> AuthenticatedUser:
+        sid = _extract_session_id(x_session_id, session_id_cookie)
+        user = _resolve_user(db, sid)
+        from app.identity import User as UserModel
+
+        row = db.query(UserModel).filter(UserModel.id == user.user_id).one_or_none()
+        if row is None or not bool(row.is_admin):
+            raise HTTPException(status_code=403, detail="Admin privileges required.")
+        return user
