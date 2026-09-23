@@ -1,4 +1,4 @@
-"""PR #91 remediation regressions (Issue #90 review findings 1–4).
+"""PR #91 remediation regressions (Issue #90 review findings 1–11).
 
 F1 — dry-run recognition: `{"operation": "dry_run"}` must be treated as a
      dry run even when `dry_run` is omitted; the platform-credential gate
@@ -205,14 +205,18 @@ class TestF2AtomicControlAudit:
 class TestF3AppendOnlyHistory:
     def test_history_beyond_50_versions_keeps_earliest_entry(self, db_session):
         from app.services import admin_controls
-        from app.services.admin_controls import set_control_and_audit
+        from app.services.admin_controls import ControlValueRejected, set_control_and_audit
 
         actor = "admin-history"
+        # Secretish KEY shape (contains "session") carrying non-secret values:
+        # under the pre-F9 implementation the audit sanitizer stripped every
+        # value on this key into {}.  Authoritative storage must keep each
+        # submitted value verbatim across the whole ledger (PR #91 F9/F10).
         for i in range(1, 61):  # 60 updates
             set_control_and_audit(
                 db_session,
                 domain="configuration",
-                key="history_probe",
+                key="session_cache_limit",
                 value=i,
                 updated_by=actor,
                 audit_action="controls.set",
@@ -221,7 +225,7 @@ class TestF3AppendOnlyHistory:
             db_session.query(admin_controls.AdminControl)
             .filter(
                 admin_controls.AdminControl.domain == "configuration",
-                admin_controls.AdminControl.key == "history_probe",
+                admin_controls.AdminControl.key == "session_cache_limit",
             )
             .one()
         )
@@ -231,8 +235,38 @@ class TestF3AppendOnlyHistory:
         assert min(versions) == 1  # earliest recorded version still present
         assert versions == sorted(versions)
         assert versions[-1] == 60
-        # Historical values remain sanitized — no secret-shaped material.
-        assert "tok-secret-analytics-value" not in repr(row.history)
+        # Append-only ledger stays complete and authoritative (F9): every
+        # historical entry equals the exact submitted integer — never an
+        # audit-redacted placeholder.
+        assert [h["value"] for h in row.history] == list(range(1, 61))
+        assert row.value == {"v": 60}
+        # A genuinely credential-shaped VALUE is rejected outright and appends
+        # nothing to the ledger — secret material can never reach storage (F10:
+        # the security assertion rides an actual secret-shaped input).
+        secret = "tok-super-secret-analytics-value-7710"
+        with pytest.raises(ControlValueRejected):
+            set_control_and_audit(
+                db_session,
+                domain="configuration",
+                key="session_cache_limit",
+                value={"analytics_token": secret},
+                updated_by=actor,
+            )
+        db_session.expire_all()
+        row2 = (
+            db_session.query(admin_controls.AdminControl)
+            .filter(
+                admin_controls.AdminControl.domain == "configuration",
+                admin_controls.AdminControl.key == "session_cache_limit",
+            )
+            .one()
+        )
+        assert row2.version == 60
+        assert len(row2.history) == 60  # the rejected write appended nothing
+        # The refused secret appears NOWHERE in the authoritative store: not
+        # in the current value, not in any of the 60 retained history entries.
+        assert secret not in repr(row2.value)
+        assert secret not in repr(row2.history)
 
 
 # ---------------------------------------------------------------------------
@@ -454,3 +488,186 @@ class TestF6CookieOnlyAdminAuth:
         sid, _uid = admin_session
         resp = client.get("/auth/status", headers={"X-Session-Id": sid})
         assert resp.status_code == 200
+        # Prove real authentication, not a 200-for-anonymous response
+        # (PR #91 F11): the legacy header path must actually resolve the
+        # session for non-admin routes.
+        assert resp.json()["logged_in"] is True
+
+
+# ---------------------------------------------------------------------------
+# F9 — control values are validated, not audit-sanitized, before persistence
+# ---------------------------------------------------------------------------
+
+
+class TestF9ControlValueIntegrity:
+    """PR #91 F9: authoritative control values must survive persistence
+    exactly.  Audit redaction must never mutate stored configuration, and
+    credential-bearing values must be REJECTED (422) — never transformed
+    into different stored values.
+    """
+
+    def test_legitimate_session_config_persists_exactly(self, db_session):
+        from app.services.admin_controls import get_control_value, set_control_and_audit
+
+        value = {"session_timeout": 30}
+        set_control_and_audit(
+            db_session,
+            domain="configuration",
+            key="api_session",
+            value=value,
+            updated_by="admin-f9",
+        )
+        stored = get_control_value(db_session, "configuration", "api_session")
+        assert stored == value
+
+    def test_legitimate_session_config_persists_exactly_via_api(self, client, admin_session):
+        sid, _user = admin_session
+        resp = client.post(
+            "/api/v1/admin/controls",
+            json={
+                "domain": "configuration",
+                "key": "ui_session",
+                "value": {"session_timeout": 30},
+            },
+            cookies=_cookie(sid),
+        )
+        assert resp.status_code == 200
+        assert resp.json()["control"]["value"] == {"session_timeout": 30}
+        read = client.get("/api/v1/admin/controls/configuration", cookies=_cookie(sid))
+        stored = {c["key"]: c["value"] for c in read.json()["controls"]}["ui_session"]
+        assert stored == {"session_timeout": 30}
+
+    def test_history_preserves_authoritative_non_secret_value(self, db_session):
+        from app.services import admin_controls
+        from app.services.admin_controls import set_control_and_audit
+
+        set_control_and_audit(
+            db_session,
+            domain="configuration",
+            key="auth_session",
+            value={"session_timeout": 45},
+            updated_by="admin-f9",
+        )
+        row = (
+            db_session.query(admin_controls.AdminControl)
+            .filter(
+                admin_controls.AdminControl.domain == "configuration",
+                admin_controls.AdminControl.key == "auth_session",
+            )
+            .one()
+        )
+        assert row.history[-1]["value"] == {"session_timeout": 45}
+
+    def test_credential_bearing_control_is_rejected_with_422(self, client, admin_session, db_session):
+        from app.services import admin_controls
+
+        sid, _user = admin_session
+        resp = client.post(
+            "/api/v1/admin/controls",
+            json={
+                "domain": "configuration",
+                "key": "probe",
+                "value": {"analytics_token": "tok-super-secret-abc123456"},
+            },
+            cookies=_cookie(sid),
+        )
+        assert resp.status_code == 422
+        body = resp.json()
+        code = body.get("code") or (body.get("error") or {}).get("code")
+        assert code == "CONTROL_VALUE_REJECTED"
+        rows = (
+            db_session.query(admin_controls.AdminControl)
+            .filter(
+                admin_controls.AdminControl.domain == "configuration",
+                admin_controls.AdminControl.key == "probe",
+            )
+            .all()
+        )
+        assert rows == []  # no durable control value, no durable history
+
+    def test_rejected_secret_never_reaches_authoritative_storage(self, client, admin_session, db_session):
+        from app.services import admin_controls
+
+        sid, _user = admin_session
+        secret = "tok-super-secret-analytics-token-9999"
+        client.post(
+            "/api/v1/admin/controls",
+            json={
+                "domain": "retention",
+                "key": "probe2",
+                "value": {"access_token": secret},
+            },
+            cookies=_cookie(sid),
+        )
+        blob = repr(
+            db_session.query(admin_controls.AdminControl)
+            .filter(
+                admin_controls.AdminControl.domain == "retention",
+                admin_controls.AdminControl.key == "probe2",
+            )
+            .all()
+        )
+        assert secret not in blob
+        assert "probe2" not in blob  # nothing was persisted at all
+
+    def test_nested_secret_key_rejected_service_level(self, db_session):
+        from app.services import admin_controls
+        from app.services.admin_controls import ControlValueRejected, set_control_and_audit
+
+        with pytest.raises(ControlValueRejected):
+            set_control_and_audit(
+                db_session,
+                domain="retention",
+                key="nested",
+                value={"retry": {"password": "hunter2-secret-value"}},
+                updated_by="admin-f9",
+            )
+        assert (
+            db_session.query(admin_controls.AdminControl)
+            .filter(
+                admin_controls.AdminControl.domain == "retention",
+                admin_controls.AdminControl.key == "nested",
+            )
+            .one_or_none()
+            is None
+        )
+
+    def test_flat_secret_string_under_innocent_key_is_rejected(self, db_session):
+        """A credential-shaped VALUE under an innocent KEY is refused (F9 D).
+
+        Key-name detection alone is not enough: a raw bearer/token string
+        stashed under an innocuous key must also be rejected outright, never
+        persisted under a different value and never accepted silently.
+        """
+        from app.services import admin_controls
+        from app.services.admin_controls import ControlValueRejected, set_control_and_audit
+
+        secret = "tok-super-secret-analytics-value-7710"
+        with pytest.raises(ControlValueRejected):
+            set_control_and_audit(
+                db_session,
+                domain="configuration",
+                key="plain_note",
+                value=secret,
+                updated_by="admin-f9",
+            )
+        # No durable control value, no durable history entry.
+        assert (
+            db_session.query(admin_controls.AdminControl)
+            .filter(
+                admin_controls.AdminControl.domain == "configuration",
+                admin_controls.AdminControl.key == "plain_note",
+            )
+            .one_or_none()
+            is None
+        )
+
+    def test_plain_values_remain_accepted(self, client, admin_session):
+        sid, _user = admin_session
+        for v in [90, 3000, True, "strict", None, {"max_rows": 5000, "batch": [1, 2, 3]}]:
+            resp = client.post(
+                "/api/v1/admin/controls",
+                json={"domain": "retention", "key": "plain", "value": v},
+                cookies=_cookie(sid),
+            )
+            assert resp.status_code == 200, f"legitimate value {v!r} was rejected"

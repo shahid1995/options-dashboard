@@ -440,11 +440,16 @@ class TestAdminAudit:
         assert ev["target"]["operation"] == "contracts"
 
     def test_audit_records_never_contain_secrets(self, client, admin_session, db_session):
+        """Audit redaction still holds even when a control write is refused (F9).
+
+        Credential-bearing control input is REJECTED (422, no mutation); the
+        refused secret must not surface in any audit record either.
+        """
         from app.services.admin_audit import list_admin_audit
 
         sid, _user = admin_session
         secret_like = "tok-super-secret-analytics-token"
-        client.post(
+        resp = client.post(
             "/api/v1/admin/controls",
             json={
                 "domain": "configuration",
@@ -453,6 +458,7 @@ class TestAdminAudit:
             },
             cookies=_cookie(sid),
         )
+        assert resp.status_code == 422
         blob = repr(list_admin_audit(db_session))
         assert secret_like not in blob
 

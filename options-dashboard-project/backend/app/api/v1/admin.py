@@ -36,6 +36,7 @@ from app.routers.deps import AdminUser, AuthenticatedUser
 from app.services.admin_audit import list_admin_audit, record_admin_action
 from app.services.admin_controls import (
     CONTROL_DOMAINS,
+    ControlValueRejected,
     UnknownControlDomain,
     list_controls,
     require_platform_admin,
@@ -301,6 +302,14 @@ def create_or_update_control(
         )
     except UnknownControlDomain as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ControlValueRejected as exc:
+        # PR #91 F9: credential-bearing control values are REJECTED, never
+        # transformed — no control mutation, no secret persistence. The
+        # domain code rides the Day 43 envelope's ``error_code`` extension
+        # point so /api/v1 consumers get CONTROL_VALUE_REJECTED.
+        http_exc = HTTPException(status_code=422, detail=str(exc))
+        http_exc.error_code = "CONTROL_VALUE_REJECTED"  # Day 43 envelope extension point
+        raise http_exc from exc
     return {"status": "ok", "control": row}
 
 
