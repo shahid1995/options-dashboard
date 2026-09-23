@@ -1,0 +1,239 @@
+{
+  "name": "StrikeNova Engineering Rules",
+  "description": "Project-specific review rules for StrikeNova options trading platform",
+  "version": "1.0.0",
+  "rules": [
+    {
+      "id": "SEC-001",
+      "category": "security",
+      "severity": "critical",
+      "title": "Credential exposure in logs or responses",
+      "description": "Never log, print, or expose API keys, tokens, passwords, session IDs, or other credentials in responses, logs, or error messages.",
+      "check": "Verify that no credential material is logged or returned in API responses."
+    },
+    {
+      "id": "SEC-002",
+      "category": "security",
+      "severity": "critical",
+      "title": "SQL injection risk",
+      "description": "Database queries must use parameterized queries or ORM. Never construct SQL via string concatenation with user input.",
+      "check": "Verify all database queries use parameterized statements or ORM methods."
+    },
+    {
+      "id": "SEC-003",
+      "category": "security",
+      "severity": "high",
+      "title": "Missing authentication/authorization check",
+      "description": "API endpoints that access user data must verify authentication and authorization. Broker operations must verify broker connection ownership.",
+      "check": "Verify endpoints check authentication and resource ownership."
+    },
+    {
+      "id": "SEC-004",
+      "category": "security",
+      "severity": "high",
+      "title": "Unsafe session handling",
+      "description": "Session IDs must be cryptographically strong and stored hashed. The only browser session transport is the HttpOnly strikenova_session cookie.",
+      "check": "Verify session handling follows ADR-007 and SECURITY.md requirements."
+    },
+    {
+      "id": "SEC-005",
+      "category": "security",
+      "severity": "high",
+      "title": "Broker token exposure",
+      "description": "Broker tokens must be encrypted at rest and never exposed to the frontend or logged.",
+      "check": "Verify broker tokens are encrypted and never returned to clients."
+    },
+    {
+      "id": "SEC-006",
+      "category": "security",
+      "severity": "high",
+      "title": "Missing input validation",
+      "description": "All API inputs must be validated. Financial amounts, quantities, and symbols must be validated for type, range, and format.",
+      "check": "Verify input validation on all API endpoints."
+    },
+    {
+      "id": "SEC-007",
+      "category": "security",
+      "severity": "medium",
+      "title": "CORS misconfiguration",
+      "description": "CORS must not allow arbitrary origins in production. Verify FRONTEND_URL is used for CORS configuration.",
+      "check": "Verify CORS is properly configured for production."
+    },
+    {
+      "id": "AUTH-001",
+      "category": "security",
+      "severity": "critical",
+      "title": "OAuth state validation missing",
+      "description": "Broker OAuth state must be HMAC-signed with session binding and TTL. Unsigned state must be rejected.",
+      "check": "Verify OAuth state validation follows ADR-008."
+    },
+    {
+      "id": "AUTH-002",
+      "category": "security",
+      "severity": "high",
+      "title": "Session fixation risk",
+      "description": "Session IDs must be regenerated on login. Old sessions must be invalidated on password change.",
+      "check": "Verify session regeneration on authentication events."
+    },
+    {
+      "id": "DB-001",
+      "category": "bug",
+      "severity": "critical",
+      "title": "Database migration without Alembic",
+      "description": "Schema changes must go through Alembic migrations. No ad-hoc DDL in application code.",
+      "check": "Verify schema changes use Alembic migrations per ADR-002."
+    },
+    {
+      "id": "DB-002",
+      "category": "bug",
+      "severity": "high",
+      "title": "Missing transaction boundary",
+      "description": "Multi-step database operations must use transactions. Verify rollback on failure.",
+      "check": "Verify transaction boundaries for multi-step operations."
+    },
+    {
+      "id": "DB-003",
+      "category": "bug",
+      "severity": "high",
+      "title": "Race condition in concurrent access",
+      "description": "Shared resources (positions, balances, orders) must handle concurrent access. Verify locking or atomic operations.",
+      "check": "Verify concurrency control for shared resources."
+    },
+    {
+      "id": "DB-004",
+      "category": "bug",
+      "severity": "medium",
+      "title": "N+1 query pattern",
+      "description": "Avoid N+1 queries in list endpoints. Use eager loading or batch queries.",
+      "check": "Verify efficient query patterns."
+    },
+    {
+      "id": "FIN-001",
+      "category": "bug",
+      "severity": "critical",
+      "title": "Financial calculation precision",
+      "description": "Financial calculations must use Decimal, not float. Verify precision for prices, quantities, and P&L.",
+      "check": "Verify Decimal usage for all financial calculations."
+    },
+    {
+      "id": "FIN-002",
+      "category": "bug",
+      "severity": "critical",
+      "title": "Incorrect GEX convention",
+      "description": "GEX calculations must follow docs/GEX_V1_0_SPEC.md. Verify sign conventions, flip/wall definitions, and aggregation windows.",
+      "check": "Verify GEX calculations match the specification."
+    },
+    {
+      "id": "FIN-003",
+      "category": "bug",
+      "severity": "high",
+      "title": "Timezone handling error",
+      "description": "Use IST for market context and UTC for storage. No naive datetime.now() in production paths.",
+      "check": "Verify timezone handling per ADR-017."
+    },
+    {
+      "id": "FIN-004",
+      "category": "bug",
+      "severity": "high",
+      "title": "Paper trade not server-authoritative",
+      "description": "Paper trading balances, positions, exits, and P&L must be computed server-side. Client is renderer only.",
+      "check": "Verify server-authoritative paper trading per ADR-009."
+    },
+    {
+      "id": "WS-001",
+      "category": "bug",
+      "severity": "high",
+      "title": "WebSocket session authentication missing",
+      "description": "WebSocket connections must authenticate via cookie. Never accept session credentials from Sec-WebSocket-Protocol.",
+      "check": "Verify WebSocket authentication uses cookies per ADR-007."
+    },
+    {
+      "id": "WS-002",
+      "category": "bug",
+      "severity": "medium",
+      "title": "WebSocket connection leak",
+      "description": "WebSocket connections must be properly closed on disconnect. Verify cleanup in finally blocks.",
+      "check": "Verify WebSocket connection cleanup."
+    },
+    {
+      "id": "API-001",
+      "category": "bug",
+      "severity": "high",
+      "title": "Missing error handling",
+      "description": "API endpoints must handle errors gracefully. No unhandled exceptions leaking stack traces.",
+      "check": "Verify error handling on all endpoints."
+    },
+    {
+      "id": "API-002",
+      "category": "bug",
+      "severity": "high",
+      "title": "Incorrect HTTP status code",
+      "description": "Use appropriate HTTP status codes: 200 for success, 400 for bad request, 401 for unauthorized, 403 for forbidden, 404 for not found, 500 for server error.",
+      "check": "Verify correct HTTP status codes."
+    },
+    {
+      "id": "API-003",
+      "category": "bug",
+      "severity": "medium",
+      "title": "Missing rate limiting",
+      "description": "API endpoints must have rate limiting. Verify rate limiter is applied.",
+      "check": "Verify rate limiting on API endpoints."
+    },
+    {
+      "id": "TEST-001",
+      "category": "test",
+      "severity": "high",
+      "title": "Missing test coverage for new code",
+      "description": "New features and bug fixes must include tests. Verify test coverage for changed code.",
+      "check": "Verify tests exist for new functionality."
+    },
+    {
+      "id": "TEST-002",
+      "category": "test",
+      "severity": "medium",
+      "title": "No regression test for bug fix",
+      "description": "Bug fixes must include a regression test that would have caught the bug.",
+      "check": "Verify regression tests for bug fixes."
+    },
+    {
+      "id": "TEST-003",
+      "category": "test",
+      "severity": "medium",
+      "title": "Missing security test",
+      "description": "Security-related changes must include security tests. Verify auth, authorization, and input validation tests.",
+      "check": "Verify security test coverage."
+    },
+    {
+      "id": "PERF-001",
+      "category": "performance",
+      "severity": "medium",
+      "title": "Unbounded query result",
+      "description": "Database queries must have limits. Verify pagination or LIMIT clauses.",
+      "check": "Verify query result limits."
+    },
+    {
+      "id": "PERF-002",
+      "category": "performance",
+      "severity": "medium",
+      "title": "Missing index for query",
+      "description": "Frequently queried columns must have indexes. Verify index usage.",
+      "check": "Verify database indexes for common queries."
+    },
+    {
+      "id": "MAINT-001",
+      "category": "maintainability",
+      "severity": "medium",
+      "title": "Hardcoded configuration",
+      "description": "Configuration must use environment variables. No hardcoded URLs, keys, or paths.",
+      "check": "Verify configuration uses environment variables."
+    },
+    {
+      "id": "MAINT-002",
+      "category": "maintainability",
+      "severity": "low",
+      "title": "Missing type hints",
+      "description": "Python functions should have type hints for parameters and return values.",
+      "check": "Verify type hints on public APIs."
+    }
+  ]
+}
