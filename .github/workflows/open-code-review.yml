@@ -1,0 +1,56 @@
+name: OpenCodeReview PR Review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
+
+jobs:
+  open-code-review:
+    name: OpenCodeReview Analysis
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      pull-requests: write
+    
+    concurrency:
+      group: open-code-review-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
+    
+    steps:
+      - name: Run OpenCodeReview
+        uses: alibaba/open-code-review@bccbc15f785269400735d5255540c231e6c02b6d # v1.12.9
+        with:
+          # Pin OCR CLI version for reproducibility
+          ocr_version: '1.12.9'
+          
+          # LLM configuration (secrets/variables configured in repo settings)
+          llm_url: ${{ secrets.OCR_LLM_URL }}
+          llm_auth_token: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
+          llm_model: ${{ vars.OCR_LLM_MODEL }}
+          llm_use_anthropic: ${{ vars.OCR_LLM_USE_ANTHROPIC }}
+          
+          # Review quality
+          effort: high
+          review_concurrency: 5
+          
+          # Non-destructive incremental review
+          sticky_summary: 'true'
+          incremental: 'true'
+          incremental_overlap_threshold: '0.6'
+          
+          # Progress and artifacts
+          stream_progress: 'true'
+          upload_artifacts: 'true'
+          
+          # Custom rules for StrikeNova
+          rule: .github/open-code-review-rules.json
+          
+          # GitHub token for posting comments
+          github_token: ${{ github.token }}
+          
+          # Timeouts
+          llm_timeout: '300'
+          review_task_timeout: '15'
