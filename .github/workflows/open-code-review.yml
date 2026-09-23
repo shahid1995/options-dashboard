@@ -73,7 +73,7 @@ jobs:
           github-token: ${{ github.token }}
           script: |
             const prNumber = context.issue.number;
-            const { data: pr } = await context.octokit.pulls.get({
+            const { data: pr } = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: prNumber,
