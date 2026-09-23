@@ -63,7 +63,13 @@ _CREDENTIAL_VALUE_VOCAB = re.compile(
     r"(token|secret|credential|password|passwd|api[-_]?key|apikey|authorization|bearer)",
     re.IGNORECASE,
 )
-_WORD_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+_WORD_CHARS = set(
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789"
+)  # ``_``/``-`` are SEPARATORS, not word characters (PR #91 F12): compound
+# credential keys such as ``analytics_token``/``access-token`` must split
+# into words so the credential-tail check can see them.
 
 
 def _key_segments(key: str) -> list[str]:

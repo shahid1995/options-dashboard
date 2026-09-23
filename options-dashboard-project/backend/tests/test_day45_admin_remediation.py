@@ -671,3 +671,121 @@ class TestF9ControlValueIntegrity:
                 cookies=_cookie(sid),
             )
             assert resp.status_code == 200, f"legitimate value {v!r} was rejected"
+
+
+# ---------------------------------------------------------------------------
+# F12 — compound credential KEYS cannot bypass validation via _/- segmentation
+# ---------------------------------------------------------------------------
+
+
+class TestF12CredentialKeyBypass:
+    """PR #91 F12: under the old segmentation ``_``/``-`` counted as word
+    characters, so compound credential keys such as ``analytics_token`` were
+    a SINGLE segment and the credential-tail check missed them entirely.
+    Every case below uses a deliberately SHORT value ("abc", "xyz", "pwd",
+    "key") so rejection proves KEY-based detection — not the value-shape
+    heuristic the previous tests accidentally rode on."""
+
+    def _row(self, db, domain, key):
+        from app.identity import AdminControl
+
+        return (
+            db.query(AdminControl)
+            .filter(AdminControl.domain == domain, AdminControl.key == key)
+            .one_or_none()
+        )
+
+    @pytest.mark.parametrize(
+        ("payload", "label"),
+        [
+            ({"analytics_token": "abc"}, "analytics_token"),
+            ({"access_token": "xyz"}, "access_token"),
+            ({"admin_password": "pwd"}, "admin_password"),
+            ({"access-token": "key"}, "access-token"),
+        ],
+    )
+    def test_short_credential_keys_are_rejected_service_level(
+        self, db_session, payload, label
+    ):
+        from app.services.admin_controls import ControlValueRejected, set_control_and_audit
+
+        control_key = f"f12-{label}"
+        # Pre-existing valid control state on a DIFFERENT key must remain
+        # completely untouched by the rejection.
+        set_control_and_audit(
+            db_session,
+            domain="configuration",
+            key="f12_keep",
+            value={"session_timeout": 30},
+            updated_by="admin-f12",
+            audit_action="controls.set",
+        )
+        keep_before = self._row(db_session, "configuration", "f12_keep")
+        version_before = keep_before.version
+        history_before = list(keep_before.history)
+
+        with pytest.raises(ControlValueRejected):
+            set_control_and_audit(
+                db_session,
+                domain="configuration",
+                key=control_key,
+                value=payload,
+                updated_by="admin-f12",
+                audit_action="controls.set",
+            )
+
+        # The rejected credential-bearing value reaches NO durable storage:
+        # no new AdminControl row/version, no history entry, and the valid
+        # control state + its history are unchanged.
+        assert self._row(db_session, "configuration", control_key) is None
+        db_session.expire_all()
+        assert self._row(db_session, "configuration", control_key) is None
+        keep_after = self._row(db_session, "configuration", "f12_keep")
+        assert keep_after.version == version_before
+        assert list(keep_after.history) == history_before
+        assert label not in repr(keep_after.history)
+
+    def test_short_credential_key_rejected_via_api(self, client, admin_session, db_session):
+        from app.services import admin_controls
+
+        sid, _user = admin_session
+        resp = client.post(
+            "/api/v1/admin/controls",
+            json={
+                "domain": "configuration",
+                "key": "f12-api-probe",
+                "value": {"analytics_token": "abc"},
+            },
+            cookies=_cookie(sid),
+        )
+        assert resp.status_code == 422
+        body = resp.json()
+        code = body.get("code") or (body.get("error") or {}).get("code")
+        assert code == "CONTROL_VALUE_REJECTED"  # Day 43 envelope code
+        rows = (
+            db_session.query(admin_controls.AdminControl)
+            .filter(
+                admin_controls.AdminControl.domain == "configuration",
+                admin_controls.AdminControl.key == "f12-api-probe",
+            )
+            .all()
+        )
+        assert rows == []  # no durable control record, no durable history
+
+    def test_legitimate_compound_keys_remain_accepted(self, db_session):
+        from app.services.admin_controls import get_control_value, set_control_and_audit
+
+        for key, value in [
+            ("session_timeout", 30),
+            ("session_cache_limit", 500),
+            ("cache_key_size", 256),
+        ]:
+            set_control_and_audit(
+                db_session,
+                domain="configuration",
+                key=key,
+                value=value,
+                updated_by="admin-f12",
+                audit_action="controls.set",
+            )
+            assert get_control_value(db_session, "configuration", key) == value
