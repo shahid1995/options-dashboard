@@ -586,11 +586,16 @@ class TestF9ControlValueIntegrity:
         assert rows == []  # no durable control value, no durable history
 
     def test_rejected_secret_never_reaches_authoritative_storage(self, client, admin_session, db_session):
+        """Rejected credential input proves all three boundaries: the request
+        is REJECTED (422), the secret is NOT RETURNED, and NO durable control
+        row/history exists. Persistence is proven by direct row queries — the
+        ORM's default ``repr()`` carries no stored key/value, so it can never
+        serve as a persistence assertion."""
         from app.services import admin_controls
 
         sid, _user = admin_session
         secret = "tok-super-secret-analytics-token-9999"
-        client.post(
+        resp = client.post(
             "/api/v1/admin/controls",
             json={
                 "domain": "retention",
@@ -599,7 +604,12 @@ class TestF9ControlValueIntegrity:
             },
             cookies=_cookie(sid),
         )
-        blob = repr(
+        assert resp.status_code == 422
+        body = resp.json()
+        code = body.get("code") or (body.get("error") or {}).get("code")
+        assert code == "CONTROL_VALUE_REJECTED"
+        assert secret not in resp.text  # secret never leaks in the response
+        rows = (
             db_session.query(admin_controls.AdminControl)
             .filter(
                 admin_controls.AdminControl.domain == "retention",
@@ -607,8 +617,7 @@ class TestF9ControlValueIntegrity:
             )
             .all()
         )
-        assert secret not in blob
-        assert "probe2" not in blob  # nothing was persisted at all
+        assert rows == []  # no durable control value, no durable history
 
     def test_nested_secret_key_rejected_service_level(self, db_session):
         from app.services import admin_controls
@@ -772,7 +781,11 @@ class TestF12CredentialKeyBypass:
         )
         assert rows == []  # no durable control record, no durable history
 
-    def test_legitimate_compound_keys_remain_accepted(self, db_session):
+    def test_legitimate_compound_payload_keys_remain_accepted(self, db_session):
+        """F12 acceptance boundary: compound NON-credential keys remain valid
+        INSIDE the submitted payload — the boundary `_validate_control_value`
+        actually inspects (the top-level control key is neutral by design).
+        """
         from app.services.admin_controls import get_control_value, set_control_and_audit
 
         for key, value in [
@@ -780,12 +793,17 @@ class TestF12CredentialKeyBypass:
             ("session_cache_limit", 500),
             ("cache_key_size", 256),
         ]:
+            control_key = f"f12-valid-{key}"
             set_control_and_audit(
                 db_session,
                 domain="configuration",
-                key=key,
-                value=value,
+                key=control_key,
+                value={key: value},
                 updated_by="admin-f12",
                 audit_action="controls.set",
             )
-            assert get_control_value(db_session, "configuration", key) == value
+            assert get_control_value(
+                db_session,
+                "configuration",
+                control_key,
+            ) == {key: value}
