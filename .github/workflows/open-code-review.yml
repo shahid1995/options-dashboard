@@ -11,19 +11,36 @@ jobs:
     name: OpenCodeReview Analysis
     runs-on: ubuntu-latest
     
-    # SECURITY: Only run on issue comments that are:
-    # 1. Attached to a pull request
-    # 2. Contain the exact trigger phrase /open-code-review or @open-code-review
-    # 3. Authored by a trusted repository member (OWNER, MEMBER, COLLABORATOR)
-    # This prevents arbitrary users from spending the OpenRouter credential.
+    # SECURITY: Gate automatic PR reviews to prevent abuse of the OpenRouter credential.
+    # 
+    # Automatic reviews run only when:
+    # 1. PR is internal (not from a fork), OR
+    # 2. PR is from a fork but the author is a trusted repository member
+    #    (OWNER, MEMBER, or COLLABORATOR)
+    # 3. issue_comment events pass the trusted-author and trigger-phrase checks
+    #    and are attached to a pull request
+    #
+    # Untrusted external fork PRs do NOT trigger automatic reviews, but a trusted
+    # user can manually trigger /open-code-review on any PR.
     if: |
-      github.event_name == 'pull_request_target' ||
+      (
+        github.event_name == 'pull_request_target' &&
+        (
+          github.event.pull_request.head.repo.fork == false ||
+          (
+            github.event.pull_request.author_association == 'OWNER' ||
+            github.event.pull_request.author_association == 'MEMBER' ||
+            github.event.pull_request.author_association == 'COLLABORATOR'
+          )
+        )
+      ) ||
       (
         github.event_name == 'issue_comment' &&
         github.event.issue.pull_request != null &&
+        github.event.comment.user.type != 'Bot' &&
         (
-          contains(github.event.comment.body, '/open-code-review') ||
-          contains(github.event.comment.body, '@open-code-review')
+          startsWith(github.event.comment.body, '/open-code-review') ||
+          startsWith(github.event.comment.body, '@open-code-review')
         ) &&
         (
           github.event.comment.author_association == 'OWNER' ||
@@ -41,6 +58,30 @@ jobs:
       cancel-in-progress: true
     
     steps:
+      # For issue_comment events, resolve the commented PR's metadata.
+      # This step uses the GitHub API (not PR code checkout) to obtain:
+      # - PR number
+      # - base branch ref
+      # - current head SHA
+      # These are passed to the OpenCodeReview action for the manual review path.
+      # This step does NOT checkout or execute PR-controlled code.
+      - name: Resolve PR refs for manual trigger
+        if: github.event_name == 'issue_comment'
+        id: resolve-pr
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const prNumber = context.issue.number;
+            const { data: pr } = await context.octokit.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+            core.setOutput('pr_number', prNumber);
+            core.setOutput('base_ref', pr.base.ref);
+            core.setOutput('head_sha', pr.head.sha);
+      
       - name: Run OpenCodeReview
         uses: alibaba/open-code-review@bccbc15f785269400735d5255540c231e6c02b6d # v1.12.9
         with:
@@ -53,6 +94,13 @@ jobs:
           llm_model: ${{ vars.OCR_LLM_MODEL }}
           llm_use_anthropic: ${{ vars.OCR_LLM_USE_ANTHROPIC }}
           llm_protocol: openai
+          
+          # For issue_comment events, use the resolved PR metadata from the previous step.
+          # For pull_request_target events, these are empty strings and the action uses
+          # its own defaults from the event payload.
+          pr_number: ${{ steps.resolve-pr.outputs.pr_number }}
+          base_ref: ${{ steps.resolve-pr.outputs.base_ref }}
+          head_sha: ${{ steps.resolve-pr.outputs.head_sha }}
           
           # Review quality
           effort: high
