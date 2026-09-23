@@ -39,8 +39,8 @@ jobs:
         github.event.issue.pull_request != null &&
         github.event.comment.user.type != 'Bot' &&
         (
-          startsWith(github.event.comment.body, '/open-code-review') ||
-          startsWith(github.event.comment.body, '@open-code-review')
+          github.event.comment.body == '/open-code-review' ||
+          github.event.comment.body == '@open-code-review'
         ) &&
         (
           github.event.comment.author_association == 'OWNER' ||
