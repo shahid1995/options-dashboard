@@ -1,0 +1,78 @@
+name: OpenCodeReview PR Review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
+
+jobs:
+  open-code-review:
+    name: OpenCodeReview Analysis
+    runs-on: ubuntu-latest
+    
+    # SECURITY: Only run on issue comments that are:
+    # 1. Attached to a pull request
+    # 2. Contain the exact trigger phrase /open-code-review or @open-code-review
+    # 3. Authored by a trusted repository member (OWNER, MEMBER, COLLABORATOR)
+    # This prevents arbitrary users from spending the OpenRouter credential.
+    if: |
+      github.event_name == 'pull_request_target' ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request != null &&
+        (
+          contains(github.event.comment.body, '/open-code-review') ||
+          contains(github.event.comment.body, '@open-code-review')
+        ) &&
+        (
+          github.event.comment.author_association == 'OWNER' ||
+          github.event.comment.author_association == 'MEMBER' ||
+          github.event.comment.author_association == 'COLLABORATOR'
+        )
+      )
+    
+    permissions:
+      contents: read
+      pull-requests: write
+    
+    concurrency:
+      group: open-code-review-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
+    
+    steps:
+      - name: Run OpenCodeReview
+        uses: alibaba/open-code-review@bccbc15f785269400735d5255540c231e6c02b6d # v1.12.9
+        with:
+          # Pin OCR CLI version for reproducibility
+          ocr_version: '1.12.9'
+          
+          # OpenRouter LLM configuration (secrets/variables configured in repo settings)
+          llm_url: ${{ secrets.OCR_LLM_URL }}
+          llm_auth_token: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
+          llm_model: ${{ vars.OCR_LLM_MODEL }}
+          llm_use_anthropic: ${{ vars.OCR_LLM_USE_ANTHROPIC }}
+          llm_protocol: openai
+          
+          # Review quality
+          effort: high
+          review_concurrency: 5
+          
+          # Non-destructive incremental review
+          sticky_summary: 'true'
+          incremental: 'true'
+          incremental_overlap_threshold: '0.6'
+          
+          # Progress and artifacts
+          stream_progress: 'true'
+          upload_artifacts: 'true'
+          
+          # Custom rules for StrikeNova
+          rule: .github/open-code-review-rules.json
+          
+          # GitHub token for posting comments
+          github_token: ${{ github.token }}
+          
+          # Timeouts
+          llm_timeout: '300'
+          review_task_timeout: '15'
