@@ -10,6 +10,29 @@ from app.db import get_db
 
 SESSION_COOKIE_NAME = "strikenova_session"
 
+# Day 46 (Issue #92): request-scoped user facts for the structured access
+# log, stored by the auth dependencies when a request authenticates. The
+# middleware reads these AFTER the response so the log record can carry
+# safe, non-secret actor facts (user id + tenant scope only — never
+# session IDs, tokens, or cookie values).
+import contextvars as _ctxvars
+
+_request_user_facts: "_ctxvars.ContextVar[dict | None]" = _ctxvars.ContextVar(
+    "request_user_facts", default=None
+)
+
+
+def set_request_user_facts(user_id: str | None, tenant_scope: str | None = None) -> None:
+    """Record safe actor facts for the current request's log record."""
+    _request_user_facts.set(
+        {"user_id": user_id, "tenant": tenant_scope} if user_id else None
+    )
+
+
+def current_request_user_facts() -> dict:
+    facts = _request_user_facts.get()
+    return facts or {}
+
 
 def _canonical_session_id(
     x_session_id: str | None,
@@ -83,6 +106,12 @@ def _resolve_user(db: Session, sid: str) -> AuthenticatedUser:
     user = db.query(User).filter(User.id == session.user_id).one_or_none()
     if user is None or user.status != "active":
         raise HTTPException(status_code=403, detail="StrikeNova account is not active.")
+
+    # Day 46: safe actor facts for the structured access log (never secrets).
+    try:
+        set_request_user_facts(user.id)
+    except Exception:
+        pass
 
     # access_token is None for platform-only sessions (no broker connected)
     return AuthenticatedUser(user_id=user.id, access_token=broker_token)

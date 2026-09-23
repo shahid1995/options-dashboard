@@ -125,8 +125,10 @@ def test_init_db_uses_alembic(monkeypatch, temp_engine):
     # broker_authorizations via the merge head); 43 since Auth account-security
     # c1d2e3f4a5b6 added email_verification_tokens, password_reset_tokens,
     # pending_email_changes, security_events; 49 since Issue #17 research
-    # schema e9f8a7b6c5d4 added the six gap_* research tables (research-only).
-    assert len(tables) ==  51
+    # schema e9f8a7b6c5d4 added the six gap_* research tables (research-only);
+    # 51 since Day 45 (admin_controls, admin_audit_events); 52 since Day 46
+    # (notification_events, Issue #92).
+    assert len(tables) ==  52
 
 
 def test_init_db_creates_legacy_columns_via_baseline(monkeypatch, temp_engine):
