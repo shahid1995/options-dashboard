@@ -416,9 +416,15 @@ async def chain_ws(websocket: WebSocket, symbol: str, expiry_date: str = Query(.
                     try:
                         db = SessionLocal()
                         try:
+                            # Platform user resolution may legitimately fail
+                            # (legacy session-scoped WS tokens predate the
+                            # durable identity); such staleness events are
+                            # PLATFORM-scoped (user_scope None) — never an
+                            # empty-string user scope, which would strand the
+                            # event outside every tenant's visibility.
                             record_market_data_stale(
                                 db,
-                                user_scope=_platform_user_id(session_id) or "",
+                                user_scope=_platform_user_id(session_id),
                                 symbol=symbol,
                                 age_seconds=time.time() - feed._last_tick_time,
                             )

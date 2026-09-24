@@ -210,6 +210,38 @@ class TestF13ProductionAlertWiring:
         assert "market_data" in src
 
 
+    def test_stale_feed_without_platform_identity_is_platform_scoped(self, db_session, two_users):
+        """A legacy session-scoped WS caller (no durable platform identity)
+        produces a PLATFORM-scoped staleness event — never an empty-string
+        user scope, which would strand the event outside every tenant.
+
+        The WS loop needs a live broker feed, so the production call site
+        is pinned at source level (same convention as
+        ``test_market_data_stale_wired_into_live_feed``) and the identity
+        resolution is proven behaviorally: an unknown session resolves to
+        ``None``, and the call site passes that value through UNMODIFIED
+        (no ``or ""`` coercion).
+        """
+        import inspect
+
+        from app.routers import chains as chains_mod
+
+        # Behavioral: no platform row ⇒ resolved identity is None.
+        assert chains_mod._platform_user_id("legacy-session-without-platform-row") is None
+
+        # Production call site: the resolved identity is passed through
+        # verbatim as the event scope (platform scope when None).
+        call_site = inspect.getsource(chains_mod)
+        assert "user_scope=_platform_user_id(session_id)" in call_site, (
+            "staleness call site must pass the resolved platform identity "
+            "through unmodified (platform scope when it is None)"
+        )
+        assert 'user_scope=_platform_user_id(session_id) or ""' not in call_site, (
+            "staleness events must never be stranded under an empty-string "
+            "user scope"
+        )
+
+
 def _async_raises(err):
     async def _raise(*args, **kwargs):
         raise err
@@ -595,6 +627,69 @@ class TestF17TransactionAwareDelivery:
         assert outer["event_id"] in delivered_ids
         rows = _events(db_session)
         assert all("inner" != (r.summary or "") for r in rows)
+
+    def test_savepoint_release_delivers_with_outer_commit(self, db_session):
+        """A RELEASED (committed) savepoint's staged delivery ships with the
+        outer commit — release must not lose the delivery."""
+        from app.services import notifications
+
+        notifications.clear_captured_deliveries()
+        key = f"f17-sp-rel:{uuid.uuid4().hex[:8]}"
+        db_session.begin_nested()
+        inner = notifications.publish(
+            db_session,
+            event_type="market_data.stale",
+            severity="warning",
+            source="market_data",
+            summary="inner-released",
+            details={},
+            user_scope=None,
+            dedup_key=key,
+        )
+        db_session.get_nested_transaction().commit()
+        db_session.commit()
+
+        delivered_ids = {d["event_id"] for d in notifications.captured_deliveries()}
+        assert inner["event_id"] in delivered_ids, (
+            "released savepoint's event must be delivered on outer commit"
+        )
+
+    def test_savepoint_rollback_discards_only_savepoint_delivery(self, db_session):
+        """A savepoint rollback discards THAT savepoint's staged delivery
+        while the OUTER transaction's staged delivery still ships."""
+        from app.services import notifications
+
+        notifications.clear_captured_deliveries()
+        key = f"f17-sp-rb:{uuid.uuid4().hex[:8]}"
+        outer = notifications.publish(
+            db_session,
+            event_type="market_data.stale",
+            severity="warning",
+            source="market_data",
+            summary="outer-kept",
+            details={},
+            user_scope=None,
+            dedup_key=key,
+        )
+        nested = db_session.begin_nested()
+        inner = notifications.publish(
+            db_session,
+            event_type="market_data.stale",
+            severity="warning",
+            source="market_data",
+            summary="inner-dropped",
+            details={},
+            user_scope=None,
+            dedup_key=f"{key}-inner",
+        )
+        nested.rollback()
+        db_session.commit()
+
+        delivered = {d["event_id"]: d for d in notifications.captured_deliveries()}
+        assert outer["event_id"] in delivered, "outer delivery must survive"
+        assert inner["event_id"] not in delivered, (
+            "rolled-back savepoint's delivery must be discarded (no phantom)"
+        )
 
     def test_readiness_failure_does_not_emit_phantom(self, db_session):
         """If the readiness degradation transaction fails, no platform

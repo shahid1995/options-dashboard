@@ -33,9 +33,13 @@ from app.services.notifications import publish
 
 
 def record_market_data_stale(
-    db, *, user_scope: str, symbol: str, age_seconds: float, correlation_id: str | None = None
+    db, *, user_scope: str | None, symbol: str, age_seconds: float, correlation_id: str | None = None
 ) -> dict:
-    """Stale/insufficient market data for one symbol (user scope)."""
+    """Stale/insufficient market data for one symbol.
+
+    User scope when the caller has a durable platform identity; platform
+    scope (``None``) for legacy session-scoped callers (F13/G-P1b).
+    """
     return publish(
         db,
         event_type="market_data.stale",

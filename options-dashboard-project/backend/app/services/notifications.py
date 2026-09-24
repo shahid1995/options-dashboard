@@ -127,10 +127,15 @@ def _stage_delivery(db, row: NotificationEvent) -> None:
     * ``after_rollback``          → discard ALL staged deliveries;
     * ``after_soft_rollback``     → discard only the staging keyed to the
       rolled-back transaction (savepoint rollback: ``begin_nested()``
-      rollbacks carry ``nested=True``);
-    * ``after_transaction_end``   → also release savepoint-RELEASED
-      (committed savepoint) staging onto the parent, so it goes out with
-      the outer commit.
+      rollbacks carry ``nested=True``).
+
+    Staging is keyed to the INNERMOST active transaction (``Session.
+    get_nested_transaction()`` inside a savepoint, the root transaction
+    otherwise) — a savepoint's staged delivery must die with that
+    savepoint, and the outer transaction's staged delivery must survive
+    a savepoint rollback. A savepoint RELEASE needs no handler: its
+    staged rows remain keyed to the (still-open) nested transaction
+    object and are released by the session-wide ``after_commit`` sweep.
 
     ``publish()`` never commits on the caller's behalf, and a commit
     FAILURE (exception out of ``commit()``) never reaches after_commit,
@@ -158,29 +163,22 @@ def _stage_delivery(db, row: NotificationEvent) -> None:
         def _discard_tx(session, transaction):
             staged.pop(transaction, None)
 
-        def _promote_to_parent(session, transaction):
-            # A savepoint that closed WITHOUT rollback (released/committed)
-            # moves its staged events onto the parent transaction so they
-            # are delivered only when the OUTER transaction commits.
-            pending = staged.pop(transaction, None)
-            if pending and transaction.parent is not None:
-                staged.setdefault(transaction.parent, []).extend(pending)
-
         event.listen(db, "after_commit", _release_all)
         event.listen(db, "after_rollback", _discard_on_rollback)
         event.listen(db, "after_soft_rollback", _discard_tx)
-        event.listen(db, "after_transaction_end", _promote_to_parent)
         db._day46_unlisten = lambda: [
             event.remove(db, name, handler)
             for name, handler in (
                 ("after_commit", _release_all),
                 ("after_rollback", _discard_on_rollback),
                 ("after_soft_rollback", _discard_tx),
-                ("after_transaction_end", _promote_to_parent),
             )
         ]
 
-    transaction = db.get_transaction()
+    # Innermost active transaction: inside a savepoint this is the nested
+    # transaction (get_transaction() would return the ROOT and a savepoint
+    # rollback could then never discard that savepoint's staged delivery).
+    transaction = db.get_nested_transaction() or db.get_transaction()
     staged.setdefault(transaction, []).append(row)
 
 
