@@ -691,6 +691,37 @@ class TestF17TransactionAwareDelivery:
             "rolled-back savepoint's delivery must be discarded (no phantom)"
         )
 
+    def test_savepoint_release_does_not_deliver_before_root_commit(self, db_session):
+        """Releasing a savepoint must NOT deliver staged events.
+
+        SQLAlchemy fires ``after_commit`` on savepoint RELEASE as well; a
+        release must therefore never sweep staging, because the OUTER
+        transaction may still roll back (phantom delivery). The row must
+        ship only when the root transaction commits.
+        """
+        from app.services import notifications
+
+        notifications.clear_captured_deliveries()
+        key = f"f17-rel-gate:{uuid.uuid4().hex[:8]}"
+        notifications.publish(
+            db_session,
+            event_type="market_data.stale",
+            severity="warning",
+            source="market_data",
+            summary="pre-release",
+            details={},
+            user_scope=None,
+            dedup_key=key,
+        )
+        db_session.begin_nested()
+        db_session.get_nested_transaction().commit()  # RELEASE
+        db_session.rollback()  # outer rollback AFTER the release
+
+        assert not notifications.captured_deliveries(), (
+            "savepoint release must not deliver: the outer transaction "
+            "rolled back after the release, so delivery here is a phantom"
+        )
+
     def test_readiness_failure_does_not_emit_phantom(self, db_session):
         """If the readiness degradation transaction fails, no platform
         notification is delivered."""

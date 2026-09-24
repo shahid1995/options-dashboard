@@ -121,21 +121,31 @@ def _deliver(event_row: NotificationEvent) -> None:
 def _stage_delivery(db, row: NotificationEvent) -> None:
     """Schedule channel delivery on the session's transaction boundary.
 
-    Uses SQLAlchemy's session-level transaction signals (F17):
+    Uses SQLAlchemy's session-level transaction signals (F17). Events
+    are keyed to their ENABLING transaction — the innermost active one
+    when ``publish()`` runs inside a savepoint, the root otherwise — so
+    a savepoint's staged delivery dies with that savepoint while the
+    outer transaction's staged delivery survives a savepoint rollback:
 
-    * ``after_commit``            → release every staged delivery;
-    * ``after_rollback``          → discard ALL staged deliveries;
-    * ``after_soft_rollback``     → discard only the staging keyed to the
-      rolled-back transaction (savepoint rollback: ``begin_nested()``
-      rollbacks carry ``nested=True``).
+    * ``after_commit``        → deliver ALL staged rows, but ONLY when
+      the ROOT transaction committed. SQLAlchemy also fires
+      ``after_commit`` on savepoint RELEASE (the released savepoint is
+      still the innermost active transaction at that moment), so the
+      handler gates on ``session.in_nested_transaction()``: at release
+      it returns True → no delivery; at a root commit it returns False
+      → deliver. A released savepoint's rows stay keyed to its (now
+      closed) transaction object and ship at the eventual root commit.
+    * ``after_rollback``      → discard ALL staged rows when the ROOT
+      transaction rolls back (skipped while a savepoint is still open —
+      that cascade case is handled per-savepoint below).
+    * ``after_soft_rollback`` → discard the rolled-back savepoint's rows
+      PLUS those of any inner (descendant) transaction, because
+      releasing an inner savepoint does not protect its rows from a
+      parent savepoint rollback.
 
-    Staging is keyed to the INNERMOST active transaction (``Session.
-    get_nested_transaction()`` inside a savepoint, the root transaction
-    otherwise) — a savepoint's staged delivery must die with that
-    savepoint, and the outer transaction's staged delivery must survive
-    a savepoint rollback. A savepoint RELEASE needs no handler: its
-    staged rows remain keyed to the (still-open) nested transaction
-    object and are released by the session-wide ``after_commit`` sweep.
+    ``publish()`` never commits on the caller's behalf, and a commit
+    FAILURE (exception out of ``commit()``) never reaches after_commit,
+    so the staged delivery is simply lost — no phantom notification.
 
     ``publish()`` never commits on the caller's behalf, and a commit
     FAILURE (exception out of ``commit()``) never reaches after_commit,
@@ -147,6 +157,15 @@ def _stage_delivery(db, row: NotificationEvent) -> None:
         db._day46_staged_deliveries = staged
 
         def _release_all(session):
+            # Deliver ONLY on a real root-transaction commit. SQLAlchemy
+            # fires after_commit for SAVEPOINT RELEASE as well; at release
+            # the released transaction is still the session's innermost
+            # active transaction (in_nested_transaction() True), while a
+            # root commit always completes with the root innermost. An
+            # unconditional sweep here would phantom-deliver events whose
+            # outer transaction may still roll back.
+            if session.in_nested_transaction():
+                return
             for pending in list(staged.values()):
                 for event_row in pending:
                     _deliver(event_row)
@@ -161,7 +180,17 @@ def _stage_delivery(db, row: NotificationEvent) -> None:
                 staged.clear()
 
         def _discard_tx(session, transaction):
-            staged.pop(transaction, None)
+            # A savepoint rollback discards that savepoint's staged
+            # deliveries AND those of any inner (descendant) transaction:
+            # releasing an inner savepoint does not save its staged rows
+            # from a parent savepoint rollback.
+            for key in list(staged):
+                tx = key
+                while tx is not None:
+                    if tx is transaction:
+                        staged.pop(key, None)
+                        break
+                    tx = tx.parent
 
         event.listen(db, "after_commit", _release_all)
         event.listen(db, "after_rollback", _discard_on_rollback)
