@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import Request as FastAPIRequest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -269,13 +270,49 @@ async def resolve_bulk_market_prices(access_token: str, positions) -> dict:
     return prices
 
 
-def _paper_error(exc: PaperExecutionError) -> HTTPException:
+def _paper_error(
+    exc: PaperExecutionError,
+    db: Session | None = None,
+    user_id: str | None = None,
+) -> HTTPException:
     """Map a structured execution error to an HTTP response.
 
     The detail string carries the error CODE plus a human-readable message
     (e.g. ``CHAIN_DATA_MISSING: ...``) so the UI can show a useful message
     without exposing internal stack traces.
     """
+    # Day 46 (F13): the REAL execution failure boundary emits the
+    # operational alert — observational only, the mapped HTTP error below
+    # is unchanged. The authenticated actor comes from the request's
+    # resolved identity facts (safe durable user id — never session or
+    # token material), and the alert joins the request's DB session when
+    # one is provided so it persists in the same unit of work.
+    try:
+        from app.routers.deps import current_request_user_facts
+        from app.services.operations import record_execution_failure
+        from app.db import SessionLocal
+
+        # The endpoint's already-resolved canonical identity is
+        # authoritative; the request-facts fallback covers indirect paths
+        # (sync dependencies run in the threadpool, so ContextVar writes
+        # from them do not propagate into the endpoint's context).
+        actor = user_id or current_request_user_facts().get("user_id")
+        if actor:
+            owns_db = db is None
+            alert_db = SessionLocal() if owns_db else db
+            try:
+                record_execution_failure(
+                    alert_db,
+                    user_scope=actor,
+                    order_family="paper",
+                    reason=f"{exc.code}: {exc.message}",
+                )
+                alert_db.commit()
+            finally:
+                if owns_db:
+                    alert_db.close()
+    except Exception:  # alert recording must never change the outcome
+        pass
     status = {
         "CHAIN_DATA_MISSING": 409,
         "BULK_EXIT_CHAIN_DATA_MISSING": 409,
@@ -315,7 +352,7 @@ async def submit_execution(
         prices = await resolve_market_prices(access_token, request.symbol, request.legs)
         return execute_strategy(user_id, request, db, prices)
     except PaperExecutionError as exc:
-        raise _paper_error(exc) from exc
+        raise _paper_error(exc, db=db, user_id=user_id) from exc
 
 
 @router.post("/positions/{position_id}/exit", response_model=ExitOut)
@@ -361,7 +398,7 @@ async def submit_position_exit(
         fill_price = prices[(position.expiry, position.strike, position.option_type)]
         return exit_position(user_id, position_id, request, db, fill_price)
     except PaperExecutionError as exc:
-        raise _paper_error(exc) from exc
+        raise _paper_error(exc, db=db, user_id=user_id) from exc
 
 
 @router.post("/executions/{strategy_execution_id}/exit-all", response_model=BulkExitOut)
@@ -405,7 +442,7 @@ async def submit_execution_exit_all(
         prices = await resolve_bulk_market_prices(access_token, positions)
         return bulk_exit(user_id, "STRATEGY", strategy_execution_id, request, db, prices)
     except PaperExecutionError as exc:
-        raise _paper_error(exc) from exc
+        raise _paper_error(exc, db=db, user_id=user_id) from exc
 
 
 @router.post("/positions/exit-all", response_model=BulkExitOut)
@@ -435,7 +472,7 @@ async def submit_exit_all(
         prices = await resolve_bulk_market_prices(access_token, positions)
         return bulk_exit(user_id, "ACCOUNT", None, request, db, prices)
     except PaperExecutionError as exc:
-        raise _paper_error(exc) from exc
+        raise _paper_error(exc, db=db, user_id=user_id) from exc
 
 
 @router.get("/positions", response_model=list[PositionOut])

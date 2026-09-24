@@ -30,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from fastapi import HTTPException
+from sqlalchemy import event
 
 from app.identity import NotificationEvent
 from app.structlog_config import sanitize
@@ -113,12 +114,100 @@ def _deliver(event_row: NotificationEvent) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Transaction-aware delivery staging (F17)
+# ---------------------------------------------------------------------------
+
+
+def _stage_delivery(db, row: NotificationEvent) -> None:
+    """Schedule channel delivery on the session's transaction boundary.
+
+    Uses SQLAlchemy's session-level transaction signals (F17):
+
+    * ``after_commit``            → release every staged delivery;
+    * ``after_rollback``          → discard ALL staged deliveries;
+    * ``after_soft_rollback``     → discard only the staging keyed to the
+      rolled-back transaction (savepoint rollback: ``begin_nested()``
+      rollbacks carry ``nested=True``);
+    * ``after_transaction_end``   → also release savepoint-RELEASED
+      (committed savepoint) staging onto the parent, so it goes out with
+      the outer commit.
+
+    ``publish()`` never commits on the caller's behalf, and a commit
+    FAILURE (exception out of ``commit()``) never reaches after_commit,
+    so the staged delivery is simply lost — no phantom notification.
+    """
+    staged: dict = getattr(db, "_day46_staged_deliveries", None)
+    if staged is None:
+        staged = {}
+        db._day46_staged_deliveries = staged
+
+        def _release_all(session):
+            for pending in list(staged.values()):
+                for event_row in pending:
+                    _deliver(event_row)
+            staged.clear()
+
+        def _discard_on_rollback(session):
+            # SQLAlchemy fires after_rollback for savepoint rollbacks too.
+            # Only a REAL session/outer rollback may clear everything: when
+            # a nested transaction is still active, this was a savepoint
+            # rollback handled by _discard_tx below.
+            if not session.in_nested_transaction():
+                staged.clear()
+
+        def _discard_tx(session, transaction):
+            staged.pop(transaction, None)
+
+        def _promote_to_parent(session, transaction):
+            # A savepoint that closed WITHOUT rollback (released/committed)
+            # moves its staged events onto the parent transaction so they
+            # are delivered only when the OUTER transaction commits.
+            pending = staged.pop(transaction, None)
+            if pending and transaction.parent is not None:
+                staged.setdefault(transaction.parent, []).extend(pending)
+
+        event.listen(db, "after_commit", _release_all)
+        event.listen(db, "after_rollback", _discard_on_rollback)
+        event.listen(db, "after_soft_rollback", _discard_tx)
+        event.listen(db, "after_transaction_end", _promote_to_parent)
+        db._day46_unlisten = lambda: [
+            event.remove(db, name, handler)
+            for name, handler in (
+                ("after_commit", _release_all),
+                ("after_rollback", _discard_on_rollback),
+                ("after_soft_rollback", _discard_tx),
+                ("after_transaction_end", _promote_to_parent),
+            )
+        ]
+
+    transaction = db.get_transaction()
+    staged.setdefault(transaction, []).append(row)
+
+
+# ---------------------------------------------------------------------------
 # Publish / read
 # ---------------------------------------------------------------------------
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _dedup_exists(db, *, user_scope: str | None, dedup_key: str) -> NotificationEvent | None:
+    """Find the in-window duplicate for THIS scope's dedup key (F14).
+
+    The identity is (scope, dedup_key): user-scoped events only collapse
+    within the same user; platform events (user_scope None) collapse only
+    with other platform events; the two can never cross-deduplicate.
+    """
+    window_start = _now() - timedelta(seconds=DEDUP_WINDOW_SECONDS)
+    query = db.query(NotificationEvent).filter(
+        NotificationEvent.dedup_key == dedup_key,
+        NotificationEvent.occurred_at >= window_start,
+    )
+    if user_scope is None:
+        return query.filter(NotificationEvent.user_scope.is_(None)).first()
+    return query.filter(NotificationEvent.user_scope == user_scope).first()
 
 
 def publish(
@@ -134,27 +223,27 @@ def publish(
     dedup_key: str | None = None,
     occurred_at: datetime | None = None,
 ) -> dict:
-    """Create (or deduplicate) one notification event and deliver it.
+    """Create (or deduplicate) one notification event.
 
-    Sanitization happens BEFORE persistence and delivery: credential
-    material can never reach the durable store, a channel, or a reader.
+    Sanitization happens BEFORE persistence: credential material can
+    never reach the durable store, a channel, or a reader.
+
+    Transaction-aware delivery (F17): the event row is STAGED and its
+    channel delivery is scheduled on the session's transaction. Channels
+    observe the event ONLY after the surrounding transaction COMMITs —
+    a rollback (or a failed commit) discards the staging, so no channel
+    ever receives a phantom notification. ``publish()`` never commits
+    the caller's transaction, and nested savepoints are honored: a
+    rolled-back savepoint discards its own deliveries while the outer
+    transaction's commit releases the rest.
     """
     if severity not in VALID_SEVERITIES:
         raise ValueError(f"Invalid notification severity: {severity!r}")
 
     clean_details = sanitize(details if details is not None else {})
 
-    if dedup_key and user_scope:
-        window_start = _now() - timedelta(seconds=DEDUP_WINDOW_SECONDS)
-        existing = (
-            db.query(NotificationEvent)
-            .filter(
-                NotificationEvent.user_scope == user_scope,
-                NotificationEvent.dedup_key == dedup_key,
-                NotificationEvent.occurred_at >= window_start,
-            )
-            .first()
-        )
+    if dedup_key is not None:
+        existing = _dedup_exists(db, user_scope=user_scope, dedup_key=dedup_key)
         if existing is not None:
             return display(existing)
 
@@ -172,17 +261,24 @@ def publish(
     )
     db.add(row)
     db.flush()
-    _deliver(row)
+    _stage_delivery(db, row)
     return display(row)
 
 
-def force_expire_dedup_window(db, *, user_scope: str) -> None:
-    """Age every dedup-keyed event for a scope out of the window (tests)."""
+def force_expire_dedup_window(db, *, user_scope: str | None) -> None:
+    """Age every dedup-keyed event for a scope out of the window (tests).
+
+    ``user_scope=None`` expires PLATFORM-scoped events (F14 coverage).
+    """
     cutoff = _now() - timedelta(seconds=DEDUP_WINDOW_SECONDS + 1)
-    db.query(NotificationEvent).filter(
-        NotificationEvent.user_scope == user_scope,
+    query = db.query(NotificationEvent).filter(
         NotificationEvent.dedup_key.isnot(None),
-    ).update({NotificationEvent.occurred_at: cutoff}, synchronize_session=False)
+    )
+    if user_scope is None:
+        query = query.filter(NotificationEvent.user_scope.is_(None))
+    else:
+        query = query.filter(NotificationEvent.user_scope == user_scope)
+    query.update({NotificationEvent.occurred_at: cutoff}, synchronize_session=False)
 
 
 def _require_scope(db, event_id: str, user_scope: str) -> NotificationEvent:

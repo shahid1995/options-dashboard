@@ -100,6 +100,7 @@ def _admin_guarded(action: str):
 
         try:
             principal = AdminUser()(
+                request,
                 db=db,
                 x_session_id=None,  # F6: admin is cookie-only — never the header
                 session_id_cookie=request.cookies.get(SESSION_COOKIE_NAME),

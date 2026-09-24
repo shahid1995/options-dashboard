@@ -4,6 +4,7 @@ import time
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
+from sqlalchemy.orm import Session
 
 from app.brokers.adapters.upstox.mapper import (
     UPSTOX_INSTRUMENT_KEYS as INSTRUMENT_KEYS,  # compat re-export (adapter mapping)
@@ -12,9 +13,10 @@ from app.brokers.adapters.upstox.mapper import transform_chain  # compat re-expo
 from app.brokers.domain.enums import BROKER_ID_UPSTOX
 from app.brokers.domain.errors import BrokerError, BrokerErrorCode
 from app.brokers.gateway import gateway
-from app.db import SessionLocal
+from app.db import SessionLocal, get_db
 from app.routers.deps import get_session_id
 from app.services import token_store
+from app.services.operations import record_broker_failure, record_market_data_stale
 from app.services.market_data_authorization import (
     ANALYTICS_SOURCE,
     LEGACY_SESSION_SOURCE,
@@ -49,22 +51,27 @@ _NOT_CONNECTED_DETAIL = (
 )
 
 
-def _platform_user_id(session_id: str | None) -> str | None:
+def _platform_user_id(session_id: str | None, db: Session | None = None) -> str | None:
     """Return the durable user_id for a valid platform session, else None.
 
-    Any platform-session lookup failure (no DB row, or the session store
-    being unavailable) degrades to ``None`` so resolution continues on the
-    legacy path — the same graceful behavior the pre-Analytics flow had.
+    Uses the request-scoped DB session when provided (the request's unit
+    of work — required under test fixtures that override ``get_db``);
+    ad-hoc callers fall back to a short-lived ``SessionLocal``. Any
+    lookup failure (no DB row, or the session store being unavailable)
+    degrades to ``None`` so resolution continues on the legacy path —
+    the same graceful behavior the pre-Analytics flow had.
     """
     from app.identity import get_active_session
 
     try:
-        db = SessionLocal()
+        owns_db = db is None
+        lookup_db = SessionLocal() if owns_db else db
         try:
-            session = get_active_session(db, session_id)
+            session = get_active_session(lookup_db, session_id)
             return session.user_id if session is not None else None
         finally:
-            db.close()
+            if owns_db:
+                lookup_db.close()
     except Exception:
         return None
 
@@ -78,7 +85,9 @@ def _not_connected() -> HTTPException:
     return exc
 
 
-def require_market_data_token(session_id: str | None) -> tuple[MarketDataCredential, str | None]:
+def require_market_data_token(
+    session_id: str | None, db: Session | None = None
+) -> tuple[MarketDataCredential, str | None]:
     """Resolve the caller's read-only market-data credential.
 
     Priority (the Analytics Token is the authorized market-data
@@ -98,14 +107,16 @@ def require_market_data_token(session_id: str | None) -> tuple[MarketDataCredent
     as broker credentials — they are rejected before any credential is
     handed to a broker adapter.
     """
-    user_id = _platform_user_id(session_id)
+    user_id = _platform_user_id(session_id, db=db)
 
     if user_id is not None:
-        db = SessionLocal()
+        owns_db = db is None
+        cred_db = SessionLocal() if owns_db else db
         try:
-            credential = resolve_market_data_token(db, user_id, BROKER_ID_UPSTOX.value)
+            credential = resolve_market_data_token(cred_db, user_id, BROKER_ID_UPSTOX.value)
         finally:
-            db.close()
+            if owns_db:
+                cred_db.close()
         if credential is not None:
             return credential, user_id
 
@@ -146,7 +157,14 @@ def validate_expiry_date(expiry_date: str) -> str:
     return expiry_date
 
 
-async def call_upstox(coro, *, source: str | None = None, session_id: str | None = None):
+async def call_upstox(
+    coro,
+    *,
+    source: str | None = None,
+    session_id: str | None = None,
+    db: Session | None = None,
+    user_scope: str | None = None,
+):
     """Awaits a broker-gateway call, translating broker failures into HTTP.
 
     The coroutine comes from a broker ADAPTER, so failures arrive as
@@ -162,6 +180,30 @@ async def call_upstox(coro, *, source: str | None = None, session_id: str | None
     try:
         return await coro
     except BrokerError as e:
+        # Day 46 (F13): the REAL broker failure boundary emits the
+        # operational alert — observational only, the translated HTTP
+        # error below is unchanged. The request-scoped DB session (DI)
+        # is used when provided; ad-hoc callers fall back to a short-
+        # lived SessionLocal. Any recording failure is swallowed so the
+        # original business error still surfaces.
+        try:
+            scope = user_scope if user_scope is not None else _platform_user_id(session_id)
+            if scope is not None:
+                owns_db = db is None
+                alert_db = SessionLocal() if owns_db else db
+                try:
+                    record_broker_failure(
+                        alert_db,
+                        user_scope=scope,
+                        broker=BROKER_ID_UPSTOX.value,
+                        reason=f"{getattr(e.code, 'value', e.code)}: {e.message}",
+                    )
+                    alert_db.commit()
+                finally:
+                    if owns_db:
+                        alert_db.close()
+        except Exception:  # alert recording must never change the outcome
+            pass
         if e.code in BrokerErrorCode.SESSION_CODES:
             if source == ANALYTICS_SOURCE:
                 raise HTTPException(
@@ -179,14 +221,20 @@ async def call_upstox(coro, *, source: str | None = None, session_id: str | None
 
 
 @router.get("/{symbol}/expiries")
-async def list_expiries(symbol: str, session_id: str | None = Depends(get_session_id)):
+async def list_expiries(
+    symbol: str,
+    session_id: str | None = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
     symbol = resolve_symbol(symbol)
-    credential, _user_id = require_market_data_token(session_id)
+    credential, user_id = require_market_data_token(session_id, db=db)
     adapter = gateway.create(BROKER_ID_UPSTOX, access_token=credential.token)
     return await call_upstox(
         adapter.get_option_contracts(symbol),
         source=credential.source,
         session_id=session_id,
+        db=db,
+        user_scope=user_id,
     )
 
 
@@ -195,15 +243,18 @@ async def get_chain(
     symbol: str,
     expiry_date: str = Query(..., description="YYYY-MM-DD"),
     session_id: str | None = Depends(get_session_id),
+    db: Session = Depends(get_db),
 ):
     symbol = resolve_symbol(symbol)
     expiry_date = validate_expiry_date(expiry_date)
-    credential, _user_id = require_market_data_token(session_id)
+    credential, user_id = require_market_data_token(session_id, db=db)
     adapter = gateway.create(BROKER_ID_UPSTOX, access_token=credential.token)
     return await call_upstox(
         adapter.get_option_chain(symbol, expiry_date),
         source=credential.source,
         session_id=session_id,
+        db=db,
+        user_scope=user_id,
     )
 
 
@@ -360,6 +411,22 @@ async def chain_ws(websocket: WebSocket, symbol: str, expiry_date: str = Query(.
                         "Feed data stale, attempting recovery",
                         extra={"symbol": symbol},
                     )
+                    # Day 46 (F13): real staleness boundary emits the
+                    # market_data.stale alert (observational only).
+                    try:
+                        db = SessionLocal()
+                        try:
+                            record_market_data_stale(
+                                db,
+                                user_scope=_platform_user_id(session_id) or "",
+                                symbol=symbol,
+                                age_seconds=time.time() - feed._last_tick_time,
+                            )
+                            db.commit()
+                        finally:
+                            db.close()
+                    except Exception:
+                        pass
                     # Try HTTP fallback for this push
                     try:
                         adapter = gateway.create(BROKER_ID_UPSTOX, access_token=token)

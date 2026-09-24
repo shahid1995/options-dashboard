@@ -392,13 +392,15 @@ app.include_router(
 )
 
 # Day 46 observability (Issue #92): JSON structured access logging and
-# the correlation-ID boundary. The middleware is added LAST so it runs
-# OUTERMOST (adopt/echo X-Correlation-Id around CORS and everything else).
-from app.middleware import CorrelationIdMiddleware  # noqa: E402
+# the correlation-ID boundary (pure-ASGI middleware; F15/F16 remediation).
+# install_correlation_middleware adds the unhandled-500 correlation
+# responder OUTSIDE the correlation middleware so every response —
+# including server-generated 500s — echoes the request's correlation ID.
+from app.middleware import install_correlation_middleware  # noqa: E402
 from app.structlog_config import configure_logging  # noqa: E402
 
 configure_logging()
-app.add_middleware(CorrelationIdMiddleware)
+install_correlation_middleware(app)
 
 app.include_router(auth.router, prefix="/auth", tags=["auth"])
 from app.routers import broker_diagnostics  # noqa: E402  (after app creation)

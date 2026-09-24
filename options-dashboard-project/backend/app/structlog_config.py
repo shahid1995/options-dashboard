@@ -84,12 +84,30 @@ _SECRETISH_KEY = re.compile(
 _SECRETISH_VALUE = re.compile(r"\b[A-Za-z0-9_\-]{28,}\b")
 
 
+# Correlation IDs are minted tracers (corr-<hex>), not secrets — they are
+# exempt from the generic opaque-blob value redaction so they survive in
+# structured logs and event payloads (still validated at the boundary via
+# is_safe_correlation_id). Match the adopted/created form exactly.
+_CORRELATION_ID_SHAPE = re.compile(r"^corr-[0-9a-f]{32}$")
+
+# Durable user IDs are hyphenated UUIDs (str(uuid4())) — safe, non-secret
+# actor identifiers that MUST survive into the access log (F16). The
+# hyphen groups make this shape distinct from opaque secrets: session IDs
+# are single 43-char token_urlsafe blobs and never match. The exact UUID
+# shape is required so invented long blobs can never borrow the exemption.
+_USER_ID_SHAPE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
 def sanitize(value, depth: int = 0):
     """Recursively remove/redact credential-shaped material.
 
     Keys that ARE credential names are dropped entirely; long opaque
     credential-vocabulary strings are replaced by ``REDACTED``. Safe
-    scalar configuration survives verbatim.
+    scalar configuration survives verbatim. Valid correlation IDs are
+    exempt from opaque-blob redaction (they are non-secret tracers).
     """
     if depth > 6:
         return None
@@ -103,6 +121,10 @@ def sanitize(value, depth: int = 0):
     if isinstance(value, (list, tuple)):
         return [sanitize(v, depth + 1) for v in value[:20]]
     if isinstance(value, str):
+        if _CORRELATION_ID_SHAPE.fullmatch(value):
+            return value
+        if _USER_ID_SHAPE.fullmatch(value):
+            return value
         if _SECRETISH_KEY.search(value) and len(value) >= 24 and " " not in value:
             return REDACTED
         return _SECRETISH_VALUE.sub(REDACTED, value)
@@ -111,8 +133,16 @@ def sanitize(value, depth: int = 0):
     return str(value)
 
 
-def _safe_user_facts() -> dict:
-    """Best-effort, never-secret user facts for the access log."""
+def _safe_user_facts(request_facts: dict | None = None) -> dict:
+    """Best-effort, never-secret user facts for the access log.
+
+    Facts recorded on the ASGI scope (``request.state``) take precedence —
+    they are visible to the middleware task even for sync (threadpool)
+    endpoints. The ContextVar fallback covers async paths and background
+    operations.
+    """
+    if request_facts:
+        return request_facts
     from app.routers.deps import current_request_user_facts
 
     return current_request_user_facts()
@@ -184,6 +214,7 @@ def request_log_fields(
     status_code: int,
     duration_ms: float,
     correlation: str | None = None,
+    user_facts: dict | None = None,
 ) -> dict:
     """Build the Day 46 request-log field set (sanitized, secret-free)."""
     fields = {
@@ -194,7 +225,7 @@ def request_log_fields(
         "correlation_id": correlation or correlation_id(),
     }
     try:
-        fields.update(_safe_user_facts())
+        fields.update(_safe_user_facts(user_facts))
     except Exception:  # never fail a request because logging facts failed
         pass
     return fields
