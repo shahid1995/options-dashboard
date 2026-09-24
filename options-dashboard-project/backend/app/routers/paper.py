@@ -285,9 +285,21 @@ def _paper_error(
     # operational alert — observational only, the mapped HTTP error below
     # is unchanged. The authenticated actor comes from the request's
     # resolved identity facts (safe durable user id — never session or
-    # token material), and the alert joins the request's DB session when
-    # one is provided so it persists in the same unit of work.
+    # token material). TRANSACTION OWNERSHIP (post-merge follow-up): the
+    # alert OWNS its transaction — it NEVER joins, commits, or rolls back
+    # the caller's session, so the business operation remains the only
+    # authority over its own unit of work (a helper commit here would
+    # pre-empt the caller's rollback authority and could fragment an
+    # atomic operation like the bulk exit into a partial commit). The
+    # alert's short-lived session is bound to the CALLER'S ENGINE when
+    # one is supplied (same database — request fixtures in tests, the
+    # production engine in prod) so the alert is durable immediately on
+    # error paths, where the request lifecycle never commits the DI
+    # session. A background/ad-hoc caller with no session gets
+    # SessionLocal().
     try:
+        from sqlalchemy.orm import Session
+
         from app.routers.deps import current_request_user_facts
         from app.services.operations import record_execution_failure
         from app.db import SessionLocal
@@ -298,8 +310,9 @@ def _paper_error(
         # from them do not propagate into the endpoint's context).
         actor = user_id or current_request_user_facts().get("user_id")
         if actor:
-            owns_db = db is None
-            alert_db = SessionLocal() if owns_db else db
+            # This helper creates, commits, and closes ONLY the alert's
+            # own session. The caller's session (if any) is untouched.
+            alert_db = SessionLocal() if db is None else Session(bind=db.get_bind())
             try:
                 record_execution_failure(
                     alert_db,
@@ -309,8 +322,7 @@ def _paper_error(
                 )
                 alert_db.commit()
             finally:
-                if owns_db:
-                    alert_db.close()
+                alert_db.close()
     except Exception:  # alert recording must never change the outcome
         pass
     status = {
