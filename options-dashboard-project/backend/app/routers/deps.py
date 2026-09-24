@@ -2,13 +2,47 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from fastapi import Cookie, Depends, Header, HTTPException
+from fastapi import Cookie, Depends, Header, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from app.db import get_db
 
 
 SESSION_COOKIE_NAME = "strikenova_session"
+
+# Day 46 (Issue #92, F16): request-scoped user facts for the structured
+# access log, stored by the auth dependencies when a request
+# authenticates. The storage is the Request's ``state`` (via the module
+# ContextVar fallback), NOT a bare ContextVar: sync endpoints run in the
+# threadpool, where ContextVar mutations do NOT propagate back to the
+# middleware task — request state is shared through the ASGI scope, so
+# the middleware reliably sees the authenticated actor. Facts are safe,
+# non-secret identifiers only (user id + tenant scope — never session
+# IDs, tokens, or cookie values).
+import contextvars as _ctxvars
+
+_request_user_facts: "_ctxvars.ContextVar[dict | None]" = _ctxvars.ContextVar(
+    "request_user_facts", default=None
+)
+
+
+def set_request_user_facts(
+    user_id: str | None, tenant_scope: str | None = None, *, request: Request | None = None
+) -> None:
+    """Record safe actor facts for the current request's log record."""
+    facts = {"user_id": user_id, "tenant": tenant_scope} if user_id else None
+    if request is not None:
+        request.state.user_facts = facts
+    _request_user_facts.set(facts)
+
+
+def current_request_user_facts(request: Request | None = None) -> dict:
+    if request is not None:
+        facts = getattr(request.state, "user_facts", None)
+        if facts:
+            return facts
+    facts = _request_user_facts.get()
+    return facts or {}
 
 
 def _canonical_session_id(
@@ -60,7 +94,9 @@ def _extract_session_id(
     return sid
 
 
-def _resolve_user(db: Session, sid: str) -> AuthenticatedUser:
+def _resolve_user(
+    db: Session, sid: str, request: Request | None = None
+) -> AuthenticatedUser:
     """Core resolution: session_id → (user_id, access_token|None).
 
     Two distinct lookups:
@@ -84,11 +120,20 @@ def _resolve_user(db: Session, sid: str) -> AuthenticatedUser:
     if user is None or user.status != "active":
         raise HTTPException(status_code=403, detail="StrikeNova account is not active.")
 
+    # Day 46 (F16): safe actor facts for the structured access log. Stored
+    # on the Request state when available (survives the threadpool hop for
+    # sync endpoints); never secrets.
+    try:
+        set_request_user_facts(user.id, request=request)
+    except Exception:
+        pass
+
     # access_token is None for platform-only sessions (no broker connected)
     return AuthenticatedUser(user_id=user.id, access_token=broker_token)
 
 
 def get_current_user(
+    request: Request,
     x_session_id: str | None = Header(default=None),
     session_id_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
 ) -> AuthenticatedUser:
@@ -105,7 +150,7 @@ def get_current_user(
     from app.db import SessionLocal
     own_db = SessionLocal()
     try:
-        return _resolve_user(own_db, sid)
+        return _resolve_user(own_db, sid, request=request)
     finally:
         own_db.close()
 
@@ -127,12 +172,13 @@ class CurrentUser:
 
     def __call__(
         self,
+        request: Request,
         db: Session = Depends(get_db),
         x_session_id: str | None = Header(default=None),
         session_id_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
     ) -> AuthenticatedUser:
         sid = _extract_session_id(x_session_id, session_id_cookie)
-        return _resolve_user(db, sid)
+        return _resolve_user(db, sid, request=request)
 
 
 class AdminUser:
@@ -160,6 +206,7 @@ class AdminUser:
 
     def __call__(
         self,
+        request: Request,
         db: Session = Depends(get_db),
         x_session_id: str | None = Header(default=None),
         session_id_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
@@ -167,7 +214,7 @@ class AdminUser:
         # Privileged boundary is cookie-only: the legacy header transport is
         # never consulted for admin authorization (F6).
         sid = _extract_session_id(None, session_id_cookie)
-        user = _resolve_user(db, sid)
+        user = _resolve_user(db, sid, request=request)
         from app.identity import User as UserModel
 
         row = db.query(UserModel).filter(UserModel.id == user.user_id).one_or_none()

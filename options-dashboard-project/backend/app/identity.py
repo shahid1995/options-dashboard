@@ -279,6 +279,43 @@ def _admin_audit_events_are_immutable(mapper, connection, target):
     )
 
 
+class NotificationEvent(Base):
+    """Day 46 (Issue #92) — durable, backend-authoritative notification.
+
+    One row per notification event: type, severity, source domain,
+    human-readable summary, sanitized structured details, tenant/user
+    scope (None = platform-operational), correlation/operation ID and a
+    deduplication identity. Payloads pass the shared sanitizer BEFORE
+    persistence, so no broker credential, Analytics Token, session ID,
+    or cookie value can ever reach this table, a channel, or a reader.
+    User-scoped rows are readable only within their scope (tenant
+    isolation is enforced at the service/router boundary); platform-
+    scoped rows are admin/operational-surface material only.
+    """
+
+    __tablename__ = "notification_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(64), index=True)
+    severity: Mapped[str] = mapped_column(String(16), default="info", index=True)
+    source: Mapped[str] = mapped_column(String(64))
+    summary: Mapped[str] = mapped_column(Text)
+    details: Mapped[dict] = mapped_column(JSONText, default=dict)
+    user_scope: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    correlation_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    dedup_key: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial
+        return (
+            f"NotificationEvent(id={self.id!r}, event_type={self.event_type!r}, "
+            f"severity={self.severity!r}, occurred_at={self.occurred_at!r})"
+        )
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return repr(self)
+
+
 class BrokerConnection(Base):
     """Persistent broker connection owned by a StrikeNova user. (AD-4)
 

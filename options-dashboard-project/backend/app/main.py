@@ -382,6 +382,26 @@ from app.api.v1.admin import router as admin_v1_router  # noqa: E402  (after app
 
 app.include_router(admin_v1_router, prefix=API_VERSION_PREFIX + "/admin", tags=["admin"])
 
+# Day 46: tenant-isolated, read-only notification surface (Issue #92).
+from app.api.v1.notifications import router as notifications_v1_router  # noqa: E402
+
+app.include_router(
+    notifications_v1_router,
+    prefix=API_VERSION_PREFIX + "/notifications",
+    tags=["notifications"],
+)
+
+# Day 46 observability (Issue #92): JSON structured access logging and
+# the correlation-ID boundary (pure-ASGI middleware; F15/F16 remediation).
+# install_correlation_middleware adds the unhandled-500 correlation
+# responder OUTSIDE the correlation middleware so every response —
+# including server-generated 500s — echoes the request's correlation ID.
+from app.middleware import install_correlation_middleware  # noqa: E402
+from app.structlog_config import configure_logging  # noqa: E402
+
+configure_logging()
+install_correlation_middleware(app)
+
 app.include_router(auth.router, prefix="/auth", tags=["auth"])
 from app.routers import broker_diagnostics  # noqa: E402  (after app creation)
 
@@ -407,7 +427,7 @@ def health():
 def readiness():
     """Readiness check — can the app serve production traffic?"""
     import time
-    from app.db import engine
+    from app.db import engine, SessionLocal
     from sqlalchemy import text
 
     checks = {}
@@ -430,6 +450,34 @@ def readiness():
     except Exception as e:
         checks["token_store"] = f"error: {type(e).__name__}"
         all_ok = False
+
+    # Day 46 (Issue #92): material readiness degradation raises a platform
+    # operational event (deduped, secret-free) — deterministic condition,
+    # never an opaque score. Failure to publish must never mask the check.
+    if not all_ok:
+        try:
+            from app.services import operations
+            from app.structlog_config import correlation_id
+
+            db_session = SessionLocal()
+            try:
+                degraded = [
+                    (name, state)
+                    for name, state in checks.items()
+                    if isinstance(state, str) and state.startswith("error")
+                ]
+                for name, state in degraded:
+                    operations.record_readiness_degradation(
+                        db_session,
+                        component=name,
+                        reason=state,
+                        correlation_id=correlation_id(),
+                    )
+                db_session.commit()
+            finally:
+                db_session.close()
+        except Exception:
+            pass
 
     status_code = 200 if all_ok else 503
     from fastapi.responses import JSONResponse

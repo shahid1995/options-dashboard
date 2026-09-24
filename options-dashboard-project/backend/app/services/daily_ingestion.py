@@ -59,6 +59,18 @@ from app.utils.market_time import IST
 
 logger = logging.getLogger(__name__)
 
+
+def _alert_job_failure(db: Session, run_id: str, reason: str) -> None:
+    """Day 46 (F13): the REAL ingestion failure boundary emits the
+    platform-scoped operational alert. Observational only — never alters
+    the pipeline result, and recording failures are swallowed."""
+    try:
+        from app.services.operations import record_job_failure
+
+        record_job_failure(db, job="daily_ingestion", reason=reason[:200])
+    except Exception:
+        pass
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -585,6 +597,7 @@ class DailyIngestionPipeline:
                 self.db, self.run_id, "FAILED",
                 error_message="No valid access token",
             )
+            _alert_job_failure(self.db, self.run_id, "No valid access token")
             self.db.commit()
             result.completed_at = datetime.now(timezone.utc).isoformat()
             result.elapsed_seconds = round(time.time() - start_time, 2)
@@ -661,6 +674,7 @@ class DailyIngestionPipeline:
                 error_category="AUTH_EXPIRED",
                 error_message=f"Auth failed: {e.message}",
             )
+            _alert_job_failure(self.db, self.run_id, f"Auth failed: {e.message}")
             self.db.commit()
         except Exception as e:
             result.status = "FAILED"
@@ -670,6 +684,7 @@ class DailyIngestionPipeline:
                 error_category="UNKNOWN",
                 error_message=str(e)[:500],
             )
+            _alert_job_failure(self.db, self.run_id, f"Unexpected error: {e}")
             self.db.commit()
 
         result.completed_at = datetime.now(timezone.utc).isoformat()

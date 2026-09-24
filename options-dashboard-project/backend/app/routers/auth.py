@@ -1021,7 +1021,11 @@ def status(session_id: str | None = Depends(get_session_id)):
 
 
 @router.get("/me")
-def me(session_id: str | None = Depends(get_session_id), db: Session = Depends(get_db)):
+def me(
+    request: FastAPIRequest,
+    session_id: str | None = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
     """Return the authenticated StrikeNova account without broker secrets."""
     if token_store.get_token(session_id) is None:
         raise HTTPException(status_code=401, detail="Not logged in")
@@ -1035,6 +1039,17 @@ def me(session_id: str | None = Depends(get_session_id), db: Session = Depends(g
     user = db.query(User).filter(User.id == session.user_id).one_or_none()
     if user is None or user.status != "active":
         raise HTTPException(status_code=403, detail="StrikeNova account is not active")
+
+    # Day 46 (F16): the authenticated actor's durable id reaches the
+    # structured access log — safe identifier only, never session material.
+    # Recorded on the Request state (scope) so the middleware task sees it
+    # even though this endpoint is sync (threadpool).
+    try:
+        from app.routers.deps import set_request_user_facts
+
+        set_request_user_facts(user.id, request=request)
+    except Exception:
+        pass
 
     return {
         "user_id": user.id,
