@@ -182,15 +182,25 @@ async def call_upstox(
     except BrokerError as e:
         # Day 46 (F13): the REAL broker failure boundary emits the
         # operational alert — observational only, the translated HTTP
-        # error below is unchanged. The request-scoped DB session (DI)
-        # is used when provided; ad-hoc callers fall back to a short-
-        # lived SessionLocal. Any recording failure is swallowed so the
-        # original business error still surfaces.
+        # error below is unchanged. TRANSACTION OWNERSHIP (post-merge
+        # follow-up): the alert OWNS its transaction — it NEVER joins,
+        # commits, or rolls back the caller's session, so the business
+        # operation remains the only authority over its own unit of work
+        # (a helper commit here would pre-empt the caller's rollback
+        # authority and fragment atomic operations like the bulk exit).
+        # The alert's short-lived session is bound to the CALLER'S ENGINE
+        # when one is supplied (same database — request fixtures in
+        # tests, the production engine in prod) so the alert is durable
+        # immediately on error paths, where the request lifecycle never
+        # commits the DI session. A background/ad-hoc caller with no
+        # session gets SessionLocal(). Any recording failure is swallowed
+        # so the original business error still surfaces.
         try:
             scope = user_scope if user_scope is not None else _platform_user_id(session_id)
             if scope is not None:
-                owns_db = db is None
-                alert_db = SessionLocal() if owns_db else db
+                # This helper creates, commits, and closes ONLY the alert's
+                # own session. The caller's session (if any) is untouched.
+                alert_db = SessionLocal() if db is None else Session(bind=db.get_bind())
                 try:
                     record_broker_failure(
                         alert_db,
@@ -200,8 +210,7 @@ async def call_upstox(
                     )
                     alert_db.commit()
                 finally:
-                    if owns_db:
-                        alert_db.close()
+                    alert_db.close()
         except Exception:  # alert recording must never change the outcome
             pass
         if e.code in BrokerErrorCode.SESSION_CODES:
