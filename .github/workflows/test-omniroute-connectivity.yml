@@ -12,82 +12,58 @@ jobs:
 
     steps:
       - name: Check runner identity
-        shell: powershell
+        shell: cmd
         run: |
-          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-          $os = [System.Environment]::OSVersion.ToString()
-          $name = $env:COMPUTERNAME
-          "## Runner Identity`n- **Name:** $name`n- **OS:** $os`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
-          Write-Host "Runner: $name on $os"
+          @echo off
+          echo ## Runner Identity >> "%GITHUB_STEP_SUMMARY%"
+          echo - **Name:** %COMPUTERNAME% >> "%GITHUB_STEP_SUMMARY%"
+          for /f "delims=" %%V in ('ver') do echo - **OS:** %%V >> "%GITHUB_STEP_SUMMARY%"
+          echo Runner: %COMPUTERNAME% started
 
       - name: Test 1 - localhost:20128 reachability
         id: test1
-        shell: powershell
+        shell: cmd
         run: |
-          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-          $output = curl.exe -s -o NUL -w '%{http_code}' --max-time 10 http://localhost:20128/
-          $httpCode = $output.Trim()
-          "http_code=$httpCode" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          if ($httpCode -eq '307' -or $httpCode -eq '200') {
-            "result=REACHABLE" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-            Write-Host "localhost:20128 reachable (HTTP $httpCode)"
-          } else {
-            "result=UNREACHABLE" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-            Write-Host "ERROR: localhost:20128 returned HTTP $httpCode" -ForegroundColor Red
-            exit 1
-          }
+          @echo off
+          curl.exe --noproxy "*" -s -o NUL -w "%%{http_code}" --max-time 10 http://localhost:20128/ > "%TEMP%\omr_http_code.txt"
+          set /p HTTP_CODE=<"%TEMP%\omr_http_code.txt"
+          if "%HTTP_CODE%"=="" set HTTP_CODE=000
+          echo "http_code=%HTTP_CODE%" >> "%GITHUB_OUTPUT%"
+          if "%HTTP_CODE%"=="307" (
+            echo "result=REACHABLE" >> "%GITHUB_OUTPUT%"
+            echo localhost:20128 reachable (HTTP 307)
+            exit /b 0
+          )
+          if "%HTTP_CODE%"=="200" (
+            echo "result=REACHABLE" >> "%GITHUB_OUTPUT%"
+            echo localhost:20128 reachable (HTTP 200)
+            exit /b 0
+          )
+          echo "result=UNREACHABLE" >> "%GITHUB_OUTPUT%"
+          echo ERROR: localhost:20128 returned HTTP %HTTP_CODE%
+          exit /b 1
 
       - name: Test 2 - shahid-combo chat completions
         id: test2
-        shell: powershell
+        shell: cmd
         run: |
-          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-          $body = '{"model":"shahid-combo","messages":[{"role":"user","content":"Reply with exactly: OK"}],"max_tokens":5,"temperature":0}'
-          $headers = @{ 'Content-Type' = 'application/json'; 'Authorization' = 'Bearer sk-local-connectivity-test' }
-          try {
-            $response = Invoke-RestMethod -Uri 'http://localhost:20128/v1/chat/completions' -Method Post -Headers $headers -Body $body -TimeoutSec 30 -MaximumRetryCount 0
-            if ($response.error) {
-              "http_code=200" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-              "result=REJECTED" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-              "response_preview=$($response.error.message)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-              Write-Host "ERROR: OmniRoute returned error: $($response.error.message)" -ForegroundColor Red
-              exit 1
-            }
-            $content = $response.choices[0].message.content
-            "http_code=200" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-            "result=ACCEPTED" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-            "response_preview=$content" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-            Write-Host "shahid-combo accepted (HTTP 200): $content"
-          } catch {
-            $httpCode = 0
-            if ($_.Exception.Response) {
-              $httpCode = [int]$_.Exception.Response.StatusCode
-            }
-            "http_code=$httpCode" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-            "result=REJECTED" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-            Write-Host "ERROR: shahid-combo returned HTTP $httpCode" -ForegroundColor Red
-            exit 1
-          }
+          @echo off
+          powershell -Command "$body=@{model='shahid-combo';messages=@(@{role='user';content='Reply with exactly: OK'});max_tokens=5;temperature=0}|ConvertTo-Json -Compress; $headers=@{'Content-Type'='application/json';'Authorization'='Bearer sk-local-connectivity-test'}; try { $response=Invoke-RestMethod -Uri 'http://localhost:20128/v1/chat/completions' -Method Post -Headers $headers -Body $body -TimeoutSec 30 -MaximumRetryCount 0; if($response.error){Add-Content -Path $env:GITHUB_OUTPUT -Value 'http_code=200'; Add-Content -Path $env:GITHUB_OUTPUT -Value 'result=REJECTED'; Write-Host 'ERROR: OmniRoute returned error: ' + $response.error.message -ForegroundColor Red; exit 1}; $content=$response.choices[0].message.content; Add-Content -Path $env:GITHUB_OUTPUT -Value 'http_code=200'; Add-Content -Path $env:GITHUB_OUTPUT -Value 'result=ACCEPTED'; Add-Content -Path $env:GITHUB_OUTPUT -Value ('response_preview=' + $content); Write-Host 'shahid-combo accepted (HTTP 200): ' + $content } catch { $httpCode=0; if($_.Exception.Response){$httpCode=[int]$_.Exception.Response.StatusCode}; Add-Content -Path $env:GITHUB_OUTPUT -Value ('http_code=' + $httpCode); Add-Content -Path $env:GITHUB_OUTPUT -Value 'result=REJECTED'; Write-Host 'ERROR: shahid-combo returned HTTP ' + $httpCode -ForegroundColor Red; exit 1 }"
 
       - name: Summary
         if: always()
-        shell: powershell
+        shell: cmd
         run: |
-          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-          $test1Result = "${{ steps.test1.outputs.result }}"
-          $test1Code = "${{ steps.test1.outputs.http_code }}"
-          $test2Result = "${{ steps.test2.outputs.result }}"
-          $test2Code = "${{ steps.test2.outputs.http_code }}"
-          $test2Accepted = if ($test2Result -eq 'ACCEPTED') { 'YES' } else { 'NO' }
-          $os = [System.Environment]::OSVersion.ToString()
-          $name = $env:COMPUTERNAME
-          $s = "## OmniRoute Connectivity Test Results`n`n"
-          $s += "| Check | Result |`n"
-          $s += "|-------|--------|`n"
-          $s += "| Runner name | $name |`n"
-          $s += "| Runner OS | $os |`n"
-          $s += "| localhost:20128 reachable | $test1Result (HTTP $test1Code) |`n"
-          $s += "| /v1/chat/completions reachable | $test2Result (HTTP $test2Code) |`n"
-          $s += "| shahid-combo accepted | $test2Accepted |`n"
-          $s += "`n> **Note:** No real API key used. Placeholder bearer only (OmniRoute accepts any bearer on chat path by default). No secrets printed.`n"
-          $s | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          @echo off
+          if "%test2_result%"=="ACCEPTED" (set TEST2_ACCEPTED=YES) else (set TEST2_ACCEPTED=NO)
+          echo ## OmniRoute Connectivity Test Results >> "%GITHUB_STEP_SUMMARY%"
+          echo. >> "%GITHUB_STEP_SUMMARY%"
+          echo "| Check | Result |" >> "%GITHUB_STEP_SUMMARY%"
+          echo "|-------|--------|" >> "%GITHUB_STEP_SUMMARY%"
+          echo "| Runner name | %COMPUTERNAME% |" >> "%GITHUB_STEP_SUMMARY%"
+          for /f "delims=" %%V in ('ver') do echo "| Runner OS | %%V |" >> "%GITHUB_STEP_SUMMARY%"
+          echo "| localhost:20128 reachable | %test1_result% (HTTP %test1_http_code%) |" >> "%GITHUB_STEP_SUMMARY%"
+          echo "| /v1/chat/completions reachable | %test2_result% (HTTP %test2_http_code%) |" >> "%GITHUB_STEP_SUMMARY%"
+          echo "| shahid-combo accepted | %TEST2_ACCEPTED% |" >> "%GITHUB_STEP_SUMMARY%"
+          echo. >> "%GITHUB_STEP_SUMMARY%"
+          echo "> **Note:** No real API key used. Placeholder bearer only (OmniRoute accepts any bearer on chat path by default). No secrets printed." >> "%GITHUB_STEP_SUMMARY%"
