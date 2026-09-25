@@ -132,10 +132,22 @@ def validate_production_config() -> None:
     # through THIS error contract — not with a raw SQLAlchemy
     # ``NoSuchModuleError`` from engine construction. Credential text is
     # never included: only the scheme family is echoed.
+    #
+    # CockroachDB schemes are REQUIRED: CockroachDB Cloud is the mandated
+    # production database, the SQLAlchemy psycopg dialect cannot parse
+    # CockroachDB's server version string (startup aborts with
+    # "Could not determine version from string 'CockroachDB CCL ...'"), and
+    # the project's declared dependency sqlalchemy-cockroachdb provides the
+    # working ``cockroachdb[+psycopg]://`` dialects. Staging's production
+    # configuration uses ``cockroachdb+psycopg://``. Rejecting these schemes
+    # would make it impossible to boot against the intended production
+    # database while the plain-PostgreSQL schemes cannot actually run on it.
     allowed_prefixes = (
         "postgresql+psycopg://",  # normalize_database_url() target
         "postgresql://",          # accepted pre-normalization form
         "postgres://",            # legacy pre-normalization form
+        "cockroachdb+psycopg://",  # sqlalchemy-cockroachdb (psycopg 3) — CRDB
+        "cockroachdb://",          # sqlalchemy-cockroachdb dialect — CRDB
     )
     if not normalized.startswith(allowed_prefixes):
         scheme = normalized.split(":", 1)[0]
