@@ -305,6 +305,20 @@ def _migration_engine_url() -> str:
     return str(engine.url)
 
 
+def _migration_lock_url() -> str:
+    """Resolve the URL used for the migration lease lock (ADR-017).
+
+    The lock travels with the migration identity: when
+    ``STRIKENOVA_MIGRATION_DATABASE_URL`` is set, the lease lives under the
+    migrator credential; otherwise the historical runtime URL is used. The
+    runtime identity therefore never needs DDL/owner rights for locking.
+    """
+    migration_url = getattr(settings, "STRIKENOVA_MIGRATION_DATABASE_URL", None)
+    if migration_url:
+        return normalize_database_url(migration_url)
+    return str(engine.url)
+
+
 def _run_alembic_migrations() -> None:
     """Run Alembic migrations against the migration identity.
 
@@ -330,8 +344,71 @@ def _run_alembic_migrations() -> None:
             "Using the dedicated migration identity for Alembic "
             "(STRIKENOVA_MIGRATION_DATABASE_URL is set)."
         )
-    command.upgrade(alembic_cfg, "head")
-    logger.info("Alembic migrations applied successfully")
+    if str(engine.url).startswith("sqlite"):
+        # Single-process by construction: the lease lock is a local no-op.
+        logger.info("SQLite target: migration lease lock skipped (single-process)")
+        command.upgrade(alembic_cfg, "head")
+        logger.info("Alembic migrations applied successfully")
+        return
+
+    _execute_serialized(alembic_cfg, command, logger)
+
+
+def _execute_serialized(alembic_cfg, command, logger) -> None:
+    """Run ``command.upgrade`` guarded by the ADR-017 transactional lease.
+
+    Exactly one process may execute the migration chain at a time. Waiters
+    either take over an EXPIRED lease (crashed holder) or observe the lock
+    being freed, then re-check whether the chain still needs running. The
+    wait budget is bounded: a lock that stays contested beyond
+    ``MIGRATION_LOCK_WAIT_SECONDS`` fails startup closed instead of racing.
+    """
+    import socket
+    import uuid
+
+    from app import _migration_lock as mlock
+
+    lock_url = _migration_lock_url()
+    owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+    ttl = int(getattr(settings, "MIGRATION_LOCK_TTL_SECONDS", 120))
+    wait = int(getattr(settings, "MIGRATION_LOCK_WAIT_SECONDS", 900))
+    logger.info(
+        "migration lock acquisition started (owner=%s ttl_seconds=%s wait_seconds=%s)",
+        owner,
+        ttl,
+        wait,
+    )
+    acquired, took_over = mlock.try_acquire(lock_url, owner, ttl_seconds=ttl)
+    while not acquired:
+        expired = mlock.wait_for_release(lock_url, ttl_seconds=ttl, max_wait_seconds=wait)
+        acquired, took_over = mlock.try_acquire(lock_url, owner, ttl_seconds=ttl)
+        if not acquired and not expired:
+            # Lock was freed and immediately re-taken by another instance;
+            # observe again rather than racing the new holder.
+            continue
+    renewer = mlock.LeaseRenewer(lock_url, owner, ttl)
+    renewer.start()
+    try:
+        logger.info(
+            "migration lock acquired (owner=%s took_over_expired_lease=%s)",
+            owner,
+            took_over,
+        )
+        try:
+            from alembic.script import ScriptDirectory
+
+            head_rev = ScriptDirectory.from_config(alembic_cfg).get_current_head()
+            current_rev = mlock.read_alembic_version(lock_url)
+            if head_rev and current_rev == head_rev:
+                logger.info("migration already current (version=%s)", current_rev)
+        except Exception:  # noqa: BLE001 - diagnostics only, never fatal
+            pass
+        command.upgrade(alembic_cfg, "head")
+        logger.info("Alembic migrations applied successfully")
+    finally:
+        renewer.stop()
+        released = mlock.release(lock_url, owner)
+        logger.info("migration lock released (owner=%s released=%s)", owner, released)
 
 
 # ---------------------------------------------------------------------------

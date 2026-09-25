@@ -95,3 +95,8 @@ Founder acceptance.
    set; otherwise under the runtime credential (legacy behavior). The
    runtime identity must never require cluster administration, and the
    migration identity must never be the normal serving credential (ADR-016).
+6d. **Migrations are serialized.** Only one process may execute the Alembic
+   chain at a time; concurrent application startups must wait, take over an
+   expired lease, or fail closed — never execute the same DDL concurrently.
+   The lock must work on an empty database and under the migration identity,
+   and must never require runtime DDL/owner privileges (ADR-017).
