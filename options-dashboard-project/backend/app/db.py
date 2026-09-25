@@ -69,25 +69,22 @@ def _engine():
     return eng
 
 
-engine = _engine()
-SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
-
-
 # ---------------------------------------------------------------------------
-# Production safety validation (Day 4)
+# Production safety validation (ADR-014, fail-closed)
 # ---------------------------------------------------------------------------
 
 
 def validate_production_config() -> None:
     """Fail closed when production database configuration is unsafe.
 
-    Called once at module import time. When the production signal is active
-    (``STRIKENOVA_ENV=production`` — provider-neutral — or the legacy
-    Railway-era indicators), the application MUST NOT be able to start on
-    SQLite:
+    Called at module import time BEFORE any engine is constructed. When the
+    production signal is active (``STRIKENOVA_ENV=production`` —
+    provider-neutral — or the legacy Railway-era indicators), the application
+    MUST NOT be able to start on SQLite:
 
     - missing ``DATABASE_URL``       -> RuntimeError (no silent fallback)
-    - SQLite ``DATABASE_URL``        -> RuntimeError
+    - SQLite ``DATABASE_URL``        -> RuntimeError (scheme match is
+      case-insensitive: ``sqlite:``, ``SQLITE:``, and mixed case all refused)
     - PostgreSQL/CockroachDB ``DATABASE_URL`` -> accepted
 
     Non-production environments are untouched: intentional local SQLite
@@ -117,7 +114,7 @@ def validate_production_config() -> None:
         )
 
     normalized = normalize_database_url(settings.DATABASE_URL)
-    if normalized.startswith("sqlite"):
+    if normalized.lower().startswith("sqlite"):
         logger.error(
             "Production environment detected but DATABASE_URL points to "
             "SQLite (connection string masked). Refusing to start: "
@@ -130,7 +127,14 @@ def validate_production_config() -> None:
         )
 
 
+# Validation MUST run before engine construction: a malformed SQLite URL
+# could otherwise fail inside create_engine() with a dialect error before the
+# required production-configuration error is raised.
 validate_production_config()
+
+
+engine = _engine()
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
 
 # ---------------------------------------------------------------------------
