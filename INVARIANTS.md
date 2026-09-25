@@ -39,6 +39,12 @@ Founder acceptance.
    refuses to start unless `DATABASE_URL` is set and does not point at
    SQLite (scheme match is case-insensitive). A production deployment can
    never silently run on ephemeral SQLite (ADR-014).
+6b. **Production frontend API configuration is fail-closed.** Production
+   builds of the frontend require an explicit `NEXT_PUBLIC_API_URL` https
+   origin; missing/blank/invalid values (including the historical Railway
+   URL, localhost/loopback targets, and plain http) abort the build. No
+   default or fallback backend URL is ever embedded in the build output
+   (ADR-015).
 7. **Alembic is the sole schema authority.** Schema changes happen only
    through migrations; no ad-hoc DDL in application code or tests.
 
