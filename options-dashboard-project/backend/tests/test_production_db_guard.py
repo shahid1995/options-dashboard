@@ -203,6 +203,21 @@ class TestMalformedProductionSchemes:
                 mock_settings.DATABASE_URL = url
                 validate_production_config()  # must not raise
 
+    def test_supported_cockroachdb_forms_remain_allowed(self):
+        """CockroachDB dialect schemes (sqlalchemy-cockroachdb) must pass.
+
+        CockroachDB Cloud is the mandated production database; staging's live
+        configuration uses ``cockroachdb+psycopg://``. The guard must accept
+        the schemes the project's declared dependency provides, otherwise no
+        URL can both pass the guard and boot against the production DB.
+        """
+        for url in ("cockroachdb+psycopg://u:p@h:26257/db?sslmode=require",
+                    "cockroachdb://u:p@h:26257/db?sslmode=require"):
+            with patch("app.db.settings") as mock_settings:
+                mock_settings.IS_PRODUCTION = True
+                mock_settings.DATABASE_URL = url
+                validate_production_config()  # must not raise
+
     def test_unknown_scheme_fails_import_end_to_end(self):
         """End-to-end: importing the app in production with an unknown scheme
         fails with the application error, not a SQLAlchemy dialect error.
