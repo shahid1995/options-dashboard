@@ -103,6 +103,13 @@ class Settings(BaseSettings):
     # a VM, local rehearsal).
     STRIKENOVA_ENV: str = ""
 
+    # ADR-016 (optional identity separation): when set, Alembic migrations
+    # run under this dedicated higher-privilege identity instead of the
+    # runtime DATABASE_URL. The runtime identity can then be restricted to
+    # DML (no schema ownership/DDL). Leave unset for single-identity
+    # deployments (behavior identical to the historical model).
+    STRIKENOVA_MIGRATION_DATABASE_URL: str | None = None
+
     @property
     def IS_PRODUCTION(self) -> bool:
         """Detect production environments.

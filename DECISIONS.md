@@ -269,3 +269,32 @@ Railway rejection, https/localhost/scheme rules, REST+WS consistency,
 no-fallback source assertions); production build probes (build fails without
 the variable; with a synthetic `https://api.example.test` the value is baked
 into client chunks and SSR output with zero Railway references).
+
+## ADR-016 · Runtime/migration database identity separation (opt-in) · Accepted
+
+Context: production startup runs `init_db()` → `alembic upgrade head` under
+the same identity that serves requests, forcing the runtime credential to
+hold database-owner/DDL privileges. The 2026-09-25 privilege-probe incident
+(a `DROP DATABASE` executed by the application identity during a boundary
+check) demonstrated the blast radius of that model.
+
+Decision:
+
+* `STRIKENOVA_MIGRATION_DATABASE_URL` (optional) runs Alembic under a
+  dedicated migration identity; the runtime credential can then be
+  restricted to DML with no schema ownership.
+* When unset, behavior is identical to the historical single-identity model
+  (fallback = the runtime engine URL) — existing deployments, staging, and
+  all current tests are unaffected.
+* Migration URLs pass through the existing `normalize_database_url` and the
+  ADR-014 production guard semantics remain authoritative.
+* The validated end-state (proven on a disposable database): migrator
+  identity runs the full 27-revision chain from empty to `d46aa0000001`
+  (52 tables) and is a no-op at head; runtime identity with DML-only grants
+  passes INSERT/SELECT/UPDATE/DELETE while CREATE/DROP/ALTER, CREATE
+  DATABASE/ROLE, and GRANT admin are all denied.
+
+ rollout note: production cutover to the two-identity model is a separate
+founder-authorized deployment task (create `strikenova_prod_migrator`,
+grant per ADR-014 analysis, set `STRIKENOVA_MIGRATION_DATABASE_URL` on
+Render, redeploy, verify, then downgrade the runtime credential's grants).
