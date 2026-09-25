@@ -1,0 +1,87 @@
+name: OmniRoute Connectivity Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  connectivity-test:
+    name: OmniRoute Local Connectivity
+    runs-on: [self-hosted, strikenova-ocr-local]
+
+    steps:
+      - name: Check runner identity
+        run: |
+          $os = [System.Environment]::OSVersion.ToString()
+          $name = $env:COMPUTERNAME
+          "## Runner Identity`n- **Name:** $name`n- **OS:** $os`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          Write-Host "Runner: $name on $os"
+        shell: pwsh
+
+      - name: Test 1 - localhost:20128 reachability
+        id: test1
+        run: |
+          $output = curl.exe -s -o NUL -w '%{http_code}' --max-time 10 http://localhost:20128/
+          $httpCode = $output.Trim()
+          "http_code=$httpCode" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          if ($httpCode -eq '307' -or $httpCode -eq '200') {
+            "result=REACHABLE" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "localhost:20128 reachable (HTTP $httpCode)"
+          } else {
+            "result=UNREACHABLE" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "ERROR: localhost:20128 returned HTTP $httpCode" -ForegroundColor Red
+            exit 1
+          }
+        shell: pwsh
+
+      - name: Test 2 - shahid-combo chat completions
+        id: test2
+        run: |
+          $body = '{"model":"shahid-combo","messages":[{"role":"user","content":"Reply with exactly: OK"}],"max_tokens":5,"temperature":0}'
+          $headers = @{ 'Content-Type' = 'application/json'; 'Authorization' = 'Bearer sk-local-connectivity-test' }
+          try {
+            $response = Invoke-RestMethod -Uri 'http://localhost:20128/v1/chat/completions' -Method Post -Headers $headers -Body $body -TimeoutSec 30 -MaximumRetryCount 0
+            if ($response.error) {
+              "http_code=200" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+              "result=REJECTED" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+              "response_preview=$($response.error.message)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+              Write-Host "ERROR: OmniRoute returned error: $($response.error.message)" -ForegroundColor Red
+              exit 1
+            }
+            $content = $response.choices[0].message.content
+            "http_code=200" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "result=ACCEPTED" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "response_preview=$content" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "shahid-combo accepted (HTTP 200): $content"
+          } catch {
+            $httpCode = 0
+            if ($_.Exception.Response) {
+              $httpCode = [int]$_.Exception.Response.StatusCode
+            }
+            "http_code=$httpCode" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "result=REJECTED" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "ERROR: shahid-combo returned HTTP $httpCode" -ForegroundColor Red
+            exit 1
+          }
+        shell: pwsh
+
+      - name: Summary
+        if: always()
+        run: |
+          $test1Result = "${{ steps.test1.outputs.result }}"
+          $test1Code = "${{ steps.test1.outputs.http_code }}"
+          $test2Result = "${{ steps.test2.outputs.result }}"
+          $test2Code = "${{ steps.test2.outputs.http_code }}"
+          $test2Accepted = if ($test2Result -eq 'ACCEPTED') { 'YES' } else { 'NO' }
+          $os = [System.Environment]::OSVersion.ToString()
+          $name = $env:COMPUTERNAME
+          $s = "## OmniRoute Connectivity Test Results`n`n"
+          $s += "| Check | Result |`n"
+          $s += "|-------|--------|`n"
+          $s += "| Runner name | $name |`n"
+          $s += "| Runner OS | $os |`n"
+          $s += "| localhost:20128 reachable | $test1Result (HTTP $test1Code) |`n"
+          $s += "| /v1/chat/completions reachable | $test2Result (HTTP $test2Code) |`n"
+          $s += "| shahid-combo accepted | $test2Accepted |`n"
+          $s += "`n> **Note:** No real API key used. Placeholder bearer only (OmniRoute accepts any bearer on chat path by default). No secrets printed.`n"
+          $s | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+        shell: pwsh
