@@ -17,7 +17,7 @@ jobs:
           $name = $env:COMPUTERNAME
           "## Runner Identity`n- **Name:** $name`n- **OS:** $os`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
           Write-Host "Runner: $name on $os"
-        shell: pwsh
+        shell: powershell
 
       - name: Test 1 - localhost:20128 reachability
         id: test1
@@ -33,7 +33,7 @@ jobs:
             Write-Host "ERROR: localhost:20128 returned HTTP $httpCode" -ForegroundColor Red
             exit 1
           }
-        shell: pwsh
+        shell: powershell
 
       - name: Test 2 - shahid-combo chat completions
         id: test2
@@ -64,7 +64,7 @@ jobs:
             Write-Host "ERROR: shahid-combo returned HTTP $httpCode" -ForegroundColor Red
             exit 1
           }
-        shell: pwsh
+        shell: powershell
 
       - name: Summary
         if: always()
@@ -86,4 +86,4 @@ jobs:
           $s += "| shahid-combo accepted | $test2Accepted |`n"
           $s += "`n> **Note:** No real API key used. Placeholder bearer only (OmniRoute accepts any bearer on chat path by default). No secrets printed.`n"
           $s | Add-Content -Path $env:GITHUB_STEP_SUMMARY
-        shell: pwsh
+        shell: powershell
