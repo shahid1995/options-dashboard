@@ -90,3 +90,8 @@ Founder acceptance.
     explicitly authorizes them.
 20. **Credentials are invisible to agents.** Never read, print, copy, decode,
     or expose credential files (including `.strikenova_gh_token`).
+6c. **Runtime and migration database identities are separable.** Alembic
+   runs under the identity from `STRIKENOVA_MIGRATION_DATABASE_URL` when
+   set; otherwise under the runtime credential (legacy behavior). The
+   runtime identity must never require cluster administration, and the
+   migration identity must never be the normal serving credential (ADR-016).

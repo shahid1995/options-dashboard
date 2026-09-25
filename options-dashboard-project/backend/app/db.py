@@ -175,7 +175,7 @@ SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
 
 # ---------------------------------------------------------------------------
-# Migration state validation (Day 5)
+# Migration-state validation (Day 5)
 # ---------------------------------------------------------------------------
 
 
@@ -291,12 +291,29 @@ def get_db():
         db.close()
 
 
-def _run_alembic_migrations() -> None:
-    """Run Alembic migrations against the current engine.
+def _migration_engine_url() -> str:
+    """Resolve the URL used by Alembic migrations.
 
-    Alembic is the authoritative schema-management path. The current engine
-    is passed through Config.attributes so programmatic startup and in-memory
-    tests reuse the same connectable.
+    Identity separation (ADR-016): migrations may run under a dedicated
+    higher-privilege identity via ``STRIKENOVA_MIGRATION_DATABASE_URL``.
+    When unset, migrations use the runtime ``DATABASE_URL``/engine exactly
+    as before (single-identity deployments are unaffected).
+    """
+    migration_url = getattr(settings, "STRIKENOVA_MIGRATION_DATABASE_URL", None)
+    if migration_url:
+        return normalize_database_url(migration_url)
+    return str(engine.url)
+
+
+def _run_alembic_migrations() -> None:
+    """Run Alembic migrations against the migration identity.
+
+    Alembic is the authoritative schema-management path. By default the
+    runtime engine is passed through Config.attributes so programmatic
+    startup and in-memory tests reuse the same connectable. When
+    ``STRIKENOVA_MIGRATION_DATABASE_URL`` is set, migrations run under that
+    (higher-privilege) identity instead, so the runtime credential does not
+    need schema-DDL/ownership rights.
     """
     import logging
     from alembic.config import Config
@@ -304,8 +321,15 @@ def _run_alembic_migrations() -> None:
 
     logger = logging.getLogger(__name__)
     alembic_cfg = Config("alembic.ini")
-    alembic_cfg.set_main_option("sqlalchemy.url", str(engine.url))
-    alembic_cfg.attributes["connectable"] = engine
+    migration_url = _migration_engine_url()
+    alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
+    if migration_url == str(engine.url):
+        alembic_cfg.attributes["connectable"] = engine
+    else:
+        logger.info(
+            "Using the dedicated migration identity for Alembic "
+            "(STRIKENOVA_MIGRATION_DATABASE_URL is set)."
+        )
     command.upgrade(alembic_cfg, "head")
     logger.info("Alembic migrations applied successfully")
 
