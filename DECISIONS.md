@@ -236,3 +236,36 @@ Decision (post-merge hardening on the Day 46 release tree, `b960ca2f`):
 
 Evidence: `tests/test_production_db_guard.py` (fail-closed, provider-neutral,
 redaction cases); Day 4 contract tests updated to the fail-closed semantics.
+
+## ADR-015 · Production frontend API configuration is fail-closed · Accepted
+
+Context: `next.config.js` substituted a hardcoded Railway URL
+(`options-dashboard-production-fb47.up.railway.app`) whenever
+`NEXT_PUBLIC_API_URL` was absent, and Next.js inlines `env` values into the
+client bundle. A production build without the variable therefore succeeded
+while silently pointing every REST/WebSocket/OAuth-derivation at a backend
+that no longer exists — the exact failure mode observed in the current
+Vercel production deployment.
+
+Decision:
+
+* `NEXT_PUBLIC_API_URL` is **mandatory for production builds**. The
+  `next.config.js` boundary calls the pure validator `lib/apiConfig.js`
+  (`requireApiUrl`) and any missing/blank/whitespace, non-URL, non-http(s),
+  plain-http, localhost/loopback, or historical-Railway value aborts the
+  build with a clear configuration error before any artifact is produced.
+* No fallback backend URL exists in executable configuration; the Railway
+  URL is rejected outright and may appear only in clearly historical docs.
+* Non-production builds keep intentional local behavior: an unset value
+  yields relative-URL mode, and http/localhost backends are allowed (with a
+  non-https warning).
+* `NEXT_PUBLIC_API_URL` remains the single source of truth driving REST
+  (`baseURL`), WebSocket (`chainWsUrl`, http→ws / https→wss), and the
+  OAuth callback/origin derivations; no second backend variable is
+  introduced.
+
+Evidence: `lib/apiConfig.test.js` (19 tests: valid/missing/empty/whitespace,
+Railway rejection, https/localhost/scheme rules, REST+WS consistency,
+no-fallback source assertions); production build probes (build fails without
+the variable; with a synthetic `https://api.example.test` the value is baked
+into client chunks and SSR output with zero Railway references).
