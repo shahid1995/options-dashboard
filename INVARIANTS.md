@@ -30,6 +30,11 @@ Founder acceptance.
 6. **Database portability is preserved.** Local development on SQLite,
    PostgreSQL-compatible CI, CockroachDB-validated production target. No code
    path may depend on a single vendor dialect where portability exists today.
+6a. **Production database configuration is fail-closed.** With
+   `STRIKENOVA_ENV=production` (provider-neutral — never Railway-era markers
+   alone), the backend refuses to start unless `DATABASE_URL` is set and does
+   not point at SQLite. A production deployment can never silently run on
+   ephemeral SQLite (ADR-014).
 7. **Alembic is the sole schema authority.** Schema changes happen only
    through migrations; no ad-hoc DDL in application code or tests.
 

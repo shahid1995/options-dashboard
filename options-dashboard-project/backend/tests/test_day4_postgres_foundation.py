@@ -144,26 +144,40 @@ class TestProductionSafety:
             s = Settings()
             assert s.IS_PRODUCTION is True
 
-    def test_validate_production_config_warns_missing_url(self, caplog):
-        """Production without DATABASE_URL must log a warning."""
+    def test_validate_production_config_fails_closed_missing_url(self, caplog):
+        """Production without DATABASE_URL must fail closed (fail-closed hardening).
+
+        Originally a warning-only contract (Day 4); production may NEVER
+        silently fall back to SQLite, so this now raises.
+        """
         from app.db import validate_production_config
+        import pytest
+
         with patch("app.db.settings") as mock_settings:
             mock_settings.IS_PRODUCTION = True
             mock_settings.DATABASE_URL = None
             import logging
             with caplog.at_level(logging.WARNING, logger="app.db"):
-                validate_production_config()
+                with pytest.raises(RuntimeError, match="production database configuration is required"):
+                    validate_production_config()
             assert any("DATABASE_URL" in r.message for r in caplog.records)
 
-    def test_validate_production_config_warns_sqlite_url(self, caplog):
-        """Production with sqlite:// DATABASE_URL must log a warning."""
+    def test_validate_production_config_fails_closed_sqlite_url(self, caplog):
+        """Production with sqlite:// DATABASE_URL must fail closed (fail-closed hardening).
+
+        Originally a warning-only contract (Day 4); production may NEVER
+        run on SQLite, so this now raises.
+        """
         from app.db import validate_production_config
+        import pytest
+
         with patch("app.db.settings") as mock_settings:
             mock_settings.IS_PRODUCTION = True
             mock_settings.DATABASE_URL = "sqlite:///production.db"
             import logging
             with caplog.at_level(logging.WARNING, logger="app.db"):
-                validate_production_config()
+                with pytest.raises(RuntimeError, match="production database configuration is required"):
+                    validate_production_config()
             assert any("SQLite" in r.message for r in caplog.records)
 
     def test_validate_production_config_ok_with_postgresql(self, caplog):
