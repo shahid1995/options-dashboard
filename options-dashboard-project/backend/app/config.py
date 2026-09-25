@@ -95,15 +95,27 @@ class Settings(BaseSettings):
             url = url.split(",")[0].strip()
         return url
 
+    # Provider-neutral environment selector (e.g. "production", "staging",
+    # "development"). "production" (case-insensitive) is THE production
+    # signal: it requires DATABASE_URL pointing at PostgreSQL/CockroachDB
+    # and fails startup closed otherwise. Unlike the legacy Railway-era
+    # indicators below, it works identically on any host (Render, Railway,
+    # a VM, local rehearsal).
+    STRIKENOVA_ENV: str = ""
+
     @property
     def IS_PRODUCTION(self) -> bool:
-        """Detect production environments (e.g. Railway).
+        """Detect production environments.
 
-        Returns True when common production environment indicators are set.
-        This is used to enforce that production always uses PostgreSQL and
-        never silently falls back to SQLite.
+        Primary signal is the provider-neutral ``STRIKENOVA_ENV=production``
+        (case-insensitive). The legacy Railway-era indicators are kept for
+        backward compatibility with deployments that predate the neutral
+        marker; new deployments must set STRIKENOVA_ENV instead.
         """
         import os as _os
+
+        if self.STRIKENOVA_ENV.strip().lower() == "production":
+            return True
         return bool(
             _os.environ.get("RAILWAY_ENVIRONMENT")
             or _os.environ.get("RAILWAY_SERVICE_NAME")

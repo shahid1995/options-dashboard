@@ -69,25 +69,29 @@ def _engine():
     return eng
 
 
-engine = _engine()
-SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
-
-
 # ---------------------------------------------------------------------------
-# Production safety validation (Day 4)
+# Production safety validation (ADR-014, fail-closed)
 # ---------------------------------------------------------------------------
 
 
 def validate_production_config() -> None:
-    """Log warnings when production configuration is unsafe.
+    """Fail closed when production database configuration is unsafe.
 
-    Called once at module import time.  Never crashes the application —
-    misconfigurations are logged as warnings so that operators can fix
-    them before a real production deployment.
+    Called at module import time BEFORE any engine is constructed. When the
+    production signal is active (``STRIKENOVA_ENV=production`` —
+    provider-neutral — or the legacy Railway-era indicators), the application
+    MUST NOT be able to start on SQLite:
 
-    Checks:
-    - Production must have DATABASE_URL set
-    - Production DATABASE_URL must not point to SQLite
+    - missing ``DATABASE_URL``       -> RuntimeError (no silent fallback)
+    - SQLite ``DATABASE_URL``        -> RuntimeError (scheme match is
+      case-insensitive: ``sqlite:``, ``SQLITE:``, and mixed case all refused)
+    - PostgreSQL/CockroachDB ``DATABASE_URL`` -> accepted
+
+    Non-production environments are untouched: intentional local SQLite
+    development/test behavior is preserved.
+
+    Failure messages never embed the connection string (no credentials in
+    logs or exception text).
     """
     import logging
 
@@ -97,24 +101,65 @@ def validate_production_config() -> None:
         return
 
     if not settings.DATABASE_URL:
-        logger.warning(
+        logger.error(
             "Production environment detected but DATABASE_URL is not set. "
-            "The application will fall back to local SQLite, which is "
-            "unsuitable for production. Set DATABASE_URL to a PostgreSQL "
-            "connection string."
+            "Refusing to start: the application would silently fall back to "
+            "local SQLite, which is unsuitable for production. Set "
+            "DATABASE_URL to a PostgreSQL/CockroachDB connection string."
         )
-        return
+        raise RuntimeError(
+            "production database configuration is required: DATABASE_URL is "
+            "not set while production mode is enabled. The application "
+            "refuses to silently fall back to SQLite."
+        )
 
     normalized = normalize_database_url(settings.DATABASE_URL)
-    if normalized.startswith("sqlite"):
-        logger.warning(
+    if normalized.lower().startswith("sqlite"):
+        logger.error(
             "Production environment detected but DATABASE_URL points to "
-            "SQLite (connection string masked). Production must use "
-            "PostgreSQL. Update DATABASE_URL to a PostgreSQL connection string."
+            "SQLite (connection string masked). Refusing to start: "
+            "production must use PostgreSQL/CockroachDB."
+        )
+        raise RuntimeError(
+            "production database configuration is required: DATABASE_URL "
+            "points to SQLite while production mode is enabled. Set "
+            "DATABASE_URL to a PostgreSQL/CockroachDB connection string."
+        )
+
+    # Explicit allowlist of the only dialect families production supports
+    # (PostgreSQL/CockroachDB after normalization). A malformed or unknown
+    # scheme (e.g. ``unknown://``, ``postgres+nosuchdriver://``) must fail
+    # through THIS error contract — not with a raw SQLAlchemy
+    # ``NoSuchModuleError`` from engine construction. Credential text is
+    # never included: only the scheme family is echoed.
+    allowed_prefixes = (
+        "postgresql+psycopg://",  # normalize_database_url() target
+        "postgresql://",          # accepted pre-normalization form
+        "postgres://",            # legacy pre-normalization form
+    )
+    if not normalized.startswith(allowed_prefixes):
+        scheme = normalized.split(":", 1)[0]
+        logger.error(
+            "Production environment detected but DATABASE_URL uses an "
+            "unsupported scheme (connection string masked). Refusing to "
+            "start: production must use PostgreSQL/CockroachDB."
+        )
+        raise RuntimeError(
+            "production database configuration is required: DATABASE_URL "
+            f"uses unsupported scheme '{scheme}' while production mode is "
+            "enabled. Set DATABASE_URL to a PostgreSQL/CockroachDB "
+            "connection string."
         )
 
 
+# Validation MUST run before engine construction: a malformed SQLite URL
+# could otherwise fail inside create_engine() with a dialect error before the
+# required production-configuration error is raised.
 validate_production_config()
+
+
+engine = _engine()
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
 
 # ---------------------------------------------------------------------------

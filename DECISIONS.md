@@ -213,3 +213,26 @@ actual receipt in the controlled mailboxes, which is the stronger standard.
 Pending to **Verified (2026-09-19, staging)**. *(Update 2026-09-19, Issue #69:
 the final gate subsequently passed — ADR-013; Phase 10.2 is complete on this
 branch.)*
+## ADR-014 · Production database configuration is fail-closed · Accepted
+
+Context: the production SQLite refusal (Day 4) relied on Railway-era
+markers (`RAILWAY_ENVIRONMENT`, `RAILWAY_SERVICE_NAME`, `PRODUCTION`) and
+only logged a warning, so a Render production deployment without a valid
+`DATABASE_URL` would silently boot onto ephemeral in-container SQLite.
+
+Decision (post-merge hardening on the Day 46 release tree, `b960ca2f`):
+
+* `STRIKENOVA_ENV=production` (case-insensitive) is the provider-neutral
+  production signal; the Railway-era indicators remain only for backward
+  compatibility.
+* When production mode is active, startup **fails closed**: missing
+  `DATABASE_URL` or a SQLite `DATABASE_URL` raises `RuntimeError`
+  ("production database configuration is required"); PostgreSQL/CockroachDB
+  URLs proceed unchanged through the existing psycopg normalization.
+* Failure messages never embed the connection string (no credential leak).
+* Non-production environments keep intentional SQLite behavior; Alembic
+  remains the sole schema authority and startup still runs
+  `init_db()` → `alembic upgrade head`.
+
+Evidence: `tests/test_production_db_guard.py` (fail-closed, provider-neutral,
+redaction cases); Day 4 contract tests updated to the fail-closed semantics.
