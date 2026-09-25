@@ -126,6 +126,31 @@ def validate_production_config() -> None:
             "DATABASE_URL to a PostgreSQL/CockroachDB connection string."
         )
 
+    # Explicit allowlist of the only dialect families production supports
+    # (PostgreSQL/CockroachDB after normalization). A malformed or unknown
+    # scheme (e.g. ``unknown://``, ``postgres+nosuchdriver://``) must fail
+    # through THIS error contract — not with a raw SQLAlchemy
+    # ``NoSuchModuleError`` from engine construction. Credential text is
+    # never included: only the scheme family is echoed.
+    allowed_prefixes = (
+        "postgresql+psycopg://",  # normalize_database_url() target
+        "postgresql://",          # accepted pre-normalization form
+        "postgres://",            # legacy pre-normalization form
+    )
+    if not normalized.startswith(allowed_prefixes):
+        scheme = normalized.split(":", 1)[0]
+        logger.error(
+            "Production environment detected but DATABASE_URL uses an "
+            "unsupported scheme (connection string masked). Refusing to "
+            "start: production must use PostgreSQL/CockroachDB."
+        )
+        raise RuntimeError(
+            "production database configuration is required: DATABASE_URL "
+            f"uses unsupported scheme '{scheme}' while production mode is "
+            "enabled. Set DATABASE_URL to a PostgreSQL/CockroachDB "
+            "connection string."
+        )
+
 
 # Validation MUST run before engine construction: a malformed SQLite URL
 # could otherwise fail inside create_engine() with a dialect error before the

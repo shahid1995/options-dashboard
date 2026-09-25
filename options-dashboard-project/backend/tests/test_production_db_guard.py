@@ -152,6 +152,81 @@ class TestFailClosedProductionDatabase:
         )
 
 
+class TestMalformedProductionSchemes:
+    """Every invalid production scheme must fail through the application's
+    production-configuration error contract — never with a raw SQLAlchemy
+    dialect error from engine construction (PR #102 final hardening).
+    """
+
+    def test_unknown_scheme_raises_production_error(self, caplog):
+        with patch("app.db.settings") as mock_settings:
+            mock_settings.IS_PRODUCTION = True
+            mock_settings.DATABASE_URL = "unknown://host/db"
+            with caplog.at_level(logging.ERROR, logger="app.db"):
+                with pytest.raises(RuntimeError) as excinfo:
+                    validate_production_config()
+        message = str(excinfo.value)
+        assert "production database configuration is required" in message
+        assert "unsupported scheme 'unknown'" in message
+
+    def test_malformed_postgres_dialect_raises_production_error(self, caplog):
+        with patch("app.db.settings") as mock_settings:
+            mock_settings.IS_PRODUCTION = True
+            mock_settings.DATABASE_URL = "postgres+nosuchdriver://u:p@h/db"
+            with caplog.at_level(logging.ERROR, logger="app.db"):
+                with pytest.raises(RuntimeError) as excinfo:
+                    validate_production_config()
+        message = str(excinfo.value)
+        assert "production database configuration is required" in message
+        assert "unsupported scheme 'postgres+nosuchdriver'" in message
+
+    def test_malformed_scheme_failure_does_not_leak_credentials(self, caplog):
+        secret = "supersecret"
+        with patch("app.db.settings") as mock_settings:
+            mock_settings.IS_PRODUCTION = True
+            mock_settings.DATABASE_URL = f"unknown://dbuser:{secret}@db.example:26257/verdb"
+            with caplog.at_level(logging.ERROR, logger="app.db"):
+                with pytest.raises(RuntimeError) as excinfo:
+                    validate_production_config()
+        assert secret not in str(excinfo.value)
+        assert secret not in caplog.text
+        assert "db.example" not in str(excinfo.value)
+        assert "db.example" not in caplog.text
+
+    def test_supported_postgresql_forms_remain_allowed(self):
+        """The allowlist must not reject any URL form production legitimately uses."""
+        for url in ("postgres://u:p@h:26257/db?sslmode=require",
+                    "postgresql://u:p@h:26257/db",
+                    "postgresql+psycopg://u:p@h:26257/db"):
+            with patch("app.db.settings") as mock_settings:
+                mock_settings.IS_PRODUCTION = True
+                mock_settings.DATABASE_URL = url
+                validate_production_config()  # must not raise
+
+    def test_unknown_scheme_fails_import_end_to_end(self):
+        """End-to-end: importing the app in production with an unknown scheme
+        fails with the application error, not a SQLAlchemy dialect error.
+        Runs a fresh subprocess so real import-time behavior is observed.
+        """
+        import subprocess
+        import sys as _sys
+
+        backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env = os.environ.copy()
+        for key in ("STRIKENOVA_ENV", "RAILWAY_ENVIRONMENT", "RAILWAY_SERVICE_NAME",
+                    "PRODUCTION", "DATABASE_URL"):
+            env.pop(key, None)
+        env["STRIKENOVA_ENV"] = "production"
+        env["DATABASE_URL"] = "unknown://host/db"
+        r = subprocess.run(
+            [_sys.executable, "-c", "import app.db"], env=env,
+            capture_output=True, text=True, cwd=backend_dir, timeout=120,
+        )
+        assert r.returncode != 0
+        assert "production database configuration is required" in r.stderr
+        assert "NoSuchModuleError" not in r.stderr
+
+
 class TestNoSecretLeakage:
     """Failure output must never embed the full connection string."""
 
