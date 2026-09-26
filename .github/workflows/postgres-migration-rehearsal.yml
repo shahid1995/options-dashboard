@@ -74,7 +74,8 @@ jobs:
             -p 26257:26257 -p 8080:8080 \
             cockroachdb/cockroach:v25.2.23 \
             start-single-node --insecure \
-            --listen-addr=0.0.0.0:26257 --http-addr=0.0.0.0:8080
+            --listen-addr=0.0.0.0:26257 --http-addr=0.0.0.0:8080 \
+            --advertise-addr=127.0.0.1:26257
           ok=""
           for i in $(seq 1 30); do
             if docker exec crdb /cockroach/cockroach sql --insecure \
