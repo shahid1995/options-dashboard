@@ -315,12 +315,9 @@ def resolve_migration_database_url(explicit_url: str | None = None) -> str:
     identity serves application traffic — the runtime engine keeps using
     ``DATABASE_URL`` (ADR-014's production guard semantics are untouched).
     """
-    if (
-        explicit_url
-        and explicit_url.strip()
-        and not explicit_url.startswith("driver://")
-    ):
-        return normalize_database_url(explicit_url.strip())
+    normalized_explicit = (explicit_url or "").strip()
+    if normalized_explicit and not normalized_explicit.startswith("driver://"):
+        return normalize_database_url(normalized_explicit)
     migration_url = getattr(settings, "STRIKENOVA_MIGRATION_DATABASE_URL", None)
     if migration_url and migration_url.strip():
         return normalize_database_url(migration_url.strip())
@@ -395,7 +392,11 @@ def _run_alembic_migrations() -> None:
             "Using the dedicated migration identity for Alembic "
             "(STRIKENOVA_MIGRATION_DATABASE_URL is set)."
         )
-    if str(engine.url).startswith("sqlite"):
+    # The SQLite bypass is decided by the MIGRATION TARGET, not the runtime
+    # engine: when the identities are separated (e.g. SQLite runtime URL,
+    # CockroachDB migration URL) the target is a shared server database and
+    # MUST be serialized exactly like any other non-SQLite target.
+    if migration_url.startswith("sqlite"):
         # Single-process by construction: the lease lock is a local no-op.
         logger.info("SQLite target: migration lease lock skipped (single-process)")
         command.upgrade(alembic_cfg, "head")

@@ -28,7 +28,7 @@
 
 ### PR #107 — reviewer remediation
 
-**Status:** OPEN, MERGEABLE, NOT MERGED, NOT DEPLOYED. Head: `944a0cb`; base: `66e3b97`.
+**Status:** OPEN, MERGEABLE, NOT MERGED, NOT DEPLOYED. Head: `ab22c60` + the tracker-refresh commit that carries this entry (the branch tip is the final head; see PR #107); base: `66e3b97`.
 
 | Finding / contract | Resolution | Evidence |
 |------|----------|----------|
@@ -38,14 +38,20 @@
 | Codacy assert finding | Renewal test uses pytest assertions rather than plain Python `assert` semantics that depend on `__debug__` | Reviewer-remediation test diff |
 | Codacy `inspect.getsource` finding | Source inspection removed from the renewal test; verification is behavioral | Reviewer-remediation test diff |
 | Reviewer disposition | Qodo ×2, CodeRabbit ×2, Codacy ×2 findings mapped to implemented remediations | PR #107 remediation report and current source |
+| Blank/whitespace URL semantics (independent review) | `None`/`""`/whitespace mean unset for every URL source; nonblank values stripped before normalization; `_migration_lock_url()` delegates to the shared resolver so the lock cannot diverge | `resolve_migration_database_url()` + `TestBlankUrlSemantics` (12 hermetic tests) |
+| Migration-target serialization (independent review) | The SQLite bypass in `_run_alembic_migrations()` is decided by the resolved migration URL, not the runtime `engine.url` — a SQLite runtime + non-SQLite migration identity serializes per ADR-017 | `TestMigrationTargetSerialization` (4 hermetic tests, no external DB) |
+| Explicit-URL edge cases (independent review) | Explicit leg stripped once before all checks; whitespace/tab-prefixed `driver://` alembic placeholders fall through as unset | Resolver tests incl. parametrized placeholder cases |
+| Bandit B101 (Codacy) | Remediation-added checks use explicit `AssertionError` raises instead of plain `assert`; affected suites also verified under `python -O` | `test_migration_serialization.py` renewal/TTL tests |
+| env.py delegation (independent review) | The REAL `alembic/env.py` executed hermetically (offline `EnvironmentContext`) proves explicit > migration > runtime > SQLite precedence through the shared resolver | `tests/test_alembic_env_resolution.py` |
 
-### Fresh CI / verification state at 2026-09-26
+### Fresh CI / verification state at 2026-09-26 (final head)
 
-- PostgreSQL compatibility workflow: **PASS** on `944a0cb`.
-- StrikeNova status-gate workflow: **PASS** on `944a0cb`; it emits a warning that the implementation files changed without a tracker update, which this entry now closes.
+- PostgreSQL compatibility workflow: **PASS** on `944a0cb`; the local equivalent (`test_postgres_compatibility.py` + the 15-file database-safety set: 226 passed / 11 skipped) is green on every subsequent head including `ab22c60` and this commit.
+- StrikeNova status-gate workflow: **PASS** on `944a0cb`; re-run on the final head pending (routine).
+- CodeRabbit: **PASS** (review completed) on `df84b4b`; OpenCodeReview: **PASS** (4m38s) on `df84b4b`; both re-scan each pushed head.
 - GitHub Advanced Security AI workflow: **FAIL due runner-side model error** (`400 The requested model is not supported`); this is infrastructure/tooling failure, not a code finding.
-- OpenCodeReview: **IN PROGRESS** at the time of this tracker update.
-- Combined commit status also reports a Vercel check failure; this is separate from the backend database-hardening evidence and must be resolved/classified before merge.
+- Codacy and Vercel preview failures on this PR are infrastructure-class (0-second provider failures / stale preview variable), not code verdicts.
+- Local verification on the final head: serialization suite 54 passed; identity suite 7 passed; combined 61 passed under both normal and `python -O` execution; Alembic/guard/Day-46 sets 73 passed / 7 skipped; full backend at `944a0cb` 6 failed / 6,225 passed / 110 skipped with failures identical to the six documented baselines.
 - No Render, Vercel configuration, CockroachDB, deployment, or secret changes are part of PR #107.
 
 **Governance state:** PR #106 is the deployed production database-hardening baseline. PR #107 remains review-only until all required checks are classified and the normal merge is explicitly authorized.

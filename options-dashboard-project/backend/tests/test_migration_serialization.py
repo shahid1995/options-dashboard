@@ -263,7 +263,10 @@ class TestSerializedExecution:
             with patch.object(mlock, "_connect", return_value=_FakeConn(state)):
                 renewer._run()
             actual = renewer._stop.wait.call_args_list[0].args[0]
-            assert actual == expected, f"ttl={ttl}: expected wait({expected}), got {actual}"
+            if actual != expected:
+                raise AssertionError(
+                    f"ttl={ttl}: expected wait({expected}), got {actual}"
+                )
 
 
 # ------------------------------------------------- cold bootstrap retry
@@ -342,6 +345,117 @@ class TestIdentityRules:
             assert db_module._migration_engine_url() != str(db_module.engine.url)
 
 
+# ------------------------------------------------- migration target rules
+class TestMigrationTargetSerialization:
+    """The SQLite bypass in _run_alembic_migrations must be decided by the
+    MIGRATION TARGET (the resolved migration URL), not by the runtime
+    engine. Otherwise a SQLite runtime + non-SQLite migration identity
+    would run server-backed migrations without ADR-017 serialization."""
+
+    def _patch_db(self, runtime_url, migration_url):
+        s = Settings(
+            DATABASE_URL=runtime_url,
+            STRIKENOVA_MIGRATION_DATABASE_URL=migration_url,
+        )
+        return patch.object(db_module, "settings", s)
+
+    def _run_startup_migration(self, runtime_url, migration_url):
+        """Drive _run_alembic_migrations hermetically through COHERENT
+        Settings: the real resolver decides the migration target and the
+        separation flag exactly as in production. The runtime engine is a
+        MagicMock (nothing real is touched) and _execute_serialized is a
+        mock, so no database is ever contacted. Returns the mocks plus the
+        connectable observed INSIDE the patched context (identity
+        comparisons are meaningless after exit). Pass migration_url="" for
+        the single-identity model."""
+        from unittest.mock import MagicMock as _M
+
+        fake_engine = _M(name="runtime-engine")
+        fake_engine.url = runtime_url
+        serialized = _M(name="_execute_serialized")
+        direct = _M(name="direct_upgrade")
+        cfg = _M(name="alembic_cfg")
+        cfg.attributes = {}  # real dict so get()/[] stores are observable
+        observed = {}
+        with patch.object(
+            db_module, "settings",
+            Settings(DATABASE_URL=runtime_url, STRIKENOVA_MIGRATION_DATABASE_URL=migration_url or ""),
+        ), patch.object(
+            db_module, "engine", fake_engine
+        ), patch.object(
+            db_module, "_execute_serialized", serialized
+        ), patch(
+            "alembic.command.upgrade", direct
+        ), patch(
+            "alembic.config.Config", return_value=cfg
+        ):
+            db_module._run_alembic_migrations()
+            observed["connectable"] = cfg.attributes.get("connectable")
+            observed["engine"] = fake_engine
+        return serialized, direct, cfg, observed
+
+    def test_sqlite_runtime_with_nonsqlite_migration_target_serializes(self):
+        serialized, direct, _, observed = self._run_startup_migration(
+            "sqlite:///C:/tmp/runtime.db",
+            "cockroachdb+psycopg://migrator:pw@h:26257/strikenova?sslmode=require",
+        )
+        if serialized.call_count != 1:
+            raise AssertionError(
+                "non-SQLite migration target must be serialized via "
+                f"_execute_serialized, got calls={serialized.call_count}"
+            )
+        if direct.called:
+            raise AssertionError("direct SQLite path must NOT be taken for a non-SQLite target")
+        if observed["connectable"] is not None:
+            raise AssertionError(
+                "separated identities must not reuse the runtime engine as connectable"
+            )
+
+    def test_sqlite_target_takes_the_direct_path_even_with_nonsqlite_runtime(self):
+        serialized, direct, _, observed = self._run_startup_migration(
+            "postgresql://runtime:pw@h:26257/app",
+            "sqlite:///C:/tmp/migration.db",
+        )
+        if serialized.called:
+            raise AssertionError("SQLite migration target must bypass serialization")
+        if direct.call_count != 1:
+            raise AssertionError(
+                f"SQLite target must migrate directly once, got {direct.call_count}"
+            )
+        if observed["connectable"] is not None:
+            raise AssertionError(
+                "separated identities must not reuse the runtime engine as connectable"
+            )
+
+    def test_single_identity_sqlite_still_takes_the_direct_path(self):
+        serialized, direct, _, observed = self._run_startup_migration(
+            "sqlite:///C:/tmp/single.db", ""
+        )
+        if serialized.called:
+            raise AssertionError("historical single-identity SQLite behavior changed")
+        if direct.call_count != 1:
+            raise AssertionError(
+                f"SQLite direct path must be preserved, got {direct.call_count}"
+            )
+        if observed["connectable"] is not observed["engine"]:
+            raise AssertionError(
+                "single-identity startup must reuse the runtime engine connectable"
+            )
+
+    def test_single_identity_nonsqlite_serializes_and_reuses_engine(self):
+        serialized, direct, _, observed = self._run_startup_migration(
+            "postgresql://runtime:pw@h:26257/app", ""
+        )
+        if serialized.call_count != 1:
+            raise AssertionError("non-SQLite single-identity startup must serialize")
+        if direct.called:
+            raise AssertionError("direct SQLite path must not run for server targets")
+        if observed["connectable"] is not observed["engine"]:
+            raise AssertionError(
+                "single-identity startup must reuse the runtime engine connectable"
+            )
+
+
 # ------------------------------------------------- blank URL semantics
 class TestBlankUrlSemantics:
     """None, "" and whitespace-only values mean UNSET for every URL source
@@ -389,6 +503,39 @@ class TestBlankUrlSemantics:
         with patch("app.db.settings", s):
             assert db_module.resolve_migration_database_url(self.WS) == (
                 "postgresql+psycopg://migrator:pw@h:26257/app"
+            )
+
+    def test_tab_only_explicit_url_is_unset(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url("\t") == (
+                "postgresql+psycopg://migrator:pw@h:26257/app"
+            )
+
+    @pytest.mark.parametrize(
+        "placeholder",
+        ["driver://user:pw@h/db", " driver://user:pw@h/db", "\tdriver://user:pw@h/db"],
+    )
+    def test_whitespace_prefixed_placeholder_is_not_a_real_url(self, placeholder):
+        """alembic.ini ships ``driver://...`` as a placeholder; env.py must
+        never return it (decorated with whitespace or not) — it falls through
+        to the migration/runtime URL as if unset."""
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
+        )
+        with patch("app.db.settings", s):
+            resolved = db_module.resolve_migration_database_url(placeholder)
+        if resolved.startswith("driver://"):
+            raise AssertionError(
+                f"alembic placeholder leaked as a real URL: {placeholder!r}"
+            )
+        if resolved != "postgresql+psycopg://migrator:pw@h:26257/app":
+            raise AssertionError(
+                f"placeholder did not fall through to the migration URL: {resolved}"
             )
 
     def test_blank_runtime_url_falls_back_to_sqlite(self):
@@ -473,7 +620,10 @@ class TestMigrationLockTtlValidation:
             DATABASE_URL="postgresql://runtime:pw@h:26257/app",
             MIGRATION_LOCK_TTL_SECONDS=ttl,
         )
-        assert s.MIGRATION_LOCK_TTL_SECONDS == ttl
+        if s.MIGRATION_LOCK_TTL_SECONDS != ttl:
+            raise AssertionError(
+                f"expected TTL {ttl} to be accepted, got {s.MIGRATION_LOCK_TTL_SECONDS}"
+            )
 
 
 class TestAlembicCliUrlPrecedence:
