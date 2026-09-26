@@ -247,6 +247,26 @@ class TestSerializedExecution:
             "update _migration_lock set expires_at" in s.lower() for s in state["stmts"]
         )
 
+    def test_renewal_interval_is_ttl_third_floored_at_one_second(self):
+        """Documented renewal rule (module docstring / ADR-017): the renewer
+        waits max(1.0, ttl/3) between renewals — strictly below the TTL so an
+        alive holder never leaves an expiry gap a waiter could misread as a
+        crash, with a 1s floor so tiny TTLs still renew at a sane cadence."""
+        import inspect
+
+        src = inspect.getsource(mlock.LeaseRenewer._run)
+        assert "max(1.0" in src, "renewal interval must be max(1.0, ttl/3)"
+
+        for ttl, expected in ((30, 10.0), (120, 40.0), (2, 1.0)):
+            renewer = mlock.LeaseRenewer("postgresql://x", "me", ttl)
+            state = _fresh_state(held_by="me", owner="me")
+            renewer._stop = MagicMock()
+            renewer._stop.wait.side_effect = [False, True]  # single loop
+            with patch.object(mlock, "_connect", return_value=_FakeConn(state)):
+                renewer._run()
+            actual = renewer._stop.wait.call_args_list[0].args[0]
+            assert actual == expected, f"ttl={ttl}: expected wait({expected}), got {actual}"
+
 
 # ------------------------------------------------- cold bootstrap retry
 class TestBootstrapRetry:

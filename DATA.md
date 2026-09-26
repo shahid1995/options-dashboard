@@ -1,6 +1,6 @@
 # StrikeNova — Data
 
-**Status:** Canonical · **Owner:** Founder · **Last reviewed:** 2026-09-18
+**Status:** Canonical · **Owner:** Founder · **Last reviewed:** 2026-09-26
 
 ---
 
@@ -50,7 +50,50 @@ superseded — production is CockroachDB.
   (`test_day5_alembic_authority.py`, postgres/migration suites — see
   [`TESTING.md`](TESTING.md)).
 
-## 5. Historical data architecture
+## 5. Production privilege model (database `strikenova`)
+
+Verified against live production metadata 2026-09-26. This is the state that
+actually exists; changes require a decision record.
+
+**Identities.**
+
+| Role | Login | Purpose | Privileges |
+|---|---|---|---|
+| `strikenova_production_app` | yes | Serves all application traffic | DML only: SELECT / INSERT / UPDATE / DELETE on all 53 tables; schema USAGE via PUBLIC; no CREATE, no DDL, no memberships, no admin |
+| `strikenova_prod_migrator` | yes | Runs Alembic + migration lock | Schema CREATE+USAGE on `public`; DML on all tables; no cluster attributes |
+| `strikenova_prod_runtime` | no | Ownership-only role (NOLOGIN) | Owns the 52 application tables; nobody logs in as it |
+| `strikenova_prod_admin` | yes | Break-glass superuser (never deleted) | Cluster admin; retained for recovery only |
+
+All 52 application tables are owned by the NOLOGIN `strikenova_prod_runtime`
+role; migration-created objects (including `_migration_lock`) are owned by
+`strikenova_prod_migrator`.
+
+**Future-table privilege defaults (critical operational state).** `pg_default_acl`
+in `strikenova` contains exactly two rows, both bound to the migration/creator
+role:
+
+```sql
+ALTER DEFAULT PRIVILEGES FOR ROLE strikenova_prod_migrator IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO strikenova_production_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE strikenova_prod_migrator IN SCHEMA public
+    GRANT USAGE ON SEQUENCES TO strikenova_production_app;
+```
+
+Tables and sequences created by `strikenova_prod_migrator` (i.e. by future
+Alembic revisions) therefore automatically carry runtime DML/USAGE. The
+runtime identity gains no CREATE/ALTER/DROP/TRUNCATE/ownership/admin through
+this mechanism. **The defaults do not follow a creator-role change:** if
+migrations ever run under a different role, re-apply the defaults for that
+role as part of the change (Invariant 6e, ADR-018). Do not revoke these rows
+while the migrator-creator model is in force.
+
+**Migration serialization.** The single-row lease table `_migration_lock`
+(ADR-017) is owned by `strikenova_prod_migrator`; the lock must be free
+(`locked_by IS NULL`) outside an active migration. The manual operator CLI
+path (`alembic upgrade head`) remains outside the application lock (ADR-017
+Residual).
+
+## 6. Historical data architecture
 
 The Phase 7.x record (persistence foundation, backfill orchestrators, Greeks
 reconstruction, coverage audits) lives in `options-dashboard-project/docs/` —

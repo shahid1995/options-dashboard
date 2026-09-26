@@ -8,6 +8,28 @@ Format: date — change — reference.
 
 ---
 
+## 2026-09-26 — PR #106 production cutover: migration serialization + future-table privilege defaults (ADR-017/ADR-018)
+
+- Merged PR #106 (`fix(db): serialize production migrations`, head `c5d2f7e`,
+  merge `66e3b97`) and deployed the exact merge commit to production Render
+  (`strikenova-api-production`, deploy `dep-darknq59fdbs73a0o2ag`; no-op
+  redeploy `dep-darkpsojo6nc738cr3lg` used for live verification).
+- Migration serialization is enabled and verified live: single-row lease
+  table `_migration_lock` (ADR-017), acquired/released under the migration
+  identity during startup; Alembic head `d46aa0000001` unchanged; lock
+  observed free after startup. Runtime/migration identity separation is
+  active per ADR-016 (`STRIKENOVA_MIGRATION_DATABASE_URL` →
+  `strikenova_prod_migrator`), and production health was verified
+  (`/health` 200, `/readiness` ready) with zero new regressions against the
+  documented baseline.
+- Future-table DML defaults are active per ADR-018: default privileges
+  bound to `strikenova_prod_migrator` grant `strikenova_production_app`
+  SELECT/INSERT/UPDATE/DELETE on future tables and USAGE on future
+  sequences, closing verification finding V-3. Recorded as Invariant 6e and
+  documented in `DATA.md` §5.
+
+---
+
 ## 2026-09-19 — Phase 10.2 final release/security gate PASSED (Issue #69)
 
 - Fresh post-merge verification against the integrated feature tip `798c6c2`

@@ -1,6 +1,6 @@
 # StrikeNova — Invariants
 
-**Status:** Canonical · **Owner:** Founder · **Last reviewed:** 2026-09-18
+**Status:** Canonical · **Owner:** Founder · **Last reviewed:** 2026-09-26
 
 Invariants are properties that must never regress. Any change that violates one
 requires an explicit decision record ([`DECISIONS.md`](DECISIONS.md)) and
@@ -99,4 +99,22 @@ Founder acceptance.
    chain at a time; concurrent application startups must wait, take over an
    expired lease, or fail closed — never execute the same DDL concurrently.
    The lock must work on an empty database and under the migration identity,
-   and must never require runtime DDL/owner privileges (ADR-017).
+   and must never require runtime DDL/owner privileges (ADR-017). The manual
+   operator CLI path (`alembic upgrade head` run out-of-band) remains outside
+   the application lock by design (ADR-017 Residual).
+6e. **Future application tables carry runtime DML by default.** In the
+   production database `strikenova`, default privileges bound to the
+   migration/creator role (`ALTER DEFAULT PRIVILEGES FOR ROLE
+   strikenova_prod_migrator IN SCHEMA public`) grant the runtime role
+   `strikenova_production_app` SELECT / INSERT / UPDATE / DELETE on future
+   tables and USAGE on future sequences, so a migration that creates
+   objects never requires a follow-up manual grant for the serving
+   credential to work. Through this mechanism the runtime identity never
+   receives CREATE, ALTER, DROP, TRUNCATE, ownership, admin, or
+   role-management privileges. The mechanism is scoped to the named creator
+   role in this database only — it does not apply to objects created by
+   arbitrary roles, other schemas, or other databases. **Operational
+   dependency:** the contract is coupled to the creator role; if migrations
+   ever run under a different creator/owner role, the default-privilege
+   configuration MUST be re-applied for that role as part of the role
+   change — it does not follow automatically (ADR-018).

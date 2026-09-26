@@ -25,8 +25,9 @@ A single-row lock table is managed with strictly transactional statements:
 * release: the holder clears its own row.
 
 While the holder is alive it RENEWS the lease on a background thread (every
-TTL/3, minimum 5s), so a legitimately long migration is never stolen by a
-waiter. Because renewal is a thread inside the holder process, a crashed
+``max(1.0, ttl / 3)`` — TTL/3 with a 1-second floor), so a legitimately long
+migration is never stolen by a waiter. Because renewal is a thread inside
+the holder process, a crashed
 holder simply stops renewing: waiters observe the lease expiry, take over,
 and re-run the (idempotent, Alembic-managed) chain. Alembic's version table
 makes re-running a completed migration a no-op, so takeover after a
