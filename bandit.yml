@@ -1,8 +1,10 @@
 # Bandit configuration for options-dashboard
 #
-# Suppress B101 only for Python files under tests/ directories.
+# Suppress B101 only for Python files under tests/ directories
+# and for the live_verification.py CLI verification tool.
 # Keep B101 active everywhere else.
 
 assert_used:
   skips:
     - '*/tests/*.py'
+    - '*/app/tools/live_verification.py'
