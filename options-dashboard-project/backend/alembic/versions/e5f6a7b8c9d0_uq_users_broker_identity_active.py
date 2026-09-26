@@ -80,7 +80,17 @@ _LEGACY_CONSTRAINT = "uq_users_broker_identity"
 def upgrade() -> None:
     """Drop the legacy one-user-one-broker stamp constraint."""
     dialect = op.get_bind().dialect.name
-    if dialect in ("postgresql", "cockroachdb"):
+    if dialect == "cockroachdb":
+        # CockroachDB implements UNIQUE constraints as indexes and does not
+        # support ``ALTER TABLE ... DROP CONSTRAINT`` for them
+        # (cockroachdb/cockroach#42840: "cannot drop UNIQUE constraint
+        # ... use DROP INDEX CASCADE instead"). Dropping the backing index
+        # with CASCADE removes the constraint with it; nothing else depends
+        # on this index (verified in the ADR-017 CockroachDB rehearsal).
+        # CRDB index addressing uses ``table@index`` (``schema.index`` would
+        # name a nonexistent schema).
+        op.execute(f"DROP INDEX IF EXISTS users@{_LEGACY_CONSTRAINT} CASCADE")
+    elif dialect == "postgresql":
         op.execute(
             f"ALTER TABLE users DROP CONSTRAINT IF EXISTS {_LEGACY_CONSTRAINT}"
         )
