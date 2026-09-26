@@ -14,6 +14,10 @@ verification survives ``python -O`` (no reliance on plain ``assert``).
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
+import textwrap
+import time
 import uuid
 
 import pytest
@@ -25,6 +29,149 @@ from app import _migration_lock as mlock
 from app.db import normalize_database_url, resolve_migration_database_url
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Cross-process actor for the concurrent rehearsal (Part 2): each invocation
+# is a SEPARATE OS process with its own real PostgreSQL session. Synchronized
+# via marker files in a temp dir (no fixed sleeps); every wait has a deadline
+# so a deadlock can never hang CI. Roles:
+#   holder: acquire -> signal -> keep renewing until waiter reports fail-closed
+#           -> release -> signal
+#   waiter: observe live holder (try_acquire rejected) -> wait_for_release
+#           must raise LeaseLockUnavailable (fail closed) -> signal -> after
+#           release, acquire -> signal (parent verifies persisted ownership)
+#           -> release after parent's ack
+_CONCURRENT_ACTOR = textwrap.dedent(
+    """
+    import os
+    import sys
+    import time
+    import uuid
+
+    sys.path.insert(0, os.environ["REHEARSAL_BACKEND"])
+    from app import _migration_lock as mlock  # noqa: E402
+
+    url = os.environ["REHEARSAL_DB_URL"]
+    markers = os.environ["REHEARSAL_MARKERS"]
+    ttl = int(os.environ.get("REHEARSAL_TTL", "15"))
+    role = sys.argv[1]
+
+
+    def path(name):
+        return os.path.join(markers, name)
+
+
+    def put(name, value="1"):
+        # ATOMIC publication: write a same-directory temp file, flush+fsync,
+        # then os.replace so readers only ever observe a COMPLETE marker
+        # (a bare create-then-write could expose an empty/partial file).
+        tmp = path(name) + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(value)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path(name))
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+
+
+    def wait_for(name, deadline_seconds):
+        deadline = time.monotonic() + deadline_seconds
+        while time.monotonic() < deadline:
+            if os.path.exists(path(name)):
+                with open(path(name), encoding="utf-8") as f:
+                    return f.read().strip()
+            time.sleep(0.05)
+        raise SystemExit(f"TIMEOUT waiting for marker {name}")
+
+
+    try:
+        if role == "holder":
+            owner = "holder:" + uuid.uuid4().hex[:8]
+            # Acquire a free lock OR take over a stale expired lease left by
+            # an earlier test (ADR-017 takeover); retry bounded so a
+            # still-live leftover lease (<= its TTL) can never fail the run.
+            acquired = False
+            for _attempt in range(60):
+                acquired, _took_over = mlock.try_acquire(url, owner, ttl)
+                if acquired:
+                    break
+                time.sleep(0.5)
+            if not acquired:
+                raise SystemExit(
+                    "holder could not acquire the lock (free or via expired-lease takeover)"
+                )
+            put("holder_acquired", owner)
+            renewer = mlock.LeaseRenewer(url, owner, ttl)
+            renewer.start()
+            try:
+                wait_for("waiter_failed_closed", 90)
+            finally:
+                renewer.stop()
+            if not mlock.release(url, owner):
+                raise SystemExit("holder release failed")
+            put("holder_released", owner)
+
+        elif role == "waiter":
+            wait_for("holder_acquired", 90)
+            owner = "waiter:" + uuid.uuid4().hex[:8]
+            acquired, took_over = mlock.try_acquire(url, owner, ttl)
+            if acquired or took_over:
+                raise SystemExit(
+                    "waiter acquired/takeover while a live holder was renewing"
+                )
+            # Bounded wait budget: comfortably shorter than the TTL (which
+            # the live holder keeps renewing), so exhaustion here is genuine
+            # fail-closed behavior, never an expiry artifact.
+            waiter_budget = max(2, ttl // 2)
+            failed_closed = False
+            for _attempt in range(3):
+                try:
+                    mlock.wait_for_release(
+                        url, ttl_seconds=ttl, max_wait_seconds=waiter_budget
+                    )
+                    # Returned True = expiry observed. With a LIVE holder
+                    # that is a renewal race, not a crashed holder: verify
+                    # ownership is unchanged and retry the bounded wait.
+                    if mlock.current_holder(url) is None:
+                        raise SystemExit(
+                            "lock became free while holder was renewing"
+                        )
+                except mlock.LeaseLockUnavailable:
+                    failed_closed = True
+                    break
+            if not failed_closed:
+                raise SystemExit(
+                    "waiter did NOT fail closed against a live holder"
+                )
+            put("waiter_failed_closed", owner)
+            wait_for("holder_released", 90)
+            acquired_2, took_over_2 = mlock.try_acquire(url, owner, ttl)
+            if not acquired_2 or took_over_2:
+                raise SystemExit(
+                    "waiter could not acquire after holder released"
+                )
+            put("waiter_acquired", owner)
+            wait_for("parent_ack", 90)
+            if not mlock.release(url, owner):
+                raise SystemExit("waiter cleanup release failed")
+            put("waiter_released", owner)
+        else:
+            raise SystemExit(f"unknown actor role: {role!r}")
+    except BaseException as exc:  # noqa: BLE001 - surface the failure to the
+        # parent via an ATOMIC error marker (stderr is DEVNULL by design so a
+        # chatty child can never block on an undrained pipe).
+        try:
+            put(f"error_{role}", f"{type(exc).__name__}: {exc}")
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+        raise
+    """
+)
 
 
 def _postgres_test_url() -> str:
@@ -49,12 +196,34 @@ def _check(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+def _monotonic_deadline(seconds: float) -> float:
+    """Absolute monotonic deadline for marker-file handshakes."""
+    return time.monotonic() + seconds
+
+
 class TestPostgresMigrationRehearsal:
     """The same target identity ``_run_alembic_migrations()`` serializes."""
 
-    @pytest.fixture()
+    # Rehearsal timing (reviewer finding: the old 2s TTL / ~0.7s renewal
+    # interval left too little scheduling margin). TTL 15s with renewal every
+    # max(1.0, ttl/3) ≈ 5s fits ~3 renewal intervals before expiry, and the
+    # waiter budget (7s < TTL, spanning one full renewal interval) proves
+    # fail-closed against a genuinely ALIVE holder, never an expiry artifact.
+    REHEARSAL_TTL = 15
+    WAITER_BUDGET = 7
+
+    @pytest.fixture(scope="class")
     def migration_url(self):
         return _postgres_test_url()
+
+    @pytest.fixture(scope="class")
+    def verify_engine(self, migration_url):
+        """One shared read-only verification engine for the whole class."""
+        engine = create_engine(migration_url, pool_pre_ping=True)
+        try:
+            yield engine
+        finally:
+            engine.dispose()
 
     def test_migration_url_beats_runtime_url_on_postgres(self, migration_url, monkeypatch):
         """Identity separation on the REAL server: the resolver must return
@@ -73,13 +242,13 @@ class TestPostgresMigrationRehearsal:
             "resolver must select the migration identity, not the runtime URL",
         )
 
-    def test_full_real_lock_lifecycle(self, migration_url):
+    def test_full_real_lock_lifecycle(self, migration_url, verify_engine):
         """acquire -> persisted ownership -> renew -> concurrent block ->
         release -> re-acquire, against real PostgreSQL via the production
         lock module (no mocks)."""
         owner = f"rehearsal:{os.getpid()}:{uuid.uuid4().hex[:8]}"
-        ttl = 120
-        engine = create_engine(migration_url, pool_pre_ping=True)
+        ttl = self.REHEARSAL_TTL
+        engine = verify_engine
         try:
             acquired, took_over = mlock.try_acquire(migration_url, owner, ttl)
             _check(acquired, "lock acquisition against real PostgreSQL must succeed")
@@ -122,29 +291,37 @@ class TestPostgresMigrationRehearsal:
             _check(not re_took_over, "re-acquisition of a free lock is not a takeover")
             _check(mlock.release(migration_url, again_owner), "cleanup release must succeed")
         finally:
-            engine.dispose()
+            # Shared class engine is disposed by its own fixture; the lock
+            # must end free so later tests never inherit a live lease.
+            held = mlock.current_holder(migration_url)
+            if held:
+                mlock.release(migration_url, held)
 
     def test_waiter_fails_closed_while_holder_renews_then_proceeds_after_release(
-        self, migration_url
+        self, migration_url, verify_engine
     ):
         """ADR-017 wait semantics against real PostgreSQL: a waiter whose
         budget is exhausted by a LIVE (renewing) holder fails closed with
         LeaseLockUnavailable; after the holder releases, the lock is free
         (wait_for_release -> False) and acquirable again."""
         holder_owner = f"rehearsal-holder:{os.getpid()}:{uuid.uuid4().hex[:8]}"
-        ttl = 2  # minimum: renewal interval max(1.0, ttl/3) -> ~1s
+        ttl = self.REHEARSAL_TTL  # renewal max(1.0, ttl/3) ≈ 5s, expiry 15s
         first = mlock.try_acquire(migration_url, holder_owner, ttl)
         _check(first[0], "holder must acquire the lease")
         holder = mlock.LeaseRenewer(migration_url, holder_owner, ttl)
         holder.start()
         try:
-            # While the holder renews, a short waiter budget must fail closed.
+            # While the holder is genuinely alive and renewing, a bounded
+            # waiter budget (<< TTL, but spanning >= one renewal interval)
+            # must fail closed.
             with pytest.raises(mlock.LeaseLockUnavailable):
                 mlock.wait_for_release(
-                    migration_url, ttl_seconds=ttl, max_wait_seconds=1
+                    migration_url, ttl_seconds=ttl, max_wait_seconds=self.WAITER_BUDGET
                 )
-            with create_engine(migration_url, pool_pre_ping=True).connect() as conn:
-                still = conn.execute(text("SELECT locked_by FROM _migration_lock")).scalar_one()
+            with verify_engine.connect() as conn:
+                still = conn.execute(
+                    text("SELECT locked_by FROM _migration_lock")
+                ).scalar_one()
             _check(
                 still == holder_owner,
                 "the renewing holder must retain ownership after a failed-closed waiter",
@@ -156,17 +333,152 @@ class TestPostgresMigrationRehearsal:
             "holder release must succeed after renewal stops",
         )
         # Lock free within budget -> wait_for_release returns False (not a
-        # takeover signal); the next acquisition then succeeds.
+        # takeover signal); the next acquisition then succeeds. One owner
+        # identity for BOTH acquire and release (release is holder-scoped).
         waited_after = mlock.wait_for_release(
             migration_url, ttl_seconds=ttl, max_wait_seconds=30
         )
         _check(waited_after is False, "a released lock must be observed as free")
+        after_owner = f"after:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         _check(
-            mlock.try_acquire(migration_url, f"after:{os.getpid()}:{uuid.uuid4().hex[:8]}", ttl)[0],
+            mlock.try_acquire(migration_url, after_owner, ttl)[0],
             "lock must be acquirable after the waiter observed release",
         )
         # leave the lock free for the other tests
-        mlock.release(migration_url, f"after:{os.getpid()}:{uuid.uuid4().hex[:8]}")
+        _check(
+            mlock.release(migration_url, after_owner),
+            "final cleanup release must succeed for the owning holder",
+        )
+
+    def test_two_process_concurrent_fail_closed(self, migration_url, verify_engine, tmp_path):
+        """Genuine cross-session concurrency: Process A (its own OS process
+        and PostgreSQL connection) holds and renews the lease while
+        independent Process B attempts acquisition and must fail closed;
+        after A releases, B acquires. Ownership is verified from a third,
+        independent connection in this (parent) process. No fixed sleeps:
+        marker-file handshakes with deadlines; subprocess timeouts guarantee
+        no orphans and no CI hang."""
+        markers = tmp_path / "markers"
+        markers.mkdir()
+        env = dict(
+            os.environ,
+            REHEARSAL_BACKEND=ROOT,
+            REHEARSAL_DB_URL=migration_url,
+            REHEARSAL_MARKERS=str(markers),
+            REHEARSAL_TTL=str(self.REHEARSAL_TTL),
+        )
+        actor = tmp_path / "_concurrent_lock_actor.py"
+        actor.write_text(_CONCURRENT_ACTOR, encoding="utf-8")
+
+        ROLES = frozenset({"holder", "waiter"})
+
+        def spawn(role):
+            # Reject unexpected roles deterministically before spawning.
+            if role not in ROLES:
+                raise ValueError(f"unknown actor role: {role!r}")
+            # Children run detached from the test's stdio and stderr is
+            # DEVNULL so nothing can ever block on an undrained pipe — actor
+            # failures are reported through the atomic error_<role> marker.
+            return subprocess.Popen(
+                [sys.executable, str(actor), role],
+                env=env,
+                cwd=ROOT,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+        def await_marker(name, proc, deadline_seconds=90.0):
+            deadline = _monotonic_deadline(deadline_seconds)
+            while not (markers / name).exists():
+                if proc is not None and proc.poll() is not None:
+                    err = ""
+                    error_marker = markers / f"error_{proc.args[-1]}"
+                    if error_marker.exists():
+                        err = error_marker.read_text(encoding="utf-8")
+                    raise AssertionError(
+                        f"{proc.args[-1]} actor exited before signalling {name}: "
+                        f"rc={proc.returncode} error={err[:500]!r}"
+                    )
+                if time.monotonic() > deadline:
+                    raise AssertionError(f"deadline waiting for marker {name}")
+                time.sleep(0.05)
+            with open(markers / name, encoding="utf-8") as f:
+                return f.read().strip()
+
+        holder = spawn("holder")
+        waiter = None
+        try:
+            # A holds the lock in its own OS process/session.
+            holder_owner = await_marker("holder_acquired", holder)
+
+            # Independent verification (third session): ownership persisted.
+            with verify_engine.connect() as conn:
+                locked_by = conn.execute(
+                    text("SELECT locked_by FROM _migration_lock")
+                ).scalar_one()
+            _check(
+                locked_by == holder_owner,
+                f"cross-process holder ownership must be persisted, got {locked_by!r}",
+            )
+
+            # B: independent process/session — contends, fails closed, then
+            # acquires after A releases (signalled via marker handshake).
+            waiter = spawn("waiter")
+            await_marker("waiter_failed_closed", waiter)
+            waiter_owner = await_marker("waiter_acquired", waiter)
+
+            # Independent verification of B's persisted ownership.
+            with verify_engine.connect() as conn:
+                locked_by_b = conn.execute(
+                    text("SELECT locked_by FROM _migration_lock")
+                ).scalar_one()
+            _check(
+                locked_by_b == waiter_owner,
+                f"waiter ownership must be persisted, got {locked_by_b!r}",
+            )
+            # Parent acknowledgment: published atomically (same pattern as
+            # the actor markers) so B can never observe a partial file.
+            ack_tmp = markers / "parent_ack.tmp"
+            with open(ack_tmp, "w", encoding="utf-8") as f:
+                f.write("1")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(ack_tmp, markers / "parent_ack")
+
+            # Both actors exit 0; every marker milestone was real behavior.
+            holder.wait(timeout=120)
+            if holder.returncode != 0:
+                raise AssertionError(f"holder exited non-zero: {holder.returncode}")
+            waiter.wait(timeout=120)
+            if waiter.returncode != 0:
+                raise AssertionError(f"waiter exited non-zero: {waiter.returncode}")
+            await_marker("waiter_released", None)
+
+            # Cleanup verification with the real database.
+            with verify_engine.connect() as conn:
+                final = conn.execute(
+                    text("SELECT locked_by FROM _migration_lock")
+                ).scalar_one()
+            _check(
+                final is None,
+                f"lock must be free after both processes released, got {final!r}",
+            )
+        finally:
+            # Orphan-proof cleanup: kill children if anything above raised,
+            # then force the lock free via the production release path.
+            for proc in (holder, waiter):
+                try:
+                    if proc is not None and proc.poll() is None:
+                        proc.kill()
+                        proc.wait(timeout=15)
+                except Exception:  # noqa: BLE001 - best-effort cleanup
+                    pass
+            try:
+                held = mlock.current_holder(migration_url)
+                if held:
+                    mlock.release(migration_url, held)
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
 
     def test_alembic_chain_applies_on_postgres_through_resolver_target(
         self, migration_url, monkeypatch

@@ -1,9 +1,22 @@
 # StrikeNova Implementation Status Tracker
 
 > **Master Plan SHA:** `0a244c0` (docs: add StrikeNova master day-wise implementation plan)
-> **Last Updated:** 2026-09-26 (database hardening / PR #106–#107)
+> **Last Updated:** 2026-09-26 (database hardening / PR #106–#107 + post-merge lock-rehearsal follow-up)
 
 
+
+---
+
+## 2026-09-26 — Post-merge follow-up: concurrent lock rehearsal + OpenCodeReview diagnosis
+
+**Purpose:** Post-merge verification work after PR #107 (base `6089ecb`). Branch `postmerge/ocr-fix-and-concurrent-lock`; final code head **`d7be39f`**.
+
+| Item | Resolution | Evidence |
+|------|-----------|----------|
+| OpenCodeReview PR-#107 exit-1 (post-step) | **Workflow NOT responsible — no change made.** The result artifact shows `"status": "failed"` — `"Review failed: 0 finding(s); 5 of 5 selected item(s) failed."`: both `plan_task` and `main_task` LLM requests hit `error_class: "timeout"` (`failure_phase: "context"`, ~300,000 ms to headers) on model `z-ai/glm-5.3-flash`. `ocr review` therefore exited 1 and the action's "Fail job on OCR error" gating correctly failed the job; the "Post review comments" step was skipped by design (`if: env.OCR_EXIT_CODE == '0'`). PR #106's run (log artifact) shows the identical signature (`"Review failed: 0 finding(s); 3 of 3 selected item(s) failed."`, 5 timeout entries). A genuinely completed 0-comment review (`"status": "complete"`) already exits 0 via the same gating — contract intact, nothing weakened. | `gh run view 36227261126` OCR result/stderr JSON; `gh api .../runs/36172655249/logs` artifact |
+| Real two-process concurrent lock rehearsal | New `test_two_process_concurrent_fail_closed`: Process A (separate OS process + own PostgreSQL session) acquires and renews while independent Process B (separate process + session) is rejected and must fail closed (`LeaseLockUnavailable`); after A releases, B acquires. Parent verifies persisted ownership from a third independent connection after each handoff and that the lock is free after both release. Marker-file handshakes with deadlines (no sleeps), per-child hard timeouts, kill-on-failure, production release path in cleanup. Order-independent: the holder takes over a stale expired lease via the ADR-017 takeover path. | `tests/test_migration_rehearsal_postgres.py`; disposable `postgres:16` container: 5 passed across five consecutive runs incl. stale-lease orderings; 5 skipped without `TEST_DATABASE_URL`; 62 passed under `python -O` with the serialization suite |
+
+**Governance state:** no deployment, no Render/Vercel/CockroachDB change, no secret rotation; the investigation changed no workflow or application code (the OCR failure is provider-side tooling, to be fixed in repo/model settings by the Founder if desired — e.g. a faster/more reliable `OCR_LLM_MODEL`).
 
 ---
 
@@ -28,7 +41,7 @@
 
 ### PR #107 — reviewer remediation
 
-**Status:** OPEN, MERGEABLE, NOT MERGED, NOT DEPLOYED. Final code head: `ecc4c4e` (test(ci): add postgres migration rehearsal); the branch tip is this tracker commit, which follows it; base: `66e3b97`.
+**Status (updated 2026-09-26, post-merge):** **MERGED** as `6089ecb` (squash-free history: `df84b4b` `944a0cb` `93ad441` `ab22c60` `adf157e` `ecc4c4e` `9447a49`); **NOT DEPLOYED** (docs/CI-only change — no production release required). The historical status lines below describe the OPEN state at the time of each entry and are superseded by this line; base was `66e3b97`.
 
 | Finding / contract | Resolution | Evidence |
 |------|----------|----------|
@@ -58,7 +71,7 @@
 - Local verification on the final head: focused migration/identity/alembic/guard/Day-46 sets 145 passed / 7 skipped; serialization 62 passed; `python -O` 72 passed; wide database-safety set 234 passed / 11 skipped; rehearsal 4 passed against a real disposable PostgreSQL container.
 - No Render, Vercel configuration, CockroachDB, deployment, or secret changes are part of PR #107.
 
-**Governance state:** PR #106 is the deployed production database-hardening baseline. PR #107 remains review-only until all required checks are classified and the normal merge is explicitly authorized.
+**Governance state (updated 2026-09-26):** PR #106 remains the deployed production database-hardening baseline. PR #107 has since been **merged** (`6089ecb`) after all required checks were classified; its runtime-affecting changes (migration-target serialization, resolver hardening, rehearsal CI) therefore take effect with the next production deployment.
 
 
 ## Phase 0 — Security Emergency
