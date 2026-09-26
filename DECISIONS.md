@@ -298,3 +298,41 @@ Decision:
 founder-authorized deployment task (create `strikenova_prod_migrator`,
 grant per ADR-014 analysis, set `STRIKENOVA_MIGRATION_DATABASE_URL` on
 Render, redeploy, verify, then downgrade the runtime credential's grants).
+
+## ADR-017 · Migration serialization via transactional lease lock · Accepted
+
+Context: every application instance runs `init_db() -> alembic upgrade head`
+during startup (Render free plan has no release command, so migrations cannot
+be moved to a deploy step without changing the deployment model). Two
+instances starting simultaneously can execute the same schema DDL
+concurrently; this produced a real `DuplicateTable` startup failure during
+the 2026-09 production recovery event. ADR-016 changed WHO migrates, not
+WHETHER concurrent migration attempts can overlap.
+
+Decision:
+
+* A single-row transactional lease lock (`_migration_lock`) is acquired
+  around the entire Alembic execution, using the migration identity URL
+  (ADR-016); SQLite targets skip the lock (single-process by construction).
+* Bootstrap (`CREATE TABLE IF NOT EXISTS` + `INSERT ON CONFLICT DO NOTHING`)
+  uses only transactional statements with bounded 40001 retries, so an EMPTY
+  database is safe: no Alembic table or application table is required first.
+* The lease carries an expiry (`MIGRATION_LOCK_TTL_SECONDS`, default 120)
+  renewed by the holder (interval TTL/3). A crashed holder stops renewing;
+  waiters take over the expired lease and re-run the idempotent chain, so a
+  wedged holder can never block recovery permanently.
+* Waiters poll up to `MIGRATION_LOCK_WAIT_SECONDS` (default 900) and then
+  FAIL CLOSED (LeaseLockUnavailable) rather than race concurrent DDL.
+* Lock lifecycle emits structured credential-free logs: acquisition started,
+  acquired (incl. takeover flag), already-current observation, released.
+
+Validation (disposable CockroachDB, 2026-09-25): two simultaneous full-chain
+migrations from an empty database serialized correctly (second instance
+waited the whole ~10.5-minute chain and acquired 1.1s after release; no
+duplicate DDL); 3x synthetic concurrent-DDL rounds serialized; a crashed
+holder's lease was taken over in ~6s; a renewing holder caused a bounded
+fail-closed; runtime identity remained DML-only and owns zero tables.
+
+Residual: the CLI path (`alembic upgrade head` run manually) bypasses the
+lease and remains operator-controlled; the startup race is eliminated for
+application instances, not for out-of-band operator execution.

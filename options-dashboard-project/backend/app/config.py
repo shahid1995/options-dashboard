@@ -105,10 +105,19 @@ class Settings(BaseSettings):
 
     # ADR-016 (optional identity separation): when set, Alembic migrations
     # run under this dedicated higher-privilege identity instead of the
-    # runtime DATABASE_URL. The runtime identity can then be restricted to
-    # DML (no schema ownership/DDL). Leave unset for single-identity
-    # deployments (behavior identical to the historical model).
+    # runtime DATABASE_URL production identity. The runtime identity can then
+    # be restricted to DML (no schema ownership/DDL). Leave unset for
+    # single-identity deployments (behavior identical to the historical model).
     STRIKENOVA_MIGRATION_DATABASE_URL: str | None = None
+
+    # ADR-017 (migration serialization): the transactional lease lock that
+    # guarantees only one process executes the migration chain at a time.
+    # TTL bounds crash recovery (expired leases are taken over); WAIT bounds
+    # total waiting before failing startup closed. Values are generous:
+    # the full chain takes minutes, and Render's proxy-level request timeout
+    # (~5 min) already bounds deploy health-check latency.
+    MIGRATION_LOCK_TTL_SECONDS: int = 120
+    MIGRATION_LOCK_WAIT_SECONDS: int = 900
 
     @property
     def IS_PRODUCTION(self) -> bool:
