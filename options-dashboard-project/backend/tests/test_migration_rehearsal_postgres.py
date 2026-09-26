@@ -262,6 +262,7 @@ _SIGKILL_ACTOR = textwrap.dedent(
             wait_for("sigkill_sent", 90)
 
             deadline = time.monotonic() + max(60, ttl * 4)
+            completed = False
             while time.monotonic() < deadline:
                 acquired, took_over = mlock.try_acquire(url, owner, ttl)
                 if acquired:
@@ -274,12 +275,14 @@ _SIGKILL_ACTOR = textwrap.dedent(
                     if not mlock.release(url, owner):
                         raise SystemExit("waiter cleanup release failed")
                     put("sigkill_waiter_released", owner)
-                    return
+                    completed = True
+                    break
                 time.sleep(0.25)
 
-            raise SystemExit(
-                "waiter could not take over the dead holder's expired lease before deadline"
-            )
+            if not completed:
+                raise SystemExit(
+                    "waiter could not take over the dead holder's expired lease before deadline"
+                )
 
         else:
             raise SystemExit(f"unknown actor role: {role!r}")
