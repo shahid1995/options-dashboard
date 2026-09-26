@@ -1,7 +1,55 @@
 # StrikeNova Implementation Status Tracker
 
 > **Master Plan SHA:** `0a244c0` (docs: add StrikeNova master day-wise implementation plan)
-> **Last Updated:** 2026-09-03 (Day 8 — Infrastructure Phase Gate PASS)
+> **Last Updated:** 2026-09-26 (database hardening / PR #106–#107)
+
+
+
+---
+
+## 2026-09-26 — Database hardening: ADR-016/017/018 and PR #106/#107
+
+**Purpose:** Durable implementation-status record for the production database identity/serialization hardening completed in PR #106 and the reviewer remediation now open in PR #107.
+
+### PR #106 — migration identity + serialized startup migrations
+
+**Status:** MERGED and deployed; production cutover verified.
+
+| Item | Evidence |
+|------|----------|
+| ADR-016 runtime/migration identity separation | PR #105 merged as `a54d454`; `STRIKENOVA_MIGRATION_DATABASE_URL` drives Alembic migrations under the dedicated migrator identity while application traffic remains on `DATABASE_URL` |
+| ADR-017 serialized migrations | PR #106 merged as `66e3b97`; database-backed `_migration_lock` lease serializes application-startup migrations |
+| Production deployment | Exact merge `66e3b97` deployed to `strikenova-api-production`; production health/readiness verified |
+| Migration head | Alembic head `d46aa0000001` |
+| Production runtime identity | `strikenova_production_app` remains DML-only and owns zero application tables |
+| Migration identity | `strikenova_prod_migrator` retains migration DDL privileges and owns `_migration_lock` |
+| Future-table defaults | ADR-018 default privileges grant runtime DML on future migrator-created tables and sequence USAGE; live verification confirmed the contract on `_migration_lock` |
+| Production lock state | `_migration_lock` observed free after startup |
+
+### PR #107 — reviewer remediation
+
+**Status:** OPEN, MERGEABLE, NOT MERGED, NOT DEPLOYED. Head: `944a0cb`; base: `66e3b97`.
+
+| Finding / contract | Resolution | Evidence |
+|------|----------|----------|
+| TTL renewal boundary | `MIGRATION_LOCK_TTL_SECONDS >= 2` enforced at the Pydantic configuration boundary; renewal remains `max(1.0, TTL/3)` | Source inspection of `config.py` + renewal tests in `test_migration_serialization.py` |
+| Standalone Alembic identity | Shared resolver precedence: explicit `sqlalchemy.url` > `STRIKENOVA_MIGRATION_DATABASE_URL` > `DATABASE_URL` > SQLite fallback | `app.db.resolve_migration_database_url()` + `alembic/env.py` delegation; hermetic and real-CLI verification reported on the branch |
+| Runtime-identity invariance | Runtime engine continues to use `DATABASE_URL`; separate migration URL is used only by migration paths | Source inspection of `_engine()`, `_migration_engine_url()`, and `_run_alembic_migrations()` |
+| Codacy assert finding | Renewal test uses pytest assertions rather than plain Python `assert` semantics that depend on `__debug__` | Reviewer-remediation test diff |
+| Codacy `inspect.getsource` finding | Source inspection removed from the renewal test; verification is behavioral | Reviewer-remediation test diff |
+| Reviewer disposition | Qodo ×2, CodeRabbit ×2, Codacy ×2 findings mapped to implemented remediations | PR #107 remediation report and current source |
+
+### Fresh CI / verification state at 2026-09-26
+
+- PostgreSQL compatibility workflow: **PASS** on `944a0cb`.
+- StrikeNova status-gate workflow: **PASS** on `944a0cb`; it emits a warning that the implementation files changed without a tracker update, which this entry now closes.
+- GitHub Advanced Security AI workflow: **FAIL due runner-side model error** (`400 The requested model is not supported`); this is infrastructure/tooling failure, not a code finding.
+- OpenCodeReview: **IN PROGRESS** at the time of this tracker update.
+- Combined commit status also reports a Vercel check failure; this is separate from the backend database-hardening evidence and must be resolved/classified before merge.
+- No Render, Vercel configuration, CockroachDB, deployment, or secret changes are part of PR #107.
+
+**Governance state:** PR #106 is the deployed production database-hardening baseline. PR #107 remains review-only until all required checks are classified and the normal merge is explicitly authorized.
+
 
 ## Phase 0 — Security Emergency
 
