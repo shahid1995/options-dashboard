@@ -60,18 +60,6 @@ jobs:
     name: CockroachDB migration rehearsal (ADR-017 lock on real CRDB)
     runs-on: ubuntu-latest
 
-    services:
-      cockroachdb:
-        image: cockroachdb/cockroach:v25.2.23
-        ports:
-          - 26257:26257
-        options: >-
-          --health-cmd "cockroach sql --insecure --host=localhost:26257 -e 'SELECT 1'"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
-        cmd: start-single-node --insecure --listen-addr=0.0.0.0:26257 --http-addr=0.0.0.0:8080
-
     defaults:
       run:
         working-directory: options-dashboard-project/backend
@@ -79,6 +67,24 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Start disposable CockroachDB (single node, insecure, scratch)
+        run: |
+          docker run -d --name crdb \
+            -p 26257:26257 -p 8080:8080 \
+            cockroachdb/cockroach:v25.2.23 \
+            start-single-node --insecure \
+            --listen-addr=0.0.0.0:26257 --http-addr=0.0.0.0:8080
+          for i in $(seq 1 30); do
+            if docker exec crdb /cockroach/cockroach sql --insecure \
+                 --host=localhost:26257 -e "SELECT 1" >/dev/null 2>&1; then
+              echo "CockroachDB ready"
+              break
+            fi
+            sleep 1
+          done
+          docker exec crdb /cockroach/cockroach sql --insecure \
+            --host=localhost:26257 -e "CREATE DATABASE IF NOT EXISTS rehearsal"
 
       - name: Set up Python
         uses: actions/setup-python@v5
