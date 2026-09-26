@@ -128,7 +128,9 @@ def _ensure_lock_table(conn, max_retries: int = 8) -> None:
             cur.execute(
                 "CREATE TABLE IF NOT EXISTS " + LOCK_TABLE + " ("
                 "_id BOOLEAN PRIMARY KEY DEFAULT true CHECK (_id), "
-                "locked_by STRING, "
+                # TEXT (not CRDB's STRING alias) so the bootstrap DDL is
+                # valid on BOTH CockroachDB and vanilla PostgreSQL.
+                "locked_by TEXT, "
                 "acquired_at TIMESTAMPTZ, "
                 "expires_at TIMESTAMPTZ)"
             )
