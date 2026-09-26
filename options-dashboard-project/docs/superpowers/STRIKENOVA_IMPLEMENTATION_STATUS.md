@@ -1,24 +1,47 @@
 # StrikeNova Implementation Status Tracker
 
 > **Master Plan SHA:** `0a244c0` (docs: add StrikeNova master day-wise implementation plan)
-> **Last Updated:** 2026-09-26 (database hardening / PR #106–#107 + post-merge lock-rehearsal follow-up)
-
-
+> **Last Updated:** 2026-09-26 (PR #108 merged; PR #109 SIGKILL lease-takeover rehearsal)
 
 ---
 
-## 2026-09-26 — Post-merge follow-up: concurrent lock rehearsal + OpenCodeReview diagnosis
+## 2026-09-26 — PR #109: SIGKILL migration-lock takeover rehearsal
 
-**Purpose:** Post-merge verification work after PR #107 (base `6089ecb`). Branch `postmerge/ocr-fix-and-concurrent-lock`; final code head **`d7be39f`**.
+**Status:** **OPEN / NOT MERGED.** Branch `postmerge/sigkill-lock-takeover`, based directly on PR #108 merge `4560f279`; final code head `8b56ac9be2fd56c351c36c9ede8ae579ac281b4d`.
 
 | Item | Resolution | Evidence |
 |------|-----------|----------|
-| OpenCodeReview PR-#107 exit-1 (post-step) | **Workflow NOT responsible — no change made.** The result artifact shows `"status": "failed"` — `"Review failed: 0 finding(s); 5 of 5 selected item(s) failed."`: both `plan_task` and `main_task` LLM requests hit `error_class: "timeout"` (`failure_phase: "context"`, ~300,000 ms to headers) on model `z-ai/glm-5.3-flash`. `ocr review` therefore exited 1 and the action's "Fail job on OCR error" gating correctly failed the job; the "Post review comments" step was skipped by design (`if: env.OCR_EXIT_CODE == '0'`). PR #106's run (log artifact) shows the identical signature (`"Review failed: 0 finding(s); 3 of 3 selected item(s) failed."`, 5 timeout entries). A genuinely completed 0-comment review (`"status": "complete"`) already exits 0 via the same gating — contract intact, nothing weakened. | `gh run view 36227261126` OCR result/stderr JSON; `gh api .../runs/36172655249/logs` artifact |
-| Real two-process concurrent lock rehearsal | New `test_two_process_concurrent_fail_closed`: Process A (separate OS process + own PostgreSQL session) acquires and renews while independent Process B (separate process + session) is rejected and must fail closed (`LeaseLockUnavailable`); after A releases, B acquires. Parent verifies persisted ownership from a third independent connection after each handoff and that the lock is free after both release. Marker-file handshakes with deadlines (no sleeps), per-child hard timeouts, kill-on-failure, production release path in cleanup. Order-independent: the holder takes over a stale expired lease via the ADR-017 takeover path. | `tests/test_migration_rehearsal_postgres.py`; disposable `postgres:16` container: 5 passed across five consecutive runs incl. stale-lease orderings; 5 skipped without `TEST_DATABASE_URL`; 62 passed under `python -O` with the serialization suite |
+| SIGKILL holder lifecycle | Real holder process acquires the production `_migration_lock`, starts `LeaseRenewer`, and is forcibly terminated with POSIX `SIGKILL`; the test does not call normal holder release | `tests/test_migration_rehearsal_postgres.py::test_sigkill_holder_requires_expiry_before_cross_process_takeover` |
+| Live-holder proof at kill boundary | Immediately before SIGKILL, a fresh PostgreSQL query verifies ownership and requires `expires_at` to be at least 2 seconds beyond PostgreSQL `CURRENT_TIMESTAMP`; the holder had already demonstrated an actual renewal | Same rehearsal test; fresh CI evidence |
+| Cross-process waiter | Independent waiter process is blocked while the holder is live, then takes over only after the dead holder's lease expires | Same rehearsal test; separate PostgreSQL session |
+| Persisted takeover | Parent verifies the waiter's ownership from a third independent PostgreSQL connection before allowing waiter cleanup | Same rehearsal test |
+| Cleanup | Waiter releases normally; final PostgreSQL verification confirms `locked_by IS NULL`; child cleanup is bounded and kills survivors | Same rehearsal test |
+| Timeout portability | SIGKILL marker waits use `max(90, REHEARSAL_TTL * 2)`; renewal proof uses `REHEARSAL_TTL` rather than a fixed 12-second deadline | Review remediation through final head `8b56ac9be2fd56c351c36c9ede8ae579ac281b4d` |
+| Reviewer remediation | Qodo actor-SyntaxError and pre-kill lease-validity findings addressed; Codacy static checks pass. Remaining Codacy comments are maintainability suggestions/duplicate-code observations or stale false positives, not release-blocking correctness findings | PR #109 review threads + fresh CI |
+| Fresh PostgreSQL rehearsal | **6 passed / 3 warnings** against disposable `postgres:16` | CI job on `8b56ac9be2fd56c351c36c9ede8ae579ac281b4d` |
+| Fresh PostgreSQL compatibility suite | **127 passed / 3 warnings**, explicitly including `tests/test_migration_rehearsal_postgres.py` | CI job on `48278708` |
+| Security/reviewer checks | OpenCodeReview ✅; GitHub Advanced Security ✅; Codacy ✅; Vercel Preview Comments ✅; status/master-plan validation ✅ | Fresh checks on final head `8b56ac9be2fd56c351c36c9ede8ae579ac281b4d` |
 
-**Governance state:** no deployment, no Render/Vercel/CockroachDB change, no secret rotation; the investigation changed no workflow or application code (the OCR failure is provider-side tooling, to be fixed in repo/model settings by the Founder if desired — e.g. a faster/more reliable `OCR_LLM_MODEL`).
+**Governance state:** PR #109 remains **OPEN / NOT MERGED**. No Render deployment, Vercel production change, CockroachDB production modification, or secret change.
 
 ---
+
+## 2026-09-26 — PR #108: concurrent PostgreSQL lock rehearsal + reviewer remediation
+
+**Status:** **MERGED** into `feat/strikenova-day35-portfolio-intelligence` as `4560f279144cf251d7f5480f6c8ce9135452d6fa`. No production deployment.
+
+| Item | Resolution | Evidence |
+|------|-----------|----------|
+| Real concurrent lock rehearsal | Two independent OS processes and PostgreSQL sessions prove live-holder rejection, fail-closed waiter behavior, release, re-acquisition, persisted ownership, and final lock-free state | PR #108 rehearsal tests |
+| CI coverage | Root PostgreSQL compatibility workflow explicitly includes `tests/test_migration_rehearsal_postgres.py`; the nested workflow copy is inert because GitHub Actions reads root `.github/workflows/` | PR #108 reviewer remediation |
+| Marker publication | Actor and parent markers use atomic temp-file publication with `fsync` + `os.replace` | PR #108 reviewer remediation |
+| Timing/subprocess hardening | Rehearsal TTL raised to 15s; subprocess stderr moved to `DEVNULL`; actor roles validated; shared verification engine disposed deterministically | PR #108 reviewer remediation |
+| Governance tracker | PR #107 historical state corrected from OPEN to MERGED as `6089ecb` | Tracker remediation |
+| OCR diagnosis | PR #107/#108 red OpenCodeReview runs were traced to LLM provider timeouts on `z-ai/glm-5.3-flash`; pinned action's fail gating was correct. A fresh zero-finding review on PR #108 passed, confirming completed+zero-findings success semantics | Review artifacts and PR #108 fresh check |
+| Final CI | PR #108 compatibility rehearsal and reviewer/security gates passed after remediation; merge was authorized manually | PR #108 final verification |
+
+**Governance state:** PR #108 is merged; **no deploy**, no Render/CockroachDB/Vercel production modification, no secret rotation.
+
 
 ## 2026-09-26 — Database hardening: ADR-016/017/018 and PR #106/#107
 

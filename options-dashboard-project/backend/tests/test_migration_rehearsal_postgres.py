@@ -14,11 +14,13 @@ verification survives ``python -O`` (no reliance on plain ``assert``).
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import textwrap
 import time
 import uuid
+from datetime import timedelta
 
 import pytest
 from alembic import command
@@ -165,6 +167,127 @@ _CONCURRENT_ACTOR = textwrap.dedent(
     except BaseException as exc:  # noqa: BLE001 - surface the failure to the
         # parent via an ATOMIC error marker (stderr is DEVNULL by design so a
         # chatty child can never block on an undrained pipe).
+        try:
+            put(f"error_{role}", f"{type(exc).__name__}: {exc}")
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+        raise
+    """
+)
+
+
+# Forced-termination actor for ADR-017 takeover rehearsal: a POSIX holder
+# is SIGKILLed while actively renewing; the independent waiter is blocked
+# before the kill, then must take over only after the lease actually expires.
+_SIGKILL_ACTOR = textwrap.dedent(
+    """
+    import os
+    import sys
+    import time
+    import uuid
+
+    markers = os.environ.get("REHEARSAL_MARKERS", "")
+    role = sys.argv[1] if len(sys.argv) > 1 else "unknown"
+
+    def path(name):
+        return os.path.join(markers, name)
+
+
+    def put(name, value="1"):
+        tmp = path(name) + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(value)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path(name))
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+
+
+    def wait_for(name, deadline_seconds):
+        deadline = time.monotonic() + deadline_seconds
+        while time.monotonic() < deadline:
+            if os.path.exists(path(name)):
+                with open(path(name), encoding="utf-8") as f:
+                    return f.read().strip()
+            time.sleep(0.05)
+        raise SystemExit(f"TIMEOUT waiting for marker {name}")
+
+
+    try:
+        # Keep bootstrap/import failures observable even though child stderr is
+        # intentionally DEVNULL so a noisy actor can never deadlock on a pipe.
+        sys.path.insert(0, os.environ["REHEARSAL_BACKEND"])
+        from app import _migration_lock as mlock  # noqa: E402
+
+        url = os.environ["REHEARSAL_DB_URL"]
+        ttl = int(os.environ.get("REHEARSAL_TTL", "15"))
+
+        if role == "holder":
+            owner = "sigkill-holder:" + uuid.uuid4().hex[:8]
+            acquired = False
+            for _attempt in range(60):
+                acquired, _took_over = mlock.try_acquire(url, owner, ttl)
+                if acquired:
+                    break
+                time.sleep(0.5)
+            if not acquired:
+                raise SystemExit(
+                    "holder could not acquire the lock (free or via expired-lease takeover)"
+                )
+            renewer = mlock.LeaseRenewer(url, owner, ttl)
+            renewer.start()
+            put("sigkill_holder_acquired", owner)
+            # The parent will SIGKILL this process after observing a renewal.
+            while True:
+                time.sleep(1.0)
+
+        elif role == "waiter":
+            wait_for("sigkill_holder_acquired", 90)
+            owner = "sigkill-waiter:" + uuid.uuid4().hex[:8]
+
+            acquired, took_over = mlock.try_acquire(url, owner, ttl)
+            if acquired or took_over:
+                raise SystemExit(
+                    "waiter acquired/took over before SIGKILL while the holder was live"
+                )
+            put("sigkill_waiter_blocked", owner)
+
+            # The parent kills the live holder only after proving the lease
+            # has renewed. Do not attempt takeover until that event is signalled.
+            wait_for("sigkill_sent", 90)
+
+            deadline = time.monotonic() + max(60, ttl * 4)
+            completed = False
+            while time.monotonic() < deadline:
+                acquired, took_over = mlock.try_acquire(url, owner, ttl)
+                if acquired:
+                    if not took_over:
+                        raise SystemExit(
+                            "waiter acquired after SIGKILL without takeover evidence"
+                        )
+                    put("sigkill_waiter_acquired", f"{owner}|{took_over}")
+                    wait_for("sigkill_parent_ack", 90)
+                    if not mlock.release(url, owner):
+                        raise SystemExit("waiter cleanup release failed")
+                    put("sigkill_waiter_released", owner)
+                    completed = True
+                    break
+                time.sleep(0.25)
+
+            if not completed:
+                raise SystemExit(
+                    "waiter could not take over the dead holder's expired lease before deadline"
+                )
+
+        else:
+            raise SystemExit(f"unknown actor role: {role!r}")
+    except BaseException as exc:  # noqa: BLE001 - surface the failure to parent
         try:
             put(f"error_{role}", f"{type(exc).__name__}: {exc}")
         except Exception:  # noqa: BLE001 - best effort
@@ -466,6 +589,206 @@ class TestPostgresMigrationRehearsal:
         finally:
             # Orphan-proof cleanup: kill children if anything above raised,
             # then force the lock free via the production release path.
+            for proc in (holder, waiter):
+                try:
+                    if proc is not None and proc.poll() is None:
+                        proc.kill()
+                        proc.wait(timeout=15)
+                except Exception:  # noqa: BLE001 - best-effort cleanup
+                    pass
+            try:
+                held = mlock.current_holder(migration_url)
+                if held:
+                    mlock.release(migration_url, held)
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
+
+
+    def test_sigkill_holder_requires_expiry_before_cross_process_takeover(
+        self, migration_url, verify_engine, tmp_path
+    ):
+        """A real holder killed mid-renewal blocks takeover until its lease
+        expires, then an independent PostgreSQL session takes over."""
+        if os.name != "posix":
+            pytest.skip("SIGKILL rehearsal requires a POSIX process model")
+
+        markers = tmp_path / "sigkill_markers"
+        markers.mkdir()
+        env = dict(
+            os.environ,
+            REHEARSAL_BACKEND=ROOT,
+            REHEARSAL_DB_URL=migration_url,
+            REHEARSAL_MARKERS=str(markers),
+            REHEARSAL_TTL=str(self.REHEARSAL_TTL),
+        )
+        actor = tmp_path / "_sigkill_lock_actor.py"
+        actor.write_text(_SIGKILL_ACTOR, encoding="utf-8")
+
+        roles = frozenset({"holder", "waiter"})
+
+        def spawn(role):
+            if role not in roles:
+                raise ValueError(f"unknown actor role: {role!r}")
+            return subprocess.Popen(
+                [sys.executable, str(actor), role],
+                env=env,
+                cwd=ROOT,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+        def await_marker(name, proc, deadline_seconds=90.0):
+            deadline = _monotonic_deadline(deadline_seconds)
+            while not (markers / name).exists():
+                if proc is not None and proc.poll() is not None:
+                    err = ""
+                    error_marker = markers / f"error_{proc.args[-1]}"
+                    if error_marker.exists():
+                        err = error_marker.read_text(encoding="utf-8")
+                    raise AssertionError(
+                        f"{proc.args[-1]} actor exited before signalling {name}: "
+                        f"rc={proc.returncode} error={err[:500]!r}"
+                    )
+                if time.monotonic() > deadline:
+                    raise AssertionError(f"deadline waiting for marker {name}")
+                time.sleep(0.05)
+            with open(markers / name, encoding="utf-8") as f:
+                return f.read().strip()
+
+        def put_parent_marker(name, value="1"):
+            tmp = markers / f"{name}.tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(value)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, markers / name)
+            except BaseException:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise
+
+        holder = spawn("holder")
+        waiter = None
+        marker_timeout = max(90, self.REHEARSAL_TTL * 2)
+        try:
+            holder_owner = await_marker(
+                "sigkill_holder_acquired", holder, marker_timeout
+            )
+
+            # Prove the holder currently owns a live lease, then wait until
+            # the background renewer has actually extended it at least once.
+            with verify_engine.connect() as conn:
+                row = conn.execute(
+                    text("SELECT locked_by, expires_at FROM _migration_lock")
+                ).fetchone()
+            _check(row is not None, "SIGKILL holder row must exist")
+            _check(
+                row[0] == holder_owner,
+                f"SIGKILL holder ownership must be persisted, got {row[0]!r}",
+            )
+            initial_expiry = row[1]
+            _check(initial_expiry is not None, "SIGKILL holder lease must have an expiry")
+
+            renewed = False
+            renewal_deadline = _monotonic_deadline(self.REHEARSAL_TTL)
+            while time.monotonic() < renewal_deadline:
+                time.sleep(0.25)
+                with verify_engine.connect() as conn:
+                    current = conn.execute(
+                        text("SELECT locked_by, expires_at FROM _migration_lock")
+                    ).fetchone()
+                _check(
+                    current is not None and current[0] == holder_owner,
+                    "live SIGKILL holder must retain ownership while renewing",
+                )
+                if current[1] is not None and current[1] > initial_expiry:
+                    renewed = True
+                    break
+            _check(
+                renewed,
+                "SIGKILL holder must demonstrate at least one successful renewal before termination",
+            )
+
+            # Start the independent waiter before killing the holder. It must
+            # prove that takeover is blocked while the live lease is valid.
+            waiter = spawn("waiter")
+            waiter_owner = await_marker(
+                "sigkill_waiter_blocked", waiter, marker_timeout
+            )
+
+            with verify_engine.connect() as conn:
+                live = conn.execute(
+                    text(
+                        "SELECT locked_by, expires_at, CURRENT_TIMESTAMP "
+                        "FROM _migration_lock"
+                    )
+                ).fetchone()
+            _check(live is not None, "live-holder row must exist before SIGKILL")
+            _check(live[0] == holder_owner, "waiter must remain blocked by the live holder")
+            _check(
+                live[1] is not None and live[1] > live[2] + timedelta(seconds=2),
+                "holder lease must still be unexpired with margin at the exact SIGKILL point",
+            )
+
+            # Force abrupt process death. This intentionally bypasses the
+            # normal release path so the database must recover by expiry.
+            os.kill(holder.pid, signal.SIGKILL)
+            holder.wait(timeout=15)
+            _check(
+                holder.returncode == -signal.SIGKILL,
+                f"holder must terminate via SIGKILL, got return code {holder.returncode}",
+            )
+            put_parent_marker("sigkill_sent")
+
+            acquired_marker = await_marker(
+                "sigkill_waiter_acquired", waiter, marker_timeout
+            )
+            parts = acquired_marker.split("|", 1)
+            _check(
+                len(parts) == 2,
+                f"waiter acquisition marker must include owner and takeover flag, got {acquired_marker!r}",
+            )
+            acquired_owner, took_over_text = parts
+            _check(
+                acquired_owner == waiter_owner,
+                f"waiter owner mismatch after takeover: {acquired_owner!r} != {waiter_owner!r}",
+            )
+            _check(
+                took_over_text == "True",
+                "waiter must report a genuine expired-lease takeover after SIGKILL",
+            )
+
+            # Third independent PostgreSQL connection: takeover persisted in
+            # the database before the waiter receives the release ack.
+            with verify_engine.connect() as conn:
+                taken = conn.execute(
+                    text("SELECT locked_by FROM _migration_lock")
+                ).scalar_one()
+            _check(
+                taken == waiter_owner,
+                f"taken-over lock ownership must persist as waiter, got {taken!r}",
+            )
+
+            put_parent_marker("sigkill_parent_ack")
+            waiter.wait(timeout=30)
+            _check(
+                waiter.returncode == 0,
+                f"waiter must exit cleanly after takeover/release, got {waiter.returncode}",
+            )
+            await_marker("sigkill_waiter_released", None, marker_timeout)
+
+            with verify_engine.connect() as conn:
+                final = conn.execute(
+                    text("SELECT locked_by FROM _migration_lock")
+                ).scalar_one()
+            _check(
+                final is None,
+                f"lock must be free after SIGKILL takeover rehearsal, got {final!r}",
+            )
+        finally:
             for proc in (holder, waiter):
                 try:
                     if proc is not None and proc.poll() is None:
