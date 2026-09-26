@@ -28,7 +28,7 @@
 
 ### PR #107 — reviewer remediation
 
-**Status:** OPEN, MERGEABLE, NOT MERGED, NOT DEPLOYED. Head: `ab22c60` + the tracker-refresh commit that carries this entry (the branch tip is the final head; see PR #107); base: `66e3b97`.
+**Status:** OPEN, MERGEABLE, NOT MERGED, NOT DEPLOYED. Final code head: `ecc4c4e` (test(ci): add postgres migration rehearsal); the branch tip is this tracker commit, which follows it; base: `66e3b97`.
 
 | Finding / contract | Resolution | Evidence |
 |------|----------|----------|
@@ -43,15 +43,19 @@
 | Explicit-URL edge cases (independent review) | Explicit leg stripped once before all checks; whitespace/tab-prefixed `driver://` alembic placeholders fall through as unset | Resolver tests incl. parametrized placeholder cases |
 | Bandit B101 (Codacy) | Remediation-added checks use explicit `AssertionError` raises instead of plain `assert`; affected suites also verified under `python -O` | `test_migration_serialization.py` renewal/TTL tests |
 | env.py delegation (independent review) | The REAL `alembic/env.py` executed hermetically (offline `EnvironmentContext`) proves explicit > migration > runtime > SQLite precedence through the shared resolver | `tests/test_alembic_env_resolution.py` |
+| Migration-target serialization (independent review) | The SQLite bypass in `_run_alembic_migrations()` is decided by the resolved migration URL, not the runtime `engine.url` — a SQLite runtime + non-SQLite migration identity serializes per ADR-017 | `TestMigrationTargetSerialization` (4 hermetic tests, no external DB) |
+| PostgreSQL migration rehearsal (CI) | New `PostgreSQL migration rehearsal` workflow runs `tests/test_migration_rehearsal_postgres.py` against a disposable `postgres:16` service container: real resolver precedence (migration identity beats runtime identity; startup target == rehearsal target), the REAL `_migration_lock` lifecycle (acquire → persisted ownership → renew → concurrent rejection → release → re-acquire), fail-closed waiter semantics, and the full Alembic chain through the resolver-selected target. First local run against a disposable container caught a real portability defect: the lock bootstrap DDL used CRDB's `STRING`; fixed to `TEXT` (valid on both engines; production's live table already reports `text`) | `.github/workflows/postgres-migration-rehearsal.yml`; local disposable-container run 4 passed |
 
 ### Fresh CI / verification state at 2026-09-26 (final head)
 
-- PostgreSQL compatibility workflow: **PASS** on `944a0cb`; the local equivalent (`test_postgres_compatibility.py` + the 15-file database-safety set: 226 passed / 11 skipped) is green on every subsequent head including `ab22c60` and this commit.
-- StrikeNova status-gate workflow: **PASS** on `944a0cb`; re-run on the final head pending (routine).
-- CodeRabbit: **PASS** (review completed) on `df84b4b`; OpenCodeReview: **PASS** (4m38s) on `df84b4b`; both re-scan each pushed head.
+- Backend PostgreSQL compatibility workflow: **PASS** at `adf157e` (run `36225272038` / `36225269328`, head SHA verified); re-run on `ecc4c4e` pending (routine).
+- PostgreSQL migration rehearsal workflow: **ADDED at `ecc4c4e`**; verified locally against a disposable `postgres:16` container (4 passed) and via skip-hygiene (4 skipped without `TEST_DATABASE_URL`); the first CI run is the remaining evidence and must be green before merge.
+- StrikeNova status-gate workflow: **PASS** on `adf157e` (runs `36225272074` / `36225269344`); this tracker update closes its implementation-file warning for `ecc4c4e`.
+- CodeRabbit: **PASS** (review completed) on `df84b4b`; OpenCodeReview: **PASS** (4m38s) on `df84b4b`, re-runs on each pushed head.
 - GitHub Advanced Security AI workflow: **FAIL due runner-side model error** (`400 The requested model is not supported`); this is infrastructure/tooling failure, not a code finding.
 - Codacy and Vercel preview failures on this PR are infrastructure-class (0-second provider failures / stale preview variable), not code verdicts.
-- Local verification on the final head: serialization suite 54 passed; identity suite 7 passed; combined 61 passed under both normal and `python -O` execution; Alembic/guard/Day-46 sets 73 passed / 7 skipped; full backend at `944a0cb` 6 failed / 6,225 passed / 110 skipped with failures identical to the six documented baselines.
+- Full backend suite at `adf157e` (tree-identical code to `ecc4c4e` except this tracker): **6 failed / 6,248 passed / 114 skipped**, failures **identical to the six documented baselines** (diff-verified); +4 skips are the new rehearsal tests without `TEST_DATABASE_URL`.
+- Local verification on the final head: focused migration/identity/alembic/guard/Day-46 sets 145 passed / 7 skipped; serialization 62 passed; `python -O` 72 passed; wide database-safety set 234 passed / 11 skipped; rehearsal 4 passed against a real disposable PostgreSQL container.
 - No Render, Vercel configuration, CockroachDB, deployment, or secret changes are part of PR #107.
 
 **Governance state:** PR #106 is the deployed production database-hardening baseline. PR #107 remains review-only until all required checks are classified and the normal merge is explicitly authorized.
