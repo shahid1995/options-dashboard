@@ -20,6 +20,7 @@ import sys
 import textwrap
 import time
 import uuid
+from datetime import timedelta
 
 import pytest
 from alembic import command
@@ -671,8 +672,11 @@ class TestPostgresMigrationRehearsal:
 
         holder = spawn("holder")
         waiter = None
+        marker_timeout = max(90, self.REHEARSAL_TTL * 2)
         try:
-            holder_owner = await_marker("sigkill_holder_acquired", holder)
+            holder_owner = await_marker(
+                "sigkill_holder_acquired", holder, marker_timeout
+            )
 
             # Prove the holder currently owns a live lease, then wait until
             # the background renewer has actually extended it at least once.
@@ -689,7 +693,7 @@ class TestPostgresMigrationRehearsal:
             _check(initial_expiry is not None, "SIGKILL holder lease must have an expiry")
 
             renewed = False
-            renewal_deadline = _monotonic_deadline(12)
+            renewal_deadline = _monotonic_deadline(self.REHEARSAL_TTL)
             while time.monotonic() < renewal_deadline:
                 time.sleep(0.25)
                 with verify_engine.connect() as conn:
@@ -711,17 +715,22 @@ class TestPostgresMigrationRehearsal:
             # Start the independent waiter before killing the holder. It must
             # prove that takeover is blocked while the live lease is valid.
             waiter = spawn("waiter")
-            waiter_owner = await_marker("sigkill_waiter_blocked", waiter)
+            waiter_owner = await_marker(
+                "sigkill_waiter_blocked", waiter, marker_timeout
+            )
 
             with verify_engine.connect() as conn:
                 live = conn.execute(
-                    text("SELECT locked_by, expires_at FROM _migration_lock")
+                    text(
+                        "SELECT locked_by, expires_at, CURRENT_TIMESTAMP "
+                        "FROM _migration_lock"
+                    )
                 ).fetchone()
             _check(live is not None, "live-holder row must exist before SIGKILL")
             _check(live[0] == holder_owner, "waiter must remain blocked by the live holder")
             _check(
-                live[1] is not None and live[1] > initial_expiry,
-                "holder lease must still be live after the renewal proof",
+                live[1] is not None and live[1] > live[2] + timedelta(seconds=2),
+                "holder lease must still be unexpired with margin at the exact SIGKILL point",
             )
 
             # Force abrupt process death. This intentionally bypasses the
@@ -734,7 +743,9 @@ class TestPostgresMigrationRehearsal:
             )
             put_parent_marker("sigkill_sent")
 
-            acquired_marker = await_marker("sigkill_waiter_acquired", waiter, 90)
+            acquired_marker = await_marker(
+                "sigkill_waiter_acquired", waiter, marker_timeout
+            )
             parts = acquired_marker.split("|", 1)
             _check(
                 len(parts) == 2,
@@ -767,7 +778,7 @@ class TestPostgresMigrationRehearsal:
                 waiter.returncode == 0,
                 f"waiter must exit cleanly after takeover/release, got {waiter.returncode}",
             )
-            await_marker("sigkill_waiter_released", None)
+            await_marker("sigkill_waiter_released", None, marker_timeout)
 
             with verify_engine.connect() as conn:
                 final = conn.execute(
