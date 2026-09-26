@@ -7,7 +7,7 @@
 
 ## 2026-09-26 — PR #109: SIGKILL migration-lock takeover rehearsal
 
-**Status:** **OPEN / NOT MERGED.** Branch `postmerge/sigkill-lock-takeover`, based directly on PR #108 merge `4560f279`; final code head `8b56ac9be2fd56c351c36c9ede8ae579ac281b4d`.
+**Status:** **MERGED** into `feat/strikenova-day35-portfolio-intelligence` as `8114996a2b59797730474924b6d5b42bc413e63e`. Implementation code head was `8b56ac9be2fd56c351c36c9ede8ae579ac281b4d`; documentation sync commit was `0dd50bd29f6e601023fd0dd30947a757ed2d7c30`.
 
 | Item | Resolution | Evidence |
 |------|-----------|----------|
@@ -19,10 +19,10 @@
 | Timeout portability | SIGKILL marker waits use `max(90, REHEARSAL_TTL * 2)`; renewal proof uses `REHEARSAL_TTL` rather than a fixed 12-second deadline | Review remediation through final head `8b56ac9be2fd56c351c36c9ede8ae579ac281b4d` |
 | Reviewer remediation | Qodo actor-SyntaxError and pre-kill lease-validity findings addressed; Codacy static checks pass. Remaining Codacy comments are maintainability suggestions/duplicate-code observations or stale false positives, not release-blocking correctness findings | PR #109 review threads + fresh CI |
 | Fresh PostgreSQL rehearsal | **6 passed / 3 warnings** against disposable `postgres:16` | CI job on `8b56ac9be2fd56c351c36c9ede8ae579ac281b4d` |
-| Fresh PostgreSQL compatibility suite | **127 passed / 3 warnings**, explicitly including `tests/test_migration_rehearsal_postgres.py` | CI job on `48278708` |
+| Fresh PostgreSQL compatibility suite | **127 passed / 3 warnings**, explicitly including `tests/test_migration_rehearsal_postgres.py` | CI run #396 on `0dd50bd29f6e601023fd0dd30947a757ed2d7c30` |
 | Security/reviewer checks | OpenCodeReview ✅; GitHub Advanced Security ✅; Codacy ✅; Vercel Preview Comments ✅; status/master-plan validation ✅ | Fresh checks on final head `8b56ac9be2fd56c351c36c9ede8ae579ac281b4d` |
 
-**Governance state:** PR #109 remains **OPEN / NOT MERGED**. No Render deployment, Vercel production change, CockroachDB production modification, or secret change.
+**Governance state:** PR #109 is **MERGED** as `8114996a2b59797730474924b6d5b42bc413e63e`. No Render deployment, Vercel production deployment, CockroachDB production modification, or secret change was performed as part of PR #109.
 
 ---
 
