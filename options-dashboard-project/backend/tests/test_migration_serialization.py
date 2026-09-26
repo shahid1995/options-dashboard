@@ -11,6 +11,7 @@ import datetime as _dt
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 import app._migration_lock as mlock
 import app.db as db_module
@@ -247,6 +248,26 @@ class TestSerializedExecution:
             "update _migration_lock set expires_at" in s.lower() for s in state["stmts"]
         )
 
+    def test_renewal_interval_is_ttl_third_floored_at_one_second(self):
+        """Documented renewal rule (module docstring / ADR-017): the renewer
+        waits max(1.0, ttl/3) between renewals — strictly below the TTL so an
+        alive holder never leaves an expiry gap a waiter could misread as a
+        crash, with a 1s floor so tiny TTLs still renew at a sane cadence.
+        Verified behaviorally against the wait interval the renewer sleeps
+        for, never by inspecting source text."""
+        for ttl, expected in ((30, 10.0), (120, 40.0), (2, 1.0)):
+            renewer = mlock.LeaseRenewer("postgresql://x", "me", ttl)
+            state = _fresh_state(held_by="me", owner="me")
+            renewer._stop = MagicMock()
+            renewer._stop.wait.side_effect = [False, True]  # single loop
+            with patch.object(mlock, "_connect", return_value=_FakeConn(state)):
+                renewer._run()
+            actual = renewer._stop.wait.call_args_list[0].args[0]
+            if actual != expected:
+                raise AssertionError(
+                    f"ttl={ttl}: expected wait({expected}), got {actual}"
+                )
+
 
 # ------------------------------------------------- cold bootstrap retry
 class TestBootstrapRetry:
@@ -311,7 +332,9 @@ class TestIdentityRules:
     def test_lock_falls_back_to_runtime_url_when_unset(self):
         s = Settings(DATABASE_URL="postgresql://runtime:pw@h:26257/app")
         with patch("app.db.settings", s):
-            assert db_module._migration_lock_url() == str(db_module.engine.url)
+            assert db_module._migration_lock_url() == (
+                "postgresql+psycopg://runtime:pw@h:26257/app"
+            )
 
     def test_runtime_identity_not_used_for_ddl_when_separated(self):
         s = Settings(
@@ -322,7 +345,369 @@ class TestIdentityRules:
             assert db_module._migration_engine_url() != str(db_module.engine.url)
 
 
+# ------------------------------------------------- migration target rules
+class TestMigrationTargetSerialization:
+    """The SQLite bypass in _run_alembic_migrations must be decided by the
+    MIGRATION TARGET (the resolved migration URL), not by the runtime
+    engine. Otherwise a SQLite runtime + non-SQLite migration identity
+    would run server-backed migrations without ADR-017 serialization."""
+
+    def _patch_db(self, runtime_url, migration_url):
+        s = Settings(
+            DATABASE_URL=runtime_url,
+            STRIKENOVA_MIGRATION_DATABASE_URL=migration_url,
+        )
+        return patch.object(db_module, "settings", s)
+
+    def _run_startup_migration(self, runtime_url, migration_url):
+        """Drive _run_alembic_migrations hermetically through COHERENT
+        Settings: the real resolver decides the migration target and the
+        separation flag exactly as in production. The runtime engine is a
+        MagicMock (nothing real is touched) and _execute_serialized is a
+        mock, so no database is ever contacted. Returns the mocks plus the
+        connectable observed INSIDE the patched context (identity
+        comparisons are meaningless after exit). Pass migration_url="" for
+        the single-identity model."""
+        from unittest.mock import MagicMock as _M
+
+        fake_engine = _M(name="runtime-engine")
+        fake_engine.url = runtime_url
+        serialized = _M(name="_execute_serialized")
+        direct = _M(name="direct_upgrade")
+        cfg = _M(name="alembic_cfg")
+        cfg.attributes = {}  # real dict so get()/[] stores are observable
+        observed = {}
+        with patch.object(
+            db_module, "settings",
+            Settings(DATABASE_URL=runtime_url, STRIKENOVA_MIGRATION_DATABASE_URL=migration_url or ""),
+        ), patch.object(
+            db_module, "engine", fake_engine
+        ), patch.object(
+            db_module, "_execute_serialized", serialized
+        ), patch(
+            "alembic.command.upgrade", direct
+        ), patch(
+            "alembic.config.Config", return_value=cfg
+        ):
+            db_module._run_alembic_migrations()
+            observed["connectable"] = cfg.attributes.get("connectable")
+            observed["engine"] = fake_engine
+        return serialized, direct, cfg, observed
+
+    def test_sqlite_runtime_with_nonsqlite_migration_target_serializes(self):
+        serialized, direct, _, observed = self._run_startup_migration(
+            "sqlite:///C:/tmp/runtime.db",
+            "cockroachdb+psycopg://migrator:pw@h:26257/strikenova?sslmode=require",
+        )
+        if serialized.call_count != 1:
+            raise AssertionError(
+                "non-SQLite migration target must be serialized via "
+                f"_execute_serialized, got calls={serialized.call_count}"
+            )
+        if direct.called:
+            raise AssertionError("direct SQLite path must NOT be taken for a non-SQLite target")
+        if observed["connectable"] is not None:
+            raise AssertionError(
+                "separated identities must not reuse the runtime engine as connectable"
+            )
+
+    def test_sqlite_target_takes_the_direct_path_even_with_nonsqlite_runtime(self):
+        serialized, direct, _, observed = self._run_startup_migration(
+            "postgresql://runtime:pw@h:26257/app",
+            "sqlite:///C:/tmp/migration.db",
+        )
+        if serialized.called:
+            raise AssertionError("SQLite migration target must bypass serialization")
+        if direct.call_count != 1:
+            raise AssertionError(
+                f"SQLite target must migrate directly once, got {direct.call_count}"
+            )
+        if observed["connectable"] is not None:
+            raise AssertionError(
+                "separated identities must not reuse the runtime engine as connectable"
+            )
+
+    def test_single_identity_sqlite_still_takes_the_direct_path(self):
+        serialized, direct, _, observed = self._run_startup_migration(
+            "sqlite:///C:/tmp/single.db", ""
+        )
+        if serialized.called:
+            raise AssertionError("historical single-identity SQLite behavior changed")
+        if direct.call_count != 1:
+            raise AssertionError(
+                f"SQLite direct path must be preserved, got {direct.call_count}"
+            )
+        if observed["connectable"] is not observed["engine"]:
+            raise AssertionError(
+                "single-identity startup must reuse the runtime engine connectable"
+            )
+
+    def test_single_identity_nonsqlite_serializes_and_reuses_engine(self):
+        serialized, direct, _, observed = self._run_startup_migration(
+            "postgresql://runtime:pw@h:26257/app", ""
+        )
+        if serialized.call_count != 1:
+            raise AssertionError("non-SQLite single-identity startup must serialize")
+        if direct.called:
+            raise AssertionError("direct SQLite path must not run for server targets")
+        if observed["connectable"] is not observed["engine"]:
+            raise AssertionError(
+                "single-identity startup must reuse the runtime engine connectable"
+            )
+
+
+# ------------------------------------------------- blank URL semantics
+class TestBlankUrlSemantics:
+    """None, "" and whitespace-only values mean UNSET for every URL source
+    (explicit sqlalchemy.url, STRIKENOVA_MIGRATION_DATABASE_URL,
+    DATABASE_URL); nonblank values are stripped before normalization. The
+    lock URL shares the resolver's semantics exactly and never diverges."""
+
+    WS = "   "
+
+    def test_blank_migration_url_falls_back_to_runtime(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url() == (
+                "postgresql+psycopg://runtime:pw@h:26257/app"
+            )
+
+    def test_whitespace_migration_url_falls_back_to_runtime(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL=self.WS,
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url() == (
+                "postgresql+psycopg://runtime:pw@h:26257/app"
+            )
+
+    def test_blank_explicit_url_falls_through_to_migration_url(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url("") == (
+                "postgresql+psycopg://migrator:pw@h:26257/app"
+            )
+
+    def test_whitespace_explicit_url_falls_through_to_migration_url(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url(self.WS) == (
+                "postgresql+psycopg://migrator:pw@h:26257/app"
+            )
+
+    def test_tab_only_explicit_url_is_unset(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url("\t") == (
+                "postgresql+psycopg://migrator:pw@h:26257/app"
+            )
+
+    @pytest.mark.parametrize(
+        "placeholder",
+        ["driver://user:pw@h/db", " driver://user:pw@h/db", "\tdriver://user:pw@h/db"],
+    )
+    def test_whitespace_prefixed_placeholder_is_not_a_real_url(self, placeholder):
+        """alembic.ini ships ``driver://...`` as a placeholder; env.py must
+        never return it (decorated with whitespace or not) — it falls through
+        to the migration/runtime URL as if unset."""
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
+        )
+        with patch("app.db.settings", s):
+            resolved = db_module.resolve_migration_database_url(placeholder)
+        if resolved.startswith("driver://"):
+            raise AssertionError(
+                f"alembic placeholder leaked as a real URL: {placeholder!r}"
+            )
+        if resolved != "postgresql+psycopg://migrator:pw@h:26257/app":
+            raise AssertionError(
+                f"placeholder did not fall through to the migration URL: {resolved}"
+            )
+
+    def test_blank_runtime_url_falls_back_to_sqlite(self):
+        s = Settings(DATABASE_URL="", STRIKENOVA_MIGRATION_DATABASE_URL=None)
+        with patch("app.db.settings", s):
+            url = db_module.resolve_migration_database_url()
+        assert url.startswith("sqlite:///"), url
+        assert url.endswith("paper_journal.db"), url
+
+    def test_whitespace_runtime_url_falls_back_to_sqlite(self):
+        s = Settings(DATABASE_URL=self.WS, STRIKENOVA_MIGRATION_DATABASE_URL=None)
+        with patch("app.db.settings", s):
+            url = db_module.resolve_migration_database_url()
+        assert url.startswith("sqlite:///"), url
+        assert url.endswith("paper_journal.db"), url
+
+    def test_nonblank_urls_are_stripped_before_normalization(self):
+        s = Settings(
+            DATABASE_URL="  postgresql://runtime:pw@h:26257/app  ",
+            STRIKENOVA_MIGRATION_DATABASE_URL="  cockroachdb+psycopg://migrator:pw@h:26257/strikenova?sslmode=require  ",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url() == (
+                "cockroachdb+psycopg://migrator:pw@h:26257/strikenova?sslmode=require"
+            )
+            assert db_module._migration_engine_url() == (
+                "cockroachdb+psycopg://migrator:pw@h:26257/strikenova?sslmode=require"
+            )
+            assert db_module._migration_lock_url() == (
+                "cockroachdb+psycopg://migrator:pw@h:26257/strikenova?sslmode=require"
+            )
+
+    def test_explicit_url_is_stripped(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url(
+                "  cockroachdb+psycopg://explicit:pw@h:26257/strikenova  "
+            ) == "cockroachdb+psycopg://explicit:pw@h:26257/strikenova"
+
+    @pytest.mark.parametrize(
+        "migration_url",
+        [
+            "postgresql://migrator:pw@h:26257/app",  # normal
+            "",  # blank
+            "   ",  # whitespace
+            None,  # unset
+        ],
+    )
+    def test_lock_url_never_diverges_from_migration_url(self, migration_url):
+        """Lock URL == engine URL under normal AND blank configurations:
+        the lock travels with the migration identity and shares the exact
+        blank-value semantics of the resolver."""
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL=migration_url,
+        )
+        with patch("app.db.settings", s):
+            expected = db_module._migration_engine_url()
+            assert db_module._migration_lock_url() == expected
+
+
 # ------------------------------------------------- config contract
+class TestMigrationLockTtlValidation:
+    """The renewal interval max(1.0, TTL/3) is only strictly below the TTL
+    when TTL >= 2; smaller/zero/negative values could make a live holder's
+    lease appear expired, so the configuration boundary rejects them."""
+
+    @pytest.mark.parametrize("ttl", [1, 0, -1, -120])
+    def test_ttl_below_two_is_rejected(self, ttl):
+        with pytest.raises(ValidationError, match="MIGRATION_LOCK_TTL_SECONDS"):
+            Settings(
+                DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+                MIGRATION_LOCK_TTL_SECONDS=ttl,
+            )
+
+    @pytest.mark.parametrize("ttl", [2, 3, 120, 900])
+    def test_ttl_of_two_or_more_is_accepted(self, ttl):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            MIGRATION_LOCK_TTL_SECONDS=ttl,
+        )
+        if s.MIGRATION_LOCK_TTL_SECONDS != ttl:
+            raise AssertionError(
+                f"expected TTL {ttl} to be accepted, got {s.MIGRATION_LOCK_TTL_SECONDS}"
+            )
+
+
+class TestAlembicCliUrlPrecedence:
+    """ADR-016 identity separation must hold for standalone CLI migrations
+    too (PR #107 review): alembic env.py resolves its URL through
+    app.db.resolve_migration_database_url with precedence
+    explicit sqlalchemy.url > STRIKENOVA_MIGRATION_DATABASE_URL >
+    DATABASE_URL > SQLite fallback."""
+
+    def test_explicit_url_wins_over_both_env_urls(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url(
+                "postgresql://explicit:pw@h:26257/app"
+            ) == "postgresql+psycopg://explicit:pw@h:26257/app"
+
+    def test_migration_url_beats_runtime_url(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url() == (
+                "postgresql+psycopg://migrator:pw@h:26257/app"
+            )
+
+    def test_falls_back_to_runtime_url_when_migration_url_absent(self):
+        s = Settings(DATABASE_URL="postgresql://runtime:pw@h:26257/app")
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url() == (
+                "postgresql+psycopg://runtime:pw@h:26257/app"
+            )
+
+    def test_blank_migration_url_is_treated_as_absent(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="   ",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url() == (
+                "postgresql+psycopg://runtime:pw@h:26257/app"
+            )
+
+    def test_blank_explicit_url_falls_through_to_migration_url(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url("   ") == (
+                "postgresql+psycopg://migrator:pw@h:26257/app"
+            )
+
+    def test_sqlite_fallback_when_nothing_set(self):
+        s = Settings(DATABASE_URL=None, STRIKENOVA_MIGRATION_DATABASE_URL=None)
+        with patch("app.db.settings", s):
+            url = db_module.resolve_migration_database_url()
+        assert url.startswith("sqlite:///"), url
+        assert url.endswith("paper_journal.db")
+
+    def test_explicit_cockroach_url_is_preserved(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url(
+                "cockroachdb+psycopg://migrator:pw@h:26257/strikenova?sslmode=require"
+            ) == "cockroachdb+psycopg://migrator:pw@h:26257/strikenova?sslmode=require"
+
+    def test_migration_url_is_normalized_like_the_startup_path(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url() == (
+                db_module._migration_engine_url()
+            )
+
+
 class TestConfigContract:
     def test_lock_settings_exist_with_defaults(self):
         s = Settings(DATABASE_URL="postgresql://runtime:pw@h:26257/app")

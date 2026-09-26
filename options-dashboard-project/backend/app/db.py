@@ -291,6 +291,42 @@ def get_db():
         db.close()
 
 
+def resolve_migration_database_url(explicit_url: str | None = None) -> str:
+    """Resolve the database URL for an Alembic invocation (ADR-016/ADR-017).
+
+    Precedence (PR #107 review contract):
+
+    1. ``explicit_url`` — an operator-supplied ``sqlalchemy.url`` (the
+       alembic.ini / CLI-configured value passed in by ``alembic/env.py``);
+       the highest-priority, intentional operator override.
+    2. ``STRIKENOVA_MIGRATION_DATABASE_URL`` — the dedicated migration
+       identity, so a standalone ``alembic upgrade head`` runs under the
+       same higher-privilege creator role as application-startup
+       migrations (future tables then receive the runtime default
+       privileges automatically).
+    3. ``DATABASE_URL`` — the runtime URL (historical single-identity
+       behavior).
+    4. The local SQLite file when nothing is configured.
+
+    Blank/whitespace values are treated as unset at every level, and every
+    resolved URL passes through :func:`normalize_database_url` exactly like
+    the startup migration path (``cockroachdb+psycopg://`` and other
+    explicit driver URLs are preserved). This resolver never changes which
+    identity serves application traffic — the runtime engine keeps using
+    ``DATABASE_URL`` (ADR-014's production guard semantics are untouched).
+    """
+    normalized_explicit = (explicit_url or "").strip()
+    if normalized_explicit and not normalized_explicit.startswith("driver://"):
+        return normalize_database_url(normalized_explicit)
+    migration_url = getattr(settings, "STRIKENOVA_MIGRATION_DATABASE_URL", None)
+    if migration_url and migration_url.strip():
+        return normalize_database_url(migration_url.strip())
+    runtime_url = settings.DATABASE_URL
+    if runtime_url and runtime_url.strip():
+        return normalize_database_url(runtime_url.strip())
+    return f"sqlite:///{_DEFAULT_DB_PATH}"
+
+
 def _migration_engine_url() -> str:
     """Resolve the URL used by Alembic migrations.
 
@@ -298,11 +334,11 @@ def _migration_engine_url() -> str:
     higher-privilege identity via ``STRIKENOVA_MIGRATION_DATABASE_URL``.
     When unset, migrations use the runtime ``DATABASE_URL``/engine exactly
     as before (single-identity deployments are unaffected).
+
+    Delegates to :func:`resolve_migration_database_url` so the startup path
+    and the standalone Alembic CLI resolve URLs identically.
     """
-    migration_url = getattr(settings, "STRIKENOVA_MIGRATION_DATABASE_URL", None)
-    if migration_url:
-        return normalize_database_url(migration_url)
-    return str(engine.url)
+    return resolve_migration_database_url()
 
 
 def _migration_lock_url() -> str:
@@ -310,13 +346,16 @@ def _migration_lock_url() -> str:
 
     The lock travels with the migration identity: when
     ``STRIKENOVA_MIGRATION_DATABASE_URL`` is set, the lease lives under the
-    migrator credential; otherwise the historical runtime URL is used. The
-    runtime identity therefore never needs DDL/owner rights for locking.
+    migrator credential; otherwise the runtime URL (or the local SQLite
+    fallback) is used. The runtime identity therefore never needs DDL/owner
+    rights for locking.
+
+    Delegates to :func:`resolve_migration_database_url` so the lock shares
+    the exact precedence and blank/whitespace semantics of the migration
+    resolver — it can never diverge (e.g. a whitespace-only migration URL
+    is "unset" for the lock exactly as it is for migrations).
     """
-    migration_url = getattr(settings, "STRIKENOVA_MIGRATION_DATABASE_URL", None)
-    if migration_url:
-        return normalize_database_url(migration_url)
-    return str(engine.url)
+    return resolve_migration_database_url()
 
 
 def _run_alembic_migrations() -> None:
@@ -337,14 +376,27 @@ def _run_alembic_migrations() -> None:
     alembic_cfg = Config("alembic.ini")
     migration_url = _migration_engine_url()
     alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
-    if migration_url == str(engine.url):
+    # Reuse the runtime engine when no separate migration identity is
+    # configured (single-identity deployments, in-memory tests). This is a
+    # configuration decision, not a URL-string comparison: the resolver is
+    # settings-driven, so comparing URLs against the live engine would be
+    # fragile and could silently retarget a patched/replaced engine.
+    _migration_separated = bool(
+        getattr(settings, "STRIKENOVA_MIGRATION_DATABASE_URL", None)
+        and settings.STRIKENOVA_MIGRATION_DATABASE_URL.strip()
+    )
+    if not _migration_separated:
         alembic_cfg.attributes["connectable"] = engine
     else:
         logger.info(
             "Using the dedicated migration identity for Alembic "
             "(STRIKENOVA_MIGRATION_DATABASE_URL is set)."
         )
-    if str(engine.url).startswith("sqlite"):
+    # The SQLite bypass is decided by the MIGRATION TARGET, not the runtime
+    # engine: when the identities are separated (e.g. SQLite runtime URL,
+    # CockroachDB migration URL) the target is a shared server database and
+    # MUST be serialized exactly like any other non-SQLite target.
+    if migration_url.startswith("sqlite"):
         # Single-process by construction: the lease lock is a local no-op.
         logger.info("SQLite target: migration lease lock skipped (single-process)")
         command.upgrade(alembic_cfg, "head")

@@ -25,8 +25,10 @@ A single-row lock table is managed with strictly transactional statements:
 * release: the holder clears its own row.
 
 While the holder is alive it RENEWS the lease on a background thread (every
-TTL/3, minimum 5s), so a legitimately long migration is never stolen by a
-waiter. Because renewal is a thread inside the holder process, a crashed
+``max(1.0, ttl / 3)`` — TTL/3 with a 1-second floor; configuration enforces
+``ttl >= 2`` so the interval is always strictly below the TTL), so a
+legitimately long migration is never stolen by a waiter. Because renewal is
+a thread inside the holder process, a crashed
 holder simply stops renewing: waiters observe the lease expiry, take over,
 and re-run the (idempotent, Alembic-managed) chain. Alembic's version table
 makes re-running a completed migration a no-op, so takeover after a
@@ -126,7 +128,9 @@ def _ensure_lock_table(conn, max_retries: int = 8) -> None:
             cur.execute(
                 "CREATE TABLE IF NOT EXISTS " + LOCK_TABLE + " ("
                 "_id BOOLEAN PRIMARY KEY DEFAULT true CHECK (_id), "
-                "locked_by STRING, "
+                # TEXT (not CRDB's STRING alias) so the bootstrap DDL is
+                # valid on BOTH CockroachDB and vanilla PostgreSQL.
+                "locked_by TEXT, "
                 "acquired_at TIMESTAMPTZ, "
                 "expires_at TIMESTAMPTZ)"
             )

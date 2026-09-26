@@ -318,7 +318,13 @@ Decision:
   uses only transactional statements with bounded 40001 retries, so an EMPTY
   database is safe: no Alembic table or application table is required first.
 * The lease carries an expiry (`MIGRATION_LOCK_TTL_SECONDS`, default 120)
-  renewed by the holder (interval TTL/3). A crashed holder stops renewing;
+  renewed by the holder (interval `max(1.0, TTL/3)`, i.e. TTL/3 with a 1s
+  floor — strictly below the TTL so an alive holder never leaves an expiry
+  gap). Configuration enforces `MIGRATION_LOCK_TTL_SECONDS >= 2`: the
+  renewal interval is only strictly below the TTL when TTL >= 2, so TTL <= 1
+  could let a live, renewing holder's lease lapse between renewals and let
+  a waiter steal it. The no-expiry-gap guarantee holds only for valid
+  (TTL >= 2) configurations. A crashed holder stops renewing;
   waiters take over the expired lease and re-run the idempotent chain, so a
   wedged holder can never block recovery permanently.
 * Waiters poll up to `MIGRATION_LOCK_WAIT_SECONDS` (default 900) and then
@@ -335,4 +341,54 @@ fail-closed; runtime identity remained DML-only and owns zero tables.
 
 Residual: the CLI path (`alembic upgrade head` run manually) bypasses the
 lease and remains operator-controlled; the startup race is eliminated for
-application instances, not for out-of-band operator execution.
+application instances, not for out-of-band operator execution. Standalone
+CLI runs resolve their database through
+`app.db.resolve_migration_database_url` (precedence: explicit
+`sqlalchemy.url`/CLI-configured URL, then `STRIKENOVA_MIGRATION_DATABASE_URL`,
+then `DATABASE_URL`), so a manual run uses the migration identity by default
+— the same identity as startup migrations — and only an explicit operator
+URL overrides it. Operators must ensure that identity is the intended one:
+running a manual migration under a DML-only runtime identity would create
+future tables that lack the runtime default privileges (ADR-018).
+
+## ADR-018 · Production future-table privilege defaults (migrator-creator scope) · Accepted
+
+Context: `GRANT ... ON ALL TABLES IN SCHEMA` binds only to tables existing at
+grant time. With ADR-016/ADR-017 in force, migration DDL runs as
+`strikenova_prod_migrator`, so a future Alembic revision that creates a table
+would produce an object the runtime credential (`strikenova_production_app`)
+could not read or write — breaking the DML-only runtime contract on the next
+schema change. Independent verification of PR #106 surfaced this (finding
+V-3) before it could occur in production.
+
+Decision:
+
+* In the production database `strikenova`, default privileges are bound to
+  the migration/creator role:
+  `ALTER DEFAULT PRIVILEGES FOR ROLE strikenova_prod_migrator IN SCHEMA
+  public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO
+  strikenova_production_app;` and the equivalent `GRANT USAGE ON SEQUENCES`.
+* The grant is exactly DML (+ sequence USAGE). The runtime identity never
+  receives CREATE, ALTER, DROP, TRUNCATE, ownership, admin, or
+  role-management privileges through defaults or otherwise.
+* Scope is precise: this applies only to objects created by
+  `strikenova_prod_migrator` in database `strikenova`, schema `public`. It
+  does not apply to objects created by arbitrary roles, other schemas, or
+  other databases.
+* Operational dependency: the contract is coupled to the creator role. If
+  future schema migrations are executed under a different creator/owner
+  role, the default-privilege configuration does NOT follow automatically;
+  re-applying `ALTER DEFAULT PRIVILEGES` for the new creator role is a
+  mandatory step of any migration-role change (Invariant 6e).
+* Verified 2026-09-26 (disposable CockroachDB, then production): future
+  migrator-created tables/sequences automatically carried runtime DML/USAGE;
+  CREATE/DROP/ALTER/TRUNCATE/GRANT all denied to the runtime role;
+  memberships remained zero; no cross-schema or cross-database leakage.
+  Live confirmation: the PR #106 production deploy created
+  `_migration_lock` under the migrator identity and runtime DML on it was
+  granted automatically via these defaults.
+
+Residual: the two `pg_default_acl` rows in production `strikenova` are now
+critical operational state. Operators must not revoke them while the
+migrator-creator model is in force, and any role-model change must update
+them in the same change.

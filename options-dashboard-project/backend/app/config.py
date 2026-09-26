@@ -1,3 +1,4 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -116,8 +117,26 @@ class Settings(BaseSettings):
     # total waiting before failing startup closed. Values are generous:
     # the full chain takes minutes, and Render's proxy-level request timeout
     # (~5 min) already bounds deploy health-check latency.
+    #
+    # TTL must be >= 2: the holder renews every max(1.0, TTL/3), and that
+    # interval is only strictly below the TTL when TTL >= 2. TTL <= 1 would
+    # let a live, renewing holder's lease expire between renewals, so a
+    # waiter could steal the lease and run the migration chain concurrently.
+    # Validated at the configuration boundary (fail fast at startup).
     MIGRATION_LOCK_TTL_SECONDS: int = 120
     MIGRATION_LOCK_WAIT_SECONDS: int = 900
+
+    @field_validator("MIGRATION_LOCK_TTL_SECONDS")
+    @classmethod
+    def _validate_migration_lock_ttl(cls, v: int) -> int:
+        if v < 2:
+            raise ValueError(
+                "MIGRATION_LOCK_TTL_SECONDS must be >= 2: the lease renewal "
+                "interval is max(1.0, TTL/3), which is only strictly below "
+                "the TTL when TTL >= 2; smaller values could let a live "
+                "holder's lease expire between renewals"
+            )
+        return v
 
     @property
     def IS_PRODUCTION(self) -> bool:

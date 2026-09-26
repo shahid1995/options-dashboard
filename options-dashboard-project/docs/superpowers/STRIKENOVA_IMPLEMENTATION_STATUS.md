@@ -1,7 +1,65 @@
 # StrikeNova Implementation Status Tracker
 
 > **Master Plan SHA:** `0a244c0` (docs: add StrikeNova master day-wise implementation plan)
-> **Last Updated:** 2026-09-03 (Day 8 — Infrastructure Phase Gate PASS)
+> **Last Updated:** 2026-09-26 (database hardening / PR #106–#107)
+
+
+
+---
+
+## 2026-09-26 — Database hardening: ADR-016/017/018 and PR #106/#107
+
+**Purpose:** Durable implementation-status record for the production database identity/serialization hardening completed in PR #106 and the reviewer remediation now open in PR #107.
+
+### PR #106 — migration identity + serialized startup migrations
+
+**Status:** MERGED and deployed; production cutover verified.
+
+| Item | Evidence |
+|------|----------|
+| ADR-016 runtime/migration identity separation | PR #105 merged as `a54d454`; `STRIKENOVA_MIGRATION_DATABASE_URL` drives Alembic migrations under the dedicated migrator identity while application traffic remains on `DATABASE_URL` |
+| ADR-017 serialized migrations | PR #106 merged as `66e3b97`; database-backed `_migration_lock` lease serializes application-startup migrations |
+| Production deployment | Exact merge `66e3b97` deployed to `strikenova-api-production`; production health/readiness verified |
+| Migration head | Alembic head `d46aa0000001` |
+| Production runtime identity | `strikenova_production_app` remains DML-only and owns zero application tables |
+| Migration identity | `strikenova_prod_migrator` retains migration DDL privileges and owns `_migration_lock` |
+| Future-table defaults | ADR-018 default privileges grant runtime DML on future migrator-created tables and sequence USAGE; live verification confirmed the contract on `_migration_lock` |
+| Production lock state | `_migration_lock` observed free after startup |
+
+### PR #107 — reviewer remediation
+
+**Status:** OPEN, MERGEABLE, NOT MERGED, NOT DEPLOYED. Final code head: `ecc4c4e` (test(ci): add postgres migration rehearsal); the branch tip is this tracker commit, which follows it; base: `66e3b97`.
+
+| Finding / contract | Resolution | Evidence |
+|------|----------|----------|
+| TTL renewal boundary | `MIGRATION_LOCK_TTL_SECONDS >= 2` enforced at the Pydantic configuration boundary; renewal remains `max(1.0, TTL/3)` | Source inspection of `config.py` + renewal tests in `test_migration_serialization.py` |
+| Standalone Alembic identity | Shared resolver precedence: explicit `sqlalchemy.url` > `STRIKENOVA_MIGRATION_DATABASE_URL` > `DATABASE_URL` > SQLite fallback | `app.db.resolve_migration_database_url()` + `alembic/env.py` delegation; hermetic and real-CLI verification reported on the branch |
+| Runtime-identity invariance | Runtime engine continues to use `DATABASE_URL`; separate migration URL is used only by migration paths | Source inspection of `_engine()`, `_migration_engine_url()`, and `_run_alembic_migrations()` |
+| Codacy assert finding | Renewal test uses pytest assertions rather than plain Python `assert` semantics that depend on `__debug__` | Reviewer-remediation test diff |
+| Codacy `inspect.getsource` finding | Source inspection removed from the renewal test; verification is behavioral | Reviewer-remediation test diff |
+| Reviewer disposition | Qodo ×2, CodeRabbit ×2, Codacy ×2 findings mapped to implemented remediations | PR #107 remediation report and current source |
+| Blank/whitespace URL semantics (independent review) | `None`/`""`/whitespace mean unset for every URL source; nonblank values stripped before normalization; `_migration_lock_url()` delegates to the shared resolver so the lock cannot diverge | `resolve_migration_database_url()` + `TestBlankUrlSemantics` (12 hermetic tests) |
+| Migration-target serialization (independent review) | The SQLite bypass in `_run_alembic_migrations()` is decided by the resolved migration URL, not the runtime `engine.url` — a SQLite runtime + non-SQLite migration identity serializes per ADR-017 | `TestMigrationTargetSerialization` (4 hermetic tests, no external DB) |
+| Explicit-URL edge cases (independent review) | Explicit leg stripped once before all checks; whitespace/tab-prefixed `driver://` alembic placeholders fall through as unset | Resolver tests incl. parametrized placeholder cases |
+| Bandit B101 (Codacy) | Remediation-added checks use explicit `AssertionError` raises instead of plain `assert`; affected suites also verified under `python -O` | `test_migration_serialization.py` renewal/TTL tests |
+| env.py delegation (independent review) | The REAL `alembic/env.py` executed hermetically (offline `EnvironmentContext`) proves explicit > migration > runtime > SQLite precedence through the shared resolver | `tests/test_alembic_env_resolution.py` |
+| Migration-target serialization (independent review) | The SQLite bypass in `_run_alembic_migrations()` is decided by the resolved migration URL, not the runtime `engine.url` — a SQLite runtime + non-SQLite migration identity serializes per ADR-017 | `TestMigrationTargetSerialization` (4 hermetic tests, no external DB) |
+| PostgreSQL migration rehearsal (CI) | New `PostgreSQL migration rehearsal` workflow runs `tests/test_migration_rehearsal_postgres.py` against a disposable `postgres:16` service container: real resolver precedence (migration identity beats runtime identity; startup target == rehearsal target), the REAL `_migration_lock` lifecycle (acquire → persisted ownership → renew → concurrent rejection → release → re-acquire), fail-closed waiter semantics, and the full Alembic chain through the resolver-selected target. First local run against a disposable container caught a real portability defect: the lock bootstrap DDL used CRDB's `STRING`; fixed to `TEXT` (valid on both engines; production's live table already reports `text`) | `.github/workflows/postgres-migration-rehearsal.yml`; local disposable-container run 4 passed |
+
+### Fresh CI / verification state at 2026-09-26 (final head)
+
+- Backend PostgreSQL compatibility workflow: **PASS** at `adf157e` (run `36225272038` / `36225269328`, head SHA verified); re-run on `ecc4c4e` pending (routine).
+- PostgreSQL migration rehearsal workflow: **ADDED at `ecc4c4e`**; verified locally against a disposable `postgres:16` container (4 passed) and via skip-hygiene (4 skipped without `TEST_DATABASE_URL`); the first CI run is the remaining evidence and must be green before merge.
+- StrikeNova status-gate workflow: **PASS** on `adf157e` (runs `36225272074` / `36225269344`); this tracker update closes its implementation-file warning for `ecc4c4e`.
+- CodeRabbit: **PASS** (review completed) on `df84b4b`; OpenCodeReview: **PASS** (4m38s) on `df84b4b`, re-runs on each pushed head.
+- GitHub Advanced Security AI workflow: **FAIL due runner-side model error** (`400 The requested model is not supported`); this is infrastructure/tooling failure, not a code finding.
+- Codacy and Vercel preview failures on this PR are infrastructure-class (0-second provider failures / stale preview variable), not code verdicts.
+- Full backend suite at `adf157e` (tree-identical code to `ecc4c4e` except this tracker): **6 failed / 6,248 passed / 114 skipped**, failures **identical to the six documented baselines** (diff-verified); +4 skips are the new rehearsal tests without `TEST_DATABASE_URL`.
+- Local verification on the final head: focused migration/identity/alembic/guard/Day-46 sets 145 passed / 7 skipped; serialization 62 passed; `python -O` 72 passed; wide database-safety set 234 passed / 11 skipped; rehearsal 4 passed against a real disposable PostgreSQL container.
+- No Render, Vercel configuration, CockroachDB, deployment, or secret changes are part of PR #107.
+
+**Governance state:** PR #106 is the deployed production database-hardening baseline. PR #107 remains review-only until all required checks are classified and the normal merge is explicitly authorized.
+
 
 ## Phase 0 — Security Emergency
 
