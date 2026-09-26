@@ -1,0 +1,31 @@
+# Bandit configuration for options-dashboard
+#
+# Scope:
+#   - B101 (assert_used) suppressed for pytest test files only.
+#   - All other checks run against the full backend tree.
+#
+# Format: Codacy Bandit plugin-specific key (assert_used) with
+# file-glob skips. This is the documented Codacy format for
+# suppressing specific Bandit checks for specific file patterns.
+# See: https://docs.codacy.com/repositories-configure/configuring-code-patterns/
+#
+# Glob: '**/tests/**/*.py' matches any file under any 'tests/'
+# directory anywhere in the repository. This covers
+# backend/tests/**/*.py and any other test directories.
+#
+# Do NOT use a global 'skips: [B101]' because that would suppress
+# B101 in production code too.
+#
+# Production/application Python code outside the test suite keeps
+# B101 active.
+
+assert_used:
+  skips:
+    - '**/tests/**/*.py'
+
+# Optional: globs for files/directories to exclude from all checks.
+# Not used here to keep the suppression narrowly scoped to B101 test files.
+#exclude_dirs:
+#  - '.git'
+#  - '__pycache__'
+#  - 'node_modules'
