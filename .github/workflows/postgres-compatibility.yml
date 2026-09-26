@@ -60,3 +60,4 @@ jobs:
           tests/test_migration_large_rehearsal.py
           tests/test_day5_alembic_authority.py
           tests/test_day6_performance_baseline.py
+          tests/test_migration_rehearsal_postgres.py

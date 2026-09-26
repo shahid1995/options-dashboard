@@ -41,7 +41,7 @@
 
 ### PR #107 — reviewer remediation
 
-**Status:** OPEN, MERGEABLE, NOT MERGED, NOT DEPLOYED. Final code head: `ecc4c4e` (test(ci): add postgres migration rehearsal); the branch tip is this tracker commit, which follows it; base: `66e3b97`.
+**Status (updated 2026-09-26, post-merge):** **MERGED** as `6089ecb` (squash-free history: `df84b4b` `944a0cb` `93ad441` `ab22c60` `adf157e` `ecc4c4e` `9447a49`); **NOT DEPLOYED** (docs/CI-only change — no production release required). The historical status lines below describe the OPEN state at the time of each entry and are superseded by this line; base was `66e3b97`.
 
 | Finding / contract | Resolution | Evidence |
 |------|----------|----------|
@@ -71,7 +71,7 @@
 - Local verification on the final head: focused migration/identity/alembic/guard/Day-46 sets 145 passed / 7 skipped; serialization 62 passed; `python -O` 72 passed; wide database-safety set 234 passed / 11 skipped; rehearsal 4 passed against a real disposable PostgreSQL container.
 - No Render, Vercel configuration, CockroachDB, deployment, or secret changes are part of PR #107.
 
-**Governance state:** PR #106 is the deployed production database-hardening baseline. PR #107 remains review-only until all required checks are classified and the normal merge is explicitly authorized.
+**Governance state (updated 2026-09-26):** PR #106 remains the deployed production database-hardening baseline. PR #107 has since been **merged** (`6089ecb`) after all required checks were classified; its runtime-affecting changes (migration-target serialization, resolver hardening, rehearsal CI) therefore take effect with the next production deployment.
 
 
 ## Phase 0 — Security Emergency
