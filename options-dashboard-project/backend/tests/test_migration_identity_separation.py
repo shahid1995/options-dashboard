@@ -13,13 +13,13 @@ from app.db import _migration_engine_url, normalize_database_url
 
 
 class TestMigrationIdentityResolution:
-    def test_default_uses_runtime_engine_url_when_no_migration_url(self):
-        import app.db as db_module
-
+    def test_default_uses_runtime_url_when_no_migration_url(self):
         s = Settings(DATABASE_URL="postgresql://runtime:pw@h:26257/app", STRIKENOVA_MIGRATION_DATABASE_URL=None)
         with patch("app.db.settings", s):
-            # Fallback is the live runtime engine URL (historical behavior).
-            assert _migration_engine_url() == str(db_module.engine.url)
+            # Fallback is the runtime identity URL (historical behavior) —
+            # resolved from settings and normalized, exactly what the runtime
+            # engine is built from in every real deployment.
+            assert _migration_engine_url() == "postgresql+psycopg://runtime:pw@h:26257/app"
 
     def test_migration_url_takes_precedence_when_set(self):
         s = Settings(
@@ -49,11 +49,9 @@ class TestMigrationIdentityResolution:
             assert _migration_engine_url() == "postgresql+psycopg://migrator:pw@h:26257/app"
 
     def test_blank_migration_url_falls_back_to_runtime(self):
-        import app.db as db_module
-
         s = Settings(DATABASE_URL="postgresql://runtime:pw@h:26257/app", STRIKENOVA_MIGRATION_DATABASE_URL="")
         with patch("app.db.settings", s):
-            assert _migration_engine_url() == str(db_module.engine.url)
+            assert _migration_engine_url() == "postgresql+psycopg://runtime:pw@h:26257/app"
 
 
 class TestSingleIdentityBackwardCompatibility:

@@ -99,9 +99,16 @@ Founder acceptance.
    chain at a time; concurrent application startups must wait, take over an
    expired lease, or fail closed — never execute the same DDL concurrently.
    The lock must work on an empty database and under the migration identity,
-   and must never require runtime DDL/owner privileges (ADR-017). The manual
-   operator CLI path (`alembic upgrade head` run out-of-band) remains outside
-   the application lock by design (ADR-017 Residual).
+   and must never require runtime DDL/owner privileges (ADR-017). The lease
+   configuration must keep the renewal interval strictly below the TTL:
+   `MIGRATION_LOCK_TTL_SECONDS >= 2` with renewal every `max(1.0, TTL/3)`,
+   enforced at the configuration boundary. The manual operator CLI path
+   (`alembic upgrade head` run out-of-band) remains outside the application
+   lock by design (ADR-017 Residual); it resolves its database with the
+   same identity precedence as startup migrations (explicit operator URL >
+   `STRIKENOVA_MIGRATION_DATABASE_URL` > `DATABASE_URL`), so it must be run
+   under the migration identity unless an explicit operator URL is
+   intentionally supplied.
 6e. **Future application tables carry runtime DML by default.** In the
    production database `strikenova`, default privileges bound to the
    migration/creator role (`ALTER DEFAULT PRIVILEGES FOR ROLE

@@ -320,7 +320,11 @@ Decision:
 * The lease carries an expiry (`MIGRATION_LOCK_TTL_SECONDS`, default 120)
   renewed by the holder (interval `max(1.0, TTL/3)`, i.e. TTL/3 with a 1s
   floor — strictly below the TTL so an alive holder never leaves an expiry
-  gap). A crashed holder stops renewing;
+  gap). Configuration enforces `MIGRATION_LOCK_TTL_SECONDS >= 2`: the
+  renewal interval is only strictly below the TTL when TTL >= 2, so TTL <= 1
+  could let a live, renewing holder's lease lapse between renewals and let
+  a waiter steal it. The no-expiry-gap guarantee holds only for valid
+  (TTL >= 2) configurations. A crashed holder stops renewing;
   waiters take over the expired lease and re-run the idempotent chain, so a
   wedged holder can never block recovery permanently.
 * Waiters poll up to `MIGRATION_LOCK_WAIT_SECONDS` (default 900) and then
@@ -337,7 +341,15 @@ fail-closed; runtime identity remained DML-only and owns zero tables.
 
 Residual: the CLI path (`alembic upgrade head` run manually) bypasses the
 lease and remains operator-controlled; the startup race is eliminated for
-application instances, not for out-of-band operator execution.
+application instances, not for out-of-band operator execution. Standalone
+CLI runs resolve their database through
+`app.db.resolve_migration_database_url` (precedence: explicit
+`sqlalchemy.url`/CLI-configured URL, then `STRIKENOVA_MIGRATION_DATABASE_URL`,
+then `DATABASE_URL`), so a manual run uses the migration identity by default
+— the same identity as startup migrations — and only an explicit operator
+URL overrides it. Operators must ensure that identity is the intended one:
+running a manual migration under a DML-only runtime identity would create
+future tables that lack the runtime default privileges (ADR-018).
 
 ## ADR-018 · Production future-table privilege defaults (migrator-creator scope) · Accepted
 

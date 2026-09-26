@@ -89,9 +89,17 @@ while the migrator-creator model is in force.
 
 **Migration serialization.** The single-row lease table `_migration_lock`
 (ADR-017) is owned by `strikenova_prod_migrator`; the lock must be free
-(`locked_by IS NULL`) outside an active migration. The manual operator CLI
-path (`alembic upgrade head`) remains outside the application lock (ADR-017
-Residual).
+(`locked_by IS NULL`) outside an active migration. The lease TTL must be
+>= 2 seconds (`MIGRATION_LOCK_TTL_SECONDS`, default 120; renewal interval
+`max(1.0, TTL/3)` — configuration rejects smaller values). The manual
+operator CLI path (`alembic upgrade head`) remains outside the application
+lock (ADR-017 Residual). It resolves its database with the same precedence
+as startup migrations — explicit operator `sqlalchemy.url`, then
+`STRIKENOVA_MIGRATION_DATABASE_URL` (the migration identity), then
+`DATABASE_URL` — so a standalone CLI run must use the migration identity
+(`strikenova_prod_migrator`) unless an explicit operator URL is
+intentionally supplied; running it under the DML-only runtime identity
+would create future tables that lack the runtime default privileges.
 
 ## 6. Historical data architecture
 

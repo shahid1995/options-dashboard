@@ -11,6 +11,7 @@ import datetime as _dt
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 import app._migration_lock as mlock
 import app.db as db_module
@@ -251,12 +252,9 @@ class TestSerializedExecution:
         """Documented renewal rule (module docstring / ADR-017): the renewer
         waits max(1.0, ttl/3) between renewals — strictly below the TTL so an
         alive holder never leaves an expiry gap a waiter could misread as a
-        crash, with a 1s floor so tiny TTLs still renew at a sane cadence."""
-        import inspect
-
-        src = inspect.getsource(mlock.LeaseRenewer._run)
-        assert "max(1.0" in src, "renewal interval must be max(1.0, ttl/3)"
-
+        crash, with a 1s floor so tiny TTLs still renew at a sane cadence.
+        Verified behaviorally against the wait interval the renewer sleeps
+        for, never by inspecting source text."""
         for ttl, expected in ((30, 10.0), (120, 40.0), (2, 1.0)):
             renewer = mlock.LeaseRenewer("postgresql://x", "me", ttl)
             state = _fresh_state(held_by="me", owner="me")
@@ -343,6 +341,110 @@ class TestIdentityRules:
 
 
 # ------------------------------------------------- config contract
+class TestMigrationLockTtlValidation:
+    """The renewal interval max(1.0, TTL/3) is only strictly below the TTL
+    when TTL >= 2; smaller/zero/negative values could make a live holder's
+    lease appear expired, so the configuration boundary rejects them."""
+
+    @pytest.mark.parametrize("ttl", [1, 0, -1, -120])
+    def test_ttl_below_two_is_rejected(self, ttl):
+        with pytest.raises(ValidationError, match="MIGRATION_LOCK_TTL_SECONDS"):
+            Settings(
+                DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+                MIGRATION_LOCK_TTL_SECONDS=ttl,
+            )
+
+    @pytest.mark.parametrize("ttl", [2, 3, 120, 900])
+    def test_ttl_of_two_or_more_is_accepted(self, ttl):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            MIGRATION_LOCK_TTL_SECONDS=ttl,
+        )
+        assert s.MIGRATION_LOCK_TTL_SECONDS == ttl
+
+
+class TestAlembicCliUrlPrecedence:
+    """ADR-016 identity separation must hold for standalone CLI migrations
+    too (PR #107 review): alembic env.py resolves its URL through
+    app.db.resolve_migration_database_url with precedence
+    explicit sqlalchemy.url > STRIKENOVA_MIGRATION_DATABASE_URL >
+    DATABASE_URL > SQLite fallback."""
+
+    def test_explicit_url_wins_over_both_env_urls(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url(
+                "postgresql://explicit:pw@h:26257/app"
+            ) == "postgresql+psycopg://explicit:pw@h:26257/app"
+
+    def test_migration_url_beats_runtime_url(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url() == (
+                "postgresql+psycopg://migrator:pw@h:26257/app"
+            )
+
+    def test_falls_back_to_runtime_url_when_migration_url_absent(self):
+        s = Settings(DATABASE_URL="postgresql://runtime:pw@h:26257/app")
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url() == (
+                "postgresql+psycopg://runtime:pw@h:26257/app"
+            )
+
+    def test_blank_migration_url_is_treated_as_absent(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="   ",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url() == (
+                "postgresql+psycopg://runtime:pw@h:26257/app"
+            )
+
+    def test_blank_explicit_url_falls_through_to_migration_url(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url("   ") == (
+                "postgresql+psycopg://migrator:pw@h:26257/app"
+            )
+
+    def test_sqlite_fallback_when_nothing_set(self):
+        s = Settings(DATABASE_URL=None, STRIKENOVA_MIGRATION_DATABASE_URL=None)
+        with patch("app.db.settings", s):
+            url = db_module.resolve_migration_database_url()
+        assert url.startswith("sqlite:///"), url
+        assert url.endswith("paper_journal.db")
+
+    def test_explicit_cockroach_url_is_preserved(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url(
+                "cockroachdb+psycopg://migrator:pw@h:26257/strikenova?sslmode=require"
+            ) == "cockroachdb+psycopg://migrator:pw@h:26257/strikenova?sslmode=require"
+
+    def test_migration_url_is_normalized_like_the_startup_path(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url() == (
+                db_module._migration_engine_url()
+            )
+
+
 class TestConfigContract:
     def test_lock_settings_exist_with_defaults(self):
         s = Settings(DATABASE_URL="postgresql://runtime:pw@h:26257/app")
