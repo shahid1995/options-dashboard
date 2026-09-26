@@ -329,7 +329,9 @@ class TestIdentityRules:
     def test_lock_falls_back_to_runtime_url_when_unset(self):
         s = Settings(DATABASE_URL="postgresql://runtime:pw@h:26257/app")
         with patch("app.db.settings", s):
-            assert db_module._migration_lock_url() == str(db_module.engine.url)
+            assert db_module._migration_lock_url() == (
+                "postgresql+psycopg://runtime:pw@h:26257/app"
+            )
 
     def test_runtime_identity_not_used_for_ddl_when_separated(self):
         s = Settings(
@@ -338,6 +340,117 @@ class TestIdentityRules:
         )
         with patch("app.db.settings", s):
             assert db_module._migration_engine_url() != str(db_module.engine.url)
+
+
+# ------------------------------------------------- blank URL semantics
+class TestBlankUrlSemantics:
+    """None, "" and whitespace-only values mean UNSET for every URL source
+    (explicit sqlalchemy.url, STRIKENOVA_MIGRATION_DATABASE_URL,
+    DATABASE_URL); nonblank values are stripped before normalization. The
+    lock URL shares the resolver's semantics exactly and never diverges."""
+
+    WS = "   "
+
+    def test_blank_migration_url_falls_back_to_runtime(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url() == (
+                "postgresql+psycopg://runtime:pw@h:26257/app"
+            )
+
+    def test_whitespace_migration_url_falls_back_to_runtime(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL=self.WS,
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url() == (
+                "postgresql+psycopg://runtime:pw@h:26257/app"
+            )
+
+    def test_blank_explicit_url_falls_through_to_migration_url(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url("") == (
+                "postgresql+psycopg://migrator:pw@h:26257/app"
+            )
+
+    def test_whitespace_explicit_url_falls_through_to_migration_url(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url(self.WS) == (
+                "postgresql+psycopg://migrator:pw@h:26257/app"
+            )
+
+    def test_blank_runtime_url_falls_back_to_sqlite(self):
+        s = Settings(DATABASE_URL="", STRIKENOVA_MIGRATION_DATABASE_URL=None)
+        with patch("app.db.settings", s):
+            url = db_module.resolve_migration_database_url()
+        assert url.startswith("sqlite:///"), url
+        assert url.endswith("paper_journal.db"), url
+
+    def test_whitespace_runtime_url_falls_back_to_sqlite(self):
+        s = Settings(DATABASE_URL=self.WS, STRIKENOVA_MIGRATION_DATABASE_URL=None)
+        with patch("app.db.settings", s):
+            url = db_module.resolve_migration_database_url()
+        assert url.startswith("sqlite:///"), url
+        assert url.endswith("paper_journal.db"), url
+
+    def test_nonblank_urls_are_stripped_before_normalization(self):
+        s = Settings(
+            DATABASE_URL="  postgresql://runtime:pw@h:26257/app  ",
+            STRIKENOVA_MIGRATION_DATABASE_URL="  cockroachdb+psycopg://migrator:pw@h:26257/strikenova?sslmode=require  ",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url() == (
+                "cockroachdb+psycopg://migrator:pw@h:26257/strikenova?sslmode=require"
+            )
+            assert db_module._migration_engine_url() == (
+                "cockroachdb+psycopg://migrator:pw@h:26257/strikenova?sslmode=require"
+            )
+            assert db_module._migration_lock_url() == (
+                "cockroachdb+psycopg://migrator:pw@h:26257/strikenova?sslmode=require"
+            )
+
+    def test_explicit_url_is_stripped(self):
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
+        )
+        with patch("app.db.settings", s):
+            assert db_module.resolve_migration_database_url(
+                "  cockroachdb+psycopg://explicit:pw@h:26257/strikenova  "
+            ) == "cockroachdb+psycopg://explicit:pw@h:26257/strikenova"
+
+    @pytest.mark.parametrize(
+        "migration_url",
+        [
+            "postgresql://migrator:pw@h:26257/app",  # normal
+            "",  # blank
+            "   ",  # whitespace
+            None,  # unset
+        ],
+    )
+    def test_lock_url_never_diverges_from_migration_url(self, migration_url):
+        """Lock URL == engine URL under normal AND blank configurations:
+        the lock travels with the migration identity and shares the exact
+        blank-value semantics of the resolver."""
+        s = Settings(
+            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
+            STRIKENOVA_MIGRATION_DATABASE_URL=migration_url,
+        )
+        with patch("app.db.settings", s):
+            expected = db_module._migration_engine_url()
+            assert db_module._migration_lock_url() == expected
 
 
 # ------------------------------------------------- config contract

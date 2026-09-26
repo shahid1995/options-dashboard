@@ -117,12 +117,6 @@ class Settings(BaseSettings):
     # total waiting before failing startup closed. Values are generous:
     # the full chain takes minutes, and Render's proxy-level request timeout
     # (~5 min) already bounds deploy health-check latency.
-    # ADR-017 (migration serialization): the transactional lease lock that
-    # guarantees only one process executes the migration chain at a time.
-    # TTL bounds crash recovery (expired leases are taken over); WAIT bounds
-    # total waiting before failing startup closed. Values are generous:
-    # the full chain takes minutes, and Render's proxy-level request timeout
-    # (~5 min) already bounds deploy health-check latency.
     #
     # TTL must be >= 2: the holder renews every max(1.0, TTL/3), and that
     # interval is only strictly below the TTL when TTL >= 2. TTL <= 1 would

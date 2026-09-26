@@ -323,9 +323,10 @@ def resolve_migration_database_url(explicit_url: str | None = None) -> str:
         return normalize_database_url(explicit_url.strip())
     migration_url = getattr(settings, "STRIKENOVA_MIGRATION_DATABASE_URL", None)
     if migration_url and migration_url.strip():
-        return normalize_database_url(migration_url)
-    if settings.DATABASE_URL:
-        return normalize_database_url(settings.DATABASE_URL)
+        return normalize_database_url(migration_url.strip())
+    runtime_url = settings.DATABASE_URL
+    if runtime_url and runtime_url.strip():
+        return normalize_database_url(runtime_url.strip())
     return f"sqlite:///{_DEFAULT_DB_PATH}"
 
 
@@ -348,13 +349,16 @@ def _migration_lock_url() -> str:
 
     The lock travels with the migration identity: when
     ``STRIKENOVA_MIGRATION_DATABASE_URL`` is set, the lease lives under the
-    migrator credential; otherwise the historical runtime URL is used. The
-    runtime identity therefore never needs DDL/owner rights for locking.
+    migrator credential; otherwise the runtime URL (or the local SQLite
+    fallback) is used. The runtime identity therefore never needs DDL/owner
+    rights for locking.
+
+    Delegates to :func:`resolve_migration_database_url` so the lock shares
+    the exact precedence and blank/whitespace semantics of the migration
+    resolver — it can never diverge (e.g. a whitespace-only migration URL
+    is "unset" for the lock exactly as it is for migrations).
     """
-    migration_url = getattr(settings, "STRIKENOVA_MIGRATION_DATABASE_URL", None)
-    if migration_url:
-        return normalize_database_url(migration_url)
-    return str(engine.url)
+    return resolve_migration_database_url()
 
 
 def _run_alembic_migrations() -> None:
