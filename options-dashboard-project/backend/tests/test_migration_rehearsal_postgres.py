@@ -185,14 +185,8 @@ _SIGKILL_ACTOR = textwrap.dedent(
     import time
     import uuid
 
-    sys.path.insert(0, os.environ["REHEARSAL_BACKEND"])
-    from app import _migration_lock as mlock  # noqa: E402
-
-    url = os.environ["REHEARSAL_DB_URL"]
-    markers = os.environ["REHEARSAL_MARKERS"]
-    ttl = int(os.environ.get("REHEARSAL_TTL", "15"))
-    role = sys.argv[1]
-
+    markers = os.environ.get("REHEARSAL_MARKERS", "")
+    role = sys.argv[1] if len(sys.argv) > 1 else "unknown"
 
     def path(name):
         return os.path.join(markers, name)
@@ -225,6 +219,14 @@ _SIGKILL_ACTOR = textwrap.dedent(
 
 
     try:
+        # Keep bootstrap/import failures observable even though child stderr is
+        # intentionally DEVNULL so a noisy actor can never deadlock on a pipe.
+        sys.path.insert(0, os.environ["REHEARSAL_BACKEND"])
+        from app import _migration_lock as mlock  # noqa: E402
+
+        url = os.environ["REHEARSAL_DB_URL"]
+        ttl = int(os.environ.get("REHEARSAL_TTL", "15"))
+
         if role == "holder":
             owner = "sigkill-holder:" + uuid.uuid4().hex[:8]
             acquired = False
