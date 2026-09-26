@@ -70,12 +70,15 @@ jobs:
 
       - name: Start disposable CockroachDB (single node, insecure, scratch)
         run: |
+          # Exactly the documented quickstart: start-single-node --insecure.
+          # Any --listen-addr/--advertise-addr override makes v25.2 reject
+          # the startup ("hostname of listen_addr must be 127.0.0.1 or
+          # localhost" / "unknown flag: --advertise-addr"); the container's
+          # default binding + Docker port publishing already serve 26257.
           docker run -d --name crdb \
             -p 26257:26257 -p 8080:8080 \
             cockroachdb/cockroach:v25.2.23 \
-            start-single-node --insecure \
-            --listen-addr=0.0.0.0:26257 --http-addr=0.0.0.0:8080 \
-            --advertise-addr=127.0.0.1:26257
+            start-single-node --insecure
           ok=""
           for i in $(seq 1 30); do
             if docker exec crdb /cockroach/cockroach sql --insecure \
