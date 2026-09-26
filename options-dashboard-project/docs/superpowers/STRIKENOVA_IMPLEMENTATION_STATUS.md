@@ -7,7 +7,7 @@
 
 ## 2026-09-26 — PR #109: SIGKILL migration-lock takeover rehearsal
 
-**Status:** **OPEN / NOT MERGED.** Branch `postmerge/sigkill-lock-takeover`, based directly on PR #108 merge `4560f279`; final code head `48278708`.
+**Status:** **OPEN / NOT MERGED.** Branch `postmerge/sigkill-lock-takeover`, based directly on PR #108 merge `4560f279`; final code head `8b56ac9be2fd56c351c36c9ede8ae579ac281b4d`.
 
 | Item | Resolution | Evidence |
 |------|-----------|----------|
@@ -16,11 +16,11 @@
 | Cross-process waiter | Independent waiter process is blocked while the holder is live, then takes over only after the dead holder's lease expires | Same rehearsal test; separate PostgreSQL session |
 | Persisted takeover | Parent verifies the waiter's ownership from a third independent PostgreSQL connection before allowing waiter cleanup | Same rehearsal test |
 | Cleanup | Waiter releases normally; final PostgreSQL verification confirms `locked_by IS NULL`; child cleanup is bounded and kills survivors | Same rehearsal test |
-| Timeout portability | SIGKILL marker waits use `max(90, REHEARSAL_TTL * 2)`; renewal proof uses `REHEARSAL_TTL` rather than a fixed 12-second deadline | Review remediation at `48278708` |
+| Timeout portability | SIGKILL marker waits use `max(90, REHEARSAL_TTL * 2)`; renewal proof uses `REHEARSAL_TTL` rather than a fixed 12-second deadline | Review remediation through final head `8b56ac9be2fd56c351c36c9ede8ae579ac281b4d` |
 | Reviewer remediation | Qodo actor-SyntaxError and pre-kill lease-validity findings addressed; Codacy static checks pass. Remaining Codacy comments are maintainability suggestions/duplicate-code observations or stale false positives, not release-blocking correctness findings | PR #109 review threads + fresh CI |
-| Fresh PostgreSQL rehearsal | **6 passed / 3 warnings** against disposable `postgres:16` | CI job on `48278708` |
+| Fresh PostgreSQL rehearsal | **6 passed / 3 warnings** against disposable `postgres:16` | CI job on `8b56ac9be2fd56c351c36c9ede8ae579ac281b4d` |
 | Fresh PostgreSQL compatibility suite | **127 passed / 3 warnings**, explicitly including `tests/test_migration_rehearsal_postgres.py` | CI job on `48278708` |
-| Security/reviewer checks | OpenCodeReview ✅; GitHub Advanced Security ✅; Codacy ✅; Vercel Preview Comments ✅; status/master-plan validation ✅ | Fresh checks on `48278708` |
+| Security/reviewer checks | OpenCodeReview ✅; GitHub Advanced Security ✅; Codacy ✅; Vercel Preview Comments ✅; status/master-plan validation ✅ | Fresh checks on final head `8b56ac9be2fd56c351c36c9ede8ae579ac281b4d` |
 
 **Governance state:** PR #109 remains **OPEN / NOT MERGED**. No Render deployment, Vercel production change, CockroachDB production modification, or secret change.
 
