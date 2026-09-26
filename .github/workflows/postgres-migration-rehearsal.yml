@@ -1,4 +1,4 @@
-name: PostgreSQL migration rehearsal
+name: Database migration rehearsal (PostgreSQL + CockroachDB)
 
 on:
   push:
@@ -55,3 +55,55 @@ jobs:
         run: >-
           python -m pytest -q
           tests/test_migration_rehearsal_postgres.py
+
+  cockroachdb-migration-rehearsal:
+    name: CockroachDB migration rehearsal (ADR-017 lock on real CRDB)
+    runs-on: ubuntu-latest
+
+    services:
+      cockroachdb:
+        image: cockroachdb/cockroach:v25.2.23
+        ports:
+          - 26257:26257
+        options: >-
+          --health-cmd "cockroach sql --insecure --host=localhost:26257 -e 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+        cmd: start-single-node --insecure --listen-addr=0.0.0.0:26257 --http-addr=0.0.0.0:8080
+
+    defaults:
+      run:
+        working-directory: options-dashboard-project/backend
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install backend dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements-dev.txt
+
+      - name: Create secondary rehearsal database (identity-coupling evidence)
+        run: |
+          python - <<'PY'
+          import psycopg
+
+          with psycopg.connect(
+              "postgresql://root@127.0.0.1:26257/defaultdb", autocommit=True
+          ) as conn:
+              conn.execute("CREATE DATABASE IF NOT EXISTS rehearsal_runtime")
+          print("rehearsal_runtime database ready")
+          PY
+
+      - name: Run migration rehearsal against real CockroachDB
+        env:
+          TEST_COCKROACHDB_URL: cockroachdb+psycopg://root@127.0.0.1:26257/rehearsal?sslmode=disable
+          TEST_COCKROACHDB_RUNTIME_URL: cockroachdb+psycopg://root@127.0.0.1:26257/rehearsal_runtime?sslmode=disable
+        run: >-
+          python -m pytest -q
+          tests/test_migration_rehearsal_cockroachdb.py
