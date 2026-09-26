@@ -75,14 +75,21 @@ jobs:
             cockroachdb/cockroach:v25.2.23 \
             start-single-node --insecure \
             --listen-addr=0.0.0.0:26257 --http-addr=0.0.0.0:8080
+          ok=""
           for i in $(seq 1 30); do
             if docker exec crdb /cockroach/cockroach sql --insecure \
                  --host=localhost:26257 -e "SELECT 1" >/dev/null 2>&1; then
+              ok=1
               echo "CockroachDB ready"
               break
             fi
             sleep 1
           done
+          if [ -z "$ok" ]; then
+            echo "::error::CockroachDB did not become ready; container logs:"
+            docker logs crdb 2>&1 | tail -80
+            exit 1
+          fi
           docker exec crdb /cockroach/cockroach sql --insecure \
             --host=localhost:26257 -e "CREATE DATABASE IF NOT EXISTS rehearsal"
 
