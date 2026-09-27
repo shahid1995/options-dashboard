@@ -72,10 +72,12 @@ broker (Redis/Celery/RabbitMQ/Kafka) is introduced.
   effective lease is resolved ONCE by `claim_next` (explicit override >
   payload `policy.lease_seconds` > default) and threaded through
   execution, heartbeat, and completion unchanged. Renewal stops when
-  execution ends (either path) or when ownership is lost; a renewal DB
-  failure is logged, never fabricated into success. A crashed process
-  stops renewing by construction, so lease expiry remains the crash-
-  recovery path and no second ownership race is introduced.
+  execution ends (either path) or when ownership is lost; a database
+  failure — session acquisition OR renewal — is logged, retried at the
+  next interval, never fatal to the thread, and never fabricated into
+  success. A crashed process stops renewing by construction, so lease
+  expiry remains the crash-recovery path and no second ownership race
+  is introduced.
 - **Retry/dead-letter semantics:** bounded attempts with exponential
   backoff (payload-overridable policy: `max_attempts`,
   `backoff_base_seconds`, `lease_seconds`); transient failures
