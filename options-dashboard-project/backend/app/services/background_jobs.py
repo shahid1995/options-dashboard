@@ -523,15 +523,22 @@ def _heartbeat_loop(
     exits when ``stop`` is set (normal completion, exception, or worker
     shutdown) or when a renewal reports ownership loss / expiry.
 
-    A database failure during a renewal is logged and NOT treated as a
-    successful renewal; ownership safeguards remain the only authority for
-    the final outcome. A heartbeat thread is always a daemon, so a worker
-    process death cannot leak it or keep it alive.
+    A database failure — during session acquisition OR during the renewal
+    itself — is logged and NOT treated as a successful renewal; ownership
+    safeguards remain the only authority for the final outcome. A
+    heartbeat thread is always a daemon, so a worker process death cannot
+    leak it or keep it alive.
     """
     interval = heartbeat_interval(lease_seconds)
     while not stop.wait(interval):
-        session = session_factory()
+        session = None
         try:
+            # Session acquisition is INSIDE the error-handling path: a
+            # transient failure to obtain a connection (pool exhaustion,
+            # connection loss) is logged and retried next cycle exactly like
+            # a renewal failure — it must never terminate the heartbeat and
+            # leave a long-running job without lease renewal.
+            session = session_factory()
             renewed = renew_lease(
                 session, job_id, worker_id=worker_id, lease_seconds=lease_seconds
             )
@@ -541,19 +548,21 @@ def _heartbeat_loop(
             # successful renewal, and it never kills the thread: the
             # ownership-protected transitions remain the final authority.
             logger.warning(
-                "heartbeat renewal for job %s failed transiently; the lease "
-                "safeguard remains authoritative",
+                "heartbeat cycle for job %s failed transiently (session "
+                "acquisition or renewal); the lease safeguard remains "
+                "authoritative",
                 job_id,
                 exc_info=True,
             )
             continue
         finally:
-            try:
-                session.close()
-            except Exception:  # pragma: no cover - defensive
-                logger.warning(
-                    "heartbeat session failed to close cleanly", exc_info=True
-                )
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:  # pragma: no cover - defensive
+                    logger.warning(
+                        "heartbeat session failed to close cleanly", exc_info=True
+                    )
         if not renewed:
             logger.warning(
                 "heartbeat for job %s stopped: worker %s no longer owns a "

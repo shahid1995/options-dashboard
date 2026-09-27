@@ -1571,6 +1571,185 @@ class TestHeartbeatDuringExecution:
             engine.dispose()
 
 
+class TestHeartbeatSessionAcquisitionFailure:
+    """Heartbeat durability gap: a failure to ACQUIRE the heartbeat's DB
+    session (pool exhaustion, connection loss) must be handled exactly
+    like a renewal failure — logged, retried next cycle, never fatal.
+    Before the fix, session_factory() sat OUTSIDE the try block, so an
+    acquisition failure killed the heartbeat thread with an uncaught
+    exception and a long-running job silently lost lease renewal."""
+
+    def test_acquisition_failure_is_recoverable(
+        self, session_factory, monkeypatch
+    ):
+        """Test A: first acquisition fails, later ones succeed; the thread
+        survives, renews, and the worker still completes with ownership
+        intact. No unhandled exception may escape the heartbeat thread
+        (asserted via threading.excepthook)."""
+        import threading as _threading
+        import time as _time
+
+        factory, engine = _shared_memory_sqlite_factory()
+        try:
+            db = factory()
+            # 2s lease -> 0.67s heartbeat period (lease/3); the first
+            # heartbeat acquisition fails, later ones succeed.
+            _enqueue(db, "hb:acq:1", payload={"policy": {"lease_seconds": 2}})
+            db.close()
+
+            escaped = []
+            prev_excepthook = _threading.excepthook
+
+            def _hook(args):
+                escaped.append(args)
+
+            _threading.excepthook = _hook
+            try:
+                renewals = {"ok": 0}
+                real_renew = bj.renew_lease
+
+                def counting_renew(db, job_id, **kwargs):
+                    ok = real_renew(db, job_id, **kwargs)
+                    if ok:
+                        renewals["ok"] += 1
+                    return ok
+
+                monkeypatch.setattr(bj, "renew_lease", counting_renew)
+
+                def long_execute(db, job):
+                    _time.sleep(2.5)  # outlives the original 2s lease
+
+                monkeypatch.setattr(bj, "execute_job", long_execute)
+                summary = bj.run_worker(
+                    session_factory=_HeartbeatFailingFactory(factory, fail_first=1),
+                    once=True,
+                    worker_id="worker-A",
+                )
+                assert summary["succeeded"] == 1, summary
+            finally:
+                _threading.excepthook = prev_excepthook
+
+            assert escaped == [], (
+                f"no unhandled exception may escape the heartbeat thread: {escaped}"
+            )
+            assert renewals["ok"] >= 1, "a later renewal must succeed after recovery"
+            db = factory()
+            row = db.scalar(select(BackgroundJob))
+            assert row.status == "SUCCEEDED"
+            assert row.completed_at is not None
+            db.close()
+        finally:
+            engine.dispose()
+
+    def test_repeated_acquisition_failures_logged_not_fatal(
+        self, session_factory, monkeypatch, caplog
+    ):
+        """Test B: repeated acquisition failures must keep the heartbeat
+        attempting (logged, thread alive), report NO false renewal, and
+        leave the ownership-protected completion as the final authority.
+
+        Deterministic scenario: every heartbeat acquisition fails during
+        attempt 1 (2.4s execution, 1s lease), so ownership is genuinely
+        lost and attempt 1's completion is refused (stale). The drain loop
+        then reclaims the expired job; with acquisitions working again,
+        attempt 2 renews and completes — proving the outcome was decided
+        by ownership protection, not by the heartbeat failing silently."""
+        import logging as _logging
+        import threading as _threading
+        import time as _time
+
+        factory, engine = _shared_memory_sqlite_factory()
+        try:
+            db = factory()
+            _enqueue(db, "hb:acq:2", payload={"policy": {"lease_seconds": 1}})
+            db.close()
+
+            escaped = []
+            prev_excepthook = _threading.excepthook
+
+            def _hook(args):
+                escaped.append(args)
+
+            _threading.excepthook = _hook
+            state = {"fail": True, "first_attempt_done": False}
+
+            def failing_while_flagged():
+                if state["fail"] and _threading.current_thread().name.startswith(
+                    "heartbeat-"
+                ):
+                    raise RuntimeError("db unavailable (test injection)")
+                return factory()
+
+            def execute_by_attempt(db, job):
+                if state["first_attempt_done"]:  # attempt 2 (reclaim): healthy
+                    _time.sleep(0.2)
+                    return
+                _time.sleep(2.4)  # attempt 1: outlives the 1s lease
+                state["first_attempt_done"] = True
+                state["fail"] = False  # later heartbeats succeed
+
+            monkeypatch.setattr(bj, "execute_job", execute_by_attempt)
+            try:
+                with caplog.at_level(_logging.WARNING):
+                    summary = bj.run_worker(
+                        session_factory=failing_while_flagged,
+                        once=True,
+                        worker_id="worker-A",
+                    )
+            finally:
+                _threading.excepthook = prev_excepthook
+
+            # Thread survived (no unhandled escape), no fabricated success
+            # during attempt 1 (its completion was refused as stale), and
+            # the ownership-protected transition decided the final result.
+            assert escaped == [], (
+                f"heartbeat thread must survive repeated failures: {escaped}"
+            )
+            assert summary == {
+                "claimed": 2,
+                "succeeded": 1,
+                "failed": 0,
+                "dead_lettered": 0,
+                "stale": 1,
+            }, summary
+            failures = [
+                r
+                for r in caplog.records
+                if "heartbeat cycle" in r.getMessage() and r.exc_info
+            ]
+            assert len(failures) >= 2, "acquisition failures must be logged with exc_info"
+            db = factory()
+            row = db.scalar(select(BackgroundJob))
+            assert row.status == "SUCCEEDED"  # attempt 2, valid ownership
+            db.close()
+        finally:
+            engine.dispose()
+
+
+class _HeartbeatFailingFactory:
+    """Session-factory wrapper that fails session ACQUISITION for the
+    heartbeat thread's first N attempts — deterministically, by thread
+    name (the worker names the thread ``heartbeat-<job-id-8>``). Every
+    other consumer (claim, execution, completion — all on the worker
+    thread) passes through untouched, so only the heartbeat's acquisition
+    path is exercised."""
+
+    def __init__(self, inner, fail_first: int):
+        self._inner = inner
+        self._remaining = fail_first
+
+    def __call__(self):
+        import threading
+
+        if (
+            self._remaining > 0
+            and threading.current_thread().name.startswith("heartbeat-")
+        ):
+            self._remaining -= 1
+            raise RuntimeError("connection pool exhausted (test injection)")
+        return self._inner()
+
+
 class TestCompletionRetry:
     """CodeRabbit Minor: the SUCCESS transition survives transient DB
     errors exactly like the failure transition (F7 parity)."""
