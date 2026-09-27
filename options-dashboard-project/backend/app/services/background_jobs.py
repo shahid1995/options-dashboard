@@ -67,6 +67,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.models import BackgroundJob, JobStatus, JobType
+from app.services.rate_limiter import GlobalRateLimiter  # stdlib-only module, no cycle
 from app.utils.retry import retry_on_serialization  # noqa: E402 (patch point for tests)
 
 logger = logging.getLogger(__name__)
@@ -665,7 +666,46 @@ def fail_job(
 # --------------------------------------------------------------------------
 
 
-def execute_historical_ingestion(db: Session, job: BackgroundJob) -> dict[str, Any]:
+def prepare_run_rate_limiter(
+    limiter: Any | None,
+    *,
+    concurrency: int,
+) -> Any:
+    """Adapt the worker's shared limiter for one job run.
+
+    The ``GlobalRateLimiter`` is a WORKER-LIFETIME (in-process) global
+    limiter — the same scope ``run_backfill.py`` uses for its whole CLI
+    process: adaptive/cooldown state (429 cooldown, widened pacing
+    interval, consecutive-429 count, cumulative request metrics) must
+    survive job boundaries so a cooldown earned by one job still protects
+    the next. The PER-JOB concurrency ceiling is the current job's policy:
+    this re-points the adaptive recovery ceiling (``config.initial_concurrency``)
+    and force-applies the semaphore ceiling to the job's request without
+    touching the preserved adaptive state.
+
+    ``limiter=None`` creates a fresh limiter — every direct caller (CLI
+    tools, tests) gets exactly the per-job construction this module always
+    had; only ``run_worker`` shares one limiter across its jobs.
+    """
+    from app.services.rate_limiter import GlobalRateLimiter
+
+    if limiter is None:
+        limiter = GlobalRateLimiter()
+    limiter.config.initial_concurrency = max(1, int(concurrency))
+    limiter._concurrency = max(
+        limiter.config.min_concurrency,
+        min(limiter.config.initial_concurrency, limiter.config.max_concurrency),
+    )
+    limiter._semaphore = asyncio.Semaphore(limiter._concurrency)
+    return limiter
+
+
+def execute_historical_ingestion(
+    db: Session,
+    job: BackgroundJob,
+    *,
+    rate_limiter: Any | None = None,
+) -> dict[str, Any]:
     """Execute a HISTORICAL_INGESTION job through the real orchestrator.
 
     Drives the same ``BackfillOrchestrator`` application service the CLI
@@ -673,13 +713,16 @@ def execute_historical_ingestion(db: Session, job: BackgroundJob) -> dict[str, A
     idempotency comes from the orchestrator's durable checkpoint resume
     plus the ingestion tables' unique-constraint insert semantics.
 
+    ``rate_limiter`` is the worker's shared limiter when called from the
+    worker loop (adaptive state persists across jobs); omitted, a fresh
+    limiter is constructed for this run (direct/CLI/test callers).
+
     Raises :class:`JobExecutionError` with a retryability verdict:
     authentication problems are permanent (human re-authentication
     required); other stage failures are retryable because the orchestrator
     resumes from durable checkpoints.
     """
     from app.services.backfill_orchestrator import BackfillOrchestrator, TokenBridge
-    from app.services.rate_limiter import GlobalRateLimiter, RateLimiterConfig
     from app.services.upstox_client import UpstoxClient
 
     try:
@@ -735,9 +778,10 @@ def execute_historical_ingestion(db: Session, job: BackgroundJob) -> dict[str, A
 
     token_bridge = TokenBridge()
     client = UpstoxClient(token_provider=token_bridge)
-    rate_limiter = GlobalRateLimiter(
-        config=RateLimiterConfig(initial_concurrency=concurrency, max_concurrency=6)
-    )
+    # Worker-lifetime adaptive limiter; the job's requested concurrency is
+    # applied as THIS job's ceiling (per-job policy), preserving any
+    # cooldown/pacing state earned by earlier jobs in the same worker.
+    rate_limiter = prepare_run_rate_limiter(rate_limiter, concurrency=concurrency)
     orchestrator = BackfillOrchestrator(
         db, client, force=force, rate_limiter=rate_limiter
     )
@@ -774,10 +818,19 @@ def execute_historical_ingestion(db: Session, job: BackgroundJob) -> dict[str, A
     )
 
 
-def execute_job(db: Session, job: BackgroundJob) -> dict[str, Any]:
-    """Dispatch a claimed job by type."""
+def execute_job(
+    db: Session,
+    job: BackgroundJob,
+    *,
+    rate_limiter: Any | None = None,
+) -> dict[str, Any]:
+    """Dispatch a claimed job by type.
+
+    ``rate_limiter`` (optional) is the worker's shared limiter; direct
+    callers may omit it, exactly as before.
+    """
     if job.job_type == JobType.HISTORICAL_INGESTION.value:
-        return execute_historical_ingestion(db, job)
+        return execute_historical_ingestion(db, job, rate_limiter=rate_limiter)
     raise JobExecutionError(
         f"unknown job type: {job.job_type!r}", retryable=False
     )
@@ -794,6 +847,7 @@ def _execute_one(
     job_id: str,
     worker_id: str,
     lease_seconds: int | None = None,
+    rate_limiter: Any | None = None,
 ) -> str:
     """Execute one claimed job with ownership-protected transitions.
 
@@ -860,7 +914,7 @@ def _execute_one(
         )
         heartbeat.start()
         try:
-            execute_job(db, job)
+            execute_job(db, job, rate_limiter=rate_limiter)
         except Exception as exc:
             # F7: persist the failure transition on a FRESH session via the
             # repository's serialization retry — the execution session may
@@ -984,6 +1038,14 @@ def run_worker(
         "stale": 0,
     }
 
+    # ONE GlobalRateLimiter for the worker's lifetime (the same in-process
+    # scope run_backfill.py gives its whole CLI process): 429 cooldown,
+    # widened pacing, and adaptive-concurrency state survive job boundaries
+    # so a cooldown earned by one job still protects the next. Each job's
+    # requested concurrency is applied per-run by
+    # prepare_run_rate_limiter without touching the preserved state.
+    worker_rate_limiter = GlobalRateLimiter()
+
     effective_lease_box: dict[str, int | None] = {}
 
     def _claim_id(db: Session) -> str | None:
@@ -1044,6 +1106,7 @@ def run_worker(
                 job_id=job_id,
                 worker_id=wid,
                 lease_seconds=effective_lease_box.get("lease"),
+                rate_limiter=worker_rate_limiter,
             )
         except Exception:  # pragma: no cover - defensive belt-and-braces
             logger.exception("job %s execution failed unexpectedly", job_id)

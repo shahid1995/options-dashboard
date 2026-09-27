@@ -379,7 +379,7 @@ class TestWorkerLoop:
 
         executed = []
 
-        def fake_execute(db, job):
+        def fake_execute(db, job, **kwargs):
             executed.append(job.idempotency_key)
             return {"ok": True}
 
@@ -405,7 +405,7 @@ class TestWorkerLoop:
 
         calls = {"n": 0}
 
-        def fake_execute(db, job):
+        def fake_execute(db, job, **kwargs):
             calls["n"] += 1
             raise bj.JobExecutionError("transient", retryable=True)
 
@@ -430,7 +430,7 @@ class TestWorkerLoop:
     ):
         _enqueue(session_factory(), "job:bad")
 
-        def fake_execute(db, job):
+        def fake_execute(db, job, **kwargs):
             raise bj.JobExecutionError("malformed", retryable=False)
 
         monkeypatch.setattr(bj, "execute_job", fake_execute)
@@ -736,7 +736,7 @@ class TestWorkerRollbackFailureLogging:
         monkeypatch.setattr(
             bj,
             "execute_job",
-            lambda db, job: (_ for _ in ()).throw(RuntimeError("executor exploded")),
+            lambda db, job, **kwargs: (_ for _ in ()).throw(RuntimeError("executor exploded")),
         )
 
         def fake_fail_job(db, job, exc, *, worker_id, attempt_count=None):
@@ -851,7 +851,7 @@ class TestStaleWorkerOwnershipProtection:
             idempotency_key="stale:loop",
         )
 
-        def slow_execute(db, job):
+        def slow_execute(db, job, **kwargs):
             s = session_factory()
             row = s.scalar(select(BackgroundJob))
             row.lease_expires_at = _utcnow() - timedelta(seconds=1)
@@ -889,7 +889,7 @@ class TestFailureTransitionPersistence:
         )
         outcome_box = {}
 
-        def fake_execute(db, job):
+        def fake_execute(db, job, **kwargs):
             outcome_box["attempt_count"] = job.attempt_count
             outcome_box["job_id"] = job.id
             raise bj.JobExecutionError("connection reset", retryable=True)
@@ -936,7 +936,7 @@ class TestWorkerLookupFailure:
 
         monkeypatch.setattr(Session, "get", boom)
         executed = []
-        monkeypatch.setattr(bj, "execute_job", lambda db, job: executed.append(job.id))
+        monkeypatch.setattr(bj, "execute_job", lambda db, job, **kwargs: executed.append(job.id))
 
         summary = bj.run_worker(session_factory=session_factory, once=True)
         assert summary["claimed"] == 1
@@ -963,7 +963,7 @@ class TestWorkerLookupFailure:
             return original_get(self, entity, key)
 
         monkeypatch.setattr(Session, "get", flaky_get)
-        monkeypatch.setattr(bj, "execute_job", lambda db, job: None)
+        monkeypatch.setattr(bj, "execute_job", lambda db, job, **kwargs: None)
         summary = bj.run_worker(session_factory=session_factory, once=True)
         assert summary["claimed"] == 2
 
@@ -1081,7 +1081,7 @@ class TestStageValidation:
         monkeypatch.setattr(
             bj,
             "execute_job",
-            lambda db, job: seen.append(json.loads(job.payload)["stages"]),
+            lambda db, job, **kwargs: seen.append(json.loads(job.payload)["stages"]),
         )
         summary = bj.run_worker(session_factory=session_factory, once=True)
         assert summary["succeeded"] == 1
@@ -1428,7 +1428,7 @@ class TestHeartbeatDuringExecution:
 
             monkeypatch.setattr(bj, "renew_lease", counting_renew)
 
-            def long_execute(db, job):
+            def long_execute(db, job, **kwargs):
                 # Exceeds the 1s payload lease; only renewal keeps it valid.
                 import time as _time
 
@@ -1464,7 +1464,7 @@ class TestHeartbeatDuringExecution:
 
             monkeypatch.setattr(bj, "renew_lease", counting_renew)
 
-            def brief_execute(db, job):
+            def brief_execute(db, job, **kwargs):
                 import time as _time
 
                 _time.sleep(1.2)  # >= 2 heartbeat cycles while RUNNING
@@ -1500,7 +1500,7 @@ class TestHeartbeatDuringExecution:
             _enqueue(db, "hb:stale")
             db.close()
 
-            def steal_lease(db, job):
+            def steal_lease(db, job, **kwargs):
                 s = factory()
                 row = s.scalar(select(BackgroundJob))
                 row.lease_expires_at = _utcnow() - timedelta(seconds=1)
@@ -1549,7 +1549,7 @@ class TestHeartbeatDuringExecution:
 
             monkeypatch.setattr(bj, "renew_lease", flaky_renew)
 
-            def slow_execute(db, job):
+            def slow_execute(db, job, **kwargs):
                 import time as _time
 
                 _time.sleep(1.2)
@@ -1616,7 +1616,7 @@ class TestHeartbeatSessionAcquisitionFailure:
 
                 monkeypatch.setattr(bj, "renew_lease", counting_renew)
 
-                def long_execute(db, job):
+                def long_execute(db, job, **kwargs):
                     _time.sleep(2.5)  # outlives the original 2s lease
 
                 monkeypatch.setattr(bj, "execute_job", long_execute)
@@ -1680,7 +1680,7 @@ class TestHeartbeatSessionAcquisitionFailure:
                     raise RuntimeError("db unavailable (test injection)")
                 return factory()
 
-            def execute_by_attempt(db, job):
+            def execute_by_attempt(db, job, **kwargs):
                 if state["first_attempt_done"]:  # attempt 2 (reclaim): healthy
                     _time.sleep(0.2)
                     return
@@ -1750,6 +1750,217 @@ class _HeartbeatFailingFactory:
         return self._inner()
 
 
+class TestWorkerRateLimiterLifecycle:
+    """Rate-limiter lifecycle finding (verified against repository
+    architecture, then fixed): ``GlobalRateLimiter`` is a WORKER-LIFETIME
+    in-process limiter — the same scope ``run_backfill.py`` gives its whole
+    CLI process. Adaptive/cooldown state must survive job boundaries; each
+    job's requested concurrency is applied as THAT job's ceiling without
+    inheriting the previous job's request."""
+
+    def test_a_limiter_persists_across_sequential_jobs(
+        self, session_factory, monkeypatch
+    ):
+        """Two jobs through one worker lifecycle observe the SAME limiter
+        object and its preserved adaptive state (no fresh limiter per
+        job, no process-wide singleton reset)."""
+        factory, engine = _shared_memory_sqlite_factory()
+        try:
+            db = factory()
+            _enqueue(db, "lim:1")
+            _enqueue(db, "lim:2")
+            db.close()
+
+            observed = []
+
+            def fake_execute(db, job, **kwargs):
+                limiter = kwargs["rate_limiter"]
+                observed.append(
+                    {
+                        "job": job.idempotency_key,
+                        "id": id(limiter),
+                        "interval": limiter.interval,
+                    }
+                )
+                if job.idempotency_key == "lim:1":
+                    # Simulate adaptive state earned during job 1.
+                    limiter._interval = 2.5
+                    limiter._consecutive_429s = 3
+
+            monkeypatch.setattr(bj, "execute_job", fake_execute)
+            summary = bj.run_worker(session_factory=factory, once=True)
+            assert summary["succeeded"] == 2
+            assert len(observed) == 2
+            assert observed[0]["id"] == observed[1]["id"], (
+                "one worker lifecycle must reuse ONE limiter across jobs"
+            )
+            assert observed[1]["interval"] == 2.5, (
+                "job 2 must observe the adaptive state job 1 earned"
+            )
+        finally:
+            engine.dispose()
+
+    def test_b_real_dispatch_preserves_state_and_applies_per_job_concurrency(
+        self, session_factory, monkeypatch
+    ):
+        """Through the REAL execute_historical_ingestion path (fake
+        orchestrator boundary): the shared limiter's adaptive state
+        survives prepare_run_rate_limiter, while each job's requested
+        concurrency is applied as that job's ceiling — job 2 does NOT
+        inherit job 1's request."""
+        import app.services.backfill_orchestrator as orch_mod
+        import app.services.upstox_client as upstox_mod
+
+        factory, engine = _shared_memory_sqlite_factory()
+        try:
+            db = factory()
+            _enqueue(db, "lim:conc:5", payload={"stages": ["contracts"], "concurrency": 5})
+            _enqueue(db, "lim:conc:2", payload={"stages": ["options"], "concurrency": 2})
+            db.close()
+
+            seen = []
+
+            class _LocalResult:
+                operation = "backfill_all"
+                status = "SUCCESS"
+                api_calls = 1
+                rows_fetched = 0
+                rows_inserted = 0
+                rows_skipped = 0
+                errors = []
+
+            class _FakeOrch:
+                def __init__(self, db, client, *, force=False, rate_limiter=None):
+                    seen.append(
+                        {
+                            "limiter": rate_limiter,
+                            "concurrency": rate_limiter.concurrency,
+                            "ceiling": rate_limiter.config.initial_concurrency,
+                            "interval": rate_limiter.interval,
+                        }
+                    )
+
+                async def run_all(
+                    self, *, stages=None, nifty_start_date=None, options_concurrency=None
+                ):
+                    # Job 1 earns adaptive state AFTER prepare ran.
+                    if seen[-1]["ceiling"] == 5:
+                        seen[-1]["limiter"]._interval = 3.3
+                    return _LocalResult()
+
+            monkeypatch.setattr(orch_mod, "BackfillOrchestrator", _FakeOrch)
+            monkeypatch.setattr(orch_mod, "TokenBridge", type("B", (), {}))
+            monkeypatch.setattr(
+                upstox_mod,
+                "UpstoxClient",
+                type("C", (), {"__init__": lambda self, token_provider=None: None}),
+            )
+            summary = bj.run_worker(session_factory=factory, once=True)
+            assert summary["succeeded"] == 2
+            assert len(seen) == 2
+            assert seen[0]["limiter"] is seen[1]["limiter"], (
+                "the worker shares one limiter across jobs"
+            )
+            assert seen[0]["ceiling"] == 5 and seen[0]["concurrency"] == 5
+            assert seen[1]["ceiling"] == 2 and seen[1]["concurrency"] == 2, (
+                "job 2's explicit concurrency must be applied, not inherited"
+            )
+            assert seen[1]["interval"] == 3.3, (
+                "per-job ceiling application must not reset adaptive state"
+            )
+        finally:
+            engine.dispose()
+
+    def test_c_cooldown_survives_job_boundary(self, session_factory, monkeypatch):
+        """Job 1 takes a genuine 429 cooldown; job 2 starts through the
+        same worker and still sees the remaining cooldown and the widened
+        pacing interval (a fresh limiter would show neither)."""
+        import asyncio as _asyncio
+
+        factory, engine = _shared_memory_sqlite_factory()
+        try:
+            db = factory()
+            _enqueue(db, "lim:cool:1")
+            _enqueue(db, "lim:cool:2")
+            db.close()
+
+            observed = []
+
+            def fake_execute(db, job, **kwargs):
+                limiter = kwargs["rate_limiter"]
+                if job.idempotency_key == "lim:cool:1":
+                    # Real limiter mechanics: 30s Retry-After cooldown.
+                    _asyncio.run(limiter.on_429(retry_after=30.0))
+                else:
+                    observed.append(
+                        {
+                            "cooldown": limiter.cooldown_remaining,
+                            "interval": limiter.interval,
+                            "consecutive_429s": limiter._consecutive_429s,
+                        }
+                    )
+
+            monkeypatch.setattr(bj, "execute_job", fake_execute)
+            summary = bj.run_worker(session_factory=factory, once=True)
+            assert summary["succeeded"] == 2
+            assert len(observed) == 1
+            assert observed[0]["cooldown"] > 25.0, (
+                f"job 2 must inherit the remaining cooldown: {observed}"
+            )
+            # on_429 widens pacing to min(config.max_interval, cooldown) —
+            # the default ceiling is 5.0s; a fresh limiter would show the
+            # 0.25s initial interval instead.
+            assert observed[0]["interval"] == 5.0, (
+                "pacing interval widened by the 429 must persist"
+            )
+            assert observed[0]["consecutive_429s"] == 1
+        finally:
+            engine.dispose()
+
+    def test_d_worker_lifecycles_have_independent_limiters(
+        self, session_factory, monkeypatch
+    ):
+        """Two separate run_worker lifecycles get separate limiter objects
+        (no process-wide singleton): state earned in worker 1 never leaks
+        into worker 2."""
+        factory1, engine1 = _shared_memory_sqlite_factory()
+        factory2, engine2 = _shared_memory_sqlite_factory()
+        try:
+            db = factory1()
+            _enqueue(db, "lim:w1")
+            db.close()
+            db = factory2()
+            _enqueue(db, "lim:w2")
+            db.close()
+
+            observed = []
+
+            def fake_execute(db, job, **kwargs):
+                limiter = kwargs["rate_limiter"]
+                if not observed:  # only worker 1's job "earns" state
+                    limiter._interval = 4.2
+                # Hold the OBJECT (not id()): the first worker's limiter
+                # would otherwise be garbage-collected and CPython could
+                # reuse its address for the second, faking equality.
+                observed.append({"job": job.idempotency_key, "limiter": limiter})
+
+            monkeypatch.setattr(bj, "execute_job", fake_execute)
+            s1 = bj.run_worker(session_factory=factory1, once=True, worker_id="w-A")
+            s2 = bj.run_worker(session_factory=factory2, once=True, worker_id="w-B")
+            assert s1["succeeded"] == 1 and s2["succeeded"] == 1
+            assert len(observed) == 2
+            assert observed[0]["limiter"] is not observed[1]["limiter"], (
+                "separate worker lifecycles must NOT share a limiter singleton"
+            )
+            assert observed[0]["limiter"].interval == 4.2
+            assert observed[1]["limiter"].interval != 4.2, (
+                "worker 2 must not inherit worker 1's adaptive state"
+            )
+        finally:
+            engine1.dispose()
+            engine2.dispose()
+
+
 class TestCompletionRetry:
     """CodeRabbit Minor: the SUCCESS transition survives transient DB
     errors exactly like the failure transition (F7 parity)."""
@@ -1777,7 +1988,7 @@ class TestCompletionRetry:
 
         monkeypatch.setattr(bj, "complete_job", flaky_complete)
         # Successful (fake) execution; only the transition is under test.
-        monkeypatch.setattr(bj, "execute_job", lambda db, job: {"ok": True})
+        monkeypatch.setattr(bj, "execute_job", lambda db, job, **kwargs: {"ok": True})
         summary = bj.run_worker(session_factory=session_factory, once=True)
         assert calls["n"] == 2, "completion must be retried, not fatal"
         assert summary["succeeded"] == 1
@@ -1796,7 +2007,7 @@ class TestCompletionRetry:
         )
         seen = {}
 
-        def record_session(db, job):
+        def record_session(db, job, **kwargs):
             seen["execution_session"] = db
             return {"ok": True}
 
@@ -1827,7 +2038,7 @@ class TestCompletionRetry:
             idempotency_key="f2:complete:3",
         )
 
-        def steal_lease(db, job):
+        def steal_lease(db, job, **kwargs):
             s = session_factory()
             row = s.scalar(select(BackgroundJob))
             row.lease_expires_at = _utcnow() - timedelta(seconds=1)
@@ -1877,7 +2088,7 @@ class TestHeartbeatLeasePropagation:
         )
         started = {}
 
-        def capturing_execute(db, job):
+        def capturing_execute(db, job, **kwargs):
             started["started_at"] = job.started_at
             started["lease_expires_at"] = job.lease_expires_at
 
@@ -1916,7 +2127,7 @@ class TestHeartbeatLeasePropagation:
         )
         claim = {}
 
-        def capturing_execute(db, job):
+        def capturing_execute(db, job, **kwargs):
             claim["delta"] = (
                 job.lease_expires_at - job.started_at
             ).total_seconds()
@@ -1954,7 +2165,7 @@ class TestHeartbeatLeasePropagation:
             _enqueue(db, "f3:hb:value", payload={"policy": {"lease_seconds": 3}})
             db.close()
 
-            def slow_execute(db, job):
+            def slow_execute(db, job, **kwargs):
                 import time as _time
 
                 _time.sleep(2.2)  # spans >= 2 heartbeat cycles (1.0s period)

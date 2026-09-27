@@ -93,6 +93,18 @@ broker (Redis/Celery/RabbitMQ/Kafka) is introduced.
   is the administrative CLI; it performs NO schema mutation (Alembic is
   the sole authority — ADR-002). Historical ingestion executes through
   the real `BackfillOrchestrator` service boundary (no subprocess).
+- **Rate-limiter lifecycle:** the ``GlobalRateLimiter`` is a WORKER-
+  LIFETIME in-process limiter (the same scope ``run_backfill.py`` gives
+  its whole CLI process): ``run_worker`` creates one limiter and passes
+  it through ``_execute_one`` → ``execute_job`` →
+  ``execute_historical_ingestion``, so 429 cooldown, widened pacing, and
+  adaptive-concurrency state survive job boundaries. Each job's
+  requested concurrency is applied per-run by
+  ``prepare_run_rate_limiter`` (recovery ceiling + semaphore) WITHOUT
+  resetting the preserved adaptive state; separate worker processes keep
+  independent limiter state (no global singleton), and direct callers
+  omitting the limiter get the original per-run construction. The
+  HTTP-session ``SessionRateLimiter`` is untouched.
 - **Not deployed:** no production worker service or scheduler exists yet;
   enabling one requires separate authorization.
 
