@@ -251,8 +251,12 @@ def main() -> int:
     )
     p_work.add_argument("--job-type", type=str, default=None, help="Restrict to a job type")
     p_work.add_argument(
-        "--lease-seconds", type=int, default=background_jobs.DEFAULT_LEASE_SECONDS,
-        help="Lease duration per claim",
+        "--lease-seconds",
+        type=int,
+        default=None,
+        help="Lease duration override (default: job payload policy, else "
+        "system default) — omitting it preserves the documented lease "
+        "precedence",
     )
     p_work.set_defaults(func=_cmd_work)
 

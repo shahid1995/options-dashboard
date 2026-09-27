@@ -1291,3 +1291,607 @@ class TestCliStageCombinations:
 
     def test_no_stage_is_empty(self):
         assert self._stages() == []
+
+
+# ---------------------------------------------------------------------------
+# 11. Heartbeat / lease renewal (CodeRabbit Major) + completion retry (Minor)
+# ---------------------------------------------------------------------------
+
+
+def _shared_memory_sqlite_factory():
+    """A session factory sharing ONE in-memory SQLite database across ALL
+    threads.
+
+    Plain ``sqlite://`` gives each thread its own empty database, so the
+    heartbeat thread (a different thread) could never see claimed rows.
+    Sharing a single connection is the standard cross-thread in-memory
+    SQLite pattern; SQLite serializes the writes, which is exactly what a
+    heartbeat needs.
+    """
+    from sqlalchemy.pool import StaticPool
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=engine)
+    return sessionmaker(bind=engine, autocommit=False, autoflush=False), engine
+
+
+class TestRenewLease:
+    """F1: renew_lease is ownership-protected exactly like complete_job."""
+
+    def test_current_owner_renews(self, session_factory):
+        db = session_factory()
+        _enqueue(db, "hb:1")
+        job = bj.claim_next(db, worker_id="worker-A", lease_seconds=60)
+        assert job is not None
+        before = job.lease_expires_at
+        assert bj.renew_lease(
+            db, job.id, worker_id="worker-A", lease_seconds=60
+        ) is True
+        db.expire_all()
+        row = db.scalar(select(BackgroundJob))
+        assert row.status == JobStatus.RUNNING.value
+        assert row.lease_owner == "worker-A"
+        assert row.lease_expires_at > before
+
+    def test_wrong_worker_rejected(self, session_factory):
+        db = session_factory()
+        _enqueue(db, "hb:2")
+        job = bj.claim_next(db, worker_id="worker-A", lease_seconds=60)
+        assert job is not None
+        assert bj.renew_lease(
+            db, job.id, worker_id="worker-IMPOSTOR", lease_seconds=60
+        ) is False
+        db.expire_all()
+        row = db.scalar(select(BackgroundJob))
+        assert row.lease_owner == "worker-A"  # untouched
+
+    def test_expired_lease_rejected(self, session_factory):
+        db = session_factory()
+        _enqueue(db, "hb:3")
+        job = bj.claim_next(db, worker_id="worker-A", lease_seconds=60)
+        assert job is not None
+        db.expire_all()
+        row = db.scalar(select(BackgroundJob))
+        row.lease_expires_at = _utcnow() - timedelta(seconds=1)
+        db.commit()
+        assert bj.renew_lease(
+            db, job.id, worker_id="worker-A", lease_seconds=60
+        ) is False
+        db.expire_all()
+        row = db.scalar(select(BackgroundJob))
+        assert row.lease_expires_at <= _utcnow() - timedelta(seconds=1)
+
+    def test_repeated_renewal_extends_lease(self, session_factory):
+        db = session_factory()
+        _enqueue(db, "hb:4")
+        job = bj.claim_next(db, worker_id="worker-A", lease_seconds=60)
+        assert job is not None
+        for _ in range(3):
+            assert bj.renew_lease(
+                db, job.id, worker_id="worker-A", lease_seconds=60
+            ) is True
+        db.expire_all()
+        row = db.scalar(select(BackgroundJob))
+        delta = (row.lease_expires_at - _utcnow()).total_seconds()
+        # The lease keeps getting pushed ~60s out (commit latency tolerated).
+        assert 55 <= delta <= 65
+
+    def test_renewal_requires_running_state(self, session_factory):
+        db = session_factory()
+        _enqueue(db, "hb:5")
+        job = bj.claim_next(db, worker_id="worker-A", lease_seconds=60)
+        assert job is not None
+        db.expire_all()
+        row = db.scalar(select(BackgroundJob))
+        row.status = JobStatus.SUCCEEDED.value
+        row.lease_owner = None
+        row.lease_expires_at = None
+        db.commit()
+        assert bj.renew_lease(
+            db, job.id, worker_id="worker-A", lease_seconds=60
+        ) is False
+
+
+class TestHeartbeatInterval:
+    def test_interval_is_lease_over_three(self):
+        assert bj.heartbeat_interval(90) == 30.0
+
+    def test_interval_has_safe_floor(self):
+        assert bj.heartbeat_interval(1) == bj._MIN_HEARTBEAT_INTERVAL_SECONDS
+        assert bj.heartbeat_interval(0) == bj._MIN_HEARTBEAT_INTERVAL_SECONDS
+
+
+class TestHeartbeatDuringExecution:
+    """The worker's heartbeat loop: renews while executing, stops after."""
+
+    def test_execution_beyond_original_lease_completes_via_heartbeat(
+        self, session_factory, monkeypatch
+    ):
+        factory, engine = _shared_memory_sqlite_factory()
+        try:
+            db = factory()
+            _enqueue(db, "hb:long", payload={"policy": {"lease_seconds": 1}}
+                     )
+            db.close()
+            renewals = {"n": 0}
+            real_renew = bj.renew_lease
+
+            def counting_renew(db, job_id, **kwargs):
+                ok = real_renew(db, job_id, **kwargs)
+                if ok:
+                    renewals["n"] += 1
+                return ok
+
+            monkeypatch.setattr(bj, "renew_lease", counting_renew)
+
+            def long_execute(db, job):
+                # Exceeds the 1s payload lease; only renewal keeps it valid.
+                import time as _time
+
+                _time.sleep(1.8)
+
+            monkeypatch.setattr(bj, "execute_job", long_execute)
+            summary = bj.run_worker(
+                session_factory=factory, once=True, worker_id="worker-A"
+            )
+            assert summary["succeeded"] == 1, summary
+            assert renewals["n"] >= 1, "heartbeat must have renewed the lease"
+            db = factory()
+            row = db.scalar(select(BackgroundJob))
+            assert row.status == JobStatus.SUCCEEDED.value
+            db.close()
+        finally:
+            engine.dispose()
+
+    def test_heartbeat_stops_after_execution(self, session_factory, monkeypatch):
+        factory, engine = _shared_memory_sqlite_factory()
+        try:
+            db = factory()
+            # 1s lease -> 0.5s heartbeat period, so a leaked thread would
+            # attempt a renewal within the observation window below.
+            _enqueue(db, "hb:stop", payload={"policy": {"lease_seconds": 1}})
+            db.close()
+            attempts = {"n": 0}
+            real_renew = bj.renew_lease
+
+            def counting_renew(db, job_id, **kwargs):
+                attempts["n"] += 1
+                return real_renew(db, job_id, **kwargs)
+
+            monkeypatch.setattr(bj, "renew_lease", counting_renew)
+
+            def brief_execute(db, job):
+                import time as _time
+
+                _time.sleep(1.2)  # >= 2 heartbeat cycles while RUNNING
+
+            monkeypatch.setattr(bj, "execute_job", brief_execute)
+            summary = bj.run_worker(
+                session_factory=factory, once=True, worker_id="worker-A"
+            )
+            assert summary["succeeded"] == 1
+            during = attempts["n"]
+            assert during >= 2, "heartbeat must have run during execution"
+            import time as _time
+
+            _time.sleep(0.9)  # > one full heartbeat period
+            assert attempts["n"] == during, (
+                "no renewal attempt may happen after execution finished"
+            )
+            db = factory()
+            row = db.scalar(select(BackgroundJob))
+            assert row.status == "SUCCEEDED"
+            db.close()
+        finally:
+            engine.dispose()
+
+    def test_ownership_lost_mid_execution_stale_outcome(
+        self, session_factory, monkeypatch
+    ):
+        """Heartbeat stops renewing when ownership is lost; the stale worker
+        still cannot overwrite the replacement attempt."""
+        factory, engine = _shared_memory_sqlite_factory()
+        try:
+            db = factory()
+            _enqueue(db, "hb:stale")
+            db.close()
+
+            def steal_lease(db, job):
+                s = factory()
+                row = s.scalar(select(BackgroundJob))
+                row.lease_expires_at = _utcnow() - timedelta(seconds=1)
+                s.commit()
+                reclaimer = factory()
+                assert bj.claim_next(reclaimer, worker_id="worker-B") is not None
+                reclaimer.close()
+                s.close()
+
+            monkeypatch.setattr(bj, "execute_job", steal_lease)
+            summary = bj.run_worker(
+                session_factory=factory, once=True, worker_id="worker-A"
+            )
+            assert summary["stale"] == 1
+            assert summary["succeeded"] == 0
+            db = factory()
+            row = db.scalar(select(BackgroundJob))
+            assert row.status == "RUNNING"
+            assert row.lease_owner == "worker-B"  # replacement intact
+            db.close()
+        finally:
+            engine.dispose()
+
+    def test_renewal_db_failure_does_not_crash_worker(
+        self, session_factory, monkeypatch, caplog
+    ):
+        """A transient renewal DB failure is logged; the lease safeguard
+        (not the heartbeat) remains the final authority."""
+        import logging as _logging
+
+        factory, engine = _shared_memory_sqlite_factory()
+        try:
+            db = factory()
+            # 1s lease -> heartbeat period floored to 0.5s so renewals
+            # actually occur during the 1.2s execution below.
+            _enqueue(db, "hb:dbfail", payload={"policy": {"lease_seconds": 1}})
+            db.close()
+            calls = {"n": 0}
+            real_renew = bj.renew_lease
+
+            def flaky_renew(db, job_id, **kwargs):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise RuntimeError("connection reset during renewal")
+                return real_renew(db, job_id, **kwargs)
+
+            monkeypatch.setattr(bj, "renew_lease", flaky_renew)
+
+            def slow_execute(db, job):
+                import time as _time
+
+                _time.sleep(1.2)
+
+            monkeypatch.setattr(bj, "execute_job", slow_execute)
+            with caplog.at_level(_logging.WARNING):
+                summary = bj.run_worker(
+                    session_factory=factory, once=True, worker_id="worker-A"
+                )
+            assert summary["succeeded"] == 1
+            assert calls["n"] >= 2
+            warnings = [r for r in caplog.records if "heartbeat" in r.getMessage().lower()]
+            assert warnings, "renewal failure must be logged"
+            db = factory()
+            row = db.execute(select(BackgroundJob)).scalars().first()
+            assert row.status == "SUCCEEDED"
+            db.close()
+        finally:
+            engine.dispose()
+
+
+class TestCompletionRetry:
+    """CodeRabbit Minor: the SUCCESS transition survives transient DB
+    errors exactly like the failure transition (F7 parity)."""
+
+    def test_serialization_failure_during_completion_is_retried(
+        self, session_factory, monkeypatch
+    ):
+        bj.enqueue(
+            session_factory(),
+            job_type="HISTORICAL_INGESTION",
+            idempotency_key="f2:complete:1",
+        )
+        calls = {"n": 0}
+        real_complete = bj.complete_job
+
+        def flaky_complete(db, job, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                orig = Exception("restart transaction")
+                orig.sqlstate = "40001"
+                from sqlalchemy.exc import OperationalError
+
+                raise OperationalError("UPDATE background_jobs ...", {}, orig)
+            return real_complete(db, job, **kwargs)
+
+        monkeypatch.setattr(bj, "complete_job", flaky_complete)
+        # Successful (fake) execution; only the transition is under test.
+        monkeypatch.setattr(bj, "execute_job", lambda db, job: {"ok": True})
+        summary = bj.run_worker(session_factory=session_factory, once=True)
+        assert calls["n"] == 2, "completion must be retried, not fatal"
+        assert summary["succeeded"] == 1
+        db = session_factory()
+        row = db.scalar(select(BackgroundJob))
+        assert row.status == JobStatus.SUCCEEDED.value
+
+    def test_completion_uses_fresh_session_after_execution_session_closed(
+        self, session_factory, monkeypatch
+    ):
+        """The completion transition must NOT run on the execution session."""
+        bj.enqueue(
+            session_factory(),
+            job_type="HISTORICAL_INGESTION",
+            idempotency_key="f2:complete:2",
+        )
+        seen = {}
+
+        def record_session(db, job):
+            seen["execution_session"] = db
+            return {"ok": True}
+
+        monkeypatch.setattr(bj, "execute_job", record_session)
+        sessions_used_for_completion = []
+        real_complete = bj.complete_job
+
+        def spy_complete(db, job, **kwargs):
+            sessions_used_for_completion.append(db)
+            return real_complete(db, job, **kwargs)
+
+        monkeypatch.setattr(bj, "complete_job", spy_complete)
+        summary = bj.run_worker(session_factory=session_factory, once=True)
+        assert summary["succeeded"] == 1
+        assert len(sessions_used_for_completion) == 1
+        assert sessions_used_for_completion[0] is not seen["execution_session"], (
+            "completion must run on a FRESH session, not the execution session"
+        )
+
+    def test_stale_worker_cannot_complete_replacement_attempt(
+        self, session_factory, monkeypatch
+    ):
+        """After a mid-execution takeover the retried completion still
+        refuses to touch the replacement attempt (ownership preserved)."""
+        bj.enqueue(
+            session_factory(),
+            job_type="HISTORICAL_INGESTION",
+            idempotency_key="f2:complete:3",
+        )
+
+        def steal_lease(db, job):
+            s = session_factory()
+            row = s.scalar(select(BackgroundJob))
+            row.lease_expires_at = _utcnow() - timedelta(seconds=1)
+            s.commit()
+            reclaimer = session_factory()
+            assert bj.claim_next(reclaimer, worker_id="worker-B") is not None
+            reclaimer.close()
+            s.close()
+
+        monkeypatch.setattr(bj, "execute_job", steal_lease)
+        summary = bj.run_worker(
+            session_factory=session_factory, once=True, worker_id="worker-A"
+        )
+        assert summary["stale"] == 1
+        assert summary["succeeded"] == 0
+        db = session_factory()
+        row = db.scalar(select(BackgroundJob))
+        assert row.status == JobStatus.RUNNING.value
+        assert row.lease_owner == "worker-B"
+        assert row.completed_at is None
+
+
+class TestHeartbeatLeasePropagation:
+    """F3: execution/heartbeat/completion use the SAME effective lease.
+
+    The default 900s lease is far longer than any test runs, so these tests
+    use distinct leases per precedence source and observe the heartbeat's
+    renewal arguments and the claim's stored expiry.
+    """
+
+    def _claim_and_inspect(self, session_factory, monkeypatch, *, lease_arg, payload):
+        renew_args = []
+        real_renew = bj.renew_lease
+
+        def spying_renew(db, job_id, *, worker_id, lease_seconds):
+            renew_args.append(lease_seconds)
+            return real_renew(
+                db, job_id, worker_id=worker_id, lease_seconds=lease_seconds
+            )
+
+        monkeypatch.setattr(bj, "renew_lease", spying_renew)
+        bj.enqueue(
+            session_factory(),
+            job_type="HISTORICAL_INGESTION",
+            idempotency_key=f"f3:lease:{lease_arg}:{json.dumps(payload, sort_keys=True)}",
+            payload=payload,
+        )
+        started = {}
+
+        def capturing_execute(db, job):
+            started["started_at"] = job.started_at
+            started["lease_expires_at"] = job.lease_expires_at
+
+        monkeypatch.setattr(bj, "execute_job", capturing_execute)
+        bj.run_worker(session_factory=session_factory, once=True)
+        db = session_factory()
+        row = db.scalar(select(BackgroundJob))
+        claim_delta = (started["lease_expires_at"] - started["started_at"]).total_seconds()
+        return row, claim_delta, renew_args
+
+    def test_default_lease_used_end_to_end(self, session_factory, monkeypatch):
+        row, claim_delta, renew_args = self._claim_and_inspect(
+            session_factory, monkeypatch, lease_arg=None, payload={}
+        )
+        assert 899 <= claim_delta <= 901
+        assert row.status == JobStatus.SUCCEEDED.value
+
+    def test_payload_policy_lease_used_end_to_end(self, session_factory, monkeypatch):
+        row, claim_delta, _ = self._claim_and_inspect(
+            session_factory,
+            monkeypatch,
+            lease_arg=None,
+            payload={"policy": {"lease_seconds": 7777}},
+        )
+        assert 7770 <= claim_delta <= 7790
+        assert row.status == JobStatus.SUCCEEDED.value
+
+    def test_explicit_override_beats_payload_end_to_end(
+        self, session_factory, monkeypatch
+    ):
+        bj.enqueue(
+            session_factory(),
+            job_type="HISTORICAL_INGESTION",
+            idempotency_key="f3:lease:override",
+            payload={"policy": {"lease_seconds": 7777}},
+        )
+        claim = {}
+
+        def capturing_execute(db, job):
+            claim["delta"] = (
+                job.lease_expires_at - job.started_at
+            ).total_seconds()
+
+        monkeypatch.setattr(bj, "execute_job", capturing_execute)
+        bj.run_worker(
+            session_factory=session_factory,
+            once=True,
+            worker_id="w1",
+            lease_seconds=42,
+        )
+        assert 41 <= claim["delta"] <= 43  # explicit override won at claim
+        db = session_factory()
+        row = db.scalar(select(BackgroundJob))
+        assert row.status == JobStatus.SUCCEEDED.value
+
+    def test_heartbeat_renews_with_the_selected_value(
+        self, session_factory, monkeypatch
+    ):
+        """The heartbeat's renewal duration equals the claim's effective
+        lease (payload-policy case exercised through the real worker)."""
+        renew_args = []
+        real_renew = bj.renew_lease
+
+        def spying_renew(db, job_id, *, worker_id, lease_seconds):
+            renew_args.append(lease_seconds)
+            return real_renew(
+                db, job_id, worker_id=worker_id, lease_seconds=lease_seconds
+            )
+
+        monkeypatch.setattr(bj, "renew_lease", spying_renew)
+        factory, engine = _shared_memory_sqlite_factory()
+        try:
+            db = factory()
+            _enqueue(db, "f3:hb:value", payload={"policy": {"lease_seconds": 3}})
+            db.close()
+
+            def slow_execute(db, job):
+                import time as _time
+
+                _time.sleep(2.2)  # spans >= 2 heartbeat cycles (1.0s period)
+
+            monkeypatch.setattr(bj, "execute_job", slow_execute)
+            bj.run_worker(session_factory=factory, once=True)
+            assert renew_args, "heartbeat must have attempted renewal"
+            assert set(renew_args) == {3}, (
+                f"heartbeat must renew with the effective lease (3), got {renew_args}"
+            )
+        finally:
+            engine.dispose()
+
+
+class TestCliLeaseOverrideDefault:
+    """CodeRabbit outside-diff Minor: --lease-seconds defaults to None so
+    the documented lease precedence (explicit > payload > default) holds
+    for CLI workers too — a CLI process without the flag must NOT force
+    the system default over a job's payload policy."""
+
+    def test_cli_work_without_flag_passes_no_override(self, tmp_path, monkeypatch):
+        import run_jobs
+
+        db_path = tmp_path / "cli-lease.db"
+        engine = create_engine(
+            f"sqlite:///{db_path}", connect_args={"check_same_thread": False}
+        )
+        Base.metadata.create_all(bind=engine)
+
+        captured = {}
+
+        def fake_run_worker(**kwargs):
+            captured.update(kwargs)
+            return {"claimed": 0, "succeeded": 0, "failed": 0,
+                    "dead_lettered": 0, "stale": 0}
+
+        monkeypatch.setattr(run_jobs.settings, "DATABASE_URL", f"sqlite:///{db_path}",
+                            raising=False)
+        monkeypatch.setattr(bj, "run_worker", fake_run_worker)
+        monkeypatch.setattr(
+            "sys.argv", ["run_jobs.py", "work", "--once"]
+        )
+        assert run_jobs.main() == 0
+        # The CLI must NOT inject the system default as an explicit override:
+        # claim_next then applies payload policy > default per documentation.
+        assert captured["lease_seconds"] is None
+
+    def test_cli_work_with_flag_passes_override(self, tmp_path, monkeypatch):
+        import run_jobs
+
+        db_path = tmp_path / "cli-lease2.db"
+        engine = create_engine(
+            f"sqlite:///{db_path}", connect_args={"check_same_thread": False}
+        )
+        Base.metadata.create_all(bind=engine)
+
+        captured = {}
+
+        def fake_run_worker(**kwargs):
+            captured.update(kwargs)
+            return {"claimed": 0, "succeeded": 0, "failed": 0,
+                    "dead_lettered": 0, "stale": 0}
+
+        monkeypatch.setattr(run_jobs.settings, "DATABASE_URL", f"sqlite:///{db_path}",
+                            raising=False)
+        monkeypatch.setattr(bj, "run_worker", fake_run_worker)
+        monkeypatch.setattr(
+            "sys.argv", ["run_jobs.py", "work", "--once", "--lease-seconds", "42"]
+        )
+        assert run_jobs.main() == 0
+        assert captured["lease_seconds"] == 42
+
+
+class TestCrashRecoveryWithHeartbeat:
+    """A crashed process stops renewing; the expired lease is reclaimable.
+    (Recovery itself is already proven by TestRestartRecovery and the
+    real-engine restart tests — here we prove the heartbeat does not
+    interfere with it.)"""
+
+    def test_no_heartbeat_after_process_death_lease_reclaimable(
+        self, tmp_path
+    ):
+        import time as _time
+
+        from sqlalchemy.pool import StaticPool
+
+        db_path = tmp_path / "hb-crash.db"
+        url = f"sqlite:///{db_path}"
+
+        def make_factory():
+            engine = create_engine(
+                url,
+                connect_args={"check_same_thread": False},
+                poolclass=StaticPool,
+            )
+            Base.metadata.create_all(bind=engine)
+            return sessionmaker(bind=engine, autocommit=False, autoflush=False), engine
+
+        factory1, engine1 = make_factory()
+        db = factory1()
+        _enqueue(db, "crash:hb:1", payload={"policy": {"lease_seconds": 1}})
+        job = bj.claim_next(db, worker_id="worker-crashed", lease_seconds=1)
+        assert job is not None
+        db.close()
+        engine1.dispose()  # process death: heartbeat thread dies with it
+
+        # No heartbeat is running -> the 1s lease actually expires.
+        _time.sleep(1.3)
+
+        factory2, engine2 = make_factory()
+        try:
+            db2 = factory2()
+            recovered = bj.claim_next(db2, worker_id="worker-new")
+            assert recovered is not None
+            assert recovered.idempotency_key == "crash:hb:1"
+            assert recovered.attempt_count == 2
+            assert recovered.lease_owner == "worker-new"
+        finally:
+            engine2.dispose()

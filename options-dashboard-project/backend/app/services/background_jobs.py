@@ -18,6 +18,15 @@ Boundaries
   worker sets a lease owner + deadline; losers observe ``rowcount == 0``
   and move on. A crashed worker's lease simply expires, making the job
   claimable again — no cleanup process is needed.
+* **Heartbeat (lease renewal)** — while a claimed job executes, the worker
+  renews its lease every ~lease/3 (floored) through :func:`renew_lease`, an
+  atomic conditional UPDATE requiring the row to still be ``RUNNING``, still
+  leased to the same worker, and unexpired at renewal time. Each renewal runs
+  on its own session/transaction (execution work never shares it). The
+  heartbeat stops the moment execution ends — normally or via exception — and
+  a lost or failed renewal is logged, never fabricated into success. A crashed
+  process stops renewing by construction, so its lease expires and the job is
+  reclaimed: crash recovery is unchanged.
 * **Completion / failure** — :func:`complete_job` and :func:`fail_job`
   are the only transitions out of ``RUNNING``. Retryable failures are
   rescheduled with bounded exponential backoff; non-retryable failures
@@ -47,6 +56,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -68,6 +78,10 @@ DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_BACKOFF_BASE_SECONDS = 30.0
 DEFAULT_BACKOFF_CAP_SECONDS = 3600.0
 DEFAULT_LEASE_SECONDS = 900
+
+# Heartbeat period floor: a lease shorter than ~1.5s (test-scale only) still
+# gets at least this long between renewal attempts instead of busy-looping.
+_MIN_HEARTBEAT_INTERVAL_SECONDS = 0.5
 
 _TERMINAL_STATUSES = frozenset(
     {
@@ -443,6 +457,113 @@ def complete_job(db: Session, job: BackgroundJob, *, worker_id: str) -> bool:
     return (result.rowcount or 0) == 1
 
 
+def renew_lease(
+    db: Session,
+    job_id: str,
+    *,
+    worker_id: str,
+    lease_seconds: int,
+) -> bool:
+    """Extend the OWNED, still-valid lease by ``lease_seconds``. Returns True
+    on renewal, False when the caller may no longer renew.
+
+    Ownership-protected exactly like :func:`complete_job`: a single atomic
+    conditional UPDATE requires the row to still be ``RUNNING``, still
+    leased to ``worker_id``, and its CURRENT lease to be unexpired at
+    renewal time. False therefore means one of:
+
+    * the job was reclaimed by another worker after our lease expired, or
+    * our lease already expired (another worker may claim it at any
+      instant), or
+    * the row reached a terminal state.
+
+    A ``False`` return is the stale-worker signal: the caller must stop
+    renewing and rely on the ownership-protected transitions; it must
+    never overwrite a replacement attempt. The heartbeat machinery lives
+    in :func:`_heartbeat_loop`.
+    """
+    now = _utcnow()
+    result = db.execute(
+        update(BackgroundJob)
+        .where(BackgroundJob.id == job_id)
+        .where(BackgroundJob.status == JobStatus.RUNNING.value)
+        .where(BackgroundJob.lease_owner == worker_id)
+        .where(BackgroundJob.lease_expires_at.isnot(None))
+        .where(BackgroundJob.lease_expires_at > now)
+        .values(lease_expires_at=now + timedelta(seconds=lease_seconds))
+    )
+    db.commit()
+    return (result.rowcount or 0) == 1
+
+
+def heartbeat_interval(lease_seconds: int) -> float:
+    """Heartbeat period derived from the lease: ~lease/3 with a floor.
+
+    Short leases (typically test-scale) clamp to
+    ``_MIN_HEARTBEAT_INTERVAL_SECONDS`` so tests with sub-second leases run
+    quickly without busy-looping the renewal thread.
+    """
+    return max(_MIN_HEARTBEAT_INTERVAL_SECONDS, lease_seconds / 3.0)
+
+
+def _heartbeat_loop(
+    session_factory: Callable[[], Session] | sessionmaker,
+    job_id: str,
+    *,
+    worker_id: str,
+    lease_seconds: int,
+    stop: threading.Event,
+) -> None:
+    """Renew the claimed job's lease until ``stop`` is set or ownership is
+    lost.
+
+    Runs on its own thread with its own session per renewal (execution work
+    NEVER shares the heartbeat's transaction). Each cycle waits
+    :func:`heartbeat_interval` and then attempts one renewal. The loop
+    exits when ``stop`` is set (normal completion, exception, or worker
+    shutdown) or when a renewal reports ownership loss / expiry.
+
+    A database failure during a renewal is logged and NOT treated as a
+    successful renewal; ownership safeguards remain the only authority for
+    the final outcome. A heartbeat thread is always a daemon, so a worker
+    process death cannot leak it or keep it alive.
+    """
+    interval = heartbeat_interval(lease_seconds)
+    while not stop.wait(interval):
+        session = session_factory()
+        try:
+            renewed = renew_lease(
+                session, job_id, worker_id=worker_id, lease_seconds=lease_seconds
+            )
+        except Exception:
+            # Renewal failure (transient DB error, connection loss, ...) is
+            # logged and retried next cycle. It is NEVER reported as a
+            # successful renewal, and it never kills the thread: the
+            # ownership-protected transitions remain the final authority.
+            logger.warning(
+                "heartbeat renewal for job %s failed transiently; the lease "
+                "safeguard remains authoritative",
+                job_id,
+                exc_info=True,
+            )
+            continue
+        finally:
+            try:
+                session.close()
+            except Exception:  # pragma: no cover - defensive
+                logger.warning(
+                    "heartbeat session failed to close cleanly", exc_info=True
+                )
+        if not renewed:
+            logger.warning(
+                "heartbeat for job %s stopped: worker %s no longer owns a "
+                "valid lease (reclaimed, expired, or terminal)",
+                job_id,
+                worker_id,
+            )
+            return
+
+
 # Outcomes of a failure transition.
 FAIL_RETRIED = "retry"          # rescheduled with backoff by the owning worker
 FAIL_DEAD_LETTERED = "dead"     # permanently failed by the owning worker
@@ -663,6 +784,7 @@ def _execute_one(
     session_factory: Callable[[], Session] | sessionmaker,
     job_id: str,
     worker_id: str,
+    lease_seconds: int | None = None,
 ) -> str:
     """Execute one claimed job with ownership-protected transitions.
 
@@ -671,6 +793,16 @@ def _execute_one(
     ``"succeeded"``, ``"retried"``, ``"dead_lettered"``, ``"stale"``
     (ownership lost before completion) or ``"lost"`` (claimed row could
     not be safely re-loaded; its lease expires and recovery reclaims it).
+
+    ``lease_seconds`` is the effective lease claim_next applied for this
+    claim (explicit override > payload policy > default); the heartbeat
+    renews with exactly this value (F3). While the job runs, a daemon
+    heartbeat thread extends the lease every ~lease/3 on its own session,
+    so a long execution never expires its own lease. The heartbeat stops
+    when execution ends — success or exception — and a crashed process
+    stops it by construction (lease expiry stays the recovery path). If
+    ownership is lost, renewal reports False and the ownership-protected
+    transitions still refuse to touch the row.
     """
     db = session_factory()
     try:
@@ -700,6 +832,24 @@ def _execute_one(
             logger.warning("claimed job %s no longer exists", job_id)
             return "lost"
 
+        effective_lease = (
+            lease_seconds
+            if lease_seconds is not None
+            else policy_from_payload(job.payload).lease_seconds
+        )
+        stop_heartbeat = threading.Event()
+        heartbeat = threading.Thread(
+            target=_heartbeat_loop,
+            args=(session_factory, job_id),
+            kwargs={
+                "worker_id": worker_id,
+                "lease_seconds": effective_lease,
+                "stop": stop_heartbeat,
+            },
+            name=f"heartbeat-{job_id[:8]}",
+            daemon=True,
+        )
+        heartbeat.start()
         try:
             execute_job(db, job)
         except Exception as exc:
@@ -741,8 +891,35 @@ def _execute_one(
             if verdict == FAIL_STALE:
                 return "stale"
             return "retried"
+        finally:
+            # The heartbeat stops before this function returns on every
+            # path: on success it is stopped before the completion
+            # transition below (no renewal races the final update); on
+            # failure it keeps the owner's lease alive while the failure
+            # transition persists, then stops. No thread or session leaks.
+            stop_heartbeat.set()
+            heartbeat.join(timeout=10.0)
+            if heartbeat.is_alive():  # pragma: no cover - defensive
+                logger.warning(
+                    "heartbeat thread for job %s did not stop within 10s; "
+                    "it is a daemon and cannot block worker shutdown",
+                    job_id,
+                )
 
-        owned = complete_job(db, job, worker_id=worker_id)
+        # Completion retry: the SUCCESS transition gets the same durable
+        # treatment as the failure transition. The execution session is
+        # closed and the ownership-protected completion runs on a FRESH
+        # session through the repository's serialization retry — only the
+        # idempotent state transition is retried, never the ingestion work.
+        db.close()
+
+        def _complete_transition(session: Session) -> bool:
+            fresh = session.get(BackgroundJob, job_id)
+            if fresh is None:  # pragma: no cover - row vanished mid-flight
+                return False
+            return complete_job(session, fresh, worker_id=worker_id)
+
+        owned = retry_on_serialization(_complete_transition, session_factory)
         if owned:
             return "succeeded"
         # F1/F10: our lease expired mid-execution and another worker
@@ -798,6 +975,8 @@ def run_worker(
         "stale": 0,
     }
 
+    effective_lease_box: dict[str, int | None] = {}
+
     def _claim_id(db: Session) -> str | None:
         # Read the id while the claim session is still open: ORM instances
         # expire on commit and cannot be refreshed after the session closes.
@@ -807,7 +986,17 @@ def run_worker(
             job_type=job_type,
             lease_seconds=lease_seconds,
         )
-        return claimed.id if claimed is not None else None
+        if claimed is None:
+            return None
+        # F3: remember the effective lease claim_next applied (explicit
+        # override > payload policy > default) so execution, heartbeat, and
+        # completion all use the SAME value.
+        effective_lease_box["lease"] = (
+            lease_seconds
+            if lease_seconds is not None
+            else policy_from_payload(claimed.payload).lease_seconds
+        )
+        return claimed.id
 
     while stop is None or not stop.is_set():
         db = None
@@ -845,6 +1034,7 @@ def run_worker(
                 session_factory=session_factory,
                 job_id=job_id,
                 worker_id=wid,
+                lease_seconds=effective_lease_box.get("lease"),
             )
         except Exception:  # pragma: no cover - defensive belt-and-braces
             logger.exception("job %s execution failed unexpectedly", job_id)

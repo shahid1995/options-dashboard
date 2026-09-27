@@ -180,6 +180,186 @@ class _RealQueueBase:
             _cleanup(engine)
             engine.dispose()
 
+    def run_heartbeat_long_job_test(self, url: str) -> None:
+        """CodeRabbit Major on a real engine: a job whose execution outlives
+        its lease still completes because the worker's heartbeat keeps
+        renewing the lease on separate sessions/transactions."""
+        import time as _time
+
+        engine, factory = self.make_stack(url)
+        try:
+            key = f"{engine.dialect.name}:heartbeat:long"
+            db = factory()
+            bj.enqueue(
+                db,
+                job_type="HISTORICAL_INGESTION",
+                idempotency_key=key,
+                payload={"policy": {"lease_seconds": 2}},
+            )
+            db.close()
+
+            s1 = factory()
+            claimed = bj.claim_next(s1, worker_id="worker-A", lease_seconds=2)
+            job_id = claimed.id
+            s1.close()
+
+            # The worker's heartbeat: independent sessions, ownership-checked
+            # renewal every ~0.6s while "execution" runs below.
+            stop = threading.Event()
+            renewed = {"ok": 0, "rejected": 0}
+
+            def heartbeat():
+                while not stop.wait(0.6):
+                    s = factory()
+                    try:
+                        if bj.renew_lease(
+                            s, job_id, worker_id="worker-A", lease_seconds=2
+                        ):
+                            renewed["ok"] += 1
+                        else:
+                            renewed["rejected"] += 1
+                            return
+                    finally:
+                        s.close()
+
+            hb = threading.Thread(target=heartbeat, daemon=True)
+            hb.start()
+            try:
+                _time.sleep(3.5)  # well beyond the 2s lease
+            finally:
+                stop.set()
+                hb.join(timeout=5)
+
+            assert renewed["ok"] >= 2, f"heartbeat must have renewed: {renewed}"
+            assert renewed["rejected"] == 0, f"renewal must never fail here: {renewed}"
+
+            # The STILL-VALID lease lets the original owner complete.
+            s2 = factory()
+            row = s2.get(BackgroundJob, job_id)
+            assert row.status == "RUNNING"
+            completed = bj.complete_job(s2, row, worker_id="worker-A")
+            s2.close()
+            assert completed is True
+
+            s3 = factory()
+            final = s3.get(BackgroundJob, job_id)
+            final_status = final.status
+            final_owner = final.lease_owner
+            s3.close()
+            assert final_status == "SUCCEEDED"
+            assert final_owner is None
+        finally:
+            _cleanup(engine)
+            engine.dispose()
+
+    def run_owner_without_heartbeat_is_locked_out_test(self, url: str) -> None:
+        """Crash-recovery counterpart: with NO heartbeat the lease expires
+        and even the original owner can neither renew nor complete — the
+        row waits (untouched) for the next claim."""
+        import time as _time
+
+        engine, factory = self.make_stack(url)
+        try:
+            key = f"{engine.dialect.name}:heartbeat:norenew"
+            db = factory()
+            bj.enqueue(db, job_type="HISTORICAL_INGESTION", idempotency_key=key)
+            db.close()
+
+            s1 = factory()
+            claimed = bj.claim_next(s1, worker_id="worker-A", lease_seconds=2)
+            job_id = claimed.id
+            s1.close()
+
+            _time.sleep(2.3)  # lease expires; nobody renews
+
+            s2 = factory()
+            row = s2.get(BackgroundJob, job_id)
+            assert (
+                bj.renew_lease(s2, job_id, worker_id="worker-A", lease_seconds=2)
+                is False
+            )
+            assert bj.complete_job(s2, row, worker_id="worker-A") is False
+            outcome = bj.fail_job(
+                s2,
+                row,
+                bj.JobExecutionError("late failure", retryable=True),
+                worker_id="worker-A",
+            )
+            s2.close()
+            assert outcome == bj.FAIL_STALE
+
+            s3 = factory()
+            final = s3.get(BackgroundJob, job_id)
+            final_status = final.status
+            final_owner = final.lease_owner
+            final_attempts = final.attempt_count
+            s3.close()
+            assert final_status == "RUNNING"
+            assert final_owner == "worker-A"
+            assert final_attempts == 1
+        finally:
+            _cleanup(engine)
+            engine.dispose()
+
+    def run_stale_heartbeat_owner_cannot_touch_replacement_test(self, url: str) -> None:
+        """After a takeover, the stale worker's renew/complete/fail are all
+        rejected and the replacement attempt stays intact."""
+        import time as _time
+
+        engine, factory = self.make_stack(url)
+        try:
+            key = f"{engine.dialect.name}:heartbeat:switch"
+            db = factory()
+            bj.enqueue(db, job_type="HISTORICAL_INGESTION", idempotency_key=key)
+            db.close()
+
+            s1 = factory()
+            claimed = bj.claim_next(s1, worker_id="worker-A", lease_seconds=2)
+            job_id = claimed.id
+            s1.close()
+
+            _time.sleep(2.3)  # A's lease expires (crashed-worker scenario)
+
+            # Worker B reclaims the expired attempt.
+            s2 = factory()
+            b_job = bj.claim_next(s2, worker_id="worker-B", lease_seconds=60)
+            assert b_job.id == job_id
+            b_attempts = b_job.attempt_count
+            s2.close()
+            assert b_attempts == 2
+
+            # Stale A comes back: renewal, completion, failure ALL rejected.
+            s3 = factory()
+            stale_row = s3.get(BackgroundJob, job_id)
+            assert (
+                bj.renew_lease(s3, job_id, worker_id="worker-A", lease_seconds=2)
+                is False
+            )
+            assert bj.complete_job(s3, stale_row, worker_id="worker-A") is False
+            outcome = bj.fail_job(
+                s3,
+                stale_row,
+                bj.JobExecutionError("stale failure", retryable=True),
+                worker_id="worker-A",
+            )
+            s3.close()
+            assert outcome == bj.FAIL_STALE
+
+            s4 = factory()
+            final = s4.get(BackgroundJob, job_id)
+            final_status = final.status
+            final_owner = final.lease_owner
+            final_attempts = final.attempt_count
+            final_last_error = final.last_error
+            s4.close()
+            assert final_status == "RUNNING"
+            assert final_owner == "worker-B"
+            assert final_attempts == 2
+            assert final_last_error is None  # stale worker wrote nothing
+        finally:
+            _cleanup(engine)
+            engine.dispose()
+
     def run_restart_recovery_test(self, url: str) -> None:
         key = f"{engine_key(url)}:crash:1"
 
@@ -387,6 +567,15 @@ class TestPostgresDurableQueue(_RealQueueBase):
     def test_worker_crash_is_recovered_after_restart(self, pg_queue_url):
         self.run_restart_recovery_test(pg_queue_url)
 
+    def test_heartbeat_keeps_long_job_claimable_only_by_owner(self, pg_queue_url):
+        self.run_heartbeat_long_job_test(pg_queue_url)
+
+    def test_owner_without_heartbeat_is_locked_out_after_expiry(self, pg_queue_url):
+        self.run_owner_without_heartbeat_is_locked_out_test(pg_queue_url)
+
+    def test_stale_heartbeat_owner_cannot_touch_replacement(self, pg_queue_url):
+        self.run_stale_heartbeat_owner_cannot_touch_replacement_test(pg_queue_url)
+
     def test_real_orchestrator_boundary_fails_closed_without_credentials(
         self, pg_queue_url
     ):
@@ -445,6 +634,119 @@ class TestCockroachDBDurableQueue(_RealQueueBase):
 
     def test_worker_crash_is_recovered_after_restart(self, crdb_queue_url):
         self.run_restart_recovery_test(crdb_queue_url)
+
+    def test_heartbeat_keeps_long_job_claimable_only_by_owner(
+        self, crdb_queue_url
+    ):
+        self.run_heartbeat_long_job_test(crdb_queue_url)
+
+    def test_owner_without_heartbeat_is_locked_out_after_expiry(
+        self, crdb_queue_url
+    ):
+        self.run_owner_without_heartbeat_is_locked_out_test(crdb_queue_url)
+
+    def test_stale_heartbeat_owner_cannot_touch_replacement(
+        self, crdb_queue_url
+    ):
+        self.run_stale_heartbeat_owner_cannot_touch_replacement_test(
+            crdb_queue_url
+        )
+
+
+# ---------------------------------------------------------------------------
+# CodeRabbit Minor on a real engine: SUCCESS-transition serialization retry.
+# ---------------------------------------------------------------------------
+
+
+class TestCompletionSerializationRetryReal(_RealQueueBase):
+    def _run_completion_retry(self, url: str) -> None:
+        import time as _time
+
+        from sqlalchemy.exc import OperationalError
+
+        from app.utils.retry import retry_on_serialization
+
+        engine, factory = self.make_stack(url)
+        try:
+            key = f"{engine.dialect.name}:complete:retry"
+            db = factory()
+            bj.enqueue(
+                db,
+                job_type="HISTORICAL_INGESTION",
+                idempotency_key=key,
+                payload={"policy": {"lease_seconds": 2}},
+            )
+            db.close()
+
+            s1 = factory()
+            claimed = bj.claim_next(s1, worker_id="worker-A", lease_seconds=2)
+            job_id = claimed.id
+            s1.close()
+
+            # "Execution" outlives the 2s lease; a heartbeat on separate
+            # sessions (exactly what the worker does) keeps the lease valid.
+            stop = threading.Event()
+            renewed = {"ok": 0}
+
+            def heartbeat():
+                while not stop.wait(0.5):
+                    s = factory()
+                    try:
+                        if bj.renew_lease(
+                            s, job_id, worker_id="worker-A", lease_seconds=2
+                        ):
+                            renewed["ok"] += 1
+                        else:
+                            return
+                    finally:
+                        s.close()
+
+            hb = threading.Thread(target=heartbeat, daemon=True)
+            hb.start()
+            try:
+                _time.sleep(3.0)
+            finally:
+                stop.set()
+                hb.join(timeout=5)
+            assert renewed["ok"] >= 2, renewed
+
+            # A 40001 hits the FIRST completion attempt; the repository's
+            # serialization retry re-runs the idempotent state transition on
+            # a fresh session and it lands. Only the transition retries —
+            # never the (already finished) execution work.
+            calls = {"n": 0}
+            real_complete = bj.complete_job
+
+            def flaky_complete(session, job, **kwargs):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    orig = Exception("restart transaction")
+                    orig.sqlstate = "40001"
+                    raise OperationalError(
+                        "UPDATE background_jobs ...", {}, orig
+                    )
+                return real_complete(session, job, **kwargs)
+
+            def _complete_transition(session):
+                fresh = session.get(BackgroundJob, job_id)
+                assert fresh is not None
+                return flaky_complete(session, fresh, worker_id="worker-A")
+
+            owned = retry_on_serialization(_complete_transition, factory)
+            assert owned is True
+            assert calls["n"] == 2
+
+            s3 = factory()
+            final = s3.get(BackgroundJob, job_id)
+            final_status = final.status
+            s3.close()
+            assert final_status == "SUCCEEDED"
+        finally:
+            _cleanup(engine)
+            engine.dispose()
+
+    def test_completion_serialization_retry_cockroachdb(self, crdb_queue_url):
+        self._run_completion_retry(crdb_queue_url)
 
 
 # ---------------------------------------------------------------------------
