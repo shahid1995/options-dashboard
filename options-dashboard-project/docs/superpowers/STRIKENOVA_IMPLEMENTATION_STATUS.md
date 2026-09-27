@@ -1,7 +1,7 @@
 # StrikeNova Implementation Status Tracker
 
 > **Master Plan SHA:** `0a244c0` (docs: add StrikeNova master day-wise implementation plan)
-> **Last Updated:** 2026-09-27 (PR #111 merged; CockroachDB ADR-017 rehearsal verified)
+> **Last Updated:** 2026-09-27 (PR #111 post-merge CI verified green; PR #112 fixture cleanup opened)
 
 ---
 
@@ -19,10 +19,32 @@
 | Alembic compatibility defect | Fresh CRDB exposed the legacy UNIQUE-constraint drop incompatibility; minimal dialect-specific backing-index drop added while PostgreSQL path remained unchanged | `e5f6a7b8c9d0_uq_users_broker_identity_active.py`; PR #111 |
 | Alembic chain / idempotence | Full chain applied through production serialized runner; second run was a no-op with unchanged head and released lease | CRDB-specific idempotence test; CI evidence |
 | CockroachDB rehearsal CI | **10 passed / 5 warnings** in 123.47s; PostgreSQL rehearsal job also passed in the same workflow | CI run #36269651308 |
-| Post-merge status | Merge completed; post-merge CI has not yet produced a completed status at tracker-update time | Merge commit `d0f2beb`; follow-up CI remains authoritative |
+| Post-merge status | Post-merge CI **completed green** on the merge commit and the tracker-sync commit; details recorded in the 2026-09-27 PR #112 section below | Merge commit `d0f2beb`: runs #504/#404/#29; tracker-sync commit `5447ff3`: run #505 |
 | Residual | Rehearsal proves lock/migration behavior on real CRDB but does not certify production deployment readiness, TLS/auth behavior, or full FastAPI boot against CRDB | PR #111 evidence report |
 
 **Governance state:** PR #111 is **MERGED**. No Render deployment, Vercel production deployment, production CockroachDB modification, credential rotation, or live trading occurred as part of this work. The ADR-017 evidence gap between PostgreSQL-only rehearsal and real CockroachDB rehearsal is now closed by executable CI evidence.
+
+---
+
+## 2026-09-27 — PR #112: PR #111 post-merge verification loop + CRDB rehearsal fixture cleanup
+
+**Status:** **OPEN** (not merged). Branch `postmerge/pr111-cleanup` (implementation commit `10af256`) based on `5447ff3`. This is documentation- and test-hygiene-only work: no production deployment, no merge performed, no behavior change to the lock or migrations.
+
+| Item | Resolution | Evidence |
+|------|------------|----------|
+| Post-merge CI on merge commit `d0f2beb` | All three push-triggered workflows completed **success**: StrikeNova Status Gate run #504 (`36296544032`), PostgreSQL compatibility run #404 (`36296544030`), Database migration rehearsal run #29 (`36296544036`) — the Actions listing still shows the workflow under its pre-rename label "PostgreSQL migration rehearsal" (run-level metadata cache), but both jobs prove the renamed file executed | `gh run list --commit d0f2beb…`; check-runs API on `d0f2beb` |
+| Post-merge CRDB rehearsal job | **CockroachDB migration rehearsal (ADR-017 lock on real CRDB)** job `108556340010` concluded success: `10 passed, 5 warnings in 124.53s` on real CockroachDB in CI | Job log of run `36296544036` |
+| Post-merge PG rehearsal job | **PostgreSQL migration rehearsal (resolver + ADR-017 lock)** job `108556340147` concluded success: `6 passed, 3 warnings in 36.05s` | Job log of run `36296544036` |
+| Post-merge CI on tracker-sync commit `5447ff3` | StrikeNova Status Gate run #505 (`36296619265`) success; Vercel status success. PostgreSQL-compatibility and rehearsal workflows correctly did not trigger (path filters exclude a docs-only change) | `gh run list --commit 5447ff3…` |
+| OpenCodeReview / Codacy on merged commits | Absent by design, not pending: OpenCodeReview triggers on `pull_request_target` only and Codacy is an external app without a push trigger; PR #111's own PR-run Codacy failure was previously classified as pre-existing infrastructure | Workflow `on:` blocks; PR #111 evidence |
+| CRDB fixture deprecation cleanup | 4× `PytestRemovedIn10Warning: Class-scoped fixture defined as instance method` in the CRDB rehearsal run eliminated by converting `migration_url`, `crdb_url`, `verify_engine` to the pytest-supported `@classmethod` form in the CRDB file; the inherited base-class `verify_engine` is shadowed with an identical classmethod copy because its definition lives in the PostgreSQL rehearsal file (deliberately untouched) | `tests/test_migration_rehearsal_cockroachdb.py`; PR #112 diff |
+| Fixture-fix verification | CRDB rehearsal locally on CockroachDB v25.2.23: **10 passed, 1 warning in 199.76s** run under `-W error::pytest.PytestRemovedIn10Warning` (any recurrence would fail the run); warning delta 5 → 1. Migration-lock module suite: **62 passed, 1 warning** (`tests/test_migration_serialization.py`) | Local WSL verification 2026-09-27 |
+| Migration-lock documentation audit | The reported "TTL / 3, minimum 5 seconds" renewal wording does **not exist** in the current tree or in `_migration_lock.py`'s history; all live references already state the implementation `max(1.0, ttl / 3)` (module docstring, `LeaseRenewer._run` comment, `DECISIONS.md` ADR-017, `INVARIANTS.md`, `DATA.md`, `config.py`). No documentation edit was required; the mismatch appears to have been corrected before PR #111 | Repo-wide grep; `git log -S "minimum 5"` |
+| Remaining warnings (classified, not masked) | (1) Pydantic `PydanticDeprecatedSince20` at `app/config.py:5` — pre-existing baseline, out of scope; (2) PostgreSQL rehearsal file still emits 2× fixture deprecation in its own run (`6 passed, 3 warnings`) — separate cleanup candidate, outside this task's file scope; (3) known pre-existing stale assertion `test_day41_1_migration_reality.py::test_alembic_head_is_day41_single_row` (head `d46aa0000001` vs asserted `e2b4c6d8f0a1`) — untouched, pre-dates PR #111 | Focused local runs |
+| PR #112 own CI (evidence at heads `062e091`/`07726c9`) | All repo-owned GitHub Actions checks **pass**: Status Gate ×2, PostgreSQL compatibility, CRDB rehearsal job **`10 passed, 1 warning`** (was `10 passed, 5 warnings in 124.53s` before the fixture fix), PG rehearsal job `6 passed, 3 warnings`, OpenCodeReview pass; Vercel preview deployed. Two non-repo-owned checks fail for provider-side reasons, neither related to this PR's test/docs changes: Codacy fails at 0s (same pre-existing infrastructure failure class as PR #111's PR run), and the GitHub-managed `github-advanced-security` code-scanning-AI check fails with Copilot `CAPIError: 400 The requested model is not supported` before any scan executes — no code-scanning analysis or alerts exist for the repository, the same failure class occurred on PRs #109/#110, and the GHAS run on the code commit `10af256` succeeded | PR #112 checks, runs `36298502088`/`36298760687`; GHAS runs `36298502654`/`36298761228`; code-scanning alerts API |
+| Residual | PR #112 remains open and unmerged by design. No broader milestone is declared by this entry | PR #112 |
+
+**Governance state:** PR #112 is **OPEN** (not merged). No production deployment, no PR merge, no changes to PRs #93/#96/#99/#100/#101, no unrelated files touched.
 
 ---
 

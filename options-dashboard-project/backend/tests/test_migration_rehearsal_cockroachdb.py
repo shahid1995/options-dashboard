@@ -84,9 +84,23 @@ class TestCockroachDBMigrationRehearsal(_PostgresRehearsalBase):
     REHEARSAL_TTL = 15
     WAITER_BUDGET = 7
 
+    # Class-scoped fixtures are @classmethod-decorated (pytest >= 9 deprecates
+    # class-scoped fixtures defined as instance methods). The verify_engine
+    # copy below shadows the inherited base-class fixture so this class does
+    # not emit the deprecation through the PostgreSQL file's definition.
     @pytest.fixture(scope="class")
-    def migration_url(self):
+    @classmethod
+    def migration_url(cls):
         return _cockroach_test_url()
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def verify_engine(cls, migration_url):
+        engine = create_engine(migration_url, pool_pre_ping=True)
+        try:
+            yield engine
+        finally:
+            engine.dispose()
 
 
 class TestCockroachDBSpecificEvidence:
@@ -99,11 +113,13 @@ class TestCockroachDBSpecificEvidence:
     """
 
     @pytest.fixture(scope="class")
-    def crdb_url(self):
+    @classmethod
+    def crdb_url(cls):
         return _cockroach_test_url()
 
     @pytest.fixture(scope="class")
-    def verify_engine(self, crdb_url):
+    @classmethod
+    def verify_engine(cls, crdb_url):
         engine = create_engine(crdb_url, pool_pre_ping=True)
         try:
             yield engine
