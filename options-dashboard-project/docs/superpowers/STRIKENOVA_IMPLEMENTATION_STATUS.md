@@ -1,6 +1,33 @@
 # StrikeNova Implementation Status Tracker
 
 > **Master Plan SHA:** `0a244c0` (docs: add StrikeNova master day-wise implementation plan)
+> **Last Updated:** 2026-09-27 (PR #111 merged; CockroachDB ADR-017 rehearsal verified)
+
+---
+
+## 2026-09-27 — PR #111: ADR-017 CockroachDB migration-lock rehearsal
+
+**Status:** **MERGED** into `feat/strikenova-day35-portfolio-intelligence` as `d0f2beb8636f4957d6f61b858fc1eb6ff66f6081`. The PR head was `060b871e7503f444888798a962aa38a09e0d0872`; no production deployment was performed.
+
+| Item | Resolution | Evidence |
+|------|------------|----------|
+| CockroachDB target | Real disposable CockroachDB `v25.2.23`, single-node, insecure scratch database; no production CockroachDB contact | PR #111; CI run #36269651308, job #108481037739 |
+| Lock lifecycle | Real production `app._migration_lock` exercised: acquire, persisted ownership/timestamps, renewal, live-holder contention, bounded fail-closed waiter, release and re-acquisition | `tests/test_migration_rehearsal_cockroachdb.py`; CI evidence |
+| Crash recovery | Independent holder process was SIGKILLed while renewing; takeover remained blocked until lease expiry, then waiter acquired with `took_over=True`; third connection verified persisted ownership; final lock free | Inherited SIGKILL rehearsal matrix; CI evidence |
+| CockroachDB serialization | Real SQLSTATE `40001` conflicts observed under contention; production acquire path survived contention without double-held lease | CRDB-specific evidence test; CI evidence |
+| Migration identity isolation | Migration resolver and `_migration_lock` use the migration identity; separate runtime database did not receive `_migration_lock` | CRDB-specific identity-coupling test; CI evidence |
+| Alembic compatibility defect | Fresh CRDB exposed the legacy UNIQUE-constraint drop incompatibility; minimal dialect-specific backing-index drop added while PostgreSQL path remained unchanged | `e5f6a7b8c9d0_uq_users_broker_identity_active.py`; PR #111 |
+| Alembic chain / idempotence | Full chain applied through production serialized runner; second run was a no-op with unchanged head and released lease | CRDB-specific idempotence test; CI evidence |
+| CockroachDB rehearsal CI | **10 passed / 5 warnings** in 123.47s; PostgreSQL rehearsal job also passed in the same workflow | CI run #36269651308 |
+| Post-merge status | Merge completed; post-merge CI has not yet produced a completed status at tracker-update time | Merge commit `d0f2beb`; follow-up CI remains authoritative |
+| Residual | Rehearsal proves lock/migration behavior on real CRDB but does not certify production deployment readiness, TLS/auth behavior, or full FastAPI boot against CRDB | PR #111 evidence report |
+
+**Governance state:** PR #111 is **MERGED**. No Render deployment, Vercel production deployment, production CockroachDB modification, credential rotation, or live trading occurred as part of this work. The ADR-017 evidence gap between PostgreSQL-only rehearsal and real CockroachDB rehearsal is now closed by executable CI evidence.
+
+---
+
+
+> **Master Plan SHA:** `0a244c0` (docs: add StrikeNova master day-wise implementation plan)
 > **Last Updated:** 2026-09-26 (PR #108 merged; PR #109 SIGKILL lease-takeover rehearsal)
 
 ---
