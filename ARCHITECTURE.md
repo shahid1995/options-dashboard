@@ -65,12 +65,28 @@ broker (Redis/Celery/RabbitMQ/Kafka) is introduced.
   ownership-protected (`complete_job`/`fail_job` verify RUNNING + owner +
   unexpired lease atomically, so a stale worker can never overwrite a
   replacement attempt).
+- **Lease heartbeat:** while a claimed job executes, a daemon heartbeat
+  thread renews the lease every ~lease/3 (floored) via `renew_lease` —
+  an atomic conditional UPDATE requiring RUNNING + owner + unexpired
+  lease, on its own session (execution work never shares it). The
+  effective lease is resolved ONCE by `claim_next` (explicit override >
+  payload `policy.lease_seconds` > default) and threaded through
+  execution, heartbeat, and completion unchanged. Renewal stops when
+  execution ends (either path) or when ownership is lost; a renewal DB
+  failure is logged, never fabricated into success. A crashed process
+  stops renewing by construction, so lease expiry remains the crash-
+  recovery path and no second ownership race is introduced.
 - **Retry/dead-letter semantics:** bounded attempts with exponential
   backoff (payload-overridable policy: `max_attempts`,
   `backoff_base_seconds`, `lease_seconds`); transient failures
   (SQLSTATE 40001/40P01/55P03, connection markers) are retried;
   authentication failures and malformed payloads are non-retryable;
   exhausted jobs become inspectable `DEAD_LETTERED` rows, never deleted.
+  BOTH transitions out of RUNNING persist through
+  `retry_on_serialization` on a fresh session — success re-fetches the
+  row and re-runs the ownership-protected completion (only the state
+  transition is retried, never the ingestion work); failures re-run the
+  ownership-protected `fail_job`.
 - **Entry points:** `run_jobs.py` (`enqueue-backfill`, `work`, `status`)
   is the administrative CLI; it performs NO schema mutation (Alembic is
   the sole authority — ADR-002). Historical ingestion executes through
