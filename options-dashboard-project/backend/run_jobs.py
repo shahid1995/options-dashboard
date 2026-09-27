@@ -48,7 +48,7 @@ from sqlalchemy import create_engine, func, select  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 
 from app.config import settings  # noqa: E402
-from app.db import Base, _DEFAULT_DB_PATH  # noqa: E402
+from app.db import _DEFAULT_DB_PATH  # noqa: E402
 from app.models import BackgroundJob, JobStatus  # noqa: E402
 from app.services import background_jobs  # noqa: E402
 
@@ -60,10 +60,18 @@ LIVE_STATUSES = (
 
 
 def _get_session_factory():
+    """Build a session factory for the configured database.
+
+    Alembic is the sole schema authority (ADR-002): this CLI NEVER creates
+    or mutates schema — no ``create_all``, no implicit migration run. It
+    assumes the target database has already been migrated (e.g. via the
+    application's serialized startup path or ``alembic upgrade head``).
+    Against an uninitialized database the CLI fails with a normal
+    database/schema error, which is the intended fail-closed behavior.
+    """
     url = settings.DATABASE_URL or f"sqlite:///{_DEFAULT_DB_PATH}"
     connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
     engine = create_engine(url, connect_args=connect_args)
-    Base.metadata.create_all(bind=engine)
     return sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
 

@@ -592,8 +592,10 @@ def run_worker(
             try:
                 if db is not None:
                     db.close()
-            except Exception:  # pragma: no cover
-                pass
+            except Exception:  # pragma: no cover - defensive
+                logger.warning(
+                    "worker claim session failed to close cleanly", exc_info=True
+                )
 
         if job_id is None:
             if once:
@@ -621,11 +623,18 @@ def run_worker(
         except Exception as exc:
             # A failed executor can leave the session mid-transaction or in
             # a rolled-back-required state; clear it so fail_job's own
-            # transition commits cleanly on a fresh transaction.
+            # transition commits cleanly on a fresh transaction. Rollback
+            # failure is itself a database-stability signal: keep the loop
+            # alive but never swallow it silently.
             try:
                 db.rollback()
-            except Exception:  # pragma: no cover - defensive
-                pass
+            except Exception as rollback_exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "rollback before failure handling failed for job %s; "
+                    "continuing with failure transition",
+                    job.id,
+                    exc_info=rollback_exc,
+                )
             job = fail_job(db, job, exc)
             if job.status == JobStatus.DEAD_LETTERED.value:
                 summary["dead_lettered"] += 1

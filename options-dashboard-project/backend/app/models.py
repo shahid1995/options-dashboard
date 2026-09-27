@@ -1143,6 +1143,20 @@ class GapBacktestResult(Base):
 # ---------------------------------------------------------------------------
 
 
+def _utcnow_naive() -> datetime:
+    """Naive UTC timestamp for Day 47 job scheduling fields.
+
+    Deliberately scoped to the Day 47 job model: the ``background_jobs``
+    service (``app/services/background_jobs.py``) stores and compares naive
+    UTC for cross-database comparability (SQLite string ordering,
+    PostgreSQL/CockroachDB TIMESTAMP WITHOUT TIME ZONE) and binds its own
+    clock as query parameters. The rest of this module keeps the historical
+    aware-``_utcnow`` convention; the two are never mixed inside the job
+    row's scheduling fields.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 class JobStatus(str, enum.Enum):
     """Lifecycle states of a durable background job."""
 
@@ -1208,7 +1222,9 @@ class BackgroundJob(Base):
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
 
     # --- Scheduling / lease -------------------------------------------------
-    available_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    # Naive-UTC defaults (see _utcnow_naive): consistent with the service's
+    # claim/retry comparisons, which bind naive UTC as query parameters.
+    available_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow_naive)
     lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -1219,8 +1235,10 @@ class BackgroundJob(Base):
     dead_letter_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # --- Bookkeeping ------------------------------------------------------------
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow_naive)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow_naive, onupdate=_utcnow_naive
+    )
 
     __table_args__ = (
         # Idempotency invariant: at most ONE row per idempotency key, ever.
