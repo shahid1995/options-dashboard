@@ -630,10 +630,13 @@ class TestCliSchemaAuthority:
         factory = run_jobs._get_session_factory()
         db = factory()
         from sqlalchemy import select
+        from sqlalchemy.exc import OperationalError
 
-        with pytest.raises(Exception) as excinfo:
+        # Assert the SPECIFIC missing-table failure mode: a normal database
+        # error, NOT automatic schema creation and NOT an unrelated exception
+        # whose message merely contains the table name.
+        with pytest.raises(OperationalError) as excinfo:
             db.execute(select(BackgroundJob)).scalars().first()
-        # no-such-table style failure — NOT automatic schema creation
         assert "background_jobs" in str(excinfo.value)
         db.close()
 
