@@ -48,7 +48,7 @@ from sqlalchemy import create_engine, func, select  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 
 from app.config import settings  # noqa: E402
-from app.db import _DEFAULT_DB_PATH  # noqa: E402
+from app.db import _DEFAULT_DB_PATH, normalize_database_url  # noqa: E402
 from app.models import BackgroundJob, JobStatus  # noqa: E402
 from app.services import background_jobs  # noqa: E402
 
@@ -57,6 +57,28 @@ LIVE_STATUSES = (
     JobStatus.RUNNING.value,
     JobStatus.FAILED_RETRYABLE.value,
 )
+
+
+def _build_stage_list(
+    *, all_flag: bool, contracts: bool, index: bool, options: bool
+) -> list[str]:
+    """Resolve enqueue-backfill stage flags (F4, deterministic).
+
+    Individual stage flags COMBINE (``--index --options`` runs both).
+    ``--all`` is the superset: when present it replaces any individual
+    flags rather than intersecting or erroring. Empty selection means the
+    caller must reject the invocation.
+    """
+    stages = []
+    if contracts:
+        stages.append("contracts")
+    if index:
+        stages.append("nifty")
+    if options:
+        stages.append("options")
+    if all_flag:
+        stages = ["contracts", "nifty", "options"]
+    return stages
 
 
 def _get_session_factory():
@@ -70,6 +92,11 @@ def _get_session_factory():
     database/schema error, which is the intended fail-closed behavior.
     """
     url = settings.DATABASE_URL or f"sqlite:///{_DEFAULT_DB_PATH}"
+    # F3: use the application's canonical URL normalization — no duplicated
+    # parsing. ``postgres://`` and ``postgresql://`` map to the psycopg 3
+    # dialect exactly like every other application entry point; SQLite and
+    # explicit-driver URLs pass through unchanged.
+    url = normalize_database_url(url)
     connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
     engine = create_engine(url, connect_args=connect_args)
     return sessionmaker(bind=engine, autocommit=False, autoflush=False)
@@ -78,9 +105,12 @@ def _get_session_factory():
 def _print_status(SessionLocal, show_failed: bool) -> None:
     db = SessionLocal()
     try:
+        # F2: aggregate WITH an explicit GROUP BY — PostgreSQL and
+        # CockroachDB reject a bare aggregate/select mix.
         counts = dict(
             db.execute(
                 select(BackgroundJob.status, func.count(BackgroundJob.id))
+                .group_by(BackgroundJob.status)
             ).all()
         )
         total = sum(counts.values())
@@ -133,18 +163,14 @@ def _cmd_enqueue_backfill(args) -> int:
     SessionLocal = _get_session_factory()
     db = SessionLocal()
     try:
-        if args.all:
-            stages = ["contracts", "nifty", "options"]
-        else:
-            stages = []
-            if args.contracts:
-                stages.append("contracts")
-            if args.index:
-                stages.append("nifty")
-            if args.options:
-                stages.append("options")
+        stages = _build_stage_list(
+            all_flag=args.all,
+            contracts=args.contracts,
+            index=args.index,
+            options=args.options,
+        )
         if not stages:
-            print("ERROR: specify --all, --contracts, --index, or --options")
+            print("ERROR: specify --all and/or --contracts, --index, --options")
             return 1
 
         payload = {"stages": stages, "concurrency": args.concurrency}
@@ -206,11 +232,11 @@ def main() -> int:
     p_enqueue = sub.add_parser(
         "enqueue-backfill", help="Enqueue a historical-ingestion job (idempotent)"
     )
-    mode = p_enqueue.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--all", action="store_true", help="All backfill stages")
-    mode.add_argument("--contracts", action="store_true", help="Contract metadata stage")
-    mode.add_argument("--index", action="store_true", help="NIFTY index candles stage")
-    mode.add_argument("--options", action="store_true", help="Option candles stage")
+    # F4: stages combine; at least one must be selected.
+    p_enqueue.add_argument("--all", action="store_true", help="All backfill stages")
+    p_enqueue.add_argument("--contracts", action="store_true", help="Contract metadata stage")
+    p_enqueue.add_argument("--index", action="store_true", help="NIFTY index candles stage")
+    p_enqueue.add_argument("--options", action="store_true", help="Option candles stage")
     p_enqueue.add_argument("--start-date", type=str, help="NIFTY backfill start (YYYY-MM-DD)")
     p_enqueue.add_argument("--force", action="store_true", help="Force re-download")
     p_enqueue.add_argument("--concurrency", type=int, default=1, help="API concurrency")
