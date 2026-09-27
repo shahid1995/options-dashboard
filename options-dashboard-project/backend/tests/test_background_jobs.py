@@ -584,3 +584,160 @@ class TestHistoricalIngestionExecution:
         with pytest.raises(bj.JobExecutionError) as excinfo:
             bj.execute_job(db, job)
         assert excinfo.value.retryable is False
+
+
+# ---------------------------------------------------------------------------
+# 9. Reviewer remediation evidence
+# ---------------------------------------------------------------------------
+
+
+class TestCliSchemaAuthority:
+    """F1: the operational CLI must never create or mutate schema.
+
+    Alembic is the sole schema authority (ADR-002). The CLI session factory
+    connects and assumes the migrated schema; on an uninitialized database
+    it must fail with a normal database error, not silently create tables.
+    """
+
+    def test_session_factory_never_calls_create_all(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            Base.metadata,
+            "create_all",
+            lambda **kwargs: calls.append(kwargs),
+        )
+        import run_jobs
+
+        factory = run_jobs._get_session_factory()
+        assert calls == [], "CLI must not issue DDL through create_all"
+        # The factory is a working sessionmaker bound to a real engine.
+        assert factory.kw["bind"] is not None
+
+    def test_uninitialized_sqlite_database_fails_closed(self, tmp_path, monkeypatch):
+        import run_jobs
+
+        db_file = tmp_path / "unmigrated.db"
+        monkeypatch.setattr(
+            run_jobs.settings, "DATABASE_URL", f"sqlite:///{db_file}", raising=False
+        )
+        factory = run_jobs._get_session_factory()
+        db = factory()
+        from sqlalchemy import select
+
+        with pytest.raises(Exception) as excinfo:
+            db.execute(select(BackgroundJob)).scalars().first()
+        # no-such-table style failure — NOT automatic schema creation
+        assert "background_jobs" in str(excinfo.value)
+        db.close()
+
+
+class TestJobDatetimeSemantics:
+    """F2: one explicit datetime representation for Day 47 scheduling.
+
+    Model defaults and service-generated timestamps must be compatible
+    WITHOUT implicit timezone stripping at comparison sites.
+    """
+
+    def test_model_defaults_are_naive_utc(self, session_factory):
+        db = session_factory()
+        job = BackgroundJob(
+            id="dt-1", job_type="HISTORICAL_INGESTION", idempotency_key="dt:1"
+        )
+        db.add(job)
+        db.flush()  # Python-side defaults applied
+        assert job.available_at.tzinfo is None
+        assert job.created_at.tzinfo is None
+        assert job.updated_at.tzinfo is None
+
+    def test_service_transitions_are_naive_and_mutually_comparable(
+        self, session_factory
+    ):
+        db = session_factory()
+        bj.enqueue(db, job_type="HISTORICAL_INGESTION", idempotency_key="dt:2")
+        job = bj.claim_next(db, worker_id="w1")
+        # started_at / lease_expires_at come from the service's naive clock
+        assert job.started_at.tzinfo is None
+        assert job.lease_expires_at.tzinfo is None
+        # direct comparison with the service clock: no TypeError possible
+        assert job.lease_expires_at > bj._utcnow()
+        bj.complete_job(db, job)
+        assert job.completed_at.tzinfo is None
+        db.expire_all()
+        row = db.scalar(select(BackgroundJob))
+        # model default (created_at) and service value (started_at) compare
+        assert row.created_at <= row.started_at
+
+    def test_retry_scheduling_stays_in_the_same_representation(
+        self, session_factory
+    ):
+        db = session_factory()
+        bj.enqueue(db, job_type="HISTORICAL_INGESTION", idempotency_key="dt:3")
+        job = bj.claim_next(db, worker_id="w1")
+        out = bj.fail_job(db, job, bj.JobExecutionError("transient", retryable=True))
+        assert out.available_at.tzinfo is None
+        assert out.available_at > bj._utcnow()  # pure naive-vs-naive comparison
+
+
+class TestScratchIdentifierValidation:
+    """F5: database identifiers are validated before DDL interpolation."""
+
+    def test_rejects_unsafe_identifiers(self):
+        from tests.test_background_jobs_integration import _validate_identifier
+
+        for unsafe in (
+            "bad; DROP TABLE users",  # statement injection
+            "db-name",  # dash not allowed
+            "db.name",  # dot not allowed
+            "db name",  # whitespace
+            "1leadingdigit",  # must not start with a digit
+            "a" * 64,  # exceeds 63-byte PG/CRDB identifier limit
+            'quote"x',  # double quote (identifier escape char)
+        ):
+            with pytest.raises(ValueError):
+                _validate_identifier(unsafe)
+
+    def test_accepts_safe_identifiers(self):
+        from tests.test_background_jobs_integration import _validate_identifier
+
+        for safe in ("jobs_queue_test", "strikenova_jobs_mig", "_leading", "A9_"):
+            assert _validate_identifier(safe) == safe
+
+
+class TestWorkerRollbackFailureLogging:
+    """F3: rollback failure is logged, never swallowed silently."""
+
+    def test_rollback_failure_logs_warning_and_loop_survives(
+        self, session_factory, monkeypatch, caplog
+    ):
+        import logging
+
+        from sqlalchemy.exc import SQLAlchemyError
+        from sqlalchemy.orm import Session
+
+        bj.enqueue(session_factory(), job_type="HISTORICAL_INGESTION", idempotency_key="rb:1")
+
+        def boom(self):
+            raise SQLAlchemyError("rollback itself failed")
+
+        monkeypatch.setattr(Session, "rollback", boom)
+        monkeypatch.setattr(
+            bj,
+            "execute_job",
+            lambda db, job: (_ for _ in ()).throw(RuntimeError("executor exploded")),
+        )
+
+        def fake_fail_job(db, job, exc):
+            # invoked AFTER the (failed) rollback; records the transition
+            return type("Stub", (), {"id": job.id, "status": "FAILED_RETRYABLE"})()
+
+        monkeypatch.setattr(bj, "fail_job", fake_fail_job)
+
+        with caplog.at_level(logging.WARNING):
+            summary = bj.run_worker(session_factory=session_factory, once=True)
+
+        assert summary["failed"] == 1  # the loop survived the rollback error
+        rollback_warnings = [
+            r for r in caplog.records if "rollback" in r.getMessage().lower()
+        ]
+        assert rollback_warnings, "rollback failure must be logged"
+        assert rollback_warnings[0].exc_info is not None  # exception info attached

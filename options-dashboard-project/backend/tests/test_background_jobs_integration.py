@@ -26,6 +26,7 @@ authoritative Alembic path separately on scratch databases.
 from __future__ import annotations
 
 import os
+import re
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -134,6 +135,8 @@ class _RealQueueBase:
             engine.dispose()
 
     def run_enqueue_race_test(self, url: str, *, threads: int) -> None:
+        from app.utils.retry import retry_on_serialization
+
         engine, factory = self.make_stack(url)
         try:
             barrier = threading.Barrier(threads)
@@ -143,14 +146,22 @@ class _RealQueueBase:
             def enqueue_same_key() -> None:
                 barrier.wait()  # maximize the collision window
                 session = factory()
-                try:
+
+                def _enqueue(s):
                     job, _created = bj.enqueue(
-                        session,
+                        s,
                         job_type="HISTORICAL_INGESTION",
                         idempotency_key=f"{engine.dialect.name}:race:1",
                     )
+                    return job.id
+
+                try:
+                    # Producer-side transactions follow the repository's
+                    # documented convention: the caller wraps the operation
+                    # with the CRDB serialization retry (same as claims).
+                    job_id = retry_on_serialization(_enqueue, factory)
                     with ids_lock:
-                        ids.append(job.id)
+                        ids.append(job_id)
                 finally:
                     session.close()
 
@@ -177,7 +188,8 @@ class _RealQueueBase:
         try:
             db = factory1()
             bj.enqueue(db, job_type="HISTORICAL_INGESTION", idempotency_key=key)
-            claimed = bj.claim_next(db, worker_id="w-crashed", lease_seconds=30)
+            # The crash scenario REQUIRES a successful claim: assert it.
+            assert bj.claim_next(db, worker_id="w-crashed", lease_seconds=30) is not None
             db.close()
             # Backdate the lease deterministically (the crashed worker will
             # never renew it), then hard-kill the "process".
@@ -339,8 +351,26 @@ def _bootstrap_db(dialect: str) -> str:
     return "postgres" if dialect == "postgresql" else "defaultdb"
 
 
+# Strict SQL identifier whitelist: letters/digits/underscores only, must not
+# start with a digit, bounded length (PostgreSQL/CRDB limit is 63). Every
+# name interpolated into CREATE/DROP DATABASE DDL MUST pass this first —
+# database identifiers cannot be bind parameters, so validation + quoting
+# is the safety boundary (test-only infrastructure, but explicitly safe).
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
+
+
+def _validate_identifier(name: str) -> str:
+    if not _SAFE_IDENTIFIER.match(name):
+        raise ValueError(
+            f"unsafe database identifier rejected: {name!r} "
+            "(must match [A-Za-z_][A-Za-z0-9_]{0,62})"
+        )
+    return name
+
+
 def _create_scratch(url: str, dialect: str, scratch_db: str) -> None:
     """Recreate the scratch database so the chain starts from truly empty."""
+    _validate_identifier(scratch_db)
     bootstrap = _scratch_url(url, _bootstrap_db(dialect))
     engine = create_engine(bootstrap, isolation_level="AUTOCOMMIT")
     try:
@@ -352,6 +382,7 @@ def _create_scratch(url: str, dialect: str, scratch_db: str) -> None:
 
 
 def _drop_scratch(url: str, dialect: str, scratch_db: str) -> None:
+    _validate_identifier(scratch_db)
     bootstrap = _scratch_url(url, _bootstrap_db(dialect))
     engine = create_engine(bootstrap, isolation_level="AUTOCOMMIT")
     try:
