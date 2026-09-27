@@ -38,6 +38,7 @@ CockroachDB Cloud — production database (Alembic-managed schema)
 | Paper trading | `backend/app/services/paper_execution.py` | Server-authoritative execution, positions, exits, P&L |
 | Broker sync | `backend/app/broker_sync/` | Ingestion models/pipeline for broker data |
 | Data/config | `backend/app/db.py`, `backend/app/config.py` | Engine/session construction from `DATABASE_URL`; pydantic settings |
+| Durable background jobs | `backend/app/services/background_jobs.py`, `backend/run_jobs.py` | Day 47 database-backed job queue on the application database (see below) |
 | Migrations | `backend/alembic/` | **Sole schema authority** (ADR-002) |
 | Tests | `backend/tests/` | pytest suite (185 test files) |
 
@@ -46,6 +47,36 @@ Request authentication path (Issue #61 contract):
 ```text
 Cookie strikenova_session → CurrentUser/get_current_user → AuthenticatedUser(user_id, access_token|None)
 ```
+
+### 2.1 Durable background jobs (Day 47)
+
+Operational work that must survive process restart runs as durable jobs
+instead of direct CLI execution. The database IS the queue — no external
+broker (Redis/Celery/RabbitMQ/Kafka) is introduced.
+
+- **Persistence domain:** `background_jobs` table (migration
+  `d47aa0000001`), owned by Alembic like every other table. Model:
+  `BackgroundJob` in `app/models.py`.
+- **Worker/queue boundary:** producer = `enqueue` (idempotent per
+  `idempotency_key` — one row per key, ever; terminal rows are re-armed
+  in place); consumer = `claim_next` (single conditional UPDATE lease
+  claim, the ADR-017 `_migration_lock` pattern; expired leases make
+  crashed jobs claimable again); transitions out of RUNNING are
+  ownership-protected (`complete_job`/`fail_job` verify RUNNING + owner +
+  unexpired lease atomically, so a stale worker can never overwrite a
+  replacement attempt).
+- **Retry/dead-letter semantics:** bounded attempts with exponential
+  backoff (payload-overridable policy: `max_attempts`,
+  `backoff_base_seconds`, `lease_seconds`); transient failures
+  (SQLSTATE 40001/40P01/55P03, connection markers) are retried;
+  authentication failures and malformed payloads are non-retryable;
+  exhausted jobs become inspectable `DEAD_LETTERED` rows, never deleted.
+- **Entry points:** `run_jobs.py` (`enqueue-backfill`, `work`, `status`)
+  is the administrative CLI; it performs NO schema mutation (Alembic is
+  the sole authority — ADR-002). Historical ingestion executes through
+  the real `BackfillOrchestrator` service boundary (no subprocess).
+- **Not deployed:** no production worker service or scheduler exists yet;
+  enabling one requires separate authorization.
 
 ## 3. Frontend (Next.js)
 
