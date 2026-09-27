@@ -1,7 +1,7 @@
 # StrikeNova Implementation Status Tracker
 
 > **Master Plan SHA:** `0a244c0` (docs: add StrikeNova master day-wise implementation plan)
-> **Last Updated:** 2026-09-27 (PR #111 post-merge CI verified green; PR #112 fixture cleanup opened)
+> **Last Updated:** 2026-09-27 (PR #112 merged as `e84fc93e3a086c466b6ad9807be8eb6585bd462b`; no production deployment)
 
 ---
 
@@ -28,7 +28,7 @@
 
 ## 2026-09-27 — PR #112: PR #111 post-merge verification loop + CRDB rehearsal fixture cleanup
 
-**Status:** **OPEN** (not merged). Branch `postmerge/pr111-cleanup` (implementation commit `10af256`) based on `5447ff3`. This is documentation- and test-hygiene-only work: no production deployment, no merge performed, no behavior change to the lock or migrations.
+**Status:** **MERGED** into `feat/strikenova-day35-portfolio-intelligence` as `e84fc93e3a086c466b6ad9807be8eb6585bd462b` via normal merge. PR head was `68f88fd901ca45d2d0b4a527ed258f0f95d3c5b8`; no production deployment was performed. This remains documentation- and test-hygiene-only work: no behavior change to the lock or migrations.
 
 | Item | Resolution | Evidence |
 |------|------------|----------|
@@ -42,9 +42,9 @@
 | Migration-lock documentation audit | The reported "TTL / 3, minimum 5 seconds" renewal wording does **not exist** in the current tree or in `_migration_lock.py`'s history; all live references already state the implementation `max(1.0, ttl / 3)` (module docstring, `LeaseRenewer._run` comment, `DECISIONS.md` ADR-017, `INVARIANTS.md`, `DATA.md`, `config.py`). No documentation edit was required; the mismatch appears to have been corrected before PR #111 | Repo-wide grep; `git log -S "minimum 5"` |
 | Remaining warnings (classified, not masked) | (1) Pydantic `PydanticDeprecatedSince20` at `app/config.py:5` — pre-existing baseline, out of scope; (2) PostgreSQL rehearsal file still emits 2× fixture deprecation in its own run (`6 passed, 3 warnings`) — separate cleanup candidate, outside this task's file scope; (3) known pre-existing stale assertion `test_day41_1_migration_reality.py::test_alembic_head_is_day41_single_row` (head `d46aa0000001` vs asserted `e2b4c6d8f0a1`) — untouched, pre-dates PR #111 | Focused local runs |
 | PR #112 own CI (evidence at heads `062e091`/`07726c9`) | All repo-owned GitHub Actions checks **pass**: Status Gate ×2, PostgreSQL compatibility, CRDB rehearsal job **`10 passed, 1 warning`** (was `10 passed, 5 warnings in 124.53s` before the fixture fix), PG rehearsal job `6 passed, 3 warnings`, OpenCodeReview pass; Vercel preview deployed. Two non-repo-owned checks fail for provider-side reasons, neither related to this PR's test/docs changes: Codacy fails at 0s (same pre-existing infrastructure failure class as PR #111's PR run), and the GitHub-managed `github-advanced-security` code-scanning-AI check fails with Copilot `CAPIError: 400 The requested model is not supported` before any scan executes — no code-scanning analysis or alerts exist for the repository, the same failure class occurred on PRs #109/#110, and the GHAS run on the code commit `10af256` succeeded | PR #112 checks, runs `36298502088`/`36298760687`; GHAS runs `36298502654`/`36298761228`; code-scanning alerts API |
-| Residual | PR #112 remains open and unmerged by design. No broader milestone is declared by this entry | PR #112 |
+| Post-merge verification | PR #112 merged successfully as `e84fc93e3a086c466b6ad9807be8eb6585bd462b`; merge was independently verified after authorization. Combined status on the merge commit shows Vercel pending; push-triggered workflow listing is empty because the helper filters to pull-request-triggered runs. No production deployment was performed | GitHub PR #112 merge result; merge commit `e84fc93e3a086c466b6ad9807be8eb6585bd462b` |
 
-**Governance state:** PR #112 is **OPEN** (not merged). No production deployment, no PR merge, no changes to PRs #93/#96/#99/#100/#101, no unrelated files touched.
+**Governance state:** PR #112 is **MERGED** as `e84fc93e3a086c466b6ad9807be8eb6585bd462b`. No production deployment, no changes to PRs #93/#96/#99/#100/#101, no unrelated files touched. No broader milestone is declared by this entry.
 
 ---
 
