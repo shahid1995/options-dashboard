@@ -262,6 +262,121 @@ def crdb_queue_url():
     _drop_scratch(base, "cockroachdb", CRDB_QUEUE_DB)
 
 
+class TestStaleWorkerRealDatabase(_RealQueueBase):
+    """F1/F10 on real engines: lease-takeover ownership protection under
+    genuine concurrent transactions (SQLite cannot prove row-level races)."""
+
+    def _run_stale_worker_test(self, url: str) -> None:
+        engine, factory = self.make_stack(url)
+        try:
+            db = factory()
+            bj.enqueue(db, job_type="HISTORICAL_INGESTION", idempotency_key=f"{engine.dialect.name}:stale:1")
+            db.close()
+
+            # Worker A claims on engine 1, then its lease "expires".
+            e1, f1 = self.make_stack(url)
+            s1 = f1()
+            claimed = bj.claim_next(s1, worker_id="worker-A", lease_seconds=30)
+            job_id = claimed.id
+            s1.close()
+            e1.dispose()  # worker A's process dies mid-execution
+
+            s_fix = factory()
+            row = s_fix.get(BackgroundJob, job_id)
+            row.lease_expires_at = _utcnow() - timedelta(seconds=1)
+            s_fix.commit()
+            s_fix.close()
+
+            # Worker B reclaims on a fresh engine (attempt 2).
+            e2, f2 = self.make_stack(url)
+            s2 = f2()
+            b_job = bj.claim_next(s2, worker_id="worker-B")
+            b_job_id = b_job.id
+            b_attempts = b_job.attempt_count
+            s2.close()
+            assert b_job_id == job_id and b_attempts == 2
+
+            # Stale worker A returns on a NEW engine and tries to complete.
+            e3, f3 = self.make_stack(url)
+            s3 = f3()
+            stale_row = s3.get(BackgroundJob, job_id)
+            completed = bj.complete_job(s3, stale_row, worker_id="worker-A")
+            s3.close()
+            e3.dispose()
+            assert completed is False
+
+            # B's RUNNING attempt is intact on the shared engine.
+            s4 = factory()
+            final = s4.get(BackgroundJob, job_id)
+            final_status = final.status
+            final_owner = final.lease_owner
+            final_attempts = final.attempt_count
+            s4.close()
+            assert final_status == "RUNNING"
+            assert final_owner == "worker-B"
+            assert final_attempts == 2
+            e2.dispose()
+        finally:
+            _cleanup(engine)
+            engine.dispose()
+
+    def test_stale_worker_cannot_complete_after_takeover_postgres(self, pg_queue_url):
+        self._run_stale_worker_test(pg_queue_url)
+
+    def test_stale_worker_cannot_complete_after_takeover_cockroachdb(
+        self, crdb_queue_url
+    ):
+        self._run_stale_worker_test(crdb_queue_url)
+
+
+class TestStatusAggregationRealDatabase(_RealQueueBase):
+    """F2: the CLI status aggregation must be valid SQL on PG and CRDB."""
+
+    def _run_status_aggregation(self, url: str) -> None:
+        engine, factory = self.make_stack(url)
+        try:
+            from sqlalchemy import func as _func
+
+            db = factory()
+            for i, status in enumerate(
+                ["PENDING", "PENDING", "FAILED_RETRYABLE", "SUCCEEDED"]
+            ):
+                job = BackgroundJob(
+                    id=str(uuid.uuid4()),
+                    job_type="HISTORICAL_INGESTION",
+                    idempotency_key=f"{engine.dialect.name}:agg:{i}",
+                    payload="{}",
+                    status=status,
+                    attempt_count=0,
+                    available_at=_utcnow(),
+                    created_at=_utcnow(),
+                    updated_at=_utcnow(),
+                )
+                db.add(job)
+            db.commit()
+            # The exact aggregation the CLI uses (must GROUP BY).
+            counts = dict(
+                db.execute(
+                    select(BackgroundJob.status, _func.count(BackgroundJob.id)).group_by(
+                        BackgroundJob.status
+                    )
+                ).all()
+            )
+            db.close()
+            assert counts["PENDING"] == 2
+            assert counts["FAILED_RETRYABLE"] == 1
+            assert counts["SUCCEEDED"] == 1
+        finally:
+            _cleanup(engine)
+            engine.dispose()
+
+    def test_status_aggregation_valid_on_postgres(self, pg_queue_url):
+        self._run_status_aggregation(pg_queue_url)
+
+    def test_status_aggregation_valid_on_cockroachdb(self, crdb_queue_url):
+        self._run_status_aggregation(crdb_queue_url)
+
+
 class TestPostgresDurableQueue(_RealQueueBase):
     def test_concurrent_claims_are_exactly_once(self, pg_queue_url):
         self.run_concurrent_claim_test(pg_queue_url, workers=8, rounds=4, jobs=12)
@@ -474,7 +589,7 @@ def test_alembic_chain_creates_working_background_jobs(dialect, url):
         assert created is True
         claimed = bj.claim_next(db, worker_id="migration-check")
         assert claimed is not None
-        bj.complete_job(db, claimed)
+        assert bj.complete_job(db, claimed, worker_id="migration-check") is True
         db.close()
 
         # The idempotency unique constraint is REAL on this engine.
