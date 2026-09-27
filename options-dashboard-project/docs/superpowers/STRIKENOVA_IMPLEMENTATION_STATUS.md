@@ -1,7 +1,32 @@
 # StrikeNova Implementation Status Tracker
 
 > **Master Plan SHA:** `0a244c0` (docs: add StrikeNova master day-wise implementation plan)
-> **Last Updated:** 2026-09-27 (PR #112 merged as `e84fc93e3a086c466b6ad9807be8eb6585bd462b`; no production deployment)
+> **Last Updated:** 2026-09-27 (Day 47 durable background jobs implemented on branch `feat/strikenova-day47-durable-background-jobs`; PR open, no production deployment)
+
+---
+
+## 2026-09-27 — Day 47: durable background jobs (historical ingestion)
+
+**Status:** **IMPLEMENTED, PR OPEN (not merged, not deployed).** Branch `feat/strikenova-day47-durable-background-jobs` cut from integration tip `90c14051d49724ad648cb72d7deae037e7cc0607`. The Day 47 gate ("historical ingestion can survive process restart and retry safely") is demonstrated by executable evidence below; broader production rollout (a Render worker service, scheduled execution) remains explicitly out of scope and unauthorized.
+
+| Item | Resolution | Evidence |
+|------|------------|----------|
+| Durable-job architecture | Single-table database-backed queue on the EXISTING application database (`background_jobs`); no new external infrastructure — no Redis/Celery/RabbitMQ/SQS introduced | `alembic/versions/d47aa0000001_day47_durable_background_jobs.py`; `app/models.py` (`BackgroundJob`, `JobStatus`, `JobType`) |
+| Job model | UUID id, job type, idempotency key (unique), JSON payload (stage list, start date, retry/lease policy), user scope, status (PENDING/RUNNING/SUCCEEDED/FAILED_RETRYABLE/DEAD_LETTERED/CANCELLED), attempt count, available-at, lease owner + expiry, started/completed, last error, dead-letter reason, created/updated | Migration `d47aa0000001`; model docstring |
+| Idempotency (enqueue) | One row per idempotency key, ever, enforced by a real unique constraint: duplicate enqueues of a live job return the row unchanged (racing INSERTs collapse via IntegrityError handling); re-enqueueing a terminal job re-arms that same row so dead-letter history stays inspectable | `tests/test_background_jobs.py::TestEnqueueIdempotency` (6 tests); PG/CRDB enqueue-race tests (6 threads, one row) |
+| Idempotency (execution) | Provided by durable invariants of the wrapped operation, not the job row: the orchestrator's `IngestionCheckpoint` resume plus unique-constraint insert semantics mean a retry after crash/timeout never duplicates durable ingestion rows | Orchestrator unchanged; `app/services/background_jobs.py::execute_historical_ingestion` |
+| Queue/worker boundary | `enqueue` (producer) → `claim_next` (single conditional UPDATE lease-claim, the ADR-017 lock pattern) → `execute_job`/`complete_job`/`fail_job`; expired leases make crashed jobs claimable again without any cleanup process; worker loop runs each claim on a fresh session/transaction | `app/services/background_jobs.py`; `run_jobs.py` (enqueue/work/status CLI) |
+| Historical-ingestion integration | `HISTORICAL_INGESTION` jobs execute the REAL `BackfillOrchestrator` through the application service boundary (asyncio.run on `run_all`); the CLI remains the enqueue/admin trigger; no subprocess wrapping | `execute_historical_ingestion`; vertical-slice test proves worker→orchestrator fails closed on missing credentials with zero API calls |
+| Retry/backoff | Bounded: default max 3 attempts, exponential backoff base 30s cap 1h, payload-policy-overridable; retryable = SQLSTATE 40001/40P01/55P03, transient markers, or explicit `JobExecutionError(retryable=True)`; auth failures are NON-retryable; attempt budget exhaustion dead-letters at claim time (a crash-looping worker cannot retry forever) | `TestBackoffAndPolicy`, `TestRetryabilityClassification`, `TestTransitions::test_max_attempts_dead_letters_at_claim_time` |
+| Dead-letter | DEAD_LETTERED rows keep last error + reason, are never deleted, and remain visible via `run_jobs.py status --show-failed` | `TestTransitions` dead-letter tests; CLI smoke |
+| Concurrency (real engines) | Exactly-once claiming: PG 8 workers × 4 rounds over 12 jobs and CRDB 10 workers × 5 rounds over 15 jobs (serializable contention, real 40001 retries) — every job claimed exactly once, no double ownership | `TestPostgresDurableQueue::test_concurrent_claims_are_exactly_once`; `TestCockroachDBDurableQueue::...` |
+| Restart/recovery (real engines) | Worker "process" killed with a claimed job outstanding → brand-new engine/session recovers it after lease expiry (attempt 2); queued jobs survive engine disposal; verified on BOTH PostgreSQL and CockroachDB | `test_worker_crash_is_recovered_after_restart` ×2; hermetic `TestRestartRecovery` |
+| Migration compatibility | Full Alembic chain from empty DB on PG 18.6 AND CRDB v25.2.23 creates `background_jobs` with all 16 columns; service operates on the migrated schema; real IntegrityError proves the unique constraint; SQLite (dev/test) chain also verified — the constraint is declared inside CREATE TABLE because SQLite cannot ALTER-add constraints | `test_alembic_chain_creates_working_background_jobs[postgresql]` / `[cockroachdb]`; `TestOrchestratorArchitecture`/`TestArchitecture` (7 passed) |
+| Focused verification | Hermetic job suite: **37 passed** (SQLite). Real-DB integration: **9 passed** (PG+CRDB, dedicated `strikenova_jobs_queue`/`jobs_queue_test` databases, dropped after the session) | Local WSL runs 2026-09-27, CockroachDB v25.2.23 + PostgreSQL 18.6 |
+| Regression verification | Ingestion suites 141 passed (orchestrator, daily, candle/contract/option backfill); migration/DB-compat batch 94 passed; CRDB rehearsal **10 passed** and PG rehearsal **6 passed** — both chains now include `d47aa0000001` | Local WSL runs 2026-09-27 |
+| Known limitations | (1) No production worker is deployed; scheduled execution requires separate authorization. (2) Real Upstox token paths are not exercised in tests (vertical slice proves the fail-closed boundary instead). (3) The worker is single-process-by-choice; multi-worker fan-out beyond claim exclusivity is not configured. (4) `run_daily.py` remains a direct CLI (out of Day 47 scope). | This entry |
+
+**Governance state:** Day 47 PR is **OPEN** (not merged). No deployment, no production database changes, no production CockroachDB contact, no credential rotation, no Vercel/Render configuration change. Test databases used were disposable local instances (PostgreSQL 18.6 `pgrehearsal`, CockroachDB v25.2.23 single-node); all Day 47 queue tests run in dedicated scratch databases and clean up after themselves.
 
 ---
 
