@@ -252,7 +252,7 @@ def _get_position(
         Position.option_type == option_type,
     )
     if for_update:
-        statement = statement.with_for_update()
+        statement = statement.with_for_update().execution_options(populate_existing=True)
     return db.scalar(statement)
 
 
@@ -300,7 +300,7 @@ def _get_or_create_position(
             )
             db.add(position)
             db.flush()
-    except IntegrityError:
+    except IntegrityError as exc:
         position = _get_position(
             db, user_id, symbol, expiry, strike, option_type, for_update=True
         )
@@ -308,7 +308,7 @@ def _get_or_create_position(
             raise PaperExecutionError(
                 "POSITION_CONCURRENCY",
                 "Position creation raced another execution and could not be re-read safely.",
-            )
+            ) from exc
 
     return position
 
@@ -701,6 +701,7 @@ def exit_position(
         select(Position)
         .where(Position.id == position_id, Position.user_id == user_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if position is None:
         raise PaperExecutionError("POSITION_NOT_FOUND", "Position not found.")
