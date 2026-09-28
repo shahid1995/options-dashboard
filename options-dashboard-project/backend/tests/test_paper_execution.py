@@ -88,7 +88,18 @@ def chain_mock(chain_quotes):
     async def fake(token, instrument_key, expiry):
         return chain_payload(expiry, chain_quotes.get(expiry, {}))
 
-    with patch("app.services.upstox.get_option_chain", new=AsyncMock(side_effect=fake)) as m:
+    async def fake_contracts(token, instrument_key):
+        data = []
+        for expiry, strikes in chain_quotes.items():
+            for strike in strikes:
+                data.extend((
+                    {"expiry": expiry, "strike_price": strike, "instrument_type": "CE", "lot_size": LOT},
+                    {"expiry": expiry, "strike_price": strike, "instrument_type": "PE", "lot_size": LOT},
+                ))
+        return {"data": data}
+
+    with patch("app.services.upstox.get_option_chain", new=AsyncMock(side_effect=fake)) as m, \
+         patch("app.services.upstox.get_option_contracts", new=AsyncMock(side_effect=fake_contracts)):
         yield m
 
 
@@ -202,6 +213,31 @@ def first_position(db_session):
 
     return db_session.query(Position).order_by(Position.id).first()
 
+
+
+def test_client_lot_size_cannot_change_server_accounting(client, logged_in, db_session):
+    from app.models import PaperOrder, Position
+
+    payload = single_leg_payload(
+        client_order_id="exec-authoritative-lot-size",
+        legs=[{
+            "symbol": "NIFTY",
+            "expiration_date": EXPIRY,
+            "strike_price": 24350,
+            "option_type": "call",
+            "action": "buy",
+            "quantity": 1,
+            "lot_size": 1,
+        }],
+    )
+    response = execute(client, logged_in, payload)
+    assert response.status_code == 200, response.text
+
+    order = db_session.query(PaperOrder).one()
+    position = db_session.query(Position).one()
+    assert order.lot_size == LOT
+    assert position.lot_size == LOT
+    assert response.json()["order"]["lot_size"] == LOT
 
 # ---- Order lifecycle (§5) ----------------------------------------------------
 
