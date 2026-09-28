@@ -1,13 +1,13 @@
 # StrikeNova Implementation Status Tracker
 
 > **Master Plan SHA:** `0a244c0` (docs: add StrikeNova master day-wise implementation plan)
-> **Last Updated:** 2026-09-28 (Day 47 merged; Day 48 historical data governance in progress; no production deployment)
+> **Last Updated:** 2026-09-28 (Day 48 governance gate passed; PR #115 remains open/draft; no production deployment)
 
 ---
 
 ## 2026-09-28 — Day 48: historical data governance
 
-**Status:** **IN PROGRESS.** Issue #114. Branch `feat/strikenova-day48-historical-data-governance`, based on merged Day 47 commit `e880b62ba50031b69322a69a52e45f1612bb3ee7`.
+**Status:** **IMPLEMENTED — GATE PASSED.** Issue #114. Branch `feat/strikenova-day48-historical-data-governance`, PR #115 open/draft, based on merged Day 47 commit `e880b62ba50031b69322a69a52e45f1612bb3ee7`.
 
 | Item | Resolution | Evidence |
 |------|------------|----------|
@@ -17,10 +17,11 @@
 | Entitlement / redistribution | Fail-closed checks require explicit verified entitlement / redistribution approval; current Upstox-derived catalog entries remain `REVIEW_REQUIRED` rather than inferring rights from API availability. | `app/services/historical_data_governance.py`; seeded catalog policy |
 | Recomputability | Raw datasets are marked immutable/recomputable; model/analytics datasets carry explicit governed dependencies and are checked transitively before recomputation is considered safe. | `assert_recomputation_safe()` |
 | Retention | Dry-run-first retention planner plus explicit execution switch; deletion uses a static allow-list of known ORM models/columns; raw-tier deletion remains non-executable. | `plan_retention()` / `enforce_retention()` |
+| Review remediation | Pre-fix review findings were independently re-checked: `models.py` was restored to its Day 47 baseline plus only the two governance models; completeness metrics are SQL-aggregated; the governance `run_id` is explicitly assigned to the existing `BackfillOrchestrator` run identity so checkpoints and ingestion logs join the audit manifest. | Commit `a6b9c575a818ecad0059ccdf47b4006a31cb38ef`; full PostgreSQL/CRDB gates green |
 | Production safety | No production retention execution, scheduling, deployment, or database mutation performed. | Governance workflow rule |
-| Verification | Focused governance test suite added; CI/migration compatibility still pending for the Day 48 gate. | `tests/test_historical_data_governance.py` |
+| Verification | Corrected-head CI is green: StrikeNova Status Gate passed; PostgreSQL compatibility passed; PostgreSQL migration rehearsal passed; CockroachDB migration rehearsal passed; CodeRabbit and Vercel checks green. | Commit `a6b9c575a818ecad0059ccdf47b4006a31cb38ef`; PR #115 CI runs 553 / 445 / 70 |
 
-**Day 48 gate:** NOT YET PASSED.
+**Day 48 gate:** **PASSED.** Historical datasets now have explicit provenance and lifecycle metadata, a durable acquisition manifest, fail-closed redistribution/entitlement checks, recomputation-safe dependency contracts, and policy-controlled retention enforcement. PR #115 remains draft/open pending review/merge authority.
 
 ## 2026-09-27 — Day 47: durable background jobs (historical ingestion)
 
