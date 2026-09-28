@@ -67,6 +67,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.models import BackgroundJob, JobStatus, JobType
+from app.services.historical_data_governance import (
+    PURPOSE_INTERNAL_RESEARCH,
+    RUN_FAILED,
+    RUN_PARTIAL,
+    RUN_SUCCEEDED,
+    dataset_keys_for_stages,
+    finish_ingestion_run,
+    start_ingestion_run,
+)
 from app.services.rate_limiter import GlobalRateLimiter  # stdlib-only module, no cycle
 from app.utils.retry import retry_on_serialization  # noqa: E402 (patch point for tests)
 
@@ -782,18 +791,43 @@ def execute_historical_ingestion(
     # applied as THIS job's ceiling (per-job policy), preserving any
     # cooldown/pacing state earned by earlier jobs in the same worker.
     rate_limiter = prepare_run_rate_limiter(rate_limiter, concurrency=concurrency)
+    dataset_keys = dataset_keys_for_stages(stages)
+    governance_run = start_ingestion_run(
+        db,
+        dataset_keys=dataset_keys,
+        background_job_id=job.id,
+        purpose=PURPOSE_INTERNAL_RESEARCH,
+        coverage_start=str(start_raw) if start_raw else None,
+        metadata={"job_type": job.job_type, "stages": stages},
+    )
     orchestrator = BackfillOrchestrator(
         db, client, force=force, rate_limiter=rate_limiter
     )
     # F5: forward the requested concurrency so the option stage's limiter
     # ceiling is the job's request, not the orchestrator default.
-    result = asyncio.run(
-        orchestrator.run_all(
-            stages=list(stages),
-            nifty_start_date=nifty_start_date,
-            options_concurrency=concurrency,
+    try:
+        result = asyncio.run(
+            orchestrator.run_all(
+                stages=list(stages),
+                nifty_start_date=nifty_start_date,
+                options_concurrency=concurrency,
+            )
         )
-    )
+    except Exception as exc:
+        try:
+            finish_ingestion_run(
+                db,
+                governance_run.run_id,
+                status=RUN_FAILED,
+                error_message=str(exc)[:2000],
+            )
+        except Exception:
+            logger.exception(
+                "failed to finalize historical governance run %s after "
+                "ingestion exception",
+                governance_run.run_id,
+            )
+        raise
 
     summary: dict[str, Any] = {
         "operation": result.operation,
@@ -803,13 +837,21 @@ def execute_historical_ingestion(
         "rows_inserted": result.rows_inserted,
         "rows_skipped": result.rows_skipped,
         "errors": result.errors[:10],
+        "governance_run_id": governance_run.run_id,
     }
 
     if result.status == "SUCCESS":
+        finish_ingestion_run(db, governance_run.run_id, status=RUN_SUCCEEDED)
         return summary
 
     auth_failure = any(
         "AUTH_EXPIRED" in e or "Authentication" in e for e in result.errors
+    )
+    finish_ingestion_run(
+        db,
+        governance_run.run_id,
+        status=RUN_PARTIAL if result.status == "PARTIAL" else RUN_FAILED,
+        error_message="; ".join(result.errors[:3]) or "no error detail",
     )
     raise JobExecutionError(
         f"historical ingestion ended with status {result.status}: "
