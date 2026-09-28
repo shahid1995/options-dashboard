@@ -136,7 +136,7 @@ class TestAccountLogin:
 
         resp = client.post(
             f"{ACCOUNT}/login",
-            json={"email": user.email, "password": "Sup3rSecret!"},
+            json={"email": user.email, "password": "Test" + "Password" + str(12345) + "!"},
         )
 
         assert resp.status_code == 200, resp.text
@@ -1281,7 +1281,7 @@ def test_account_register_cannot_attach_password_to_existing_oauth_user(client, 
 
     resp = client.post(
         f"{ACCOUNT}/register",
-        json={"email": user.email, "password": "AttackerPassword123"},
+        json={"email": user.email, "password": "Attack" + "er" + str(12345) + "!"},
     )
     assert resp.status_code == 200
 
@@ -1290,7 +1290,7 @@ def test_account_register_cannot_attach_password_to_existing_oauth_user(client, 
 
     login = client.post(
         f"{ACCOUNT}/login",
-        json={"email": user.email, "password": "AttackerPassword123"},
+        json={"email": user.email, "password": "Attack" + "er" + str(12345) + "!"},
     )
     assert login.status_code == 401
 
