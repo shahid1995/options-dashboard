@@ -300,3 +300,32 @@ def test_iv_timestamp_is_normalized_before_pit_comparison(db_session):
     rows = pit.iv_observations("NIFTY", BASE_TS)
 
     assert rows == []
+
+
+def test_bulk_at_many_uses_one_loaded_history_per_instrument(db_session):
+    """Bulk PIT reads preserve latest-completed semantics across off-grid cutoffs."""
+    db_session.add_all([
+        _option(datetime(2026, 8, 27, 10, 0), key="TEST|CE", oi=100),
+        _option(datetime(2026, 8, 27, 10, 3), key="TEST|CE", oi=110),
+        _greeks(datetime(2026, 8, 27, 10, 0)),
+        _greeks(datetime(2026, 8, 27, 10, 3)),
+    ])
+    db_session.commit()
+
+    pit = PointInTimeDataset(db_session)
+    decisions = [
+        datetime(2026, 8, 27, 10, 4),
+        datetime(2026, 8, 27, 10, 6),
+    ]
+
+    candle_rows = pit.option_candles_at_many(decisions, instrument_keys=["TEST|CE"])
+    greek_rows = pit.option_greeks_at_many(decisions, instrument_keys=["TEST|CE"])
+
+    assert [row.open_time for row in candle_rows] == [
+        datetime(2026, 8, 27, 10, 0),
+        datetime(2026, 8, 27, 10, 3),
+    ]
+    assert [row.open_time for row in greek_rows] == [
+        datetime(2026, 8, 27, 10, 0),
+        datetime(2026, 8, 27, 10, 3),
+    ]
