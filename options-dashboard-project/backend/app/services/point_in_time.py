@@ -218,6 +218,7 @@ class PointInTimeDataset:
         statement = select(OptionCandle).where(
             OptionCandle.interval == interval,
             OptionCandle.open_time == target,
+        )
         if instrument_keys:
             statement = statement.where(OptionCandle.instrument_key.in_(instrument_keys))
         statement = statement.order_by(OptionCandle.open_time.desc())
@@ -332,8 +333,7 @@ class PointInTimeDataset:
             HistoricalGexSnapshot.open_time,
             cutoff,
         )
-        statement = (
-            statement.order_by(HistoricalGexSnapshot.open_time.asc())
-            .limit(max(1, limit))
-        )
-        return list(self.db.scalars(statement))
+        statement = statement.order_by(HistoricalGexSnapshot.open_time.desc()).limit(max(1, limit))
+        rows = list(self.db.scalars(statement))
+        rows.reverse()
+        return rows
