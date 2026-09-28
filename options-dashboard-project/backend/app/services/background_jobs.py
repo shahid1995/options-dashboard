@@ -787,12 +787,13 @@ def execute_historical_ingestion(
         from datetime import date as _date
 
         nifty_start_date = _date.fromisoformat(str(start_raw))
-    # Day 48 audit window: resolve the effective NIFTY window exactly once,
-    # through the same resolver run_nifty uses, so the governance manifest's
-    # coverage_start/coverage_end are the actual ingestion bounds (never
-    # NULL) and completeness aggregation cannot be skewed by rows outside
-    # this run's window.
-    effective_nifty_start, effective_nifty_end = resolve_nifty_window(
+    # Day 48 audit window: the authoritative effective NIFTY window is
+    # resolved INSIDE run_all after contract discovery (Finding A) and is
+    # returned via result.metadata["nifty_coverage_*"] (Finding B). Here we
+    # only compute provisional bounds for the manifest so a run that fails
+    # before execution still has a best-known window recorded; the manifest
+    # is updated below with the actual executed window once run_all returns.
+    provisional_nifty_start, provisional_nifty_end = resolve_nifty_window(
         db, start_date=nifty_start_date
     )
     force = bool(params.get("force", False))
@@ -809,8 +810,8 @@ def execute_historical_ingestion(
         dataset_keys=dataset_keys,
         background_job_id=job.id,
         purpose=PURPOSE_INTERNAL_RESEARCH,
-        coverage_start=effective_nifty_start.isoformat(),
-        coverage_end=effective_nifty_end.isoformat(),
+        coverage_start=provisional_nifty_start.isoformat(),
+        coverage_end=provisional_nifty_end.isoformat(),
         metadata={"job_type": job.job_type, "stages": stages},
     )
     orchestrator = BackfillOrchestrator(
@@ -826,7 +827,7 @@ def execute_historical_ingestion(
         result = asyncio.run(
             orchestrator.run_all(
                 stages=list(stages),
-                nifty_start_date=effective_nifty_start,
+                nifty_start_date=nifty_start_date,
                 options_concurrency=concurrency,
             )
         )
@@ -845,6 +846,17 @@ def execute_historical_ingestion(
                 governance_run.run_id,
             )
         raise
+
+    # The orchestrator result is the single authority for the window the
+    # execution actually used; record it on the manifest before finalization
+    # so refresh_ingestion_run_metrics aggregates completeness over exactly
+    # the executed window. Only trust the metadata when the NIFTY stage ran.
+    executed_start = result.metadata.get("nifty_coverage_start")
+    executed_end = result.metadata.get("nifty_coverage_end")
+    if executed_start and executed_end and "nifty" in stages:
+        governance_run.coverage_start = executed_start
+        governance_run.coverage_end = executed_end
+        db.commit()
 
     summary: dict[str, Any] = {
         "operation": result.operation,

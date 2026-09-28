@@ -389,6 +389,7 @@ class BackfillOrchestrator:
         *,
         stages: list[str] | None = None,
         nifty_start_date: date | None = None,
+        nifty_end_date: date | None = None,
         options_concurrency: int | None = None,
     ) -> BackfillResult:
         """Run the full backfill pipeline.
@@ -399,7 +400,12 @@ class BackfillOrchestrator:
             Which stages to run. Default: ["contracts", "nifty", "options"].
         nifty_start_date:
             Override start date for NIFTY backfill.  When *None*,
-            the default covers the full contract-registry range.
+            the default is resolved AFTER the contracts stage so a freshly
+            discovered registry extends the window (historical behavior).
+        nifty_end_date:
+            Override end date for NIFTY backfill.  When *None*, resolved
+            once (today) together with the start, so the effective window
+            is a single coherent pair.
         """
         if stages is None:
             stages = ["contracts", "nifty", "options"]
@@ -419,7 +425,21 @@ class BackfillOrchestrator:
                 result.errors.extend(contract_result.errors)
 
             if "nifty" in stages:
-                nifty_result = await self.run_nifty(start_date=nifty_start_date)
+                # Resolve the effective NIFTY window HERE — after contract
+                # discovery — so an omitted start derives from the registry
+                # as it exists post-discovery (historical behavior), and the
+                # end is fixed once so it cannot drift past UTC midnight.
+                effective_start, effective_end = resolve_nifty_window(
+                    self.db, start_date=nifty_start_date, end_date=nifty_end_date
+                )
+                nifty_result = await self.run_nifty(
+                    start_date=effective_start, end_date=effective_end
+                )
+                # Expose the actual window for audit consumers (Day 48
+                # governance records exactly these bounds on the manifest).
+                result.metadata["nifty_coverage_start"] = effective_start.isoformat()
+                result.metadata["nifty_coverage_end"] = effective_end.isoformat()
+                result.metadata["chunks"] = nifty_result.metadata.get("chunks", [])
                 result.api_calls += nifty_result.api_calls
                 result.rows_fetched += nifty_result.rows_fetched
                 result.rows_inserted += nifty_result.rows_inserted

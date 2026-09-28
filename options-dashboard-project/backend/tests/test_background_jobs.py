@@ -568,6 +568,7 @@ class _FakeResult:
         self.rows_inserted = 3
         self.rows_skipped = 0
         self.errors = errors or []
+        self.metadata = {}
 
 
 class _FakeOrchestrator:
@@ -1191,6 +1192,7 @@ class TestConcurrencyPropagation:
             rows_inserted = 0
             rows_skipped = 0
             errors = []
+            metadata = {}
 
         class _FakeOrchestrator:
             def __init__(self, db, client, *, force=False, rate_limiter=None):
@@ -1357,7 +1359,7 @@ class TestGovernanceAuditWindow:
         )
         db.commit()
 
-    def _enqueue_and_run(self, monkeypatch, session_factory, payload, captured):
+    def _enqueue_and_run(self, monkeypatch, session_factory, payload, captured, result_metadata=None, key=None):
         class _FakeResult:
             operation = "backfill_all"
             status = "SUCCESS"
@@ -1366,15 +1368,22 @@ class TestGovernanceAuditWindow:
             rows_inserted = 0
             rows_skipped = 0
             errors = []
+            metadata = result_metadata or {}
 
         class _FakeOrch:
             def __init__(self, db, client, *, force=False, rate_limiter=None):
                 self.run_id = None
 
             async def run_all(
-                self, *, stages=None, nifty_start_date=None, options_concurrency=None
+                self,
+                *,
+                stages=None,
+                nifty_start_date=None,
+                nifty_end_date=None,
+                options_concurrency=None,
             ):
                 captured["nifty_start"] = nifty_start_date
+                captured["nifty_end"] = nifty_end_date
                 captured["orchestrator_run_id"] = self.run_id
                 return _FakeResult()
 
@@ -1392,7 +1401,8 @@ class TestGovernanceAuditWindow:
         job, _ = bj.enqueue(
             db,
             job_type="HISTORICAL_INGESTION",
-            idempotency_key=f"gov-window:{payload.get('nifty_start_date', 'default')}",
+            idempotency_key=key
+            or f"gov-window:{payload.get('nifty_start_date', 'default')}",
             payload=payload,
         )
         summary = bj.execute_historical_ingestion(db, job)
@@ -1427,7 +1437,6 @@ class TestGovernanceAuditWindow:
         assert audit.coverage_start == "2024-01-01"
         assert audit.coverage_end == today.isoformat()
         assert captured["orchestrator_run_id"] == summary["governance_run_id"]
-
     def test_omitted_start_records_resolved_default_window(
         self, session_factory, monkeypatch
     ):
@@ -1445,7 +1454,9 @@ class TestGovernanceAuditWindow:
 
         today = datetime.now(timezone.utc).date()
         expected_default_start = today - timedelta(days=365)
-        assert captured["nifty_start"] == expected_default_start
+        # background_jobs forwards the RAW payload start (None when omitted);
+        # default resolution happens inside run_all after contract discovery.
+        assert captured["nifty_start"] is None
         assert audit.coverage_start == expected_default_start.isoformat()
         assert audit.coverage_end == today.isoformat()
 
@@ -1484,8 +1495,6 @@ class TestGovernanceAuditWindow:
         """Case C: with the effective window recorded, an older
         DataCompleteness row outside it must not make a successful run
         PARTIAL (finish_ingestion_run downgrade must not fire)."""
-        from datetime import date as _date
-
         from app.services import historical_data_governance as hdg
 
         today = datetime.now(timezone.utc).date()
@@ -1532,6 +1541,221 @@ class TestGovernanceAuditWindow:
 
         finished = hdg.finish_ingestion_run(db, run.run_id, status=hdg.RUN_SUCCEEDED)
         assert finished.status == hdg.RUN_SUCCEEDED
+
+    def _run_real_chain(self, session_factory, stages, nifty_start_date=None):
+        """Drive the REAL BackfillOrchestrator.run_all with only the
+        external boundaries faked: contract discovery is simulated by
+        seeding ContractSpec rows (what run_contracts would persist) and
+        the options stage is stubbed. run_nifty itself stays REAL in
+        dry-run mode, so the resolved chunk plan is observable without
+        any API or candle writes."""
+        import asyncio
+        from datetime import date as _date
+
+        from app.services.backfill_orchestrator import (
+            BackfillOrchestrator,
+            BackfillResult,
+        )
+
+        class _FakeContractsResult:
+            operation = "contracts"
+            status = "SUCCESS"
+            api_calls = 0
+            rows_fetched = 0
+            rows_inserted = 0
+            errors = []
+            metadata = {"expiries": ["2020-01-30"]}
+
+        class _ChainOrchestrator(BackfillOrchestrator):
+            async def run_contracts(self):
+                # Simulates discovered expiries; the DB seed below is the
+                # persisted effect real discovery would have produced.
+                return _FakeContractsResult()
+
+            async def run_options(self, concurrency=None):
+                return BackfillResult(operation="options", status="SUCCESS")
+
+        db = session_factory()
+        orch = _ChainOrchestrator.__new__(_ChainOrchestrator)
+        BackfillOrchestrator.__init__(
+            orch, db, client=None, dry_run=True
+        )
+        orch.force = False
+
+        result = asyncio.run(
+            orch.run_all(stages=list(stages), nifty_start_date=nifty_start_date)
+        )
+        db.close()
+        return result
+
+    def test_contracts_plus_nifty_resolves_default_start_after_discovery(
+        self, session_factory
+    ):
+        """Case A (CodeRabbit on 2d4cec2): with an initially EMPTY registry,
+        contract discovery must run BEFORE the default start is resolved.
+        A newly discovered expiry older than the 365-day fallback must
+        extend the effective window back to (expiry - 3 days)."""
+        db = session_factory()
+        # "Discovered" by the contracts stage: older than today - 365d.
+        self._seed_nifty_expiry(db, "2020-01-30")
+        db.close()
+
+        result = self._run_real_chain(session_factory, ["contracts", "nifty"])
+
+        today = datetime.now(timezone.utc).date()
+        assert result.metadata["nifty_coverage_start"] == "2020-01-27"
+        assert result.metadata["nifty_coverage_end"] == today.isoformat()
+        chunks = result.metadata["chunks"]
+        assert chunks[0]["from"] == "2020-01-27"
+        assert chunks[-1]["to"] == today.isoformat()
+
+    def test_run_all_forwards_resolved_start_and_end_to_run_nifty(
+        self, session_factory
+    ):
+        """Cases B+C (CodeRabbit on 2d4cec2): run_nifty must receive BOTH
+        the resolved start AND the resolved end explicitly — it must never
+        re-derive an omitted end (UTC-midnight divergence) — and the
+        forwarded start must be the post-discovery default."""
+        import asyncio
+
+        from app.services.backfill_orchestrator import (
+            BackfillOrchestrator,
+            BackfillResult,
+        )
+
+        db = session_factory()
+        self._seed_nifty_expiry(db, "2020-01-30")
+        db.close()
+
+        captured = {}
+
+        class _CaptureNifty(BackfillOrchestrator):
+            async def run_contracts(self):
+                result = BackfillResult(operation="contracts", status="SUCCESS")
+                result.metadata["expiries"] = ["2020-01-30"]
+                return result
+
+            async def run_nifty(self, start_date=None, end_date=None):
+                captured["start"] = start_date
+                captured["end"] = end_date
+                result = BackfillResult(operation="nifty_candles", status="SUCCESS")
+                result.metadata["chunks"] = [
+                    {"from": start_date.isoformat(), "to": end_date.isoformat()}
+                ]
+                return result
+
+            async def run_options(self, concurrency=None):
+                return BackfillResult(operation="options", status="SUCCESS")
+
+        orch = _CaptureNifty.__new__(_CaptureNifty)
+        BackfillOrchestrator.__init__(orch, session_factory(), client=None)
+
+        run_result = asyncio.run(orch.run_all(stages=["contracts", "nifty"]))
+        assert run_result.errors == [], run_result.errors
+
+        today = datetime.now(timezone.utc).date()
+        assert captured["start"] == datetime(2020, 1, 27).date()
+        assert captured["end"] == today
+
+    def test_explicit_start_survives_contracts_and_nifty(self, session_factory):
+        """Case E: an explicit nifty_start_date is respected as-is through
+        the contracts + nifty coordination (a registry with an older expiry
+        must NOT override it)."""
+        db = session_factory()
+        self._seed_nifty_expiry(db, "2020-01-30")
+        db.close()
+
+        result = self._run_real_chain(
+            session_factory,
+            ["contracts", "nifty"],
+            nifty_start_date=datetime(2024, 1, 1).date(),
+        )
+
+        assert result.metadata["nifty_coverage_start"] == "2024-01-01"
+        chunks = result.metadata["chunks"]
+        assert chunks[0]["from"] == "2024-01-01"
+
+    def test_manifest_records_actual_window_from_execution_result(
+        self, session_factory, monkeypatch
+    ):
+        """Case D: the manifest must carry the window the execution ACTUALLY
+        used (from the orchestrator result), not a value background_jobs
+        guessed before run_all."""
+        captured = {}
+        job, summary, audit = self._enqueue_and_run(
+            monkeypatch,
+            session_factory,
+            {"stages": ["nifty"]},
+            captured,
+            result_metadata={
+                "nifty_coverage_start": "2021-06-01",
+                "nifty_coverage_end": "2021-06-30",
+            },
+            key="gov-window:actual",
+        )
+
+        # background_jobs forwards the RAW payload start; the manifest's
+        # authoritative window comes from the executed result metadata.
+        assert captured["nifty_start"] is None
+        assert audit.coverage_start == "2021-06-01"
+        assert audit.coverage_end == "2021-06-30"
+        assert captured["orchestrator_run_id"] == summary["governance_run_id"]
+
+    def test_options_only_keeps_existing_manifest_semantics(
+        self, session_factory, monkeypatch
+    ):
+        """Options-only jobs have no NIFTY coverage window; the manifest
+        keeps the resolver-derived bounds and a result without NIFTY window
+        metadata must not overwrite them."""
+        captured = {}
+        job, summary, audit = self._enqueue_and_run(
+            monkeypatch,
+            session_factory,
+            {"stages": ["options"]},
+            captured,
+            result_metadata={},
+            key="gov-window:options-only",
+        )
+
+        today = datetime.now(timezone.utc).date()
+        expected_start = (today - timedelta(days=365)).isoformat()
+        assert audit.coverage_start == expected_start
+        assert audit.coverage_end == today.isoformat()
+
+    def test_contracts_failure_stops_nifty_and_records_failure(
+        self, session_factory
+    ):
+        """Failure path: run_all converts a contracts-stage exception into a
+        FAILED result WITHOUT running NIFTY — no effective NIFTY window is
+        resolved or fabricated after the failure (status/errors carry the
+        failure; background_jobs finalizes the manifest FAILED)."""
+        import asyncio
+
+        from app.services.backfill_orchestrator import BackfillOrchestrator
+
+        captured = {}
+
+        class _FailingContracts(BackfillOrchestrator):
+            async def run_contracts(self):
+                raise RuntimeError("synthetic contract discovery failure")
+
+            async def run_nifty(self, start_date=None, end_date=None):
+                captured["called"] = True
+                raise AssertionError("run_nifty must not run after contract failure")
+
+            async def run_options(self, concurrency=None):
+                raise AssertionError("run_options must not run after contract failure")
+
+        orch = _FailingContracts.__new__(_FailingContracts)
+        BackfillOrchestrator.__init__(orch, session_factory(), client=None)
+
+        result = asyncio.run(orch.run_all(stages=["contracts", "nifty"]))
+        assert result.status == "FAILED"
+        assert any(
+            "synthetic contract discovery failure" in e for e in result.errors
+        )
+        assert "called" not in captured
+        assert "nifty_coverage_start" not in result.metadata
 
 
 class TestCliDatabaseUrlNormalization:
@@ -2203,6 +2427,7 @@ class TestWorkerRateLimiterLifecycle:
                 rows_inserted = 0
                 rows_skipped = 0
                 errors = []
+                metadata = {}
 
             class _FakeOrch:
                 def __init__(self, db, client, *, force=False, rate_limiter=None):
