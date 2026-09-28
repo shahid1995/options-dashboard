@@ -434,94 +434,84 @@ class GexResearchEngine:
         ).scalars().all()
 
     def _fetch_oi_data(self, timestamps: list[datetime]) -> dict:
-        """Fetch OI and volume data from option_candles for each timestamp.
+        """Fetch OI and volume feature state through the PIT dataset boundary.
 
-        Uses option_greeks.open_time to align with historical_gex timestamps,
-        then joins with option_candles to get OI/volume.
+        Only option Greeks and option candles observed at the requested
+        decision timestamps are used. Forward NIFTY candles remain separate
+        because they are labels, not features.
         """
         if not timestamps:
             return {}
 
-        result = {}
-        batch_size = 500
-        for batch_start in range(0, len(timestamps), batch_size):
-            batch = timestamps[batch_start:batch_start + batch_size]
+        greek_rows = self.pit.option_greeks_at_many(
+            timestamps,
+            interval=DEFAULT_INTERVAL,
+            calc_version="greeks_v3",
+        )
+        if not greek_rows:
+            return {}
 
-            # Get Greek keys for these timestamps
-            greek_rows = self.db.execute(
-                select(
-                    OptionGreeks.open_time,
-                    OptionGreeks.instrument_key,
-                    OptionGreeks.option_type,
-                )
-                .where(
-                    OptionGreeks.open_time.in_(batch),
-                    OptionGreeks.calc_version == "greeks_v3",
-                )
-            ).all()
+        ts_instruments: dict[datetime, list] = defaultdict(list)
+        for row in greek_rows:
+            ts_instruments[row.open_time].append((row.instrument_key, row.option_type))
 
-            if not greek_rows:
-                continue
+        instruments = sorted({
+            instrument_key
+            for rows in ts_instruments.values()
+            for instrument_key, _ in rows
+        })
+        oi_rows = self.pit.option_candles_at_many(
+            timestamps,
+            instrument_keys=instruments,
+            interval=DEFAULT_INTERVAL,
+        )
 
-            # Group by timestamp
-            ts_instruments: dict[datetime, list] = defaultdict(list)
-            for open_time, ik, opt_type in greek_rows:
-                ts_instruments[open_time].append((ik, opt_type))
+        ik_to_type = {
+            instrument_key: option_type
+            for rows in ts_instruments.values()
+            for instrument_key, option_type in rows
+        }
 
-            # Fetch OI for each timestamp
-            for ts, instruments in ts_instruments.items():
-                ik_list = [ik for ik, _ in instruments]
+        result: dict[datetime, dict] = {}
+        for ts in sorted(ts_instruments):
+            ts_instruments_for_time = ts_instruments[ts]
+            allowed_keys = {ik for ik, _ in ts_instruments_for_time}
+            total_oi = 0.0
+            call_oi = 0.0
+            put_oi = 0.0
+            total_vol = 0.0
+            call_vol = 0.0
+            put_vol = 0.0
 
-                oi_rows = self.db.execute(
-                    select(
-                        OptionCandle.instrument_key,
-                        OptionCandle.open_interest,
-                        OptionCandle.volume,
-                    )
-                    .where(
-                        OptionCandle.open_time == ts,
-                        OptionCandle.instrument_key.in_(ik_list),
-                    )
-                ).all()
+            for row in oi_rows:
+                if row.open_time != ts or row.instrument_key not in allowed_keys:
+                    continue
+                oi_val = float(row.open_interest or 0)
+                vol_val = float(row.volume or 0)
+                opt_type = ik_to_type.get(row.instrument_key, "")
+                total_oi += oi_val
+                total_vol += vol_val
+                if opt_type == "CE":
+                    call_oi += oi_val
+                    call_vol += vol_val
+                elif opt_type == "PE":
+                    put_oi += oi_val
+                    put_vol += vol_val
 
-                # Build lookup: instrument_key -> option_type from Greek rows
-                ik_to_type = {ik: opt_type for ik, opt_type in instruments}
+            result[ts] = {
+                "total_oi": total_oi,
+                "call_oi": call_oi,
+                "put_oi": put_oi,
+                "call_put_ratio": call_oi / put_oi if put_oi > 0 else None,
+                "total_volume": total_vol,
+                "call_volume": call_vol,
+                "put_volume": put_vol,
+                "oi_change": None,
+                "call_oi_change": None,
+                "put_oi_change": None,
+            }
 
-                total_oi = 0.0
-                call_oi = 0.0
-                put_oi = 0.0
-                total_vol = 0.0
-                call_vol = 0.0
-                put_vol = 0.0
-
-                for ik, oi, vol in oi_rows:
-                    oi_val = float(oi or 0)
-                    vol_val = float(vol or 0)
-                    opt_type = ik_to_type.get(ik, "")
-                    total_oi += oi_val
-                    total_vol += vol_val
-                    if opt_type == "CE":
-                        call_oi += oi_val
-                        call_vol += vol_val
-                    elif opt_type == "PE":
-                        put_oi += oi_val
-                        put_vol += vol_val
-
-                result[ts] = {
-                    "total_oi": total_oi,
-                    "call_oi": call_oi,
-                    "put_oi": put_oi,
-                    "call_put_ratio": call_oi / put_oi if put_oi > 0 else None,
-                    "total_volume": total_vol,
-                    "call_volume": call_vol,
-                    "put_volume": put_vol,
-                    "oi_change": None,  # Computed later
-                    "call_oi_change": None,
-                    "put_oi_change": None,
-                }
-
-        # Compute OI changes
-        sorted_ts = sorted(result.keys())
+        sorted_ts = sorted(result)
         for i in range(1, len(sorted_ts)):
             curr = result[sorted_ts[i]]
             prev = result[sorted_ts[i - 1]]
