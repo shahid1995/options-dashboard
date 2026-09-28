@@ -716,3 +716,26 @@ class TestProductionDBProtection:
         """Engine URL should not reference production DB."""
         url = str(db_session.get_bind().url)
         assert "paper_journal" not in url
+
+def test_regime_percentiles_do_not_use_future_gex_values():
+    """A future GEX observation must not change an earlier regime classification."""
+    from datetime import datetime
+
+    from app.services.historical_gex_research import GexResearchEngine
+
+    t1 = datetime(2026, 8, 27, 10, 0)
+    t2 = datetime(2026, 8, 27, 10, 3)
+    t3 = datetime(2026, 8, 27, 10, 6)
+
+    gex_series = {
+        t1: {"net_gex": 100.0},
+        t2: {"net_gex": 0.0},
+        t3: {"net_gex": -1000.0},
+    }
+
+    engine = GexResearchEngine.__new__(GexResearchEngine)
+    regimes = engine._compute_regimes(gex_series)
+
+    # With only t1 known, +100 is the full historical distribution and is not
+    # made "strong positive" by the unseen -1000 future observation.
+    assert regimes[t1]["detailed_regime"] == "WEAK_POSITIVE"
