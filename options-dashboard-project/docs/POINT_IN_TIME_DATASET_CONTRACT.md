@@ -68,3 +68,19 @@ Additional datasets must adopt the same contract before they become backtest fea
 ## Non-goals
 
 This contract does not change live/paper execution, mutate production data, or create a second payoff/risk implementation. The existing shared strategy/risk calculation layer remains authoritative for strategy mathematics.
+
+
+## Strategy/risk/scenario integration seam
+
+The backend now exposes `build_point_in_time_strategy_inputs()` as the decision-bounded input seam for a historical strategy evaluation. It deliberately stops at market inputs; it does not reimplement payoff or scenario mathematics.
+
+The repository's existing authoritative calculation modules remain the shared engines:
+
+- `frontend/lib/calculations/strategyCalculator.js`
+- `frontend/lib/calculations/scenario.js`
+- `frontend/lib/calculations/greekAnalytics.js`
+- `frontend/lib/calculations/gexAnalytics.js`
+
+A future backtest runner must consume the PIT strategy-input bundle and pass only that decision-bounded market state into those existing engines. Creating a second Python payoff/risk/scenario implementation would violate the existing architecture.
+
+The current repository does not yet have a server-side backtest runner or server-side strategy evaluator, so Day 49 establishes the safe input seam without inventing a duplicate calculation engine.
