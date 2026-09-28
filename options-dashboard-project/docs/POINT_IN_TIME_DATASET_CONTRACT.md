@@ -16,8 +16,10 @@ StrikeNova historical market-data candles are persisted as **naive IST (Asia/Kol
 
 For raw market data, the source observation timestamp is the feature-availability boundary:
 
-- `NiftyCandle.open_time` plus its interval-completion boundary
-- `OptionCandle.open_time` plus its interval-completion boundary
+- `NiftyCandle.open_time` plus its interval-completion boundary; the latest
+  fully completed bar at or before T is selected
+- `OptionCandle.open_time` plus its interval-completion boundary; the latest
+  fully completed bar at or before T is selected
 - `IVObservation.observed_at`
 
 For derived historical datasets, the source market timestamp remains the PIT boundary:
