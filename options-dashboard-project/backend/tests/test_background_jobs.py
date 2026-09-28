@@ -20,7 +20,7 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
 from app.db import Base
-from app.models import BackgroundJob, JobStatus
+from app.models import BackgroundJob, HistoricalDatasetGovernance, HistoricalIngestionRun, JobStatus
 from app.services import background_jobs as bj
 
 
@@ -36,6 +36,73 @@ def session_factory():
         "sqlite://", connect_args={"check_same_thread": False}
     )
     Base.metadata.create_all(bind=engine)
+    seed = sessionmaker(bind=engine, autocommit=False, autoflush=False)()
+    seed.add_all(
+        [
+            HistoricalDatasetGovernance(
+                dataset_key="UPSTOX_OPTION_CANDLES_3MIN",
+                domain="MARKET_DATA",
+                dataset_tier="RAW",
+                table_name="option_candles",
+                pipeline="backfill_options",
+                completeness_data_type="option_candles",
+                source="UPSTOX",
+                source_reference="test",
+                source_version="test",
+                entitlement_requirement="TEST",
+                entitlement_status="REVIEW_REQUIRED",
+                license_status="REVIEW_REQUIRED",
+                usage_policy="INTERNAL_ONLY",
+                redistribution_status="REVIEW_REQUIRED",
+                retention_policy="KEEP",
+                raw_immutable=True,
+                recomputable=True,
+                dependencies_json="[]",
+            ),
+            HistoricalDatasetGovernance(
+                dataset_key="UPSTOX_NIFTY_CANDLES_3MIN",
+                domain="MARKET_DATA",
+                dataset_tier="RAW",
+                table_name="nifty_candles",
+                pipeline="backfill_nifty",
+                completeness_data_type="nifty_candles",
+                source="UPSTOX",
+                source_reference="test",
+                source_version="test",
+                entitlement_requirement="TEST",
+                entitlement_status="REVIEW_REQUIRED",
+                license_status="REVIEW_REQUIRED",
+                usage_policy="INTERNAL_ONLY",
+                redistribution_status="REVIEW_REQUIRED",
+                retention_policy="KEEP",
+                raw_immutable=True,
+                recomputable=True,
+                dependencies_json="[]",
+            ),
+            HistoricalDatasetGovernance(
+                dataset_key="UPSTOX_CONTRACT_SPECS",
+                domain="MARKET_DATA",
+                dataset_tier="RAW",
+                table_name="contract_specs",
+                pipeline="backfill_contracts",
+                completeness_data_type="contract_metadata",
+                source="UPSTOX",
+                source_reference="test",
+                source_version="test",
+                entitlement_requirement="TEST",
+                entitlement_status="REVIEW_REQUIRED",
+                license_status="REVIEW_REQUIRED",
+                usage_policy="INTERNAL_ONLY",
+                redistribution_status="REVIEW_REQUIRED",
+                retention_policy="KEEP",
+                raw_immutable=True,
+                recomputable=True,
+                dependencies_json="[]",
+            ),
+        ]
+    )
+    seed.commit()
+    seed.close()
     factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
     yield factory
     engine.dispose()
@@ -1153,8 +1220,19 @@ class TestConcurrencyPropagation:
             idempotency_key="conc:1",
             payload={"stages": ["options"], "concurrency": 4},
         )
-        bj.execute_historical_ingestion(db, job)
+        summary = bj.execute_historical_ingestion(db, job)
         assert captured["options_concurrency"] == 4
+        assert summary["governance_run_id"]
+
+        audit = db.scalar(
+            select(HistoricalIngestionRun).where(
+                HistoricalIngestionRun.run_id == summary["governance_run_id"]
+            )
+        )
+        assert audit is not None
+        assert json.loads(audit.dataset_keys_json) == ["UPSTOX_OPTION_CANDLES_3MIN"]
+        assert audit.status == "SUCCEEDED"
+        assert audit.background_job_id == job.id
 
     def test_orchestrator_run_all_forwards_to_run_options(self):
         """Direct regression: run_all(options_concurrency=N) reaches the
@@ -1205,6 +1283,50 @@ class TestConcurrencyPropagation:
         orch = _MiniOrchestrator.__new__(_MiniOrchestrator)
         asyncio.run(orch.run_all(stages=["options"]))
         assert "concurrency" not in recorded  # run_options default preserved
+
+
+class TestHistoricalGovernanceFailureAudit:
+    def test_orchestrator_failure_finalizes_governance_run(
+        self, session_factory, monkeypatch
+    ):
+        class _FailingOrchestrator:
+            def __init__(self, db, client, *, force=False, rate_limiter=None):
+                pass
+
+            async def run_all(
+                self, *, stages=None, nifty_start_date=None, options_concurrency=None
+            ):
+                raise RuntimeError("synthetic ingestion failure")
+
+        import app.services.backfill_orchestrator as orch_mod
+        import app.services.upstox_client as upstox_mod
+
+        monkeypatch.setattr(orch_mod, "BackfillOrchestrator", _FailingOrchestrator)
+        monkeypatch.setattr(orch_mod, "TokenBridge", type("B", (), {}))
+        monkeypatch.setattr(
+            upstox_mod,
+            "UpstoxClient",
+            type("C", (), {"__init__": lambda self, token_provider=None: None}),
+        )
+
+        db = session_factory()
+        job, _ = bj.enqueue(
+            db,
+            job_type="HISTORICAL_INGESTION",
+            idempotency_key="gov-fail:1",
+            payload={"stages": ["options"]},
+        )
+        with pytest.raises(RuntimeError, match="synthetic ingestion failure"):
+            bj.execute_historical_ingestion(db, job)
+
+        audit = db.scalar(
+            select(HistoricalIngestionRun).where(
+                HistoricalIngestionRun.background_job_id == job.id
+            )
+        )
+        assert audit is not None
+        assert audit.status == "FAILED"
+        assert "synthetic ingestion failure" in (audit.error_message or "")
 
 
 class TestCliDatabaseUrlNormalization:
