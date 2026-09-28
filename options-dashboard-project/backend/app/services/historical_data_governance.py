@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import case, delete, func, select
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -296,7 +297,7 @@ def start_ingestion_run(
 
     source, entitlement, policy = _snapshot_policy(db, unique_keys)
     manifest = HistoricalIngestionRun(
-        run_id=run_id or __import__("uuid").uuid4().hex,
+        run_id=run_id or uuid4().hex,
         background_job_id=background_job_id,
         dataset_keys_json=json.dumps(unique_keys, sort_keys=True),
         source_snapshot_json=json.dumps(source, sort_keys=True),
@@ -372,21 +373,38 @@ def refresh_ingestion_run_metrics(
             or 0
         )
 
-    completeness_rows = []
+    completeness_count = 0
+    expected = 0
+    actual_from_completeness = 0
+    missing = 0
+    unavailable_count = 0
     if data_types:
-        stmt = select(DataCompleteness).where(
-            DataCompleteness.data_type.in_(data_types)
-        )
+        stmt = select(
+            func.count(DataCompleteness.id),
+            func.coalesce(func.sum(DataCompleteness.expected_count), 0),
+            func.coalesce(func.sum(DataCompleteness.actual_count), 0),
+            func.coalesce(func.sum(DataCompleteness.missing_count), 0),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (DataCompleteness.status == "UNAVAILABLE", 1),
+                        else_=0,
+                    )
+                ),
+                0,
+            ),
+        ).where(DataCompleteness.data_type.in_(data_types))
         if run.coverage_start:
             stmt = stmt.where(DataCompleteness.session_date >= run.coverage_start)
         if run.coverage_end:
             stmt = stmt.where(DataCompleteness.session_date <= run.coverage_end)
-        completeness_rows = list(db.scalars(stmt).all())
-
-    expected = sum(
-        int(row.expected_count or 0) for row in completeness_rows
-    )
-    missing = sum(int(row.missing_count or 0) for row in completeness_rows)
+        (
+            completeness_count,
+            expected,
+            actual_from_completeness,
+            missing,
+            unavailable_count,
+        ) = db.execute(stmt).one()
 
     fetched = db.scalar(
         select(func.coalesce(func.sum(IngestionLog.rows_fetched), 0)).where(
@@ -394,16 +412,16 @@ def refresh_ingestion_run_metrics(
         )
     )
     actual = int(fetched or 0)
-    if actual == 0 and completeness_rows:
-        actual = sum(int(row.actual_count or 0) for row in completeness_rows)
+    if actual == 0:
+        actual = int(actual_from_completeness or 0)
 
-    if not completeness_rows:
+    if not completeness_count:
         completeness_status = "UNKNOWN"
     elif missing > 0:
         completeness_status = "PARTIAL"
     elif expected > 0:
         completeness_status = "COMPLETE"
-    elif any(row.status == "UNAVAILABLE" for row in completeness_rows):
+    elif unavailable_count > 0:
         completeness_status = "UNAVAILABLE"
     else:
         completeness_status = "UNKNOWN"
