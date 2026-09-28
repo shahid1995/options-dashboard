@@ -248,6 +248,7 @@ class GexAnalyticsEngine:
             interval=DEFAULT_INTERVAL,
             calc_version=self.calc_version,
         )
+        rows = [row for row in rows if row.open_time == ts]
 
         if not rows:
             return None
@@ -306,6 +307,7 @@ class GexAnalyticsEngine:
             interval=DEFAULT_INTERVAL,
             calc_version=self.calc_version,
         )
+        rows = [row for row in rows if row.open_time == ts]
 
         strike_map: dict[float, StrikeGex] = {}
         for r in rows:
@@ -333,6 +335,7 @@ class GexAnalyticsEngine:
             interval=DEFAULT_INTERVAL,
             calc_version=self.calc_version,
         )
+        rows = [row for row in rows if row.open_time == ts]
 
         expiry_map: dict[str, ExpiryGex] = {}
         total_abs = 0.0
@@ -463,7 +466,8 @@ class GexAnalyticsEngine:
             self._decision_timestamp_for_observation(ts),
             interval=DEFAULT_INTERVAL,
             calc_version=self.calc_version,
-        )[:1]
+        )
+        rows = [row for row in rows if row.open_time == ts][:1]
         if rows:
             spot = rows[0].spot
 
