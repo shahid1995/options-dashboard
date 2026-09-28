@@ -48,6 +48,7 @@ def build_point_in_time_strategy_inputs(
     )
     greeks = pit.option_greeks_at_many(
         [normalized_decision],
+        instrument_keys=instrument_keys,
         calc_version=greeks_calc_version,
     )
     gex = pit.historical_gex_at(
@@ -59,8 +60,6 @@ def build_point_in_time_strategy_inputs(
         decision_timestamp=normalized_decision,
         spot=decision[0].close if decision else None,
         option_candles=tuple(candles),
-        option_greeks=tuple(
-            row for row in greeks if row.instrument_key in set(instrument_keys)
-        ),
+        option_greeks=tuple(greeks),
         historical_gex=tuple(gex),
     )
