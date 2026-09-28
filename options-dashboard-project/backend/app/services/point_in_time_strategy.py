@@ -13,6 +13,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from app.services.point_in_time import PointInTimeDataset
+from app.utils.market_time import to_ist_naive
 
 
 @dataclass(frozen=True)
@@ -35,24 +36,27 @@ def build_point_in_time_strategy_inputs(
     greeks_calc_version: str = "greeks_v3",
 ) -> PointInTimeStrategyInputs:
     """Build a PIT-safe strategy-input bundle without evaluating the strategy."""
+    normalized_decision = to_ist_naive(decision_timestamp)
+    if normalized_decision is None:
+        raise ValueError("A valid decision timestamp is required.")
+
     pit = PointInTimeDataset(db)
-    decision = pit.nifty_candles_at(decision_timestamp)
+    decision = pit.nifty_candles_at(normalized_decision)
     candles = pit.option_candles_at_many(
-        [decision_timestamp],
+        [normalized_decision],
         instrument_keys=instrument_keys,
     )
     greeks = pit.option_greeks_at_many(
-        [decision_timestamp],
+        [normalized_decision],
         calc_version=greeks_calc_version,
     )
     gex = pit.historical_gex_at(
-        decision_timestamp,
+        normalized_decision,
         calc_version=gex_calc_version,
     )
 
     return PointInTimeStrategyInputs(
-        decision_timestamp=decision_timestamp if isinstance(decision_timestamp, datetime)
-        else decision[0].open_time if decision else pit._require_cutoff(decision_timestamp),
+        decision_timestamp=normalized_decision,
         spot=decision[0].close if decision else None,
         option_candles=tuple(candles),
         option_greeks=tuple(
