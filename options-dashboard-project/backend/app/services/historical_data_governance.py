@@ -426,7 +426,7 @@ def refresh_ingestion_run_metrics(
     else:
         completeness_status = "UNKNOWN"
 
-    run.expected_records = expected if completeness_rows else None
+    run.expected_records = expected if completeness_count else None
     run.actual_records = actual
     run.missing_records = missing
     run.checkpoints_total = checkpoint_total

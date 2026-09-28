@@ -13,7 +13,6 @@ from app.db import Base
 from app.models import (
     DataCompleteness,
     HistoricalDatasetGovernance,
-    HistoricalGexSnapshot,
     HistoricalIngestionRun,
     IngestionCheckpoint,
     IngestionLog,
@@ -345,3 +344,47 @@ def test_raw_retention_is_not_executable_even_when_policy_is_destructive(db):
     )
     assert plan.deleted_rows == 0
     assert db.scalar(select(func.count()).select_from(OptionCandle)) == 1
+
+
+def test_metrics_refresh_without_completeness_rows_stays_closed(db):
+    """Regression: metrics refresh must not raise when no completeness rows exist.
+
+    The SQL-level aggregation rewrite left a stale reference that raised
+    NameError whenever a run had no DataCompleteness rows, which would have
+    turned successful ingestions into falsely-reported failures at
+    finalization time.
+    """
+    key = "UPSTOX_OPTION_CANDLES_3MIN"
+    _catalog(db, key=key)
+
+    run = hdg.start_ingestion_run(
+        db,
+        dataset_keys=[key],
+        coverage_start="2026-09-01",
+        coverage_end="2026-09-02",
+        run_id="run-day48-empty",
+    )
+    db.add(
+        IngestionCheckpoint(
+            pipeline="backfill_options",
+            instrument_key="NSE_FO|TEST|01-10-2026",
+            run_id=run.run_id,
+            status="PENDING",
+            items_processed=0,
+            items_total=5,
+        )
+    )
+    db.commit()
+
+    refreshed = hdg.refresh_ingestion_run_metrics(db, run.run_id)
+    assert refreshed.expected_records is None
+    assert refreshed.actual_records == 0
+    assert refreshed.missing_records == 0
+    assert refreshed.checkpoints_total == 1
+    assert refreshed.checkpoints_completed == 0
+    assert refreshed.completeness_status == "UNKNOWN"
+
+    finished = hdg.finish_ingestion_run(db, run.run_id, status=hdg.RUN_SUCCEEDED)
+    assert finished.status == hdg.RUN_SUCCEEDED
+    assert finished.expected_records is None
+    assert finished.completed_at is not None

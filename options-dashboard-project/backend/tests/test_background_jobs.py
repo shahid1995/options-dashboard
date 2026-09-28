@@ -1440,6 +1440,54 @@ def _shared_memory_sqlite_factory():
         poolclass=StaticPool,
     )
     Base.metadata.create_all(bind=engine)
+    # Day 48: the real historical-ingestion execution path fails closed
+    # without a governed catalog, so mirror the migrated schema's seeded
+    # stage datasets here (same rows the session_factory fixture seeds).
+    seed = sessionmaker(bind=engine, autocommit=False, autoflush=False)()
+    seed.add_all(
+        HistoricalDatasetGovernance(
+            dataset_key=key,
+            domain="MARKET_DATA",
+            dataset_tier="RAW",
+            table_name=table_name,
+            pipeline=pipeline,
+            completeness_data_type=data_type,
+            source="UPSTOX",
+            source_reference="test",
+            source_version="test",
+            entitlement_requirement="TEST",
+            entitlement_status="REVIEW_REQUIRED",
+            license_status="REVIEW_REQUIRED",
+            usage_policy="INTERNAL_ONLY",
+            redistribution_status="REVIEW_REQUIRED",
+            retention_policy="KEEP",
+            raw_immutable=True,
+            recomputable=True,
+            dependencies_json="[]",
+        )
+        for key, table_name, pipeline, data_type in (
+            (
+                "UPSTOX_CONTRACT_SPECS",
+                "contract_specs",
+                "backfill_contracts",
+                "contract_metadata",
+            ),
+            (
+                "UPSTOX_NIFTY_CANDLES_3MIN",
+                "nifty_candles",
+                "backfill_nifty",
+                "nifty_candles",
+            ),
+            (
+                "UPSTOX_OPTION_CANDLES_3MIN",
+                "option_candles",
+                "backfill_options",
+                "option_candles",
+            ),
+        )
+    )
+    seed.commit()
+    seed.close()
     return sessionmaker(bind=engine, autocommit=False, autoflush=False), engine
 
 
