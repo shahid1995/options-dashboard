@@ -122,7 +122,7 @@ def get_iv_observations(
 
 def prune_iv_observations(db: Session, retention_days: int = 90) -> int:
     """Delete observations older than `retention_days`; return rows deleted."""
-    cutoff = _utcnow() - timedelta(days=max(1, retention_days))
+    cutoff = to_ist_naive(_utcnow()) - timedelta(days=max(1, retention_days))
     result = db.execute(delete(IVObservation).where(IVObservation.observed_at < cutoff))
     db.commit()
     return result.rowcount or 0
