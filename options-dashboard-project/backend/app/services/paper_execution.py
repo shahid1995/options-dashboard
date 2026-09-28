@@ -34,6 +34,7 @@ import secrets
 from datetime import datetime, timezone
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -239,16 +240,77 @@ def _get_position(
     expiry: str,
     strike: float,
     option_type: str,
+    *,
+    for_update: bool = False,
 ) -> Position | None:
-    return db.scalar(
-        select(Position).where(
-            Position.user_id == user_id,
-            Position.symbol == symbol,
-            Position.expiry == expiry,
-            Position.strike == strike,
-            Position.option_type == option_type,
-        )
+    """Load one position, optionally taking its row lock before mutation."""
+    statement = select(Position).where(
+        Position.user_id == user_id,
+        Position.symbol == symbol,
+        Position.expiry == expiry,
+        Position.strike == strike,
+        Position.option_type == option_type,
     )
+    if for_update:
+        statement = statement.with_for_update()
+    return db.scalar(statement)
+
+
+def _get_or_create_position(
+    db: Session,
+    *,
+    user_id: str,
+    symbol: str,
+    expiry: str,
+    strike: float,
+    option_type: str,
+    lot_size: int,
+    execution_id: str,
+    opened_at: datetime,
+) -> Position:
+    """Get the instrument position under lock, creating it safely when absent.
+
+    Existing rows are locked with SELECT ... FOR UPDATE. For the absent-row
+    case, the insert is isolated in a savepoint so two concurrent transactions
+    racing to create the same unique position can recover from the loser-side
+    uniqueness conflict, re-load the now-existing row under lock, and continue
+    without corrupting the outer execution transaction.
+    """
+    position = _get_position(
+        db, user_id, symbol, expiry, strike, option_type, for_update=True
+    )
+    if position is not None:
+        return position
+
+    try:
+        with db.begin_nested():
+            position = Position(
+                user_id=user_id,
+                symbol=symbol,
+                expiry=expiry,
+                strike=strike,
+                option_type=option_type,
+                net_quantity=0,
+                average_entry_price=0.0,
+                lot_size=lot_size,
+                realized_pnl=0.0,
+                status="open",
+                strategy_execution_id=execution_id,
+                opened_at=opened_at,
+            )
+            db.add(position)
+            db.flush()
+    except IntegrityError:
+        position = _get_position(
+            db, user_id, symbol, expiry, strike, option_type, for_update=True
+        )
+        if position is None:
+            raise PaperExecutionError(
+                "POSITION_CONCURRENCY",
+                "Position creation raced another execution and could not be re-read safely.",
+            )
+
+    return position
 
 
 def _instrument_orders(db: Session, user_id: str, position: Position) -> list[PaperOrder]:
@@ -504,25 +566,18 @@ def execute_strategy(
 
         # Netted position (BUY = +, SELL = −). Same instrument nets into the
         # same row; the first opening execution stays the group identity.
-        position = _get_position(db, user_id, leg_symbol, leg.expiration_date, leg.strike_price, leg.option_type)
-        if position is None:
-            position = Position(
-                user_id=user_id,
-                symbol=leg_symbol,
-                expiry=leg.expiration_date,
-                strike=leg.strike_price,
-                option_type=leg.option_type,
-                net_quantity=0,
-                average_entry_price=0.0,
-                lot_size=leg.lot_size,
-                realized_pnl=0.0,
-                status="open",
-                strategy_execution_id=execution_id,
-                opened_at=now,
-            )
-            db.add(position)
-            db.flush()
-        elif position.status == "closed":
+        position = _get_or_create_position(
+            db,
+            user_id=user_id,
+            symbol=leg_symbol,
+            expiry=leg.expiration_date,
+            strike=leg.strike_price,
+            option_type=leg.option_type,
+            lot_size=leg.lot_size,
+            execution_id=execution_id,
+            opened_at=now,
+        )
+        if position.status == "closed":
             # Reopening a previously closed instrument: the same row resumes.
             # Lifetime realized P&L for the instrument is kept (never erased)
             # and the new entry starts a fresh net quantity at the new price.
@@ -642,8 +697,12 @@ def exit_position(
     """
     now = _now()
 
-    position = db.get(Position, position_id)
-    if position is None or position.user_id != user_id:
+    position = db.scalar(
+        select(Position)
+        .where(Position.id == position_id, Position.user_id == user_id)
+        .with_for_update()
+    )
+    if position is None:
         raise PaperExecutionError("POSITION_NOT_FOUND", "Position not found.")
 
     existing = find_exit_replay(user_id, position, request.client_order_id, db)
