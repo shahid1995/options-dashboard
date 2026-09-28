@@ -155,7 +155,10 @@ def test_future_observations_are_invisible_and_boundary_is_inclusive(
     rows = method(**kwargs)
 
     assert len(rows) == 1
-    assert rows[0].open_time == BASE_TS if method_name not in {"iv_observations"} else rows[0].observed_at == BASE_TS
+    if method_name == "iv_observations":
+        assert rows[0].observed_at == BASE_TS
+    else:
+        assert rows[0].open_time == BASE_TS
 
 
 def test_derived_processing_time_does_not_widen_market_time_visibility(db_session):
