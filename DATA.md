@@ -1,6 +1,6 @@
 # StrikeNova — Data
 
-**Status:** Canonical · **Owner:** Founder · **Last reviewed:** 2026-09-26
+**Status:** Canonical · **Owner:** Founder · **Last reviewed:** 2026-09-28
 
 ---
 
@@ -36,6 +36,7 @@ superseded — production is CockroachDB.
 | Market data | option chains, candles, Greeks, GEX snapshots/history | Tier-1 backfill + live ingestion (Phases 7.x) |
 | Broker sync | `app/broker_sync/` | Ingestion pipeline models |
 | Durable jobs | `BackgroundJob` (`background_jobs`, `app/models.py`) | Day 47 queue domain: idempotency key (unique), status, attempt count, lease owner/expiry, run-after, dead-letter reason. One row per idempotency key; terminal rows re-armed in place; `DEAD_LETTERED` rows retained for inspection. While a job runs, the worker's heartbeat extends `lease_expires_at` by the effective lease every ~lease/3 via the ownership-checked `renew_lease` (separate session per renewal); both RUNNING-exit transitions (success/failure) persist through the serialization-retry boundary on fresh sessions. Schema owned by Alembic (`d47aa0000001`) |
+| Historical data governance | `HistoricalDatasetGovernance`, `HistoricalIngestionRun` | Day 48 catalog/manifest for provenance, source entitlement, usage, redistribution, immutability, recomputation dependencies, completeness/checkpoint snapshots and retention policy. Policy snapshots are append-only audit context; current catalog state remains editable by controlled administration. |
 | Templates | `StrategyTemplate` (+legs) | User-owned reusable strategy blueprints |
 
 ## 4. Conventions
@@ -111,3 +112,18 @@ would create future tables that lack the runtime default privileges.
 The Phase 7.x record (persistence foundation, backfill orchestrators, Greeks
 reconstruction, coverage audits) lives in `options-dashboard-project/docs/` —
 evidence of completed work, not open tasks.
+
+Day 48 adds a governance catalog alongside the existing raw/model/analytics
+tables. `HistoricalDatasetGovernance` records source and source-reference
+metadata, entitlement/license/usage/redistribution status, tier, immutability,
+recomputation dependencies and retention policy. `HistoricalIngestionRun`
+snapshots those policy decisions for each acquisition and records checkpoint
+and completeness metrics without replacing the existing `IngestionCheckpoint`,
+`DataCompleteness` or `IngestionLog` records.
+
+Raw market observations remain the recomputation source. Current upstream
+redistribution status is intentionally `REVIEW_REQUIRED` unless an explicit
+governance decision changes it; API availability is not treated as proof of
+redistribution rights. Retention execution is dry-run-first, allow-listed and
+disabled in the catalog by default; raw-tier deletion is not executable through
+the Day 48 service.
