@@ -387,3 +387,61 @@ def test_metrics_refresh_without_completeness_rows_stays_closed(db):
     assert finished.status == hdg.RUN_SUCCEEDED
     assert finished.expected_records is None
     assert finished.completed_at is not None
+
+
+def test_governance_datetimes_are_naive_utc(db):
+    """Regression (CodeRabbit HIGH on 2beb38b): the governance service must
+    store and compare naive UTC datetimes, matching the historical tables'
+    timezone-naive DateTime columns. An aware `now` must be normalized
+    before computing a retention cutoff, and completed_at must be naive.
+    """
+    key = "STRIKENOVA_OPTION_GREEKS"
+    _catalog(
+        db,
+        key=key,
+        tier="MODEL",
+        pipeline=None,
+        completeness_data_type=None,
+        source="STRIKENOVA",
+        entitlement_status=hdg.ENTITLEMENT_NOT_APPLICABLE,
+        license_status=hdg.LICENSE_INTERNAL,
+        retention_policy=hdg.RETENTION_DELETE_AFTER_DAYS,
+        retention_days=30,
+        retention_enforced=True,
+        raw_immutable=False,
+        recomputable=True,
+        dependencies=["UPSTOX_OPTION_CANDLES_3MIN"],
+    )
+    _catalog(db, key="UPSTOX_OPTION_CANDLES_3MIN")
+
+    def _greek(instrument_key, open_time):
+        return _option_greek(instrument_key=instrument_key, open_time=open_time)
+
+    db.add_all(
+        [
+            # Far outside the window: candidate.
+            _greek("NSE_FO|A|01-10-2026", datetime(2025, 1, 1, 3, 45)),
+            # One second before the cutoff: candidate (strict <).
+            _greek("NSE_FO|B|01-10-2026", datetime(2025, 1, 2, 11, 59, 59)),
+            # Exactly at the cutoff: NOT a candidate.
+            _greek("NSE_FO|C|01-10-2026", datetime(2025, 1, 2, 12, 0, 0)),
+            # One second after the cutoff: NOT a candidate.
+            _greek("NSE_FO|D|01-10-2026", datetime(2025, 1, 2, 12, 0, 1)),
+        ]
+    )
+    db.commit()
+
+    # An AWARE `now` and its naive equivalent must produce identical plans.
+    now_aware = datetime(2025, 2, 1, 12, 0, 0, tzinfo=timezone.utc)
+    now_naive = datetime(2025, 2, 1, 12, 0, 0)
+    plan_aware = hdg.plan_retention(db, key, now=now_aware)
+    plan_naive = hdg.plan_retention(db, key, now=now_naive)
+
+    assert plan_aware.cutoff == plan_naive.cutoff
+    assert plan_aware.cutoff.tzinfo is None
+    assert plan_aware.candidate_rows == 2
+
+    # finalize timestamps are stored naive UTC as well.
+    run = hdg.start_ingestion_run(db, dataset_keys=[key], run_id="run-naive-ts")
+    finished = hdg.finish_ingestion_run(db, run.run_id, status=hdg.RUN_FAILED)
+    assert finished.completed_at.tzinfo is None

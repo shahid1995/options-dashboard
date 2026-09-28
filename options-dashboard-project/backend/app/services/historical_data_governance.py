@@ -82,6 +82,25 @@ class HistoricalDataGovernanceError(ValueError):
     """Raised when a governance contract cannot be satisfied safely."""
 
 
+def _utcnow_naive() -> datetime:
+    """Naive UTC timestamp, matching the repository's storage convention.
+
+    Historical tables use timezone-naive ``DateTime`` columns; writing or
+    comparing with timezone-aware values breaks same-day boundaries on
+    SQLite (lexicographic string comparison) and is session-TZ dependent
+    on PostgreSQL, so every datetime this service stores or filters with
+    is normalized to naive UTC.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _naive_utc(value: datetime) -> datetime:
+    """Normalize an incoming datetime to naive UTC (idempotent for naive)."""
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 @dataclass(frozen=True)
 class RetentionPlan:
     dataset_key: str
@@ -451,7 +470,7 @@ def finish_ingestion_run(
     run.error_message = error_message
     if status == RUN_SUCCEEDED and run.completeness_status == "PARTIAL":
         run.status = RUN_PARTIAL
-    run.completed_at = datetime.now(timezone.utc)
+    run.completed_at = _utcnow_naive()
     db.commit()
     db.refresh(run)
     return run
@@ -490,7 +509,7 @@ def plan_retention(
         )
 
     model, timestamp_name = _RETENTION_TARGETS[dataset_key]
-    clock = now or datetime.now(timezone.utc)
+    clock = _naive_utc(now) if now is not None else _utcnow_naive()
     cutoff = clock - timedelta(days=row.retention_days)
     timestamp_column = getattr(model, timestamp_name)
     candidate_rows = int(
