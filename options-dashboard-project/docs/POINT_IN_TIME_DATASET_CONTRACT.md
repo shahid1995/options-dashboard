@@ -6,18 +6,18 @@ Backtesting and historical research must evaluate a simulated decision at an exp
 
 The governing invariant is:
 
-> For decision timestamp T, a feature query may return only observations whose market observation timestamp is less than or equal to T.
+> For decision timestamp T, a point observation may be used when its observation timestamp is <= T. Interval-derived market bars may be used only after the interval has completed.
 
 ## Timestamp semantics
 
-StrikeNova historical market-data candles are persisted as **naive IST (Asia/Kolkata)** timestamps. The public PIT interface therefore accepts either a naive datetime (interpreted as IST) or a timezone-aware timestamp, which is normalized through `app.utils.market_time.to_ist_naive()`.
+StrikeNova historical market-data candles are persisted as **naive IST (Asia/Kolkata)** timestamps. The public PIT interface therefore accepts either a naive datetime (interpreted as IST) or a timezone-aware timestamp, which is normalized through `app.utils.market_time.to_ist_naive()`. IV observations are normalized to the same canonical naive-IST representation when persisted.
 
 ### Feature time vs processing time
 
 For raw market data, the source observation timestamp is the feature-availability boundary:
 
-- `NiftyCandle.open_time`
-- `OptionCandle.open_time`
+- `NiftyCandle.open_time` plus its interval-completion boundary
+- `OptionCandle.open_time` plus its interval-completion boundary
 - `IVObservation.observed_at`
 
 For derived historical datasets, the source market timestamp remains the PIT boundary:
@@ -59,7 +59,7 @@ Additional datasets must adopt the same contract before they become backtest fea
 
 ## Security / integrity requirements
 
-- The cutoff is mandatory at the PIT interface.
+- - The cutoff is mandatory at the PIT interface.
 - Callers do not supply SQL predicates themselves.
 - A future observation inserted into the database must remain invisible to an earlier PIT query.
 - Exact-boundary observations remain visible.
