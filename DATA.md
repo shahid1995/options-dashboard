@@ -35,13 +35,18 @@ superseded — production is CockroachDB.
 | Paper trading | positions, executions, journal, templates (`app/models.py`) | Server-authoritative balances and P&L |
 | Market data | option chains, candles, Greeks, GEX snapshots/history | Tier-1 backfill + live ingestion (Phases 7.x) |
 | Broker sync | `app/broker_sync/` | Ingestion pipeline models |
+| Durable jobs | `BackgroundJob` (`background_jobs`, `app/models.py`) | Day 47 queue domain: idempotency key (unique), status, attempt count, lease owner/expiry, run-after, dead-letter reason. One row per idempotency key; terminal rows re-armed in place; `DEAD_LETTERED` rows retained for inspection. While a job runs, the worker's heartbeat extends `lease_expires_at` by the effective lease every ~lease/3 via the ownership-checked `renew_lease` (separate session per renewal); both RUNNING-exit transitions (success/failure) persist through the serialization-retry boundary on fresh sessions. Schema owned by Alembic (`d47aa0000001`) |
 | Templates | `StrategyTemplate` (+legs) | User-owned reusable strategy blueprints |
 
 ## 4. Conventions
 
 - **Timestamps:** UTC storage, IST market context — standardized per
   `docs/PHASE_7_24_4_TIMEZONE_STANDARDIZATION.md`; no naive `datetime.now()`
-  in production paths.
+  in production paths. Exception (scoped): the Day 47 job-scheduling fields
+  (`available_at`, `lease_expires_at`, `started_at`, `completed_at`,
+  `created_at`, `updated_at` on `background_jobs`) deliberately store and
+  compare naive UTC so claim/retry semantics are identical across SQLite,
+  PostgreSQL and CockroachDB — see `_utcnow_naive` in `app/models.py`.
 - **GEX conventions:** sign, flip/wall, and aggregation definitions are owned
   by `docs/GEX_V1_0_SPEC.md`.
 - **Secrets at rest:** broker tokens Fernet-encrypted (`app/crypto.py`);

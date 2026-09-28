@@ -38,6 +38,7 @@ CockroachDB Cloud — production database (Alembic-managed schema)
 | Paper trading | `backend/app/services/paper_execution.py` | Server-authoritative execution, positions, exits, P&L |
 | Broker sync | `backend/app/broker_sync/` | Ingestion models/pipeline for broker data |
 | Data/config | `backend/app/db.py`, `backend/app/config.py` | Engine/session construction from `DATABASE_URL`; pydantic settings |
+| Durable background jobs | `backend/app/services/background_jobs.py`, `backend/run_jobs.py` | Day 47 database-backed job queue on the application database (see below) |
 | Migrations | `backend/alembic/` | **Sole schema authority** (ADR-002) |
 | Tests | `backend/tests/` | pytest suite (185 test files) |
 
@@ -46,6 +47,66 @@ Request authentication path (Issue #61 contract):
 ```text
 Cookie strikenova_session → CurrentUser/get_current_user → AuthenticatedUser(user_id, access_token|None)
 ```
+
+### 2.1 Durable background jobs (Day 47)
+
+Operational work that must survive process restart runs as durable jobs
+instead of direct CLI execution. The database IS the queue — no external
+broker (Redis/Celery/RabbitMQ/Kafka) is introduced.
+
+- **Persistence domain:** `background_jobs` table (migration
+  `d47aa0000001`), owned by Alembic like every other table. Model:
+  `BackgroundJob` in `app/models.py`.
+- **Worker/queue boundary:** producer = `enqueue` (idempotent per
+  `idempotency_key` — one row per key, ever; terminal rows are re-armed
+  in place); consumer = `claim_next` (single conditional UPDATE lease
+  claim, the ADR-017 `_migration_lock` pattern; expired leases make
+  crashed jobs claimable again); transitions out of RUNNING are
+  ownership-protected (`complete_job`/`fail_job` verify RUNNING + owner +
+  unexpired lease atomically, so a stale worker can never overwrite a
+  replacement attempt).
+- **Lease heartbeat:** while a claimed job executes, a daemon heartbeat
+  thread renews the lease every ~lease/3 (floored) via `renew_lease` —
+  an atomic conditional UPDATE requiring RUNNING + owner + unexpired
+  lease, on its own session (execution work never shares it). The
+  effective lease is resolved ONCE by `claim_next` (explicit override >
+  payload `policy.lease_seconds` > default) and threaded through
+  execution, heartbeat, and completion unchanged. Renewal stops when
+  execution ends (either path) or when ownership is lost; a database
+  failure — session acquisition OR renewal — is logged, retried at the
+  next interval, never fatal to the thread, and never fabricated into
+  success. A crashed process stops renewing by construction, so lease
+  expiry remains the crash-recovery path and no second ownership race
+  is introduced.
+- **Retry/dead-letter semantics:** bounded attempts with exponential
+  backoff (payload-overridable policy: `max_attempts`,
+  `backoff_base_seconds`, `lease_seconds`); transient failures
+  (SQLSTATE 40001/40P01/55P03, connection markers) are retried;
+  authentication failures and malformed payloads are non-retryable;
+  exhausted jobs become inspectable `DEAD_LETTERED` rows, never deleted.
+  BOTH transitions out of RUNNING persist through
+  `retry_on_serialization` on a fresh session — success re-fetches the
+  row and re-runs the ownership-protected completion (only the state
+  transition is retried, never the ingestion work); failures re-run the
+  ownership-protected `fail_job`.
+- **Entry points:** `run_jobs.py` (`enqueue-backfill`, `work`, `status`)
+  is the administrative CLI; it performs NO schema mutation (Alembic is
+  the sole authority — ADR-002). Historical ingestion executes through
+  the real `BackfillOrchestrator` service boundary (no subprocess).
+- **Rate-limiter lifecycle:** the ``GlobalRateLimiter`` is a WORKER-
+  LIFETIME in-process limiter (the same scope ``run_backfill.py`` gives
+  its whole CLI process): ``run_worker`` creates one limiter and passes
+  it through ``_execute_one`` → ``execute_job`` →
+  ``execute_historical_ingestion``, so 429 cooldown, widened pacing, and
+  adaptive-concurrency state survive job boundaries. Each job's
+  requested concurrency is applied per-run by
+  ``prepare_run_rate_limiter`` (recovery ceiling + semaphore) WITHOUT
+  resetting the preserved adaptive state; separate worker processes keep
+  independent limiter state (no global singleton), and direct callers
+  omitting the limiter get the original per-run construction. The
+  HTTP-session ``SessionRateLimiter`` is untouched.
+- **Not deployed:** no production worker service or scheduler exists yet;
+  enabling one requires separate authorization.
 
 ## 3. Frontend (Next.js)
 

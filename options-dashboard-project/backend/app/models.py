@@ -1,6 +1,7 @@
+import enum
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -1135,3 +1136,132 @@ class GapBacktestResult(Base):
             name="uq_gap_backtest_model_period_regime",
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Day 47 — Durable background jobs
+# ---------------------------------------------------------------------------
+
+
+def _utcnow_naive() -> datetime:
+    """Naive UTC timestamp for Day 47 job scheduling fields.
+
+    Deliberately scoped to the Day 47 job model: the ``background_jobs``
+    service (``app/services/background_jobs.py``) stores and compares naive
+    UTC for cross-database comparability (SQLite string ordering,
+    PostgreSQL/CockroachDB TIMESTAMP WITHOUT TIME ZONE) and binds its own
+    clock as query parameters. The rest of this module keeps the historical
+    aware-``_utcnow`` convention; the two are never mixed inside the job
+    row's scheduling fields.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+class JobStatus(str, enum.Enum):
+    """Lifecycle states of a durable background job."""
+
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED_RETRYABLE = "FAILED_RETRYABLE"
+    DEAD_LETTERED = "DEAD_LETTERED"
+    CANCELLED = "CANCELLED"
+
+
+class JobType(str, enum.Enum):
+    """Known job types. Day 47 scope: historical ingestion only."""
+
+    HISTORICAL_INGESTION = "HISTORICAL_INGESTION"
+
+
+class BackgroundJob(Base):
+    """One durable unit of background work (database-backed job queue).
+
+    Row lifecycle::
+
+        PENDING --claim--> RUNNING --success--> SUCCEEDED
+                                |--retryable failure--> FAILED_RETRYABLE
+                                |                        (available_at in the
+                                |                         future = backoff)
+                                |--non-retryable--> DEAD_LETTERED
+                                |--attempt budget exhausted--> DEAD_LETTERED
+                                |--lease expiry--> claimable again
+
+    ``PENDING``/``FAILED_RETRYABLE``/``RUNNING`` rows are "live" for
+    enqueue-idempotency purposes; ``SUCCEEDED``/``DEAD_LETTERED``/
+    ``CANCELLED`` are terminal. ``enqueue`` collapses duplicate enqueues
+    onto the single row owned by the idempotency key: a live job is
+    returned unchanged, a terminal job is re-armed in place (reset to
+    PENDING with counters preserved) so dead-letter history stays
+    inspectable instead of being duplicated or deleted.
+
+    Execution idempotency is NOT stored here: it is provided by the
+    durable invariants of the wrapped operation (the backfill
+    orchestrator's checkpoint resume plus unique-constraint insert
+    semantics), so a retry after a crash never duplicates durable rows.
+    """
+
+    __tablename__ = "background_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+
+    # --- What to run -------------------------------------------------------
+    job_type: Mapped[str] = mapped_column(String(64), index=True)
+    # Caller-defined uniqueness scope, e.g. "backfill:all:2024-01-01" for
+    # historical ingestion. The job row stores only the reference parameters
+    # required to resume; the data itself lives in the ingestion tables.
+    idempotency_key: Mapped[str] = mapped_column(String(256))
+    payload: Mapped[str] = mapped_column(Text, default="")
+    # Tenant/context (user scope) where applicable; None = platform job.
+    user_scope: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+
+    # --- State machine -----------------------------------------------------
+    status: Mapped[str] = mapped_column(String(32), default=JobStatus.PENDING.value)
+
+    # --- Retry accounting ---------------------------------------------------
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    # --- Scheduling / lease -------------------------------------------------
+    # Naive-UTC defaults (see _utcnow_naive): consistent with the service's
+    # claim/retry comparisons, which bind naive UTC as query parameters.
+    available_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow_naive)
+    lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # --- Failure information --------------------------------------------------
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    dead_letter_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # --- Bookkeeping ------------------------------------------------------------
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow_naive)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow_naive, onupdate=_utcnow_naive
+    )
+
+    __table_args__ = (
+        # Idempotency invariant: at most ONE row per idempotency key, ever.
+        # Duplicate enqueues (including two racing INSERTs of the same key)
+        # collapse onto one row; terminal jobs are re-armed rather than
+        # duplicated, keeping dead-letter history inspectable.
+        UniqueConstraint(
+            "idempotency_key",
+            name="uq_background_jobs_idempotency",
+        ),
+        # Claim-scan index: workers poll for PENDING work ordered by
+        # availability. Claim exclusivity is guaranteed by the single
+        # conditional UPDATE in the worker service (lease-based), the same
+        # proven pattern as the ADR-017 migration lock.
+        Index(
+            "ix_background_jobs_status_available",
+            "status",
+            "available_at",
+        ),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return (
+            f"<BackgroundJob id={self.id} type={self.job_type} "
+            f"status={self.status} attempts={self.attempt_count}>"
+        )

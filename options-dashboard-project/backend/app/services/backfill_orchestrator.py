@@ -352,6 +352,7 @@ class BackfillOrchestrator:
         *,
         stages: list[str] | None = None,
         nifty_start_date: date | None = None,
+        options_concurrency: int | None = None,
     ) -> BackfillResult:
         """Run the full backfill pipeline.
 
@@ -388,7 +389,16 @@ class BackfillOrchestrator:
                 result.errors.extend(nifty_result.errors)
 
             if "options" in stages:
-                options_result = await self.run_options()
+                # Forward an explicitly requested concurrency so the option
+                # stage's limiter ceiling reflects the caller's request;
+                # when omitted, run_options keeps its own default (existing
+                # CLI behavior is unchanged).
+                if options_concurrency is not None:
+                    options_result = await self.run_options(
+                        concurrency=options_concurrency
+                    )
+                else:
+                    options_result = await self.run_options()
                 result.api_calls += options_result.api_calls
                 result.rows_fetched += options_result.rows_fetched
                 result.rows_inserted += options_result.rows_inserted

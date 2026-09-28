@@ -289,7 +289,12 @@ class GlobalRateLimiter:
         self._cooldown_until: float = 0.0
         self._cooldown_total: float = 0.0
         self._consecutive_429s: int = 0
+        # Adaptive state is worker-lifetime, but asyncio synchronization
+        # primitives are event-loop-local. The worker currently executes
+        # each job through asyncio.run(), so the lock is rebound lazily
+        # when the next job enters a different event loop.
         self._lock = _asyncio.Lock()
+        self._lock_loop = None
 
         self._total_requests: int = 0
         self._successful: int = 0
@@ -323,7 +328,18 @@ class GlobalRateLimiter:
     # -- worker lifecycle ---------------------------------------------------------
 
     async def acquire(self) -> None:
-        """Acquire a worker slot after global pacing and cooldown."""
+        """Acquire a worker slot after global pacing and cooldown.
+
+        ``run_worker`` preserves this limiter across jobs, while each
+        historical-ingestion job currently runs inside a fresh
+        ``asyncio.run()`` event loop. The adaptive/cooldown state remains
+        shared across those loops; only this async mutex is rebound when
+        the loop changes.
+        """
+        loop = _asyncio.get_running_loop()
+        if self._lock_loop is not loop:
+            self._lock = _asyncio.Lock()
+            self._lock_loop = loop
         async with self._lock:
             remaining = self._cooldown_until - time.monotonic()
             if remaining > 0:
