@@ -21,6 +21,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.models import IVObservation
+from app.utils.market_time import to_ist_naive
 
 VALID_OPTION_TYPES = {"call", "put"}
 DEFAULT_SOURCE = "upstox"
@@ -66,6 +67,9 @@ def record_iv_observations(db: Session, observations: list[dict]) -> int:
             observed_at = _utcnow()
         elif isinstance(observed_at, str):
             observed_at = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+        normalized_observed_at = to_ist_naive(observed_at)
+        if normalized_observed_at is None:
+            continue
         rows.append(
             IVObservation(
                 symbol=symbol,
@@ -75,7 +79,7 @@ def record_iv_observations(db: Session, observations: list[dict]) -> int:
                 iv=float(iv),  # canonical decimal
                 spot=spot_f,
                 source=str(o.get("source", DEFAULT_SOURCE))[:32] or DEFAULT_SOURCE,
-                observed_at=observed_at,
+                observed_at=normalized_observed_at,
             )
         )
     if not rows:
