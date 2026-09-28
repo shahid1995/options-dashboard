@@ -1044,3 +1044,29 @@ def test_open_positions_are_user_isolated(client, logged_in, db_session):
     assert all(p["strategy_execution_id"] is not None for p in active)
     assert all(p["strike"] != 24600 for p in active)
     assert len(active) == 2
+
+def test_position_mutation_queries_use_row_locking_for_postgresql():
+    """Paper position mutations must request row locks on PG/CRDB paths."""
+    from sqlalchemy.dialects.postgresql import dialect
+
+    from app.services.paper_execution import _get_position
+
+    captured = {}
+
+    class ScalarProbe:
+        def scalar(self, statement):
+            captured["statement"] = statement
+            return None
+
+    _get_position(
+        ScalarProbe(),
+        "user-1",
+        "NIFTY",
+        EXPIRY,
+        24350,
+        "call",
+        for_update=True,
+    )
+
+    sql = str(captured["statement"].compile(dialect=dialect()))
+    assert "FOR UPDATE" in sql.upper()
