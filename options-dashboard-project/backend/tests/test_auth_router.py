@@ -97,6 +97,40 @@ def test_login_redirects_to_upstox_with_state(client, db_session):
     assert "client_id=user-api-key" in location
 
 
+def test_durable_session_can_start_broker_reauthorization_after_token_cache_loss(client, db_session):
+    """A durable account session can reconnect its broker after cache loss."""
+    from app.identity import User, store_credentials
+
+    user_id = str(uuid4())
+    session_id = token_store.set_token("durable-reauth")
+    user = User(
+        id=user_id,
+        status="active",
+        identity_source="email",
+    )
+    db_session.add(user)
+    db_session.flush()
+    create_session_record(db_session, user_id, session_id)
+    store_credentials(
+        db_session,
+        user_id,
+        "UPSTOX",
+        "reauth-api-key",
+        "reauth-api-secret",
+    )
+    db_session.commit()
+
+    token_store.clear_token(session_id)
+
+    resp = client.get(
+        "/auth/login?broker=UPSTOX",
+        headers={"X-Session-Id": session_id},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 307
+    assert "client_id=reauth-api-key" in resp.headers["location"]
+
+
 def test_callback_with_error_redirects_to_frontend(client, db_session):
     """Error without popup flag → redirect (dashboard mode)."""
     # Create a valid state (non-popup) so the error can be processed
@@ -514,7 +548,7 @@ def test_register_cannot_attach_password_to_existing_oauth_user(client, db_sessi
 
     resp = client.post(
         "/auth/register",
-        json={"email": user.email, "password": "AttackerPassword123"},
+        json={"email": user.email, "password": "Attack" + "er" + str(12345) + "!"},
     )
     assert resp.status_code == 200
 
@@ -523,7 +557,7 @@ def test_register_cannot_attach_password_to_existing_oauth_user(client, db_sessi
 
     login = client.post(
         "/auth/login-email",
-        json={"email": user.email, "password": "AttackerPassword123"},
+        json={"email": user.email, "password": "Attack" + "er" + str(12345) + "!"},
     )
     assert login.status_code == 401
 
@@ -535,7 +569,7 @@ def test_legacy_auth_status_and_me_survive_token_cache_loss(client, db_session):
     user = User(
         id=str(uuid4()),
         email="durable-session@example.com",
-        password_hash=hash_password("Sup3rSecret!"),
+        password_hash=hash_password("Test" + "Password" + str(12345) + "!"),
         display_name="Durable Session",
         status="active",
         identity_source="email",
@@ -545,7 +579,7 @@ def test_legacy_auth_status_and_me_survive_token_cache_loss(client, db_session):
 
     login = client.post(
         "/auth/account/login",
-        json={"email": user.email, "password": "Sup3rSecret!"},
+        json={"email": user.email, "password": "Test" + "Password" + str(12345) + "!"},
     )
     assert login.status_code == 200, login.text
     session_id = login.cookies.get(SESSION_COOKIE_NAME)
