@@ -238,6 +238,10 @@ class GexResearchEngine:
         self.db = db
         self.calc_version = calc_version
         self.pit = PointInTimeDataset(db)
+    def _decision_timestamp_for_observation(self, timestamp: datetime) -> datetime:
+        """Return the decision time at the end of a three-minute observation bar."""
+        return timestamp + timedelta(minutes=3)
+
 
     # ==================================================================
     # Phase 2: Research Dataset Builder
@@ -444,7 +448,10 @@ class GexResearchEngine:
             return {}
 
         greek_rows = self.pit.option_greeks_at_many(
-            timestamps,
+            [
+                self._decision_timestamp_for_observation(ts)
+                for ts in timestamps
+            ],
             interval=DEFAULT_INTERVAL,
             calc_version="greeks_v3",
         )
@@ -461,7 +468,10 @@ class GexResearchEngine:
             for instrument_key, _ in rows
         })
         oi_rows = self.pit.option_candles_at_many(
-            timestamps,
+            [
+                self._decision_timestamp_for_observation(ts)
+                for ts in timestamps
+            ],
             instrument_keys=instruments,
             interval=DEFAULT_INTERVAL,
         )
@@ -531,7 +541,7 @@ class GexResearchEngine:
 
         for ts in timestamps:
             rows = self.pit.historical_gex_at(
-                ts,
+                self._decision_timestamp_for_observation(ts),
                 interval=DEFAULT_INTERVAL,
                 calc_version=self.calc_version,
             )
@@ -679,7 +689,7 @@ class GexResearchEngine:
         """Detect gamma flip at a single timestamp using strike-level GEX."""
         # Get strike-level GEX
         rows = self.pit.historical_gex_at(
-            ts,
+            self._decision_timestamp_for_observation(ts),
             interval=DEFAULT_INTERVAL,
             calc_version=self.calc_version,
         )
