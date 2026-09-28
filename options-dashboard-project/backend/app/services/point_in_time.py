@@ -4,8 +4,8 @@ The interface centralizes the temporal invariant that backtesting depends on.
 
 Point observations (such as IV quotes) are available when their observation
 timestamp is <= the decision time. Candle-derived rows are available only after
-their interval has completed, so their open_time must be strictly before the
-decision time. Forward labels are intentionally outside this interface.
+their interval has completed, so only the latest candle whose full interval
+has completed by the decision time is eligible. Forward labels are intentionally outside this interface.
 """
 
 from __future__ import annotations
