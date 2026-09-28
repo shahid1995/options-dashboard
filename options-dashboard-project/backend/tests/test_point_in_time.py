@@ -126,6 +126,7 @@ def _gex(ts):
     )
 
 
+
 def test_cutoff_is_mandatory_and_timezone_normalized(db_session):
     db_session.add(_nifty(BASE_TS, 24500))
     db_session.commit()
@@ -162,6 +163,7 @@ def test_off_grid_lookup_uses_latest_completed_bar(db_session):
         _nifty(FUTURE_TS, 24510),
         _option(BASE_TS),
         _option(FUTURE_TS),
+        _option(datetime(2026, 8, 27, 9, 57), key="TEST|PE"),
         _greeks(BASE_TS),
         _greeks(FUTURE_TS),
         _gex(BASE_TS),
@@ -173,9 +175,13 @@ def test_off_grid_lookup_uses_latest_completed_bar(db_session):
     decision = datetime(2026, 8, 27, 10, 4)
 
     assert [row.open_time for row in pit.nifty_candles_at(decision)] == [BASE_TS]
-    assert [row.open_time for row in pit.option_candles_at(
-        decision, instrument_keys=["TEST|CE"],
-    )] == [BASE_TS]
+    option_rows = pit.option_candles_at(
+        decision, instrument_keys=["TEST|CE", "TEST|PE"],
+    )
+    assert {row.instrument_key: row.open_time for row in option_rows} == {
+        "TEST|CE": BASE_TS,
+        "TEST|PE": datetime(2026, 8, 27, 9, 57),
+    }
     assert [row.open_time for row in pit.option_greeks_at(
         decision, instrument_keys=["TEST|CE"],
     )] == [BASE_TS]
@@ -265,7 +271,13 @@ def test_empty_instrument_selection_returns_no_option_features(db_session):
     decision = FUTURE_TS
 
     assert pit.option_candles_at(decision, instrument_keys=[]) == []
+    assert pit.option_candles_at_many(
+        [decision], instrument_keys=[],
+    ) == []
     assert pit.option_greeks_at(decision, instrument_keys=[]) == []
+    assert pit.option_greeks_at_many(
+        [decision], instrument_keys=[],
+    ) == []
 
 
 def test_iv_timestamp_is_normalized_before_pit_comparison(db_session):
