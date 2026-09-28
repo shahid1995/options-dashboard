@@ -496,3 +496,66 @@ def test_register_response_exposes_no_secrets(client):
     assert "password" not in body
     assert "password_hash" not in body
     assert body["ok"] is True
+
+def test_register_cannot_attach_password_to_existing_oauth_user(client, db_session):
+    """Unauthenticated registration must not take over an OAuth identity."""
+    from app.identity import User
+
+    user = User(
+        id=str(uuid4()),
+        email="oauth-victim@example.com",
+        password_hash=None,
+        display_name="OAuth User",
+        status="active",
+        identity_source="google",
+    )
+    db_session.add(user)
+    db_session.commit()
+
+    resp = client.post(
+        "/auth/register",
+        json={"email": user.email, "password": "AttackerPassword123"},
+    )
+    assert resp.status_code == 200
+
+    db_session.refresh(user)
+    assert user.password_hash is None
+
+    login = client.post(
+        "/auth/login-email",
+        json={"email": user.email, "password": "AttackerPassword123"},
+    )
+    assert login.status_code == 401
+
+
+def test_legacy_auth_status_and_me_survive_token_cache_loss(client, db_session):
+    """Durable UserSession remains authoritative after in-memory token loss."""
+    from app.identity import User, hash_password
+
+    user = User(
+        id=str(uuid4()),
+        email="durable-session@example.com",
+        password_hash=hash_password("Sup3rSecret!"),
+        display_name="Durable Session",
+        status="active",
+        identity_source="email",
+    )
+    db_session.add(user)
+    db_session.commit()
+
+    login = client.post(
+        "/auth/account/login",
+        json={"email": user.email, "password": "Sup3rSecret!"},
+    )
+    assert login.status_code == 200, login.text
+    session_id = login.cookies.get(SESSION_COOKIE_NAME)
+    assert session_id
+
+    token_store.clear_token(session_id)
+
+    status = client.get("/auth/status", cookies={SESSION_COOKIE_NAME: session_id})
+    assert status.json() == {"logged_in": True}
+
+    me = client.get("/auth/me", cookies={SESSION_COOKIE_NAME: session_id})
+    assert me.status_code == 200, me.text
+    assert me.json()["user_id"] == user.id
