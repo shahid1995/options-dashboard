@@ -209,6 +209,44 @@ class PointInTimeDataset:
             statement = statement.where(OptionGreeks.calc_version == calc_version)
         return list(self.db.scalars(statement))
 
+    def option_greeks_at_many(
+        self,
+        decision_timestamps: list[datetime | str],
+        *,
+        interval: str = "3min",
+        calc_version: str | None = None,
+    ) -> list[OptionGreeks]:
+        """Return Greeks observed at any of the supplied decision timestamps."""
+        cutoffs = [_require_cutoff(ts) for ts in decision_timestamps]
+        if not cutoffs:
+            return []
+        statement = select(OptionGreeks).where(
+            OptionGreeks.interval == interval,
+            OptionGreeks.open_time.in_(cutoffs),
+        )
+        if calc_version:
+            statement = statement.where(OptionGreeks.calc_version == calc_version)
+        return list(self.db.scalars(statement))
+
+    def option_candles_at_many(
+        self,
+        decision_timestamps: list[datetime | str],
+        *,
+        instrument_keys: list[str] | None = None,
+        interval: str = "3min",
+    ) -> list[OptionCandle]:
+        """Return option candles observed at any supplied decision timestamp."""
+        cutoffs = [_require_cutoff(ts) for ts in decision_timestamps]
+        if not cutoffs:
+            return []
+        statement = select(OptionCandle).where(
+            OptionCandle.interval == interval,
+            OptionCandle.open_time.in_(cutoffs),
+        )
+        if instrument_keys:
+            statement = statement.where(OptionCandle.instrument_key.in_(instrument_keys))
+        return list(self.db.scalars(statement))
+
     def historical_gex_at(
         self,
         decision_timestamp: datetime | str,
