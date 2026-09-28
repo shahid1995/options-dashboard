@@ -1264,4 +1264,55 @@ class TestSecurityEventEmission:
             for secret in secrets:
                 assert secret not in blob, f"secret leaked in {ev.event_type}: {blob}"
 
+def test_account_register_cannot_attach_password_to_existing_oauth_user(client, db_session):
+    """Account registration must not silently link an unauthenticated OAuth identity."""
+    from app.identity import User
 
+    user = User(
+        id=str(uuid4()),
+        email="oauth-account@example.com",
+        password_hash=None,
+        display_name="OAuth Account",
+        status="active",
+        identity_source="google",
+    )
+    db_session.add(user)
+    db_session.commit()
+
+    resp = client.post(
+        f"{ACCOUNT}/register",
+        json={"email": user.email, "password": "AttackerPassword123"},
+    )
+    assert resp.status_code == 200
+
+    db_session.refresh(user)
+    assert user.password_hash is None
+
+    login = client.post(
+        f"{ACCOUNT}/login",
+        json={"email": user.email, "password": "AttackerPassword123"},
+    )
+    assert login.status_code == 401
+
+
+def test_account_session_token_is_platform_only(client, db_session):
+    """Durable account session tokens must never be exposed as broker access tokens."""
+    from app.routers.deps import _resolve_user
+    from app.services.platform_session import is_platform_session_token
+
+    user = _local_user(db_session)
+    resp = client.post(
+        f"{ACCOUNT}/login",
+        json={"email": user.email, "password": "Sup3rSecret!"},
+    )
+    assert resp.status_code == 200
+    session_id = resp.cookies.get(SESSION_COOKIE_NAME)
+    assert session_id
+
+    raw_session_token = token_store.get_token(session_id)
+    assert raw_session_token.startswith("account:")
+    assert is_platform_session_token(raw_session_token)
+
+    resolved = _resolve_user(db_session, session_id)
+    assert resolved.user_id == user.id
+    assert resolved.access_token is None
