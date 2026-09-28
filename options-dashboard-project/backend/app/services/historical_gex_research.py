@@ -488,6 +488,10 @@ class GexResearchEngine:
             for instrument_key, option_type in rows
         }
 
+        oi_by_timestamp: dict[datetime, list] = defaultdict(list)
+        for row in oi_rows:
+            oi_by_timestamp[row.open_time].append(row)
+
         result: dict[datetime, dict] = {}
         for ts in sorted(ts_instruments):
             ts_instruments_for_time = ts_instruments[ts]
@@ -499,8 +503,8 @@ class GexResearchEngine:
             call_vol = 0.0
             put_vol = 0.0
 
-            for row in oi_rows:
-                if row.open_time != ts or row.instrument_key not in allowed_keys:
+            for row in oi_by_timestamp.get(ts, []):
+                if row.instrument_key not in allowed_keys:
                     continue
                 oi_val = float(row.open_interest or 0)
                 vol_val = float(row.volume or 0)
