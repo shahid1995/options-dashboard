@@ -150,6 +150,47 @@ def test_identity_module_has_no_engine_dependency():
     assert "from app.db import Base" in identity_source
 
 
+def test_day49_migrates_legacy_iv_timestamps_to_ist(temp_db):
+    from alembic import command
+    from alembic.config import Config
+    from app.db import Base
+    from app.models import IVObservation
+
+    engine = create_engine(temp_db, connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS alembic_version "
+                "(version_num VARCHAR(32) NOT NULL)"
+            )
+        )
+        conn.execute(
+            text("INSERT INTO alembic_version (version_num) VALUES ('d48aa0000001')")
+        )
+        conn.execute(
+            text(
+                "INSERT INTO iv_observations "
+                "(symbol, expiry, strike, option_type, iv, spot, source, observed_at) "
+                "VALUES ('NIFTY', '2026-09-03', 24500, 'call', 0.18, 24500, "
+                "'test', '2026-08-27 04:33:00')"
+            )
+        )
+    engine.dispose()
+
+    alembic_cfg = Config(os.path.join(os.path.dirname(__file__), "..", "alembic.ini"))
+    alembic_cfg.set_main_option("sqlalchemy.url", temp_db)
+    command.upgrade(alembic_cfg, "head")
+
+    engine2 = create_engine(temp_db, connect_args={"check_same_thread": False})
+    with engine2.connect() as conn:
+        value = conn.execute(
+            text("SELECT observed_at FROM iv_observations WHERE source = 'test'")
+        ).scalar_one()
+        assert str(value) == "2026-08-27 10:03:00"
+    engine2.dispose()
+
+
 def test_alembic_stamped_database_is_upgradeable(temp_db):
     """Verify that a create_all database can be stamped and then upgraded."""
     # Create database the old way
