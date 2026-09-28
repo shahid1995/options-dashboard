@@ -216,6 +216,7 @@ def first_position(db_session):
 
 
 def test_client_lot_size_cannot_change_server_accounting(client, logged_in, db_session):
+    """Persist the broker lot size even when the client submits a false value."""
     from app.models import PaperOrder, Position
 
     payload = single_leg_payload(
