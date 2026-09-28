@@ -45,6 +45,23 @@ def _with_completed_candle_cutoff(statement: Select, column, cutoff: datetime) -
     return statement.where(column < cutoff)
 
 
+def _completed_bar_open_time(decision_timestamp: datetime, interval: str) -> datetime:
+    """Return the latest fully completed candle's open time at a decision cutoff."""
+    durations = {
+        "1min": 60,
+        "3min": 180,
+        "5min": 300,
+        "15min": 900,
+        "30min": 1800,
+        "day": 86400,
+    }
+    seconds = durations.get(interval)
+    if seconds is None:
+        raise ValueError(f"Unsupported PIT candle interval: {interval}")
+    from datetime import timedelta
+    return decision_timestamp - timedelta(seconds=seconds)
+
+
 class PointInTimeDataset:
     """Server-side historical feature access bounded by a decision timestamp.
 
@@ -77,12 +94,10 @@ class PointInTimeDataset:
         if since is not None:
             start = _require_cutoff(since)
             statement = statement.where(NiftyCandle.open_time >= start)
-        statement = (
-            statement.order_by(NiftyCandle.open_time.asc())
-            .limit(max(1, limit))
-        )
-        statement = statement.order_by(NiftyCandle.open_time.desc()).limit(1)
-        return list(self.db.scalars(statement))
+        statement = statement.order_by(NiftyCandle.open_time.desc()).limit(max(1, limit))
+        rows = list(self.db.scalars(statement))
+        rows.reverse()
+        return rows
 
     def option_candles(
         self,
@@ -106,11 +121,10 @@ class PointInTimeDataset:
         if since is not None:
             start = _require_cutoff(since)
             statement = statement.where(OptionCandle.open_time >= start)
-        statement = (
-            statement.order_by(OptionCandle.open_time.asc())
-            .limit(max(1, limit))
-        )
-        return list(self.db.scalars(statement))
+        statement = statement.order_by(OptionCandle.open_time.desc()).limit(max(1, limit))
+        rows = list(self.db.scalars(statement))
+        rows.reverse()
+        return rows
 
     def iv_observations(
         self,
@@ -180,10 +194,14 @@ class PointInTimeDataset:
     ) -> list[NiftyCandle]:
         """Return the completed NIFTY candle immediately preceding the decision time."""
         cutoff = _require_cutoff(decision_timestamp)
-        statement = select(NiftyCandle).where(
-            NiftyCandle.symbol == symbol.upper(),
-            NiftyCandle.interval == interval,
-            NiftyCandle.open_time < cutoff,
+        target = _completed_bar_open_time(cutoff, interval)
+        statement = (
+            select(NiftyCandle)
+            .where(
+                NiftyCandle.symbol == symbol.upper(),
+                NiftyCandle.interval == interval,
+                NiftyCandle.open_time == target,
+            )
         )
         return list(self.db.scalars(statement))
 
@@ -196,10 +214,10 @@ class PointInTimeDataset:
     ) -> list[OptionCandle]:
         """Return completed option candles available immediately before the decision time."""
         cutoff = _require_cutoff(decision_timestamp)
+        target = _completed_bar_open_time(cutoff, interval)
         statement = select(OptionCandle).where(
             OptionCandle.interval == interval,
-            OptionCandle.open_time < cutoff,
-        )
+            OptionCandle.open_time == target,
         if instrument_keys:
             statement = statement.where(OptionCandle.instrument_key.in_(instrument_keys))
         statement = statement.order_by(OptionCandle.open_time.desc())
@@ -215,9 +233,10 @@ class PointInTimeDataset:
     ) -> list[OptionGreeks]:
         """Return completed reconstructed Greeks available before the decision time."""
         cutoff = _require_cutoff(decision_timestamp)
+        target = _completed_bar_open_time(cutoff, interval)
         statement = select(OptionGreeks).where(
             OptionGreeks.interval == interval,
-            OptionGreeks.open_time < cutoff,
+            OptionGreeks.open_time == target,
             OptionGreeks.status == "SUCCESS",
         )
         if instrument_keys:
@@ -231,7 +250,7 @@ class PointInTimeDataset:
         decision_timestamps: list[datetime | str],
         *,
         interval: str = "3min",
-        calc_version: str | None = None,
+        calc_version: str = DEFAULT_GREEKS_CALC_VERSION,
     ) -> list[OptionGreeks]:
         """Return completed Greeks for supplied decision timestamps."""
         cutoffs = [_require_cutoff(ts) for ts in decision_timestamps]
@@ -239,7 +258,7 @@ class PointInTimeDataset:
             return []
         rows: list[OptionGreeks] = []
         for offset in range(0, len(cutoffs), 500):
-            chunk = cutoffs[offset:offset + 500]
+            chunk = [_completed_bar_open_time(ts, interval) for ts in cutoffs[offset:offset + 500]]
             statement = select(OptionGreeks).where(
                 OptionGreeks.interval == interval,
                 OptionGreeks.open_time.in_(chunk),
@@ -262,7 +281,7 @@ class PointInTimeDataset:
             return []
         rows: list[OptionCandle] = []
         for offset in range(0, len(cutoffs), 500):
-            chunk = cutoffs[offset:offset + 500]
+            chunk = [_completed_bar_open_time(ts, interval) for ts in cutoffs[offset:offset + 500]]
             statement = select(OptionCandle).where(
                 OptionCandle.interval == interval,
                 OptionCandle.open_time.in_(chunk),
@@ -282,9 +301,10 @@ class PointInTimeDataset:
     ) -> list[HistoricalGexSnapshot]:
         """Return completed historical GEX whose source candle precedes T."""
         cutoff = _require_cutoff(decision_timestamp)
+        target = _completed_bar_open_time(cutoff, interval)
         statement = select(HistoricalGexSnapshot).where(
             HistoricalGexSnapshot.interval == interval,
-            HistoricalGexSnapshot.open_time < cutoff,
+            HistoricalGexSnapshot.open_time == target,
             HistoricalGexSnapshot.calc_version == calc_version,
         )
         if successful_only:
