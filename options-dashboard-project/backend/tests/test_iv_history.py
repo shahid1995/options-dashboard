@@ -109,3 +109,12 @@ def test_empty_input_records_nothing(db_session):
     assert iv_history.record_iv_observations(db_session, []) == 0
     assert iv_history.record_iv_observations(db_session, None) == 0
     assert len(iv_history.get_iv_observations(db_session, "NIFTY")) == 0
+
+def test_record_normalizes_observation_timestamp_to_ist(db_session):
+    """Persisted IV timestamps use the canonical naive-IST market-data clock."""
+    n = iv_history.record_iv_observations(db_session, [
+        obs(timestamp="2026-08-27T04:33:00Z"),
+    ])
+    assert n == 1
+    row = db_session.query(iv_history.IVObservation).one()
+    assert row.observed_at == datetime(2026, 8, 27, 10, 3)
