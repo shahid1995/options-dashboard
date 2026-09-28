@@ -10,7 +10,7 @@ The governing invariant is:
 
 ## Timestamp semantics
 
-StrikeNova historical market-data candles are persisted as **naive IST (Asia/Kolkata)** timestamps. The public PIT interface therefore accepts either a naive datetime (interpreted as IST) or a timezone-aware timestamp, which is normalized through `app.utils.market_time.to_ist_naive()`. IV observations are normalized to the same canonical naive-IST representation when persisted.
+StrikeNova historical market-data candles are persisted as **naive IST (Asia/Kolkata)** timestamps. The public PIT interface therefore accepts either a naive datetime (interpreted as IST) or a timezone-aware timestamp, which is normalized through `app.utils.market_time.to_ist_naive()`. IV observations are normalized to the same canonical naive-IST representation when persisted. A Day 49 Alembic migration converts pre-Day-49 naive-UTC IV rows to that canonical IST representation before the new contract is used.
 
 ### Feature time vs processing time
 
