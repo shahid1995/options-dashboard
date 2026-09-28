@@ -58,6 +58,8 @@ from typing import Optional
 from sqlalchemy import select, func, and_, distinct
 from sqlalchemy.orm import Session
 
+from app.services.point_in_time import PointInTimeDataset
+
 from app.models import (
     HistoricalGexSnapshot,
     OptionGreeks,
@@ -235,6 +237,7 @@ class GexResearchEngine:
     def __init__(self, db: Session, calc_version: str = DEFAULT_CALC_VERSION):
         self.db = db
         self.calc_version = calc_version
+        self.pit = PointInTimeDataset(db)
 
     # ==================================================================
     # Phase 2: Research Dataset Builder
@@ -537,14 +540,11 @@ class GexResearchEngine:
         result = {}
 
         for ts in timestamps:
-            rows = self.db.execute(
-                select(HistoricalGexSnapshot)
-                .where(
-                    HistoricalGexSnapshot.open_time == ts,
-                    HistoricalGexSnapshot.calc_version == self.calc_version,
-                    HistoricalGexSnapshot.status == "SUCCESS",
-                )
-            ).scalars().all()
+            rows = self.pit.historical_gex_at(
+                ts,
+                interval=DEFAULT_INTERVAL,
+                calc_version=self.calc_version,
+            )
 
             if not rows:
                 continue
@@ -688,14 +688,11 @@ class GexResearchEngine:
     def _detect_gamma_flip_at_timestamp(self, ts: datetime) -> dict:
         """Detect gamma flip at a single timestamp using strike-level GEX."""
         # Get strike-level GEX
-        rows = self.db.execute(
-            select(HistoricalGexSnapshot)
-            .where(
-                HistoricalGexSnapshot.open_time == ts,
-                HistoricalGexSnapshot.calc_version == self.calc_version,
-                HistoricalGexSnapshot.status == "SUCCESS",
-            )
-        ).scalars().all()
+        rows = self.pit.historical_gex_at(
+            ts,
+            interval=DEFAULT_INTERVAL,
+            calc_version=self.calc_version,
+        )
 
         if len(rows) < 2:
             return {"status": "INSUFFICIENT_DATA"}
@@ -764,14 +761,11 @@ class GexResearchEngine:
 
     def _detect_walls_at_timestamp(self, ts: datetime) -> dict:
         """Detect gamma walls at a single timestamp."""
-        rows = self.db.execute(
-            select(HistoricalGexSnapshot)
-            .where(
-                HistoricalGexSnapshot.open_time == ts,
-                HistoricalGexSnapshot.calc_version == self.calc_version,
-                HistoricalGexSnapshot.status == "SUCCESS",
-            )
-        ).scalars().all()
+        rows = self.pit.historical_gex_at(
+            ts,
+            interval=DEFAULT_INTERVAL,
+            calc_version=self.calc_version,
+        )
 
         if not rows:
             return {}
