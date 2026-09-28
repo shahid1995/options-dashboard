@@ -1917,6 +1917,40 @@ class TestWorkerRateLimiterLifecycle:
         finally:
             engine.dispose()
 
+    def test_e_shared_limiter_rebinds_async_lock_between_job_loops(self):
+        """A worker-lifetime limiter may cross asyncio.run boundaries.
+
+        Adaptive/cooldown state must remain on the shared limiter, but the
+        pacing mutex must follow the current event loop. Two concurrent
+        acquisitions in each loop force the lock onto that loop; the second
+        loop must not raise a cross-event-loop RuntimeError.
+        """
+        import asyncio
+        import time
+
+        from app.services.rate_limiter import GlobalRateLimiter, RateLimiterConfig
+
+        limiter = GlobalRateLimiter(
+            config=RateLimiterConfig(
+                initial_concurrency=2,
+                max_concurrency=2,
+                initial_interval=0.01,
+                min_interval=0.005,
+                max_interval=0.1,
+            )
+        )
+
+        async def exercise_current_job_loop():
+            # Hold the pacing lock long enough for the second acquisition
+            # to become a waiter, which binds the lock to this event loop.
+            limiter._last_request = time.monotonic()
+            await asyncio.gather(limiter.acquire(), limiter.acquire())
+            limiter.release()
+            limiter.release()
+
+        asyncio.run(exercise_current_job_loop())
+        asyncio.run(exercise_current_job_loop())
+
     def test_d_worker_lifecycles_have_independent_limiters(
         self, session_factory, monkeypatch
     ):
