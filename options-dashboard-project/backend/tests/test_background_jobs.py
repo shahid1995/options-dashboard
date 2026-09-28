@@ -1194,12 +1194,13 @@ class TestConcurrencyPropagation:
 
         class _FakeOrchestrator:
             def __init__(self, db, client, *, force=False, rate_limiter=None):
-                pass
+                self.run_id = None
 
             async def run_all(
                 self, *, stages=None, nifty_start_date=None, options_concurrency=None
             ):
                 captured["options_concurrency"] = options_concurrency
+                captured["orchestrator_run_id"] = self.run_id
                 return _FakeResult()
 
         import app.services.backfill_orchestrator as orch_mod
@@ -1223,6 +1224,7 @@ class TestConcurrencyPropagation:
         summary = bj.execute_historical_ingestion(db, job)
         assert captured["options_concurrency"] == 4
         assert summary["governance_run_id"]
+        assert captured["orchestrator_run_id"] == summary["governance_run_id"]
 
         audit = db.scalar(
             select(HistoricalIngestionRun).where(
