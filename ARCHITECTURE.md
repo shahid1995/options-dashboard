@@ -1,6 +1,6 @@
 # StrikeNova — Architecture
 
-**Status:** Canonical · **Owner:** Founder · **Last reviewed:** 2026-09-18
+**Status:** Canonical · **Owner:** Founder · **Last reviewed:** 2026-09-28
 
 Ground truth is the code; this document maps it. Deep-dive phase documents
 live under `options-dashboard-project/docs/` (historical evidence).
@@ -39,6 +39,7 @@ CockroachDB Cloud — production database (Alembic-managed schema)
 | Broker sync | `backend/app/broker_sync/` | Ingestion models/pipeline for broker data |
 | Data/config | `backend/app/db.py`, `backend/app/config.py` | Engine/session construction from `DATABASE_URL`; pydantic settings |
 | Durable background jobs | `backend/app/services/background_jobs.py`, `backend/run_jobs.py` | Day 47 database-backed job queue on the application database (see below) |
+| Historical data governance | `backend/app/services/historical_data_governance.py`, `HistoricalDatasetGovernance`, `HistoricalIngestionRun` | Day 48 provenance/entitlement/usage/redistribution/retention control plane for historical datasets; keeps policy distinct from raw market observations and derived analytics. |
 | Migrations | `backend/alembic/` | **Sole schema authority** (ADR-002) |
 | Tests | `backend/tests/` | pytest suite (185 test files) |
 
@@ -108,6 +109,33 @@ broker (Redis/Celery/RabbitMQ/Kafka) is introduced.
 - **Not deployed:** no production worker service or scheduler exists yet;
   enabling one requires separate authorization.
 
+### 2.2 Historical data governance (Day 48)
+
+Historical data acquisition is governed independently from queue mechanics:
+
+- **Dataset catalog:** `HistoricalDatasetGovernance` records source, source
+  reference/version, entitlement state, license state, usage scope,
+  redistribution state, raw immutability, recomputability, dependencies and
+  retention policy.
+- **Ingestion manifest:** `HistoricalIngestionRun` snapshots the catalog
+  decisions for each acquisition so later policy changes do not rewrite
+  historical audit context. It can link a durable `BackgroundJob` ID.
+- **Existing pipeline evidence remains authoritative:** the governance service
+  reads `IngestionCheckpoint`, `DataCompleteness` and `IngestionLog` rather
+  than duplicating their operational state.
+- **Fail-closed rights boundary:** unresolved entitlement or redistribution
+  state is not treated as permission. Public redistribution is allowed only
+  when the catalog explicitly says `ALLOWED`.
+- **Retention:** deletion is dry-run-first and uses a static allow-list of
+  governed ORM targets. The current catalog keeps raw datasets and disables
+  enforcement for derived datasets until a controlled policy enables it.
+- **Recomputation:** derived model/analytics datasets must declare governed raw
+  dependencies; the service checks the dependency graph before a dataset is
+  considered recomputation-safe.
+
+No Day 48 scheduler, production purge, production database mutation, or
+deployment is enabled by this architecture record.
+ 
 ## 3. Frontend (Next.js)
 
 | Layer | Location | Responsibility |
