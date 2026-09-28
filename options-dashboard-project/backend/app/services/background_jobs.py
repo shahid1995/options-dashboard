@@ -731,7 +731,11 @@ def execute_historical_ingestion(
     required); other stage failures are retryable because the orchestrator
     resumes from durable checkpoints.
     """
-    from app.services.backfill_orchestrator import BackfillOrchestrator, TokenBridge
+    from app.services.backfill_orchestrator import (
+        BackfillOrchestrator,
+        TokenBridge,
+        resolve_nifty_window,
+    )
     from app.services.upstox_client import UpstoxClient
 
     try:
@@ -783,6 +787,14 @@ def execute_historical_ingestion(
         from datetime import date as _date
 
         nifty_start_date = _date.fromisoformat(str(start_raw))
+    # Day 48 audit window: resolve the effective NIFTY window exactly once,
+    # through the same resolver run_nifty uses, so the governance manifest's
+    # coverage_start/coverage_end are the actual ingestion bounds (never
+    # NULL) and completeness aggregation cannot be skewed by rows outside
+    # this run's window.
+    effective_nifty_start, effective_nifty_end = resolve_nifty_window(
+        db, start_date=nifty_start_date
+    )
     force = bool(params.get("force", False))
 
     token_bridge = TokenBridge()
@@ -797,7 +809,8 @@ def execute_historical_ingestion(
         dataset_keys=dataset_keys,
         background_job_id=job.id,
         purpose=PURPOSE_INTERNAL_RESEARCH,
-        coverage_start=str(start_raw) if start_raw else None,
+        coverage_start=effective_nifty_start.isoformat(),
+        coverage_end=effective_nifty_end.isoformat(),
         metadata={"job_type": job.job_type, "stages": stages},
     )
     orchestrator = BackfillOrchestrator(
@@ -813,7 +826,7 @@ def execute_historical_ingestion(
         result = asyncio.run(
             orchestrator.run_all(
                 stages=list(stages),
-                nifty_start_date=nifty_start_date,
+                nifty_start_date=effective_nifty_start,
                 options_concurrency=concurrency,
             )
         )

@@ -20,7 +20,7 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
 from app.db import Base
-from app.models import BackgroundJob, HistoricalDatasetGovernance, HistoricalIngestionRun, JobStatus
+from app.models import BackgroundJob, ContractSpec, DataCompleteness, HistoricalDatasetGovernance, HistoricalIngestionRun, JobStatus
 from app.services import background_jobs as bj
 
 
@@ -1329,6 +1329,209 @@ class TestHistoricalGovernanceFailureAudit:
         assert audit is not None
         assert audit.status == "FAILED"
         assert "synthetic ingestion failure" in (audit.error_message or "")
+
+
+class TestGovernanceAuditWindow:
+    """Day 48 audit-window: the governance manifest's coverage window must
+    be the SAME effective window the NIFTY stage actually ingests —
+    resolved once and shared — so completeness aggregation cannot be
+    skewed by DataCompleteness rows from outside this run's window.
+    (CodeRabbit finding on 8b0071b.)"""
+
+    def _seed_nifty_expiry(self, db, expiry: str):
+        db.add(
+            ContractSpec(
+                instrument_key="NSE_FO|58124|TESTCE",
+                underlying="NIFTY",
+                underlying_key="NSE_FO|58124",
+                expiry=expiry,
+                strike_price=25000.0,
+                instrument_type="CE",
+                trading_symbol="NIFTY",
+                segment="NSE_FO",
+                exchange="NSE",
+                source="TEST",
+                source_reference="test",
+                fetched_at=datetime(2026, 9, 1),
+            )
+        )
+        db.commit()
+
+    def _enqueue_and_run(self, monkeypatch, session_factory, payload, captured):
+        class _FakeResult:
+            operation = "backfill_all"
+            status = "SUCCESS"
+            api_calls = 1
+            rows_fetched = 0
+            rows_inserted = 0
+            rows_skipped = 0
+            errors = []
+
+        class _FakeOrch:
+            def __init__(self, db, client, *, force=False, rate_limiter=None):
+                self.run_id = None
+
+            async def run_all(
+                self, *, stages=None, nifty_start_date=None, options_concurrency=None
+            ):
+                captured["nifty_start"] = nifty_start_date
+                captured["orchestrator_run_id"] = self.run_id
+                return _FakeResult()
+
+        import app.services.backfill_orchestrator as orch_mod
+        import app.services.upstox_client as upstox_mod
+
+        monkeypatch.setattr(orch_mod, "BackfillOrchestrator", _FakeOrch)
+        monkeypatch.setattr(orch_mod, "TokenBridge", type("B", (), {}))
+        monkeypatch.setattr(
+            upstox_mod,
+            "UpstoxClient",
+            type("C", (), {"__init__": lambda self, token_provider=None: None}),
+        )
+        db = session_factory()
+        job, _ = bj.enqueue(
+            db,
+            job_type="HISTORICAL_INGESTION",
+            idempotency_key=f"gov-window:{payload.get('nifty_start_date', 'default')}",
+            payload=payload,
+        )
+        summary = bj.execute_historical_ingestion(db, job)
+        audit = db.scalar(
+            select(HistoricalIngestionRun).where(
+                HistoricalIngestionRun.run_id == summary["governance_run_id"]
+            )
+        )
+        db.close()
+        return job, summary, audit
+
+    def test_explicit_start_shared_between_governance_and_ingestion(
+        self, session_factory, monkeypatch
+    ):
+        """Case A: an explicit nifty_start_date reaches run_nifty unchanged
+        AND the manifest records exactly that start plus the effective end
+        (today), not NULL bounds."""
+        db = session_factory()
+        self._seed_nifty_expiry(db, "2026-12-24")
+        db.close()
+
+        captured = {}
+        job, summary, audit = self._enqueue_and_run(
+            monkeypatch,
+            session_factory,
+            {"stages": ["nifty"], "nifty_start_date": "2024-01-01"},
+            captured,
+        )
+
+        today = datetime.now(timezone.utc).date()
+        assert captured["nifty_start"] == datetime(2024, 1, 1).date()
+        assert audit.coverage_start == "2024-01-01"
+        assert audit.coverage_end == today.isoformat()
+        assert captured["orchestrator_run_id"] == summary["governance_run_id"]
+
+    def test_omitted_start_records_resolved_default_window(
+        self, session_factory, monkeypatch
+    ):
+        """Case B: with no explicit start, run_nifty's normal default
+        (earliest NIFTY expiry - 3 days, or today - 365 without a registry)
+        must be recorded on the manifest — not NULL — so the audit window
+        equals the execution window."""
+        captured = {}
+        job, summary, audit = self._enqueue_and_run(
+            monkeypatch,
+            session_factory,
+            {"stages": ["nifty"]},
+            captured,
+        )
+
+        today = datetime.now(timezone.utc).date()
+        expected_default_start = today - timedelta(days=365)
+        assert captured["nifty_start"] == expected_default_start
+        assert audit.coverage_start == expected_default_start.isoformat()
+        assert audit.coverage_end == today.isoformat()
+
+    def test_run_nifty_resolution_matches_shared_window(
+        self, session_factory
+    ):
+        """Case B (execution side): run_nifty via run_all with no explicit
+        start must produce the SAME chunks the shared resolver computes —
+        proving the execution window equals the audit window (run_nifty in
+        dry-run mode returns the resolved chunk plan without API calls)."""
+        import asyncio
+
+        from app.services.backfill_orchestrator import (
+            BackfillOrchestrator,
+            resolve_nifty_window,
+        )
+
+        db = session_factory()
+        orch = BackfillOrchestrator.__new__(BackfillOrchestrator)
+        orch.db = db
+        orch.dry_run = True
+
+        result = asyncio.run(orch.run_nifty())
+
+        today = datetime.now(timezone.utc).date()
+        expected_start, expected_end = today - timedelta(days=365), today
+        resolved_start, resolved_end = resolve_nifty_window(db)
+        assert (resolved_start, resolved_end) == (expected_start, expected_end)
+        chunks = result.metadata["chunks"]
+        assert chunks[0]["from"] == expected_start.isoformat()
+        assert chunks[-1]["to"] == expected_end.isoformat()
+
+    def test_stale_completeness_rows_outside_window_do_not_flip_status(
+        self, session_factory
+    ):
+        """Case C: with the effective window recorded, an older
+        DataCompleteness row outside it must not make a successful run
+        PARTIAL (finish_ingestion_run downgrade must not fire)."""
+        from datetime import date as _date
+
+        from app.services import historical_data_governance as hdg
+
+        today = datetime.now(timezone.utc).date()
+        window_start = (today - timedelta(days=365)).isoformat()
+
+        run = hdg.start_ingestion_run(
+            session_factory(),
+            dataset_keys=["UPSTOX_NIFTY_CANDLES_3MIN"],
+            coverage_start=window_start,
+            coverage_end=today.isoformat(),
+            run_id="run-audit-window",
+        )
+        db = session_factory()
+        db.add_all(
+            [
+                # Stale row: far outside the effective window.
+                DataCompleteness(
+                    instrument_key="NSE_INDEX|NIFTY 50",
+                    session_date="2020-01-15",
+                    data_type="nifty_candles",
+                    expected_count=500,
+                    actual_count=0,
+                    missing_count=500,
+                    status="PARTIAL",
+                ),
+                # Current row: inside the effective window, complete.
+                DataCompleteness(
+                    instrument_key="NSE_INDEX|NIFTY 50",
+                    session_date=today.isoformat(),
+                    data_type="nifty_candles",
+                    expected_count=75,
+                    actual_count=75,
+                    missing_count=0,
+                    status="COMPLETE",
+                ),
+            ]
+        )
+        db.commit()
+
+        refreshed = hdg.refresh_ingestion_run_metrics(db, run.run_id)
+        assert refreshed.completeness_status == "COMPLETE"
+        assert refreshed.missing_records == 0
+        assert refreshed.expected_records == 75
+
+        finished = hdg.finish_ingestion_run(db, run.run_id, status=hdg.RUN_SUCCEEDED)
+        assert finished.status == hdg.RUN_SUCCEEDED
 
 
 class TestCliDatabaseUrlNormalization:

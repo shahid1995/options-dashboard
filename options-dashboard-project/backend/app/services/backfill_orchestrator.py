@@ -42,7 +42,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Protocol
 
 from sqlalchemy import func, select
@@ -243,6 +243,43 @@ def _log_ingestion(
 # ---------------------------------------------------------------------------
 # Backfill orchestrator
 # ---------------------------------------------------------------------------
+
+def resolve_nifty_window(
+    db: Session,
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> tuple[date, date]:
+    """Resolve the effective NIFTY ingestion window (single authority).
+
+    ``run_nifty`` consumes the returned dates for chunk generation, and the
+    background-job governance manifest records the same dates as its
+    coverage window, so the audit window can never diverge from the
+    execution window.
+
+    Rules (unchanged from the historical ``run_nifty`` defaults):
+      * ``end_date`` defaults to today (UTC).
+      * an explicit ``start_date`` is respected as-is.
+      * a ``None`` start resolves to the earliest NIFTY contract expiry
+        minus a 3-day buffer so ATM calculations have candles for every
+        expiry, or 365 days before today when the registry is empty.
+    """
+    if end_date is None:
+        end_date = datetime.now(timezone.utc).date()
+    if start_date is None:
+        earliest_expiry_str = db.scalar(
+            select(func.min(ContractSpec.expiry)).where(
+                ContractSpec.underlying == NIFTY_SYMBOL
+            )
+        )
+        if earliest_expiry_str:
+            earliest_expiry = datetime.strptime(
+                earliest_expiry_str, "%Y-%m-%d"
+            ).date()
+            start_date = earliest_expiry - timedelta(days=3)
+        else:
+            start_date = end_date - timedelta(days=365)
+    return start_date, end_date
+
 
 class BackfillOrchestrator:
     """Unified historical data backfill orchestrator.
@@ -544,27 +581,11 @@ class BackfillOrchestrator:
         start_time = time.time()
 
         try:
-            today = datetime.now(timezone.utc).date()
-            if end_date is None:
-                end_date = today
-
-            # Default start_date: earliest contract expiry date minus 3 day buffer,
-            # so we always have NIFTY candles for ATM calculation of all expiries.
-            # Falls back to 365 days ago if registry is empty.
-            if start_date is None:
-                from datetime import timedelta as _td
-                earliest_expiry_str = self.db.scalar(
-                    select(func.min(ContractSpec.expiry)).where(
-                        ContractSpec.underlying == NIFTY_SYMBOL
-                    )
-                )
-                if earliest_expiry_str:
-                    earliest_expiry = datetime.strptime(
-                        earliest_expiry_str, "%Y-%m-%d"
-                    ).date()
-                    start_date = earliest_expiry - _td(days=3)
-                else:
-                    start_date = today - _td(days=365)
+            # Effective window resolution is owned by the shared resolver so
+            # the governance manifest (Day 48) records exactly this window.
+            start_date, end_date = resolve_nifty_window(
+                self.db, start_date=start_date, end_date=end_date
+            )
 
             # Generate chunks
             chunks = _generate_date_chunks(start_date, end_date, CANDLE_CHUNK_DAYS)
