@@ -13,7 +13,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from sqlalchemy import Select, func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.models import (
     HistoricalGexSnapshot,
@@ -228,24 +228,17 @@ class PointInTimeDataset:
         if instrument_keys is not None and not instrument_keys:
             return []
 
+        candidate = aliased(OptionCandle)
         latest_open_time = (
-            select(func.max(OptionCandle.open_time))
+            select(func.max(candidate.open_time))
             .where(
-                OptionCandle.interval == interval,
-                OptionCandle.open_time <= target,
+                candidate.instrument_key == OptionCandle.instrument_key,
+                candidate.interval == interval,
+                candidate.open_time <= target,
             )
+            .correlate(OptionCandle)
             .scalar_subquery()
         )
-        if instrument_keys is not None:
-            latest_open_time = (
-                select(func.max(OptionCandle.open_time))
-                .where(
-                    OptionCandle.interval == interval,
-                    OptionCandle.open_time <= target,
-                    OptionCandle.instrument_key.in_(instrument_keys),
-                )
-                .scalar_subquery()
-            )
 
         statement = select(OptionCandle).where(
             OptionCandle.interval == interval,
@@ -270,14 +263,17 @@ class PointInTimeDataset:
         if instrument_keys is not None and not instrument_keys:
             return []
 
+        candidate = aliased(OptionGreeks)
         latest_open_time = (
-            select(func.max(OptionGreeks.open_time))
+            select(func.max(candidate.open_time))
             .where(
-                OptionGreeks.interval == interval,
-                OptionGreeks.open_time <= target,
-                OptionGreeks.status == "SUCCESS",
-                OptionGreeks.calc_version == (calc_version or DEFAULT_GREEKS_CALC_VERSION),
+                candidate.instrument_key == OptionGreeks.instrument_key,
+                candidate.interval == interval,
+                candidate.open_time <= target,
+                candidate.status == "SUCCESS",
+                candidate.calc_version == (calc_version or DEFAULT_GREEKS_CALC_VERSION),
             )
+            .correlate(OptionGreeks)
             .scalar_subquery()
         )
         statement = select(OptionGreeks).where(
@@ -295,12 +291,15 @@ class PointInTimeDataset:
         self,
         decision_timestamps: list[datetime | str],
         *,
+        instrument_keys: list[str] | None = None,
         interval: str = "3min",
         calc_version: str = DEFAULT_GREEKS_CALC_VERSION,
     ) -> list[OptionGreeks]:
         """Return completed Greeks for supplied decision timestamps."""
         cutoffs = [_require_cutoff(ts) for ts in decision_timestamps]
         if not cutoffs:
+            return []
+        if instrument_keys is not None and not instrument_keys:
             return []
         rows: list[OptionGreeks] = []
         for offset in range(0, len(cutoffs), 500):
@@ -310,6 +309,8 @@ class PointInTimeDataset:
                 OptionGreeks.open_time.in_(chunk),
                 OptionGreeks.status == "SUCCESS",
             )
+            if instrument_keys is not None:
+                statement = statement.where(OptionGreeks.instrument_key.in_(instrument_keys))
             statement = statement.where(OptionGreeks.calc_version == calc_version)
             rows.extend(self.db.scalars(statement))
         return rows
@@ -332,7 +333,9 @@ class PointInTimeDataset:
                 OptionCandle.interval == interval,
                 OptionCandle.open_time.in_(chunk),
             )
-            if instrument_keys:
+            if instrument_keys is not None:
+                if not instrument_keys:
+                    return []
                 statement = statement.where(OptionCandle.instrument_key.in_(instrument_keys))
             rows.extend(self.db.scalars(statement))
         return rows
