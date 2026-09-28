@@ -156,6 +156,78 @@ class PointInTimeDataset:
         )
         return list(self.db.scalars(statement))
 
+    def nifty_candles_at(
+        self,
+        decision_timestamp: datetime | str,
+        *,
+        symbol: str = "NIFTY",
+        interval: str = "3min",
+    ) -> list[NiftyCandle]:
+        """Return NIFTY candles whose observation timestamp equals the decision time."""
+        cutoff = _require_cutoff(decision_timestamp)
+        statement = select(NiftyCandle).where(
+            NiftyCandle.symbol == symbol.upper(),
+            NiftyCandle.interval == interval,
+            NiftyCandle.open_time == cutoff,
+        )
+        return list(self.db.scalars(statement))
+
+    def option_candles_at(
+        self,
+        decision_timestamp: datetime | str,
+        *,
+        instrument_keys: list[str] | None = None,
+        interval: str = "3min",
+    ) -> list[OptionCandle]:
+        """Return option candles observed exactly at the decision time."""
+        cutoff = _require_cutoff(decision_timestamp)
+        statement = select(OptionCandle).where(
+            OptionCandle.interval == interval,
+            OptionCandle.open_time == cutoff,
+        )
+        if instrument_keys:
+            statement = statement.where(OptionCandle.instrument_key.in_(instrument_keys))
+        return list(self.db.scalars(statement))
+
+    def option_greeks_at(
+        self,
+        decision_timestamp: datetime | str,
+        *,
+        instrument_keys: list[str] | None = None,
+        interval: str = "3min",
+        calc_version: str | None = None,
+    ) -> list[OptionGreeks]:
+        """Return reconstructed Greeks observed exactly at the decision time."""
+        cutoff = _require_cutoff(decision_timestamp)
+        statement = select(OptionGreeks).where(
+            OptionGreeks.interval == interval,
+            OptionGreeks.open_time == cutoff,
+        )
+        if instrument_keys:
+            statement = statement.where(OptionGreeks.instrument_key.in_(instrument_keys))
+        if calc_version:
+            statement = statement.where(OptionGreeks.calc_version == calc_version)
+        return list(self.db.scalars(statement))
+
+    def historical_gex_at(
+        self,
+        decision_timestamp: datetime | str,
+        *,
+        interval: str = "3min",
+        calc_version: str = "h_gex_v1",
+        successful_only: bool = True,
+    ) -> list[HistoricalGexSnapshot]:
+        """Return historical GEX observations whose market time equals T."""
+        cutoff = _require_cutoff(decision_timestamp)
+        statement = select(HistoricalGexSnapshot).where(
+            HistoricalGexSnapshot.interval == interval,
+            HistoricalGexSnapshot.open_time == cutoff,
+            HistoricalGexSnapshot.calc_version == calc_version,
+        )
+        if successful_only:
+            statement = statement.where(HistoricalGexSnapshot.status == "SUCCESS")
+        return list(self.db.scalars(statement))
+
     def historical_gex(
         self,
         instrument_key: str,
