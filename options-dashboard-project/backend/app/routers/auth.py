@@ -191,7 +191,7 @@ def login(
     # on first presentation (never replays); the session itself is still
     # fully validated below, and the token never creates or extends one.
     kick_session_id = _consume_popup_kick_session(popup_kick_cookie, broker_id)
-    if not session_id or token_store.get_token(session_id) is None:
+    if not session_id:
         if kick_session_id is None:
             raise HTTPException(
                 status_code=401,
