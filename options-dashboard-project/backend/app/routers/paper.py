@@ -42,6 +42,7 @@ from app.services.journal import (
 )
 from app.services.capital import get_capital_summary
 from app.services.market_status import get_market_status
+from app.services.paper_contracts import resolve_authoritative_lot_sizes
 from app.services.performance import get_analytics
 from app.services.paper_execution import (
     PaperExecutionError,
@@ -361,6 +362,20 @@ async def submit_execution(
     user_id, access_token = require_session(user)
     await require_market_open(access_token)
     try:
+        lot_sizes = await resolve_authoritative_lot_sizes(
+            access_token, request.symbol, request.legs
+        )
+        normalized_legs = [
+            leg.model_copy(update={
+                "lot_size": lot_sizes[(
+                    str(leg.expiration_date),
+                    float(leg.strike_price),
+                    str(leg.option_type).lower(),
+                )]
+            })
+            for leg in request.legs
+        ]
+        request = request.model_copy(update={"legs": normalized_legs})
         prices = await resolve_market_prices(access_token, request.symbol, request.legs)
         return execute_strategy(user_id, request, db, prices)
     except PaperExecutionError as exc:
