@@ -803,6 +803,10 @@ def execute_historical_ingestion(
     orchestrator = BackfillOrchestrator(
         db, client, force=force, rate_limiter=rate_limiter
     )
+    # The existing orchestrator already owns the checkpoint/log run_id.
+    # Reuse the governance manifest ID so the audit snapshot joins the
+    # durable ingestion records instead of creating a parallel run identity.
+    orchestrator.run_id = governance_run.run_id
     # F5: forward the requested concurrency so the option stage's limiter
     # ceiling is the job's request, not the orchestrator default.
     try:
