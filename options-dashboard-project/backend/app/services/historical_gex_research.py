@@ -481,6 +481,8 @@ class GexResearchEngine:
             instrument_keys=instruments,
             interval=DEFAULT_INTERVAL,
         )
+        requested_timestamps = set(timestamps)
+        oi_rows = [row for row in oi_rows if row.open_time in requested_timestamps]
 
         ik_to_type = {
             instrument_key: option_type
@@ -556,6 +558,7 @@ class GexResearchEngine:
                 calc_version=self.calc_version,
             )
 
+            rows = [row for row in rows if row.open_time == ts]
             if not rows:
                 continue
 
