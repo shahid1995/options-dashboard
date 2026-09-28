@@ -1542,37 +1542,36 @@ class TestGovernanceAuditWindow:
         finished = hdg.finish_ingestion_run(db, run.run_id, status=hdg.RUN_SUCCEEDED)
         assert finished.status == hdg.RUN_SUCCEEDED
 
-    def _run_real_chain(self, session_factory, stages, nifty_start_date=None):
+    def _run_real_chain(self, session_factory, stages, nifty_start_date=None, seed_expiry=None):
         """Drive the REAL BackfillOrchestrator.run_all with only the
-        external boundaries faked: contract discovery is simulated by
-        seeding ContractSpec rows (what run_contracts would persist) and
-        the options stage is stubbed. run_nifty itself stays REAL in
-        dry-run mode, so the resolved chunk plan is observable without
-        any API or candle writes."""
+        external boundaries faked: contract discovery is simulated by the
+        run_contracts override persisting ContractSpec rows (the effect
+        real discovery would have), and the options stage is stubbed.
+        run_nifty itself stays REAL in dry-run mode, so the resolved chunk
+        plan is observable without any API or candle writes.
+
+        When seed_expiry is given the registry is EMPTY before run_all and
+        is only populated inside run_contracts — proving the default NIFTY
+        start is resolved AFTER contract discovery, not before.
+        """
         import asyncio
-        from datetime import date as _date
 
         from app.services.backfill_orchestrator import (
             BackfillOrchestrator,
             BackfillResult,
         )
 
-        class _FakeContractsResult:
-            operation = "contracts"
-            status = "SUCCESS"
-            api_calls = 0
-            rows_fetched = 0
-            rows_inserted = 0
-            errors = []
-            metadata = {"expiries": ["2020-01-30"]}
+        chain = self
 
         class _ChainOrchestrator(BackfillOrchestrator):
             async def run_contracts(self):
-                # Simulates discovered expiries; the DB seed below is the
-                # persisted effect real discovery would have produced.
-                return _FakeContractsResult()
+                if seed_expiry:
+                    chain._seed_nifty_expiry(self.db, seed_expiry)
+                result = BackfillResult(operation="contracts", status="SUCCESS")
+                result.metadata["expiries"] = [seed_expiry] if seed_expiry else []
+                return result
 
-            async def run_options(self, concurrency=None):
+            async def run_options(self, concurrency=None, **kwargs):
                 return BackfillResult(operation="options", status="SUCCESS")
 
         db = session_factory()
@@ -1595,12 +1594,13 @@ class TestGovernanceAuditWindow:
         contract discovery must run BEFORE the default start is resolved.
         A newly discovered expiry older than the 365-day fallback must
         extend the effective window back to (expiry - 3 days)."""
-        db = session_factory()
-        # "Discovered" by the contracts stage: older than today - 365d.
-        self._seed_nifty_expiry(db, "2020-01-30")
-        db.close()
-
-        result = self._run_real_chain(session_factory, ["contracts", "nifty"])
+        # Registry starts EMPTY; the older-than-365d expiry only appears
+        # when the contracts stage runs (seeded inside run_contracts).
+        result = self._run_real_chain(
+            session_factory,
+            ["contracts", "nifty"],
+            seed_expiry="2020-01-30",
+        )
 
         today = datetime.now(timezone.utc).date()
         assert result.metadata["nifty_coverage_start"] == "2020-01-27"
@@ -1644,7 +1644,7 @@ class TestGovernanceAuditWindow:
                 ]
                 return result
 
-            async def run_options(self, concurrency=None):
+            async def run_options(self, concurrency=None, **kwargs):
                 return BackfillResult(operation="options", status="SUCCESS")
 
         orch = _CaptureNifty.__new__(_CaptureNifty)
@@ -1743,7 +1743,7 @@ class TestGovernanceAuditWindow:
                 captured["called"] = True
                 raise AssertionError("run_nifty must not run after contract failure")
 
-            async def run_options(self, concurrency=None):
+            async def run_options(self, concurrency=None, **kwargs):
                 raise AssertionError("run_options must not run after contract failure")
 
         orch = _FailingContracts.__new__(_FailingContracts)
