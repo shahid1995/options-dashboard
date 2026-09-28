@@ -1104,5 +1104,6 @@ def test_position_mutation_queries_use_row_locking_for_postgresql():
         for_update=True,
     )
 
-    sql = str(captured["statement"].compile(dialect=dialect()))
-    assert "FOR UPDATE" in sql.upper()
+    statement = captured["statement"]
+    assert "FOR UPDATE" in str(statement.compile(dialect=dialect())).upper()
+    assert statement.get_execution_options()["populate_existing"] is True
