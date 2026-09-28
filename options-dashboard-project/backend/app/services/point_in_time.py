@@ -220,13 +220,17 @@ class PointInTimeDataset:
         cutoffs = [_require_cutoff(ts) for ts in decision_timestamps]
         if not cutoffs:
             return []
-        statement = select(OptionGreeks).where(
-            OptionGreeks.interval == interval,
-            OptionGreeks.open_time.in_(cutoffs),
-        )
-        if calc_version:
-            statement = statement.where(OptionGreeks.calc_version == calc_version)
-        return list(self.db.scalars(statement))
+        rows: list[OptionGreeks] = []
+        for offset in range(0, len(cutoffs), 500):
+            chunk = cutoffs[offset:offset + 500]
+            statement = select(OptionGreeks).where(
+                OptionGreeks.interval == interval,
+                OptionGreeks.open_time.in_(chunk),
+            )
+            if calc_version:
+                statement = statement.where(OptionGreeks.calc_version == calc_version)
+            rows.extend(self.db.scalars(statement))
+        return rows
 
     def option_candles_at_many(
         self,
@@ -239,13 +243,17 @@ class PointInTimeDataset:
         cutoffs = [_require_cutoff(ts) for ts in decision_timestamps]
         if not cutoffs:
             return []
-        statement = select(OptionCandle).where(
-            OptionCandle.interval == interval,
-            OptionCandle.open_time.in_(cutoffs),
-        )
-        if instrument_keys:
-            statement = statement.where(OptionCandle.instrument_key.in_(instrument_keys))
-        return list(self.db.scalars(statement))
+        rows: list[OptionCandle] = []
+        for offset in range(0, len(cutoffs), 500):
+            chunk = cutoffs[offset:offset + 500]
+            statement = select(OptionCandle).where(
+                OptionCandle.interval == interval,
+                OptionCandle.open_time.in_(chunk),
+            )
+            if instrument_keys:
+                statement = statement.where(OptionCandle.instrument_key.in_(instrument_keys))
+            rows.extend(self.db.scalars(statement))
+        return rows
 
     def historical_gex_at(
         self,
