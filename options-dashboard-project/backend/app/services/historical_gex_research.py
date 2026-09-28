@@ -609,28 +609,28 @@ class GexResearchEngine:
         if not sorted_ts:
             return {}
 
-        # Compute percentile thresholds from historical distribution
-        net_gex_values = [gex_series[ts]["net_gex"] for ts in sorted_ts]
-        net_gex_values_sorted = sorted(net_gex_values)
-        n = len(net_gex_values_sorted)
-
-        def percentile(pct):
-            idx = int(pct / 100 * (n - 1))
-            return net_gex_values_sorted[max(0, min(idx, n - 1))]
-
-        p25 = percentile(STRONG_NEGATIVE_PCTILE)
-        p75 = percentile(STRONG_POSITIVE_PCTILE)
-
-        # Flip zone threshold: 10% of the median absolute GEX
-        median_abs = percentile(50)
-        flip_zone_threshold = abs(median_abs) * FLIP_ZONE_PCTILE / 100
-
         result = {}
         previous_regime = None
         regime_start_idx = 0
+        historical_values: list[float] = []
 
         for i, ts in enumerate(sorted_ts):
             net_gex = gex_series[ts]["net_gex"]
+
+            # PIT invariant: regime thresholds may use only observations known
+            # at this timestamp. Never compute thresholds from future rows.
+            historical_values.append(net_gex)
+            ordered_history = sorted(historical_values)
+            n = len(ordered_history)
+
+            def percentile(pct):
+                idx = int(pct / 100 * (n - 1))
+                return ordered_history[max(0, min(idx, n - 1))]
+
+            p25 = percentile(STRONG_NEGATIVE_PCTILE)
+            p75 = percentile(STRONG_POSITIVE_PCTILE)
+            median_abs = percentile(50)
+            flip_zone_threshold = abs(median_abs) * FLIP_ZONE_PCTILE / 100
 
             # Classify
             if abs(net_gex) <= flip_zone_threshold:
