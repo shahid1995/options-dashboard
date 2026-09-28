@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from sqlalchemy import Select, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -40,9 +40,15 @@ def _with_cutoff(statement: Select, column, cutoff: datetime) -> Select:
     return statement.where(column <= cutoff)
 
 
-def _with_completed_candle_cutoff(statement: Select, column, cutoff: datetime) -> Select:
-    """Apply the PIT predicate for interval-derived candle observations."""
-    return statement.where(column < cutoff)
+def _with_completed_candle_cutoff(
+    statement: Select,
+    column,
+    cutoff: datetime,
+    interval: str,
+) -> Select:
+    """Apply the PIT predicate for fully completed interval-derived candles."""
+    completed_through = _completed_bar_open_time(cutoff, interval)
+    return statement.where(column <= completed_through)
 
 
 def _completed_bar_open_time(decision_timestamp: datetime, interval: str) -> datetime:
@@ -89,6 +95,7 @@ class PointInTimeDataset:
             ),
             NiftyCandle.open_time,
             cutoff,
+            interval,
         )
         if since is not None:
             start = _require_cutoff(since)
@@ -116,6 +123,7 @@ class PointInTimeDataset:
             ),
             OptionCandle.open_time,
             cutoff,
+            interval,
         )
         if since is not None:
             start = _require_cutoff(since)
@@ -174,6 +182,7 @@ class PointInTimeDataset:
             ),
             OptionGreeks.open_time,
             cutoff,
+            interval,
         )
         statement = statement.where(OptionGreeks.calc_version == calc_version)
         statement = (
@@ -199,8 +208,10 @@ class PointInTimeDataset:
             .where(
                 NiftyCandle.symbol == symbol.upper(),
                 NiftyCandle.interval == interval,
-                NiftyCandle.open_time == target,
+                NiftyCandle.open_time <= target,
             )
+            .order_by(NiftyCandle.open_time.desc())
+            .limit(1)
         )
         return list(self.db.scalars(statement))
 
@@ -214,13 +225,35 @@ class PointInTimeDataset:
         """Return completed option candles available immediately before the decision time."""
         cutoff = _require_cutoff(decision_timestamp)
         target = _completed_bar_open_time(cutoff, interval)
+        if instrument_keys is not None and not instrument_keys:
+            return []
+
+        latest_open_time = (
+            select(func.max(OptionCandle.open_time))
+            .where(
+                OptionCandle.interval == interval,
+                OptionCandle.open_time <= target,
+            )
+            .scalar_subquery()
+        )
+        if instrument_keys is not None:
+            latest_open_time = (
+                select(func.max(OptionCandle.open_time))
+                .where(
+                    OptionCandle.interval == interval,
+                    OptionCandle.open_time <= target,
+                    OptionCandle.instrument_key.in_(instrument_keys),
+                )
+                .scalar_subquery()
+            )
+
         statement = select(OptionCandle).where(
             OptionCandle.interval == interval,
-            OptionCandle.open_time == target,
+            OptionCandle.open_time == latest_open_time,
         )
-        if instrument_keys:
+        if instrument_keys is not None:
             statement = statement.where(OptionCandle.instrument_key.in_(instrument_keys))
-        statement = statement.order_by(OptionCandle.open_time.desc())
+        statement = statement.order_by(OptionCandle.instrument_key)
         return list(self.db.scalars(statement))
 
     def option_greeks_at(
@@ -234,15 +267,28 @@ class PointInTimeDataset:
         """Return completed reconstructed Greeks available before the decision time."""
         cutoff = _require_cutoff(decision_timestamp)
         target = _completed_bar_open_time(cutoff, interval)
+        if instrument_keys is not None and not instrument_keys:
+            return []
+
+        latest_open_time = (
+            select(func.max(OptionGreeks.open_time))
+            .where(
+                OptionGreeks.interval == interval,
+                OptionGreeks.open_time <= target,
+                OptionGreeks.status == "SUCCESS",
+                OptionGreeks.calc_version == (calc_version or DEFAULT_GREEKS_CALC_VERSION),
+            )
+            .scalar_subquery()
+        )
         statement = select(OptionGreeks).where(
             OptionGreeks.interval == interval,
-            OptionGreeks.open_time == target,
+            OptionGreeks.open_time == latest_open_time,
             OptionGreeks.status == "SUCCESS",
+            OptionGreeks.calc_version == (calc_version or DEFAULT_GREEKS_CALC_VERSION),
         )
-        if instrument_keys:
+        if instrument_keys is not None:
             statement = statement.where(OptionGreeks.instrument_key.in_(instrument_keys))
-        statement = statement.where(OptionGreeks.calc_version == (calc_version or DEFAULT_GREEKS_CALC_VERSION))
-        statement = statement.order_by(OptionGreeks.open_time.desc())
+        statement = statement.order_by(OptionGreeks.instrument_key)
         return list(self.db.scalars(statement))
 
     def option_greeks_at_many(
@@ -302,9 +348,18 @@ class PointInTimeDataset:
         """Return completed historical GEX whose source candle precedes T."""
         cutoff = _require_cutoff(decision_timestamp)
         target = _completed_bar_open_time(cutoff, interval)
+        latest_open_time = select(func.max(HistoricalGexSnapshot.open_time)).where(
+            HistoricalGexSnapshot.interval == interval,
+            HistoricalGexSnapshot.open_time <= target,
+            HistoricalGexSnapshot.calc_version == calc_version,
+        )
+        if successful_only:
+            latest_open_time = latest_open_time.where(HistoricalGexSnapshot.status == "SUCCESS")
+        latest_open_time = latest_open_time.scalar_subquery()
+
         statement = select(HistoricalGexSnapshot).where(
             HistoricalGexSnapshot.interval == interval,
-            HistoricalGexSnapshot.open_time == target,
+            HistoricalGexSnapshot.open_time == latest_open_time,
             HistoricalGexSnapshot.calc_version == calc_version,
         )
         if successful_only:
@@ -331,6 +386,7 @@ class PointInTimeDataset:
             ),
             HistoricalGexSnapshot.open_time,
             cutoff,
+            interval,
         )
         statement = statement.order_by(HistoricalGexSnapshot.open_time.desc()).limit(max(1, limit))
         rows = list(self.db.scalars(statement))
