@@ -1,7 +1,11 @@
 from datetime import datetime, timezone
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
+from app.db import Base
 from app.models import (
     HistoricalGexSnapshot,
     IVObservation,
@@ -9,7 +13,25 @@ from app.models import (
     OptionCandle,
     OptionGreeks,
 )
+from app.services import iv_history
 from app.services.point_in_time import PointInTimeDataset
+
+
+@pytest.fixture
+def db_session():
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    session = Session()
+    try:
+        yield session
+    finally:
+        session.close()
+        Base.metadata.drop_all(engine)
 
 
 BASE_TS = datetime(2026, 8, 27, 10, 0)
@@ -111,7 +133,7 @@ def test_cutoff_is_mandatory_and_timezone_normalized(db_session):
     pit = PointInTimeDataset(db_session)
     rows = pit.nifty_candles(
         "NIFTY",
-        "2026-08-27T04:30:00Z",
+        "2026-08-27T04:33:00Z",
     )
 
     assert [row.open_time for row in rows] == [BASE_TS]
@@ -121,19 +143,20 @@ def test_cutoff_is_mandatory_and_timezone_normalized(db_session):
 
 
 @pytest.mark.parametrize(
-    ("method_name", "builder"),
+    ("method_name", "builder", "decision_timestamp"),
     [
-        ("nifty_candles", lambda ts: _nifty(ts, 24500)),
-        ("option_candles", lambda ts: _option(ts)),
-        ("iv_observations", lambda ts: _iv(ts)),
-        ("option_greeks", lambda ts: _greeks(ts)),
-        ("historical_gex", lambda ts: _gex(ts)),
+        ("nifty_candles", lambda ts: _nifty(ts, 24500), FUTURE_TS),
+        ("option_candles", lambda ts: _option(ts), FUTURE_TS),
+        ("iv_observations", lambda ts: _iv(ts), BASE_TS),
+        ("option_greeks", lambda ts: _greeks(ts), FUTURE_TS),
+        ("historical_gex", lambda ts: _gex(ts), FUTURE_TS),
     ],
 )
-def test_future_observations_are_invisible_and_boundary_is_inclusive(
+def test_future_observations_are_invisible_and_completed_boundary_is_respected(
     db_session,
     method_name,
     builder,
+    decision_timestamp,
 ):
     db_session.add_all([builder(BASE_TS), builder(FUTURE_TS)])
     db_session.commit()
@@ -142,16 +165,12 @@ def test_future_observations_are_invisible_and_boundary_is_inclusive(
     method = getattr(pit, method_name)
 
     kwargs = {}
-    if method_name == "option_candles":
-        kwargs["instrument_key"] = "TEST|CE"
-    elif method_name == "option_greeks":
-        kwargs["instrument_key"] = "TEST|CE"
-    elif method_name == "historical_gex":
+    if method_name in {"option_candles", "option_greeks", "historical_gex"}:
         kwargs["instrument_key"] = "TEST|CE"
     else:
         kwargs["symbol"] = "NIFTY"
 
-    kwargs["decision_timestamp"] = BASE_TS
+    kwargs["decision_timestamp"] = decision_timestamp
     rows = method(**kwargs)
 
     assert len(rows) == 1
@@ -168,7 +187,7 @@ def test_derived_processing_time_does_not_widen_market_time_visibility(db_sessio
     db_session.commit()
 
     pit = PointInTimeDataset(db_session)
-    rows = pit.option_greeks("TEST|CE", BASE_TS, calc_version="greeks_v3")
+    rows = pit.option_greeks("TEST|CE", FUTURE_TS, calc_version="greeks_v3")
 
     assert len(rows) == 1
     assert rows[0].open_time == BASE_TS
@@ -185,8 +204,31 @@ def test_bulk_feature_reads_preserve_timestamp_cutoff(db_session):
     db_session.commit()
 
     pit = PointInTimeDataset(db_session)
-    greeks = pit.option_greeks_at_many([BASE_TS, FUTURE_TS], calc_version="greeks_v3")
-    candles = pit.option_candles_at_many([BASE_TS, FUTURE_TS])
+    decision_times = [FUTURE_TS, datetime(2026, 8, 27, 10, 6)]
+    greeks = pit.option_greeks_at_many(decision_times, calc_version="greeks_v3")
+    candles = pit.option_candles_at_many(decision_times)
 
     assert {row.open_time for row in greeks} == {BASE_TS, FUTURE_TS}
     assert {row.open_time for row in candles} == {BASE_TS, FUTURE_TS}
+
+
+def test_iv_timestamp_is_normalized_before_pit_comparison(db_session):
+    """A UTC IV timestamp is normalized to IST before applying the PIT cutoff."""
+    iv_history.record_iv_observations(
+        db_session,
+        [{
+            "timestamp": "2026-08-27T04:33:00Z",
+            "symbol": "NIFTY",
+            "expiry": "2026-09-03",
+            "strike": 24500,
+            "optionType": "call",
+            "iv": 0.18,
+            "spot": 24500,
+            "source": "test",
+        }],
+    )
+
+    pit = PointInTimeDataset(db_session)
+    rows = pit.iv_observations("NIFTY", BASE_TS)
+
+    assert rows == []
