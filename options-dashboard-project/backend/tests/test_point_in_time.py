@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime
 
 import pytest
 from sqlalchemy import create_engine
@@ -141,6 +141,47 @@ def test_cutoff_is_mandatory_and_timezone_normalized(db_session):
     with pytest.raises(ValueError, match="decision timestamp"):
         pit.nifty_candles("NIFTY", "")
 
+def test_completed_candle_boundary_excludes_unfinished_intrabar_data(db_session):
+    db_session.add_all([
+        _nifty(BASE_TS, 24500),
+        _nifty(FUTURE_TS, 24510),
+    ])
+    db_session.commit()
+
+    pit = PointInTimeDataset(db_session)
+
+    assert pit.nifty_candles("NIFTY", datetime(2026, 8, 27, 10, 1)) == []
+    assert [row.open_time for row in pit.nifty_candles(
+        "NIFTY", FUTURE_TS,
+    )] == [BASE_TS]
+
+
+def test_off_grid_lookup_uses_latest_completed_bar(db_session):
+    db_session.add_all([
+        _nifty(BASE_TS, 24500),
+        _nifty(FUTURE_TS, 24510),
+        _option(BASE_TS),
+        _option(FUTURE_TS),
+        _greeks(BASE_TS),
+        _greeks(FUTURE_TS),
+        _gex(BASE_TS),
+        _gex(FUTURE_TS),
+    ])
+    db_session.commit()
+
+    pit = PointInTimeDataset(db_session)
+    decision = datetime(2026, 8, 27, 10, 4)
+
+    assert [row.open_time for row in pit.nifty_candles_at(decision)] == [BASE_TS]
+    assert [row.open_time for row in pit.option_candles_at(
+        decision, instrument_keys=["TEST|CE"],
+    )] == [BASE_TS]
+    assert [row.open_time for row in pit.option_greeks_at(
+        decision, instrument_keys=["TEST|CE"],
+    )] == [BASE_TS]
+    assert [row.open_time for row in pit.historical_gex_at(decision)] == [BASE_TS]
+
+
 
 @pytest.mark.parametrize(
     ("method_name", "builder", "decision_timestamp"),
@@ -210,6 +251,21 @@ def test_bulk_feature_reads_preserve_timestamp_cutoff(db_session):
 
     assert {row.open_time for row in greeks} == {BASE_TS, FUTURE_TS}
     assert {row.open_time for row in candles} == {BASE_TS, FUTURE_TS}
+
+
+def test_empty_instrument_selection_returns_no_option_features(db_session):
+    db_session.add_all([
+        _option(BASE_TS, key="TEST|CE"),
+        _option(BASE_TS, key="TEST|PE"),
+        _greeks(BASE_TS),
+    ])
+    db_session.commit()
+
+    pit = PointInTimeDataset(db_session)
+    decision = FUTURE_TS
+
+    assert pit.option_candles_at(decision, instrument_keys=[]) == []
+    assert pit.option_greeks_at(decision, instrument_keys=[]) == []
 
 
 def test_iv_timestamp_is_normalized_before_pit_comparison(db_session):
