@@ -10,7 +10,7 @@ decision time. Forward labels are intentionally outside this interface.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import Select, select
 from sqlalchemy.orm import Session
@@ -58,7 +58,6 @@ def _completed_bar_open_time(decision_timestamp: datetime, interval: str) -> dat
     seconds = durations.get(interval)
     if seconds is None:
         raise ValueError(f"Unsupported PIT candle interval: {interval}")
-    from datetime import timedelta
     return decision_timestamp - timedelta(seconds=seconds)
 
 
