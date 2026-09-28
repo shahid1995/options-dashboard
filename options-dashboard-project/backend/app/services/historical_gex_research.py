@@ -49,6 +49,7 @@ ANTI-LEAKAGE RULES:
 from __future__ import annotations
 
 import logging
+from bisect import insort
 import math
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -624,8 +625,8 @@ class GexResearchEngine:
 
             # PIT invariant: regime thresholds may use only observations known
             # at this timestamp. Never compute thresholds from future rows.
-            historical_values.append(net_gex)
-            ordered_history = sorted(historical_values)
+            insort(historical_values, net_gex)
+            ordered_history = historical_values
             n = len(ordered_history)
 
             def percentile(pct):
