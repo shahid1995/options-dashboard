@@ -1,9 +1,26 @@
 # StrikeNova Implementation Status Tracker
 
 > **Master Plan SHA:** `0a244c0` (docs: add StrikeNova master day-wise implementation plan)
-> **Last Updated:** 2026-09-27 (Day 47 durable background jobs implemented on branch `feat/strikenova-day47-durable-background-jobs`; PR open, no production deployment)
+> **Last Updated:** 2026-09-28 (Day 47 merged; Day 48 historical data governance in progress; no production deployment)
 
 ---
+
+## 2026-09-28 — Day 48: historical data governance
+
+**Status:** **IN PROGRESS.** Issue #114. Branch `feat/strikenova-day48-historical-data-governance`, based on merged Day 47 commit `e880b62ba50031b69322a69a52e45f1612bb3ee7`.
+
+| Item | Resolution | Evidence |
+|------|------------|----------|
+| Governance catalog | Added `HistoricalDatasetGovernance` catalog for source, entitlement, license, usage, redistribution, raw-immutability, recomputation and retention metadata. | `app/models.py`; migration `d48aa0000001_historical_data_governance.py` |
+| Ingestion manifest | Added `HistoricalIngestionRun` to snapshot policy/provenance at acquisition time and link optional durable job IDs. | `app/models.py` |
+| Checkpoint/completeness audit | Governance service snapshots existing `IngestionCheckpoint`, `DataCompleteness` and `IngestionLog` state without replacing the established pipeline records. | `app/services/historical_data_governance.py` |
+| Entitlement / redistribution | Fail-closed checks require explicit verified entitlement / redistribution approval; current Upstox-derived catalog entries remain `REVIEW_REQUIRED` rather than inferring rights from API availability. | `app/services/historical_data_governance.py`; seeded catalog policy |
+| Recomputability | Raw datasets are marked immutable/recomputable; model/analytics datasets carry explicit governed dependencies and are checked transitively before recomputation is considered safe. | `assert_recomputation_safe()` |
+| Retention | Dry-run-first retention planner plus explicit execution switch; deletion uses a static allow-list of known ORM models/columns; raw-tier deletion remains non-executable. | `plan_retention()` / `enforce_retention()` |
+| Production safety | No production retention execution, scheduling, deployment, or database mutation performed. | Governance workflow rule |
+| Verification | Focused governance test suite added; CI/migration compatibility still pending for the Day 48 gate. | `tests/test_historical_data_governance.py` |
+
+**Day 48 gate:** NOT YET PASSED.
 
 ## 2026-09-27 — Day 47: durable background jobs (historical ingestion)
 
@@ -31,7 +48,7 @@
 | Heartbeat acquisition-failure hardening (independent verification) | Durability gap found and fixed: `_heartbeat_loop` created the renewal session OUTSIDE its try block, so a `session_factory()` failure (pool exhaustion, connection loss) killed the heartbeat thread with an uncaught exception and a long-running job silently lost lease renewal. Session acquisition now sits inside the error-handling path: an acquisition failure is logged with `exc_info`, retried at the next heartbeat interval, never terminates the thread, and is never fabricated into a successful renewal. `renew_lease` ownership protection, lease expiry, daemon/crash-recovery behavior, and existing renewal-failure handling are unchanged. | Hermetic suite 100→102 tests (`TestHeartbeatSessionAcquisitionFailure`: (A) first acquisition fails, later succeed — thread survives with no unhandled exception via `threading.excepthook` guard, later renewal lands, worker completes retaining ownership; (B) repeated failures during attempt 1 — heartbeat keeps attempting, failures logged with `exc_info`, no false renewal, attempt 1's completion refused as stale by ownership protection, reclaimed attempt 2 completes with valid ownership; stable across 3 repeated runs). Real-DB suite re-run: 20 passed (PG + CRDB); migration batch 98; PG rehearsal 6, CRDB rehearsal 10; CLI 13; crash/stale-recovery re-verified. PR description refreshed with actual counts and tooling-failure limitations |
 | Rate-limiter lifecycle correction (independent verification) | Finding CONFIRMED against repository architecture (not merely the scanner's claim): `execute_historical_ingestion` constructed a fresh `GlobalRateLimiter` per job, discarding 429 cooldown, widened pacing, consecutive-429 count, and adaptive-concurrency state at every job boundary — contradicting the documented in-process "global" scope that `run_backfill.py` gives its whole CLI process (one limiter, all stages). Correction: `run_worker` now creates ONE limiter for its lifetime and passes it through `_execute_one` → `execute_job` → `execute_historical_ingestion`; the new `prepare_run_rate_limiter` applies each job's requested concurrency as THAT job's ceiling (recovery ceiling + semaphore) without resetting preserved adaptive state; direct/CLI/test callers omitting the limiter keep the original per-run construction; no external state, no singleton coupling of worker lifecycles; `SessionRateLimiter` untouched. | Hermetic suite 102→106 (`TestWorkerRateLimiterLifecycle`: A — one limiter object and its adaptive state persist across sequential jobs; B — through the real dispatch path, job 2's explicit concurrency (2) is applied and does NOT inherit job 1's (5) while adaptive state persists; C — a genuine 30s Retry-After 429 cooldown survives the job boundary (job 2 sees remaining cooldown, widened pacing, consecutive-429=1); D — two worker lifecycles hold distinct limiter objects with independent state, no process-wide singleton). Full battery evidence recorded before this follow-on hardening: hermetic 106, rate-limiter suite 41 (untouched), real-DB 20 (PG + CRDB), PG-compat 98, CRDB rehearsal 10, ingestion 141, CLI 13; follow-on fix adds regression E for reuse across asyncio.run event-loop boundaries. The isolated cross-loop reproducer passes; the connected repository CI does not expose the full hermetic/ingestion battery, so no new full-suite pass claim is made yet |
 
-**Governance state:** Day 47 PR is **OPEN** (not merged). No deployment, no production database changes, no production CockroachDB contact, no credential rotation, no Vercel/Render configuration change. Test databases used were disposable local instances (PostgreSQL 18.6 `pgrehearsal`, CockroachDB v25.2.23 single-node); all Day 47 queue tests run in dedicated scratch databases and clean up after themselves.
+**Governance state:** Day 47 PR is **MERGED** as `e880b62ba50031b69322a69a52e45f1612bb3ee7`. Day 48 is active on `feat/strikenova-day48-historical-data-governance`. No deployment, no production database changes, no production CockroachDB contact, no credential rotation, no Vercel/Render configuration change. Test databases used were disposable local instances (PostgreSQL 18.6 `pgrehearsal`, CockroachDB v25.2.23 single-node); all Day 47 queue tests run in dedicated scratch databases and clean up after themselves.
 
 ---
 
