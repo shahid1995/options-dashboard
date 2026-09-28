@@ -13,7 +13,6 @@ from app.db import Base
 from app.models import (
     DataCompleteness,
     HistoricalDatasetGovernance,
-    HistoricalIngestionRun,
     IngestionCheckpoint,
     IngestionLog,
     OptionGreeks,
