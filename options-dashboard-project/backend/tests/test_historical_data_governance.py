@@ -441,7 +441,15 @@ def test_governance_datetimes_are_naive_utc(db):
     assert plan_aware.cutoff.tzinfo is None
     assert plan_aware.candidate_rows == 2
 
-    # finalize timestamps are stored naive UTC as well.
+    # finalize timestamps are stored naive UTC as well, and the Day 48
+    # governance model defaults (started_at/created_at/updated_at) are naive.
     run = hdg.start_ingestion_run(db, dataset_keys=[key], run_id="run-naive-ts")
     finished = hdg.finish_ingestion_run(db, run.run_id, status=hdg.RUN_FAILED)
     assert finished.completed_at.tzinfo is None
+    assert finished.started_at.tzinfo is None
+    catalog_row = db.scalar(
+        select(HistoricalDatasetGovernance).where(
+            HistoricalDatasetGovernance.dataset_key == key
+        )
+    )
+    assert catalog_row.created_at.tzinfo is None

@@ -1146,7 +1146,8 @@ class GapBacktestResult(Base):
 def _utcnow_naive() -> datetime:
     """Naive UTC timestamp for Day 47 job scheduling fields.
 
-    Deliberately scoped to the Day 47 job model: the ``background_jobs``
+    Scoped to the Day 47 job model and the Day 48 governance models: the
+    ``background_jobs``
     service (``app/services/background_jobs.py``) stores and compares naive
     UTC for cross-database comparability (SQLite string ordering,
     PostgreSQL/CockroachDB TIMESTAMP WITHOUT TIME ZONE) and binds its own
@@ -1309,8 +1310,8 @@ class HistoricalDatasetGovernance(Base):
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     active: Mapped[bool] = mapped_column(default=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow_naive)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow_naive, onupdate=_utcnow_naive)
 
 
 class HistoricalIngestionRun(Base):
@@ -1346,5 +1347,5 @@ class HistoricalIngestionRun(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     metadata_json: Mapped[str] = mapped_column(Text, default="{}")
 
-    started_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow_naive)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
