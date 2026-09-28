@@ -238,6 +238,7 @@ class GexResearchEngine:
         self.db = db
         self.calc_version = calc_version
         self.pit = PointInTimeDataset(db)
+
     def _decision_timestamp_for_observation(self, timestamp: datetime) -> datetime:
         """Return the decision time at the end of a three-minute observation bar."""
         return timestamp + timedelta(minutes=3)
@@ -254,6 +255,10 @@ class GexResearchEngine:
         max_timestamps: Optional[int] = None,
     ) -> list[TimestampResearch]:
         """Build a complete leakage-safe research dataset.
+
+        Research timestamps identify the opening time of a three-minute
+        observation bar. Feature availability is enforced at that bar's close
+        (timestamp + 3 minutes); forward outcomes remain labels only.
 
         For every timestamp, assembles:
         - Market state (spot, returns as labels)
@@ -762,7 +767,7 @@ class GexResearchEngine:
     def _detect_walls_at_timestamp(self, ts: datetime) -> dict:
         """Detect gamma walls at a single timestamp."""
         rows = self.pit.historical_gex_at(
-            ts,
+            self._decision_timestamp_for_observation(ts),
             interval=DEFAULT_INTERVAL,
             calc_version=self.calc_version,
         )
