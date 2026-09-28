@@ -107,9 +107,14 @@ def _resolve_user(
     """
     from app.identity import get_active_session, User
     from app.services import token_store
+    from app.services.platform_session import is_platform_session_token
 
-    # Broker token: None for platform-only sessions, real token for broker sessions
-    broker_token = token_store.get_token(sid)
+    # The token store carries two different kinds of material:
+    # - broker sessions: the stored value is the broker access token
+    # - platform sessions: the stored value is only an internal session token
+    # Platform tokens must never cross a broker boundary.
+    stored_token = token_store.get_token(sid)
+    broker_token = None if is_platform_session_token(stored_token) else stored_token
 
     # Platform session validity: must exist and be active
     session = get_active_session(db, sid)
