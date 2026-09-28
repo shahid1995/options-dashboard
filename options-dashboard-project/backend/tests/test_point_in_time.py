@@ -173,3 +173,20 @@ def test_derived_processing_time_does_not_widen_market_time_visibility(db_sessio
     assert len(rows) == 1
     assert rows[0].open_time == BASE_TS
     assert rows[0].calculated_at == FUTURE_TS
+
+def test_bulk_feature_reads_preserve_timestamp_cutoff(db_session):
+    """Bulk PIT reads include multiple historical timestamps without widening their boundaries."""
+    db_session.add_all([
+        _greeks(BASE_TS),
+        _greeks(FUTURE_TS),
+        _option(BASE_TS),
+        _option(FUTURE_TS),
+    ])
+    db_session.commit()
+
+    pit = PointInTimeDataset(db_session)
+    greeks = pit.option_greeks_at_many([BASE_TS, FUTURE_TS], calc_version="greeks_v3")
+    candles = pit.option_candles_at_many([BASE_TS, FUTURE_TS])
+
+    assert {row.open_time for row in greeks} == {BASE_TS, FUTURE_TS}
+    assert {row.open_time for row in candles} == {BASE_TS, FUTURE_TS}
