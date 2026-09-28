@@ -10,6 +10,7 @@ has completed by the decision time is eligible. Forward labels are intentionally
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from datetime import datetime, timedelta
 
 from sqlalchemy import Select, func, select
@@ -301,16 +302,30 @@ class PointInTimeDataset:
             return []
         if instrument_keys is not None and not instrument_keys:
             return []
+        targets = [_completed_bar_open_time(cutoff, interval) for cutoff in cutoffs]
+        max_target = max(targets)
+        statement = select(OptionGreeks).where(
+            OptionGreeks.interval == interval,
+            OptionGreeks.open_time <= max_target,
+            OptionGreeks.status == "SUCCESS",
+            OptionGreeks.calc_version == (calc_version or DEFAULT_GREEKS_CALC_VERSION),
+        )
+        if instrument_keys is not None:
+            statement = statement.where(OptionGreeks.instrument_key.in_(instrument_keys))
+        source_rows = list(self.db.scalars(statement.order_by(
+            OptionGreeks.instrument_key, OptionGreeks.open_time
+        )))
+        by_instrument: dict[str, list[OptionGreeks]] = {}
+        for row in source_rows:
+            by_instrument.setdefault(row.instrument_key, []).append(row)
+
         rows: list[OptionGreeks] = []
-        for decision_timestamp in cutoffs:
-            rows.extend(
-                self.option_greeks_at(
-                    decision_timestamp,
-                    instrument_keys=instrument_keys,
-                    interval=interval,
-                    calc_version=calc_version,
-                )
-            )
+        for target in targets:
+            for instrument_rows in by_instrument.values():
+                opens = [row.open_time for row in instrument_rows]
+                index = bisect_right(opens, target) - 1
+                if index >= 0:
+                    rows.append(instrument_rows[index])
         return rows
 
     def option_candles_at_many(
@@ -324,15 +339,28 @@ class PointInTimeDataset:
         cutoffs = [_require_cutoff(ts) for ts in decision_timestamps]
         if not cutoffs:
             return []
+        targets = [_completed_bar_open_time(cutoff, interval) for cutoff in cutoffs]
+        max_target = max(targets)
+        statement = select(OptionCandle).where(
+            OptionCandle.interval == interval,
+            OptionCandle.open_time <= max_target,
+        )
+        if instrument_keys is not None:
+            statement = statement.where(OptionCandle.instrument_key.in_(instrument_keys))
+        source_rows = list(self.db.scalars(statement.order_by(
+            OptionCandle.instrument_key, OptionCandle.open_time
+        )))
+        by_instrument: dict[str, list[OptionCandle]] = {}
+        for row in source_rows:
+            by_instrument.setdefault(row.instrument_key, []).append(row)
+
         rows: list[OptionCandle] = []
-        for decision_timestamp in cutoffs:
-            rows.extend(
-                self.option_candles_at(
-                    decision_timestamp,
-                    instrument_keys=instrument_keys,
-                    interval=interval,
-                )
-            )
+        for target in targets:
+            for instrument_rows in by_instrument.values():
+                opens = [row.open_time for row in instrument_rows]
+                index = bisect_right(opens, target) - 1
+                if index >= 0:
+                    rows.append(instrument_rows[index])
         return rows
 
     def historical_gex_at(
