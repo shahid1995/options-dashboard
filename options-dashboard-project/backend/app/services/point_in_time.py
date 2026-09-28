@@ -302,17 +302,15 @@ class PointInTimeDataset:
         if instrument_keys is not None and not instrument_keys:
             return []
         rows: list[OptionGreeks] = []
-        for offset in range(0, len(cutoffs), 500):
-            chunk = [_completed_bar_open_time(ts, interval) for ts in cutoffs[offset:offset + 500]]
-            statement = select(OptionGreeks).where(
-                OptionGreeks.interval == interval,
-                OptionGreeks.open_time.in_(chunk),
-                OptionGreeks.status == "SUCCESS",
+        for decision_timestamp in cutoffs:
+            rows.extend(
+                self.option_greeks_at(
+                    decision_timestamp,
+                    instrument_keys=instrument_keys,
+                    interval=interval,
+                    calc_version=calc_version,
+                )
             )
-            if instrument_keys is not None:
-                statement = statement.where(OptionGreeks.instrument_key.in_(instrument_keys))
-            statement = statement.where(OptionGreeks.calc_version == calc_version)
-            rows.extend(self.db.scalars(statement))
         return rows
 
     def option_candles_at_many(
@@ -327,17 +325,14 @@ class PointInTimeDataset:
         if not cutoffs:
             return []
         rows: list[OptionCandle] = []
-        for offset in range(0, len(cutoffs), 500):
-            chunk = [_completed_bar_open_time(ts, interval) for ts in cutoffs[offset:offset + 500]]
-            statement = select(OptionCandle).where(
-                OptionCandle.interval == interval,
-                OptionCandle.open_time.in_(chunk),
+        for decision_timestamp in cutoffs:
+            rows.extend(
+                self.option_candles_at(
+                    decision_timestamp,
+                    instrument_keys=instrument_keys,
+                    interval=interval,
+                )
             )
-            if instrument_keys is not None:
-                if not instrument_keys:
-                    return []
-                statement = statement.where(OptionCandle.instrument_key.in_(instrument_keys))
-            rows.extend(self.db.scalars(statement))
         return rows
 
     def historical_gex_at(
