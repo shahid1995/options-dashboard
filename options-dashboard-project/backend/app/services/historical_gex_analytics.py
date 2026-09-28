@@ -38,6 +38,7 @@ from sqlalchemy import select, func, and_, text
 from sqlalchemy.orm import Session
 
 from app.models import HistoricalGexSnapshot, NiftyCandle
+from app.services.point_in_time import PointInTimeDataset
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +231,11 @@ class GexAnalyticsEngine:
     def __init__(self, db: Session, calc_version: str = DEFAULT_CALC_VERSION):
         self.db = db
         self.calc_version = calc_version
+        self.pit = PointInTimeDataset(db)
+
+    def _decision_timestamp_for_observation(self, timestamp: datetime) -> datetime:
+        """Return the decision time at the end of the three-minute source bar."""
+        return timestamp + timedelta(minutes=3)
 
     # ------------------------------------------------------------------
     # Phase 2: Time-series aggregation
@@ -237,14 +243,11 @@ class GexAnalyticsEngine:
 
     def aggregate_timestamp(self, ts: datetime) -> Optional[TimestampGex]:
         """Aggregate GEX at a single timestamp across all instruments."""
-        rows = self.db.execute(
-            select(HistoricalGexSnapshot)
-            .where(
-                HistoricalGexSnapshot.open_time == ts,
-                HistoricalGexSnapshot.calc_version == self.calc_version,
-                HistoricalGexSnapshot.status == "SUCCESS",
-            )
-        ).scalars().all()
+        rows = self.pit.historical_gex_at(
+            self._decision_timestamp_for_observation(ts),
+            interval=DEFAULT_INTERVAL,
+            calc_version=self.calc_version,
+        )
 
         if not rows:
             return None
@@ -298,14 +301,11 @@ class GexAnalyticsEngine:
 
     def aggregate_strike(self, ts: datetime) -> list[StrikeGex]:
         """Aggregate GEX by strike at a single timestamp."""
-        rows = self.db.execute(
-            select(HistoricalGexSnapshot)
-            .where(
-                HistoricalGexSnapshot.open_time == ts,
-                HistoricalGexSnapshot.calc_version == self.calc_version,
-                HistoricalGexSnapshot.status == "SUCCESS",
-            )
-        ).scalars().all()
+        rows = self.pit.historical_gex_at(
+            self._decision_timestamp_for_observation(ts),
+            interval=DEFAULT_INTERVAL,
+            calc_version=self.calc_version,
+        )
 
         strike_map: dict[float, StrikeGex] = {}
         for r in rows:
@@ -328,14 +328,11 @@ class GexAnalyticsEngine:
 
     def aggregate_expiry(self, ts: datetime) -> list[ExpiryGex]:
         """Aggregate GEX by expiry at a single timestamp."""
-        rows = self.db.execute(
-            select(HistoricalGexSnapshot)
-            .where(
-                HistoricalGexSnapshot.open_time == ts,
-                HistoricalGexSnapshot.calc_version == self.calc_version,
-                HistoricalGexSnapshot.status == "SUCCESS",
-            )
-        ).scalars().all()
+        rows = self.pit.historical_gex_at(
+            self._decision_timestamp_for_observation(ts),
+            interval=DEFAULT_INTERVAL,
+            calc_version=self.calc_version,
+        )
 
         expiry_map: dict[str, ExpiryGex] = {}
         total_abs = 0.0
@@ -462,15 +459,11 @@ class GexAnalyticsEngine:
 
         # Get spot from first row
         spot = 0.0
-        rows = self.db.execute(
-            select(HistoricalGexSnapshot)
-            .where(
-                HistoricalGexSnapshot.open_time == ts,
-                HistoricalGexSnapshot.calc_version == self.calc_version,
-                HistoricalGexSnapshot.status == "SUCCESS",
-            )
-            .limit(1)
-        ).scalars().all()
+        rows = self.pit.historical_gex_at(
+            self._decision_timestamp_for_observation(ts),
+            interval=DEFAULT_INTERVAL,
+            calc_version=self.calc_version,
+        )[:1]
         if rows:
             spot = rows[0].spot
 
@@ -560,15 +553,11 @@ class GexAnalyticsEngine:
             return GammaWallsResult(timestamp=ts, spot=0.0)
 
         spot = 0.0
-        rows = self.db.execute(
-            select(HistoricalGexSnapshot)
-            .where(
-                HistoricalGexSnapshot.open_time == ts,
-                HistoricalGexSnapshot.calc_version == self.calc_version,
-                HistoricalGexSnapshot.status == "SUCCESS",
-            )
-            .limit(1)
-        ).scalars().all()
+        rows = self.pit.historical_gex_at(
+            self._decision_timestamp_for_observation(ts),
+            interval=DEFAULT_INTERVAL,
+            calc_version=self.calc_version,
+        )[:1]
         if rows:
             spot = rows[0].spot
 
