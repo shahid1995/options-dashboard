@@ -377,7 +377,13 @@ async def submit_execution(
         ]
         request = request.model_copy(update={"legs": normalized_legs})
         prices = await resolve_market_prices(access_token, request.symbol, request.legs)
-        return execute_strategy(user_id, request, db, prices)
+        # Day 50 / Issue #118: every new entry must carry a genuine
+        # server-generated StrategyCandidate. The producer acquires the
+        # real evidence, runs the existing Day-28→Day-33 chain, and
+        # delegates to execute_gated_paper_entry → execute_strategy.
+        from app.services.candidate_production import produce_candidate_and_execute
+        return await produce_candidate_and_execute(
+            user_id, db, request, prices)
     except PaperExecutionError as exc:
         raise _paper_error(exc, db=db, user_id=user_id) from exc
 
