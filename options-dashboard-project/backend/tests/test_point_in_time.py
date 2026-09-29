@@ -808,6 +808,9 @@ def test_bounded_seed_uses_grouped_max_join_not_correlated_scan(db_session):
     )
     assert "group_by(" in source
     assert "func.max(" in source
+    # The outer seed scan itself is explicitly bounded by the earliest
+    # target — it can never consider rows newer than lower.
+    assert "model.open_time <= lower" in source
     # The (lower, upper] window query is retained.
     assert "> lower" in source and "<= upper" in source
 

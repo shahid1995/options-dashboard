@@ -154,6 +154,7 @@ def test_day49_migrates_legacy_iv_timestamps_to_ist(temp_db):
     from alembic import command
     from alembic.config import Config
     from app.db import Base
+    from app import models  # noqa: F401  (registers iv_observations metadata)
 
     engine = create_engine(temp_db, connect_args={"check_same_thread": False})
     Base.metadata.create_all(bind=engine)
