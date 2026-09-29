@@ -327,7 +327,9 @@ class PointInTimeDataset:
         #    filters inside the aggregation, so the seed timestamp always
         #    comes from an eligible row; the join back on both instrument
         #    identity and max open_time materializes exactly one seed row per
-        #    instrument without a correlated per-row scan of retained history.
+        #    instrument, and the outer scan itself carries the explicit
+        #    open_time <= lower bound so it can never consider rows newer
+        #    than the earliest requested target.
         seed_opens = (
             select(
                 model.instrument_key.label("seed_instrument_key"),
@@ -341,6 +343,7 @@ class PointInTimeDataset:
             .subquery()
         )
         seed_statement = select(model).where(
+            model.open_time <= lower,
             model.instrument_key == seed_opens.c.seed_instrument_key,
             model.open_time == seed_opens.c.seed_open_time,
             *eligibility_filters(model),
