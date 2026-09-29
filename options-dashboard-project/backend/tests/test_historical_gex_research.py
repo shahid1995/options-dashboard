@@ -760,7 +760,9 @@ def test_fallback_oi_is_attributed_to_its_source_timestamp(db_session):
     research decisions fall at 10:00/10:03/10:06, the same stale observation is
     neither relabeled as a fresh 10:03/10:06 observation, duplicated into later
     timestamps, nor dropped — and no OI change is fabricated between research
-    timestamps whose source observation never changed."""
+    timestamps whose source observation never changed. OI is state and
+    carries forward, but traded volume is event-scoped: a stale candle
+    contributes no fresh volume to later research timestamps."""
     ts_1000 = datetime(2026, 8, 27, 10, 0)
     ts_1003 = datetime(2026, 8, 27, 10, 3)
     ts_1006 = datetime(2026, 8, 27, 10, 6)
@@ -789,8 +791,16 @@ def test_fallback_oi_is_attributed_to_its_source_timestamp(db_session):
     # 10:00 source observation is the latest completed bar for all three.
     assert set(oi_data) == {ts_1000, ts_1003, ts_1006}
     for ts in (ts_1000, ts_1003, ts_1006):
+        # OI is state: the latest completed eligible observation carries
+        # forward without duplication or relabeling.
         assert oi_data[ts]["total_oi"] == 700
-        assert oi_data[ts]["total_volume"] == 10
+        assert oi_data[ts]["oi_source_open_time"] == ts_1000
+    # Traded volume is event-scoped: only the fresh 10:00 observation
+    # contributes it. No new candle means no fresh volume at 10:03/10:06.
+    assert oi_data[ts_1000]["total_volume"] == 10
+    assert oi_data[ts_1000]["call_volume"] == 10
+    assert oi_data[ts_1003]["total_volume"] == 0
+    assert oi_data[ts_1006]["total_volume"] == 0
 
     # No fresh observation arrived, so no OI change may be fabricated between
     # research timestamps — the fallback attribution keeps OI flat.
@@ -798,3 +808,165 @@ def test_fallback_oi_is_attributed_to_its_source_timestamp(db_session):
     assert oi_data[ts_1006]["oi_change"] == 0
     assert oi_data[ts_1003]["call_oi_change"] == 0
     assert oi_data[ts_1006]["call_oi_change"] == 0
+
+
+def _add_greek(db_session, instrument_key, ts, option_type="CE", expiry="2026-09-30"):
+    """Insert one SUCCESS greeks_v3 row so the instrument participates in the
+    PIT selection for research timestamps at/after ``ts``."""
+    db_session.add(OptionGreeks(
+        instrument_key=instrument_key, interval="3min", open_time=ts,
+        spot=24500, strike=24500, expiry=expiry, option_type=option_type,
+        option_price=100, lot_size=65, time_to_expiry=0.1,
+        risk_free_rate=0.065, intrinsic_value=0, implied_volatility=0.2,
+        delta=0.5, gamma=0.001, vega=10, theta=-5,
+        calc_model="BLACK_SCHOLES_EUROPEAN", calc_version="greeks_v3",
+        calculated_at=ts, status="SUCCESS",
+    ))
+
+
+def _add_candle(db_session, instrument_key, ts, oi, volume, option_type="CE"):
+    db_session.add(OptionCandle(
+        instrument_key=instrument_key, interval="3min", open_time=ts,
+        open=100, high=105, low=95, close=102, volume=volume,
+        open_interest=oi, fetched_at=ts,
+    ))
+
+
+def test_stale_volume_is_not_carried_forward(db_session):
+    """Greptile P1 regression: OI is state and carries forward, but traded
+    volume is event-scoped — a fallback candle contributes zero fresh volume
+    to research timestamps after its source bar."""
+    ts_1000 = datetime(2026, 8, 27, 10, 0)
+    ts_1003 = datetime(2026, 8, 27, 10, 3)
+    ts_1006 = datetime(2026, 8, 27, 10, 6)
+    _add_candle(db_session, "TEST|CE", ts_1000, oi=700, volume=10)
+    for ts in (ts_1000, ts_1003, ts_1006):
+        _add_greek(db_session, "TEST|CE", ts)
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data(
+        [ts_1000, ts_1003, ts_1006]
+    )
+
+    assert set(oi_data) == {ts_1000, ts_1003, ts_1006}
+    # OI carries forward from the 10:00 source observation.
+    for ts in (ts_1000, ts_1003, ts_1006):
+        assert oi_data[ts]["total_oi"] == 700
+        assert oi_data[ts]["oi_source_open_time"] == ts_1000
+    # Volume is only observed once — at its source bar. No fresh traded
+    # volume may be fabricated at 10:03 or 10:06.
+    assert oi_data[ts_1000]["total_volume"] == 10
+    assert oi_data[ts_1003]["total_volume"] == 0
+    assert oi_data[ts_1006]["total_volume"] == 0
+    assert oi_data[ts_1003]["call_volume"] == 0
+    assert oi_data[ts_1006]["put_volume"] == 0
+    # OI unchanged while volume was never re-observed.
+    assert oi_data[ts_1003]["oi_change"] == 0
+    assert oi_data[ts_1006]["oi_change"] == 0
+
+
+def test_fresh_volume_resumes_at_a_new_source_candle(db_session):
+    """A genuinely new candle (OI 750, volume 20) becomes the fresh source:
+    its volume counts, OI updates, and the source time advances."""
+    ts_1000 = datetime(2026, 8, 27, 10, 0)
+    ts_1003 = datetime(2026, 8, 27, 10, 3)
+    ts_1006 = datetime(2026, 8, 27, 10, 6)
+    ts_1009 = datetime(2026, 8, 27, 10, 9)
+    _add_candle(db_session, "TEST|CE", ts_1000, oi=700, volume=10)
+    _add_candle(db_session, "TEST|CE", ts_1009, oi=750, volume=20)
+    for ts in (ts_1000, ts_1003, ts_1006, ts_1009):
+        _add_greek(db_session, "TEST|CE", ts)
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data(
+        [ts_1000, ts_1003, ts_1006, ts_1009]
+    )
+
+    assert oi_data[ts_1006]["total_volume"] == 0
+    assert oi_data[ts_1006]["oi_source_open_time"] == ts_1000
+    # Fresh 10:09 candle: new OI, fresh volume, advanced source time.
+    assert oi_data[ts_1009]["total_oi"] == 750
+    assert oi_data[ts_1009]["total_volume"] == 20
+    assert oi_data[ts_1009]["call_volume"] == 20
+    assert oi_data[ts_1009]["oi_source_open_time"] == ts_1009
+    assert oi_data[ts_1009]["oi_change"] == 50
+
+
+def test_expired_option_stops_contributing_after_expiry_date(db_session):
+    """Greptile P1 regression: a contract stays eligible through its expiry
+    DATE (2026-08-27) but must not contribute OI or volume from the next
+    calendar date onward, even though PIT fallback can still see its rows."""
+    expiry = "2026-08-27"
+    ts_expiry = datetime(2026, 8, 27, 10, 0)
+    ts_next_day = datetime(2026, 8, 28, 10, 0)
+    _add_candle(db_session, "EXP|CE", ts_expiry, oi=700, volume=10)
+    _add_greek(db_session, "EXP|CE", ts_expiry, expiry=expiry)
+    # Next-day greeks would let PIT keep selecting the contract on 08-28.
+    _add_greek(db_session, "EXP|CE", ts_next_day, expiry=expiry)
+    # An active contract keeps the 08-28 research timestamp alive.
+    _add_candle(db_session, "ACT|CE", ts_next_day, oi=300, volume=5)
+    _add_greek(db_session, "ACT|CE", ts_next_day)
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data(
+        [ts_expiry, ts_next_day]
+    )
+
+    # Expiry-day research may still use the contract.
+    assert oi_data[ts_expiry]["total_oi"] == 700
+    assert oi_data[ts_expiry]["total_volume"] == 10
+    assert oi_data[ts_expiry]["oi_source_open_time"] == ts_expiry
+    # From the following calendar date the expired instrument is no longer an
+    # active research instrument: only the active contract contributes.
+    assert oi_data[ts_next_day]["total_oi"] == 300
+    assert oi_data[ts_next_day]["call_oi"] == 300
+    assert oi_data[ts_next_day]["total_volume"] == 5
+    # The expired contract's OI leaves the change calculation cleanly.
+    assert oi_data[ts_next_day]["oi_change"] == 300 - 700
+    assert oi_data[ts_next_day]["oi_source_open_time"] == ts_next_day
+
+
+def test_active_contract_oi_still_carries_forward_after_last_candle(db_session):
+    """An unexpired contract keeps contributing carried-forward OI after its
+    last candle, protecting the intended Day 49 PIT behavior."""
+    ts_1000 = datetime(2026, 8, 27, 10, 0)
+    ts_1003 = datetime(2026, 8, 27, 10, 3)
+    _add_candle(db_session, "ACT|CE", ts_1000, oi=700, volume=10)
+    _add_greek(db_session, "ACT|CE", ts_1000)
+    _add_greek(db_session, "ACT|CE", ts_1003)
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data([ts_1000, ts_1003])
+
+    assert oi_data[ts_1000]["total_oi"] == 700
+    assert oi_data[ts_1003]["total_oi"] == 700
+    assert oi_data[ts_1003]["oi_source_open_time"] == ts_1000
+    assert oi_data[ts_1003]["total_volume"] == 0
+
+
+def test_mixed_fresh_and_fallback_instruments_split_volume_by_source(db_session):
+    """Freshness is per instrument: at one research timestamp the instrument
+    with a source candle at T contributes its volume, while the instrument
+    whose source candle predates T carries OI with zero fresh volume."""
+    ts_0957 = datetime(2026, 8, 27, 9, 57)
+    ts_1000 = datetime(2026, 8, 27, 10, 0)
+    _add_candle(db_session, "A|CE", ts_1000, oi=800, volume=30)
+    _add_candle(db_session, "B|PE", ts_0957, oi=500, volume=40)
+    _add_greek(db_session, "A|CE", ts_1000, option_type="CE")
+    _add_greek(db_session, "B|PE", ts_1000, option_type="PE")
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data([ts_1000])
+
+    assert set(oi_data) == {ts_1000}
+    row = oi_data[ts_1000]
+    # Both instruments contribute OI (A fresh, B carried forward).
+    assert row["total_oi"] == 1300
+    assert row["call_oi"] == 800
+    assert row["put_oi"] == 500
+    # Only A observed volume at this timestamp; B's 09:57 volume stays there.
+    assert row["total_volume"] == 30
+    assert row["call_volume"] == 30
+    assert row["put_volume"] == 0
+    # Source-time association is visible through the audit mechanism.
+    assert row["oi_source_open_time"] == ts_1000
