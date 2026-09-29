@@ -1,8 +1,8 @@
 from datetime import datetime
 
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine, event, func, select
+from sqlalchemy.orm import aliased, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.db import Base
@@ -588,3 +588,287 @@ def test_bulk_selections_bounded_load_source_contract(db_session):
         source = inspect.getsource(
             getattr(pit_module.PointInTimeDataset, method_name))
         assert "_load_bounded_histories" in source
+
+
+# ---------------------------------------------------------------------------
+# Greptile P2 — grouped seed (portable GROUP BY/max-join, no correlated scan)
+# ---------------------------------------------------------------------------
+
+
+def _correlated_seed_load(self, model, targets, histories, eligibility_filters):
+    """The previous seed implementation (correlated scalar MAX), kept as the
+    reference the grouped implementation must be behaviorally identical to."""
+    lower = min(targets)
+    upper = max(targets)
+    candidate = aliased(model)
+    latest_open_time = (
+        select(func.max(candidate.open_time))
+        .where(
+            candidate.instrument_key == model.instrument_key,
+            candidate.open_time <= lower,
+            *eligibility_filters(candidate),
+        )
+        .correlate(model)
+        .scalar_subquery()
+    )
+    seed_statement = select(model).where(
+        model.open_time == latest_open_time,
+        *eligibility_filters(model),
+    )
+    for row in self.db.scalars(seed_statement):
+        histories.setdefault(row.instrument_key, []).append(
+            (row.open_time, row))
+    window_statement = select(model).where(
+        model.open_time > lower,
+        model.open_time <= upper,
+        *eligibility_filters(model),
+    )
+    for row in self.db.scalars(window_statement.order_by(
+        model.instrument_key, model.open_time
+    )):
+        histories.setdefault(row.instrument_key, []).append(
+            (row.open_time, row))
+
+
+SEED_MATRIX_ROWS = [
+    # (ts, key, oi) — 3min interval; decision T resolves to target T−3min.
+    (datetime(2026, 8, 27, 9, 0), "TEST|CE", 123),    # below CE's seed floor
+    (datetime(2026, 8, 27, 10, 0), "TEST|CE", 700),   # CE's seed (target 10:01)
+    (datetime(2026, 8, 27, 10, 3), "TEST|CE", 900),   # window row (target 10:03)
+    (datetime(2026, 8, 27, 10, 12), "TEST|CE", 9_999),  # beyond latest target
+    (datetime(2026, 8, 27, 7, 0), "TEST|PE", 2),      # PE's seed (target 10:01)
+    (datetime(2026, 8, 27, 10, 3), "TEST|PE", 55),    # window row (target 10:03)
+]
+SEED_MATRIX_DECISIONS = [
+    datetime(2026, 8, 27, 10, 4),   # target 10:01 → both instruments fall back
+    datetime(2026, 8, 27, 10, 6),   # target 10:03 → both select window rows
+    datetime(2026, 8, 27, 10, 12),  # target 10:09 → fallback to the 10:03 rows
+]
+
+
+def _seed_matrix_setup(db_session):
+    db_session.add_all([
+        _option(ts, key=key, oi=oi) for ts, key, oi in SEED_MATRIX_ROWS
+    ])
+    # Greeks exist for TEST|CE only: 07:00 (its seed) and 10:03 (window row).
+    db_session.add_all([
+        _greeks(datetime(2026, 8, 27, 7, 0)),
+        _greeks(datetime(2026, 8, 27, 10, 3)),
+    ])
+    db_session.commit()
+
+
+@pytest.mark.parametrize("use_grouped", [False, True])
+def test_bounded_seed_matrix_identical_selections(
+    db_session, monkeypatch, use_grouped
+):
+    """The grouped seed and the previous correlated seed produce identical
+    decisions→selections — same keys, same rows, same SOURCE open_time.
+
+    use_grouped=True runs the production implementation; use_grouped=False
+    monkeypatches the previous implementation as the reference.
+    """
+    _seed_matrix_setup(db_session)
+    if use_grouped:
+        loader = PointInTimeDataset._load_bounded_histories
+    else:
+        loader = _correlated_seed_load
+        monkeypatch.setattr(
+            PointInTimeDataset, "_load_bounded_histories", _correlated_seed_load
+        )
+    pit = PointInTimeDataset(db_session)
+
+    candle_selections = pit.option_candles_selections_at_many(
+        SEED_MATRIX_DECISIONS, instrument_keys=["TEST|CE", "TEST|PE"])
+    greek_selections = pit.option_greeks_selections_at_many(
+        SEED_MATRIX_DECISIONS, instrument_keys=["TEST|CE", "TEST|PE"])
+
+    # Decision-major pairing is preserved.
+    assert [ts for ts, _ in candle_selections] == SEED_MATRIX_DECISIONS
+    assert [ts for ts, _ in greek_selections] == SEED_MATRIX_DECISIONS
+
+    # Decision 1 (target 10:01): per-instrument fallback to each instrument's
+    # own latest eligible row ≤ 10:01, with original source open_time.
+    first = candle_selections[0][1]
+    assert set(first) == {"TEST|CE", "TEST|PE"}
+    assert first["TEST|CE"].open_time == datetime(2026, 8, 27, 10, 0)
+    assert first["TEST|CE"].open_interest == 700
+    assert first["TEST|PE"].open_time == datetime(2026, 8, 27, 7, 0)
+    assert first["TEST|PE"].open_interest == 2
+
+    # Decision 2 (target 10:03): both select their exact 10:03 window rows.
+    second = candle_selections[1][1]
+    assert set(second) == {"TEST|CE", "TEST|PE"}
+    assert second["TEST|CE"].open_time == datetime(2026, 8, 27, 10, 3)
+    assert second["TEST|CE"].open_interest == 900
+    assert second["TEST|PE"].open_time == datetime(2026, 8, 27, 10, 3)
+    assert second["TEST|PE"].open_interest == 55
+
+    # Decision 3 (target 10:09): fallback again — to the 10:03 rows, never to
+    # the 10:12 row beyond the latest target.
+    third = candle_selections[2][1]
+    assert set(third) == {"TEST|CE", "TEST|PE"}
+    assert third["TEST|CE"].open_time == datetime(2026, 8, 27, 10, 3)
+    assert third["TEST|CE"].open_interest == 900
+    assert third["TEST|PE"].open_time == datetime(2026, 8, 27, 10, 3)
+    assert third["TEST|PE"].open_interest == 55
+
+    # Greeks: TEST|PE has no rows and must never appear; TEST|CE falls back
+    # to its 07:00 seed and then selects the 10:03 window row.
+    assert set(greek_selections[0][1]) == {"TEST|CE"}
+    assert greek_selections[0][1]["TEST|CE"].open_time == datetime(
+        2026, 8, 27, 7, 0)
+    assert set(greek_selections[1][1]) == {"TEST|CE"}
+    assert greek_selections[1][1]["TEST|CE"].open_time == datetime(
+        2026, 8, 27, 10, 3)
+    assert set(greek_selections[2][1]) == {"TEST|CE"}
+    assert greek_selections[2][1]["TEST|CE"].open_time == datetime(
+        2026, 8, 27, 10, 3)
+
+
+@pytest.mark.parametrize("model_name", ["candles", "greeks"])
+def test_grouped_seed_materializes_the_same_history_as_the_correlated_seed(
+    db_session, model_name
+):
+    """Strongest equality proof: for the same data and targets, the grouped
+    seed loads EXACTLY the history the correlated seed loaded — per
+    instrument, the same (open_time, row) sequence, nothing more, nothing
+    less (rows below the per-instrument seed floor and rows beyond the
+    latest target stay unloaded in both)."""
+    _seed_matrix_setup(db_session)
+    pit = PointInTimeDataset(db_session)
+    targets = [
+        datetime(2026, 8, 27, 10, 1),
+        datetime(2026, 8, 27, 10, 3),
+        datetime(2026, 8, 27, 10, 9),
+    ]
+
+    def _load(loader, model, eligibility):
+        histories = {}
+        loader(pit, model, targets, histories, eligibility)
+        return {
+            key: [(open_time, row.id) for open_time, row in history]
+            for key, history in histories.items()
+        }
+
+    if model_name == "candles":
+        eligibility = lambda entity: [entity.interval == "3min"]  # noqa: E731
+        model = OptionCandle
+    else:
+        eligibility = lambda entity: [  # noqa: E731
+            entity.interval == "3min",
+            entity.status == "SUCCESS",
+        ]
+        model = OptionGreeks
+
+    correlated = _load(_correlated_seed_load, model, eligibility)
+    histories = {}
+    pit._load_bounded_histories(model, targets, histories, eligibility)
+    grouped = {
+        key: [(open_time, row.id) for open_time, row in history]
+        for key, history in histories.items()
+    }
+
+    assert grouped == correlated
+    # And the loaded history is exactly the bounded set: seeds at or before
+    # the floor plus window rows — never the below-floor or future rows.
+    if model_name == "candles":
+        assert {key: [open_time for open_time, _ in seq]
+                for key, seq in grouped.items()} == {
+            "TEST|CE": [
+                datetime(2026, 8, 27, 10, 0),
+                datetime(2026, 8, 27, 10, 3),
+            ],
+            "TEST|PE": [
+                datetime(2026, 8, 27, 7, 0),
+                datetime(2026, 8, 27, 10, 3),
+            ],
+        }
+    else:
+        assert {key: [open_time for open_time, _ in seq]
+                for key, seq in grouped.items()} == {
+            "TEST|CE": [
+                datetime(2026, 8, 27, 7, 0),
+                datetime(2026, 8, 27, 10, 3),
+            ],
+        }
+
+
+def test_bounded_seed_uses_grouped_max_join_not_correlated_scan(db_session):
+    """Implementation contract (repo precedent:
+    test_production_init_db_has_no_create_all): the seed must be one portable
+    GROUP BY/max-join bulk query — no correlated scalar MAX, and no extra
+    seed queries per instrument."""
+    import inspect
+
+    source = inspect.getsource(
+        PointInTimeDataset._load_bounded_histories)
+    assert ".correlate(" not in source, (
+        "the seed must not use a correlated scalar subquery"
+    )
+    assert "group_by(" in source
+    assert "func.max(" in source
+    # The (lower, upper] window query is retained.
+    assert "> lower" in source and "<= upper" in source
+
+    _seed_matrix_setup(db_session)
+    statements = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    engine = db_session.get_bind()
+    event.listen(engine, "before_cursor_execute", _record)
+    try:
+        pit = PointInTimeDataset(db_session)
+        pit.option_candles_selections_at_many(
+            SEED_MATRIX_DECISIONS, instrument_keys=["TEST|CE", "TEST|PE"])
+    finally:
+        event.remove(engine, "before_cursor_execute", _record)
+
+    grouped = [s for s in statements
+               if "GROUP BY" in s.upper() and "MAX(" in s.upper()]
+    assert len(grouped) == 1, (
+        f"exactly one grouped seed query expected, got {len(grouped)}"
+    )
+    # Every MAX-carrying statement must be the grouped one — a correlated
+    # scalar MAX would reach the database without a GROUP BY.
+    max_statements = [s for s in statements if "MAX(" in s.upper()]
+    assert len(max_statements) == len(grouped)
+    assert all("GROUP BY" in s.upper() for s in max_statements)
+
+
+@pytest.mark.parametrize("use_grouped", [False, True])
+def test_bounded_seed_edge_cases_preserved(db_session, monkeypatch, use_grouped):
+    """instrument_keys=None (no filter), an empty explicit selection, an
+    unknown instrument, and an empty database all behave identically under
+    both seed implementations."""
+    if not use_grouped:
+        monkeypatch.setattr(
+            PointInTimeDataset, "_load_bounded_histories", _correlated_seed_load
+        )
+    pit = PointInTimeDataset(db_session)
+
+    # Empty database first: every decision resolves to an empty selection.
+    selections = pit.option_candles_selections_at_many(SEED_MATRIX_DECISIONS)
+    assert [ts for ts, _ in selections] == SEED_MATRIX_DECISIONS
+    assert all(selection == {} for _, selection in selections)
+
+    _seed_matrix_setup(db_session)
+
+    # instrument_keys=None: every instrument is served by its own seed.
+    selections = pit.option_candles_selections_at_many(SEED_MATRIX_DECISIONS)
+    assert set(selections[0][1]) == {"TEST|CE", "TEST|PE"}
+    assert selections[0][1]["TEST|CE"].open_time == datetime(2026, 8, 27, 10, 0)
+    assert selections[0][1]["TEST|PE"].open_time == datetime(2026, 8, 27, 7, 0)
+
+    # Empty explicit selection: identical to the long-standing contract.
+    assert pit.option_candles_selections_at_many(
+        SEED_MATRIX_DECISIONS, instrument_keys=[]) == []
+
+    # Unknown instrument: decision-major empty selections, no rows.
+    selections = pit.option_candles_selections_at_many(
+        SEED_MATRIX_DECISIONS, instrument_keys=["NOPE|CE"])
+    assert [ts for ts, _ in selections] == SEED_MATRIX_DECISIONS
+    assert all(selection == {} for _, selection in selections)
+

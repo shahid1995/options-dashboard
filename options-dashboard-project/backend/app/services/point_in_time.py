@@ -303,8 +303,8 @@ class PointInTimeDataset:
         1. the latest eligible row per instrument at or before
            ``lower = min(targets)`` (the fallback seed for the earliest
            decision), via one portable GROUP BY/max-join bulk query —
-           the eligibility filters apply inside the max subquery so the
-           seed timestamp always comes from an eligible row;
+           the eligibility filters apply inside the grouped aggregation so
+           the seed timestamp always comes from an eligible row;
         2. all eligible rows for the relevant instruments in the window
            ``(lower, upper]`` via one bulk query.
 
@@ -322,20 +322,27 @@ class PointInTimeDataset:
         upper = max(targets)
 
         # 1. Fallback seed: the latest eligible row per instrument at or
-        #    before the earliest target (one GROUP BY/max-join bulk query).
-        candidate = aliased(model)
-        latest_open_time = (
-            select(func.max(candidate.open_time))
-            .where(
-                candidate.instrument_key == model.instrument_key,
-                candidate.open_time <= lower,
-                *eligibility_filters(candidate),
+        #    before the earliest target — one portable grouped max-join bulk
+        #    query (Greptile P2). The grouped subquery applies the eligibility
+        #    filters inside the aggregation, so the seed timestamp always
+        #    comes from an eligible row; the join back on both instrument
+        #    identity and max open_time materializes exactly one seed row per
+        #    instrument without a correlated per-row scan of retained history.
+        seed_opens = (
+            select(
+                model.instrument_key.label("seed_instrument_key"),
+                func.max(model.open_time).label("seed_open_time"),
             )
-            .correlate(model)
-            .scalar_subquery()
+            .where(
+                model.open_time <= lower,
+                *eligibility_filters(model),
+            )
+            .group_by(model.instrument_key)
+            .subquery()
         )
         seed_statement = select(model).where(
-            model.open_time == latest_open_time,
+            model.instrument_key == seed_opens.c.seed_instrument_key,
+            model.open_time == seed_opens.c.seed_open_time,
             *eligibility_filters(model),
         )
         for row in self.db.scalars(seed_statement):
@@ -374,11 +381,12 @@ class PointInTimeDataset:
             instrument_key: [open_time for open_time, _ in history]
             for instrument_key, history in histories.items()
         }
+        sorted_instruments = sorted(per_instrument_opens)
 
         selections: list[dict[str, object]] = []
         for target in targets:
             selection: dict[str, object] = {}
-            for instrument_key in sorted(per_instrument_opens):
+            for instrument_key in sorted_instruments:
                 opens = per_instrument_opens[instrument_key]
                 index = bisect_right(opens, target) - 1
                 if index >= 0:
