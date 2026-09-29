@@ -53,7 +53,7 @@ from bisect import insort
 import math
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 from sqlalchemy import select, func, and_, distinct
@@ -70,6 +70,18 @@ from app.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _expiry_date(raw_expiry: str) -> date | None:
+    """Parse a stored ``YYYY-MM-DD`` expiry string into a date.
+
+    Returns None for missing or malformed values so a data-quality defect
+    cannot silently become an eligibility decision.
+    """
+    try:
+        return date.fromisoformat(str(raw_expiry))
+    except (TypeError, ValueError):
+        return None
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -453,6 +465,15 @@ class GexResearchEngine:
         requesting decision time, never double-counted across decisions, and
         never dropped merely because it is stale. Forward NIFTY candles remain
         separate because they are labels, not features.
+
+        Two research-layer feature rules are applied on top of the PIT
+        boundary without altering it:
+        - OI is state and carries forward; traded volume is event-scoped, so
+          only a candle whose source open_time equals the research timestamp
+          contributes volume. Fallback candles contribute zero fresh volume.
+        - An instrument is an eligible research instrument through its expiry
+          DATE and stops contributing from the following calendar date,
+          judged against the research timestamp's own date.
         """
         if not timestamps:
             return {}
@@ -505,6 +526,17 @@ class GexResearchEngine:
             for instrument_key, row in selection.items()
         }
 
+        # Research-specific contract-lifecycle eligibility: an instrument is a
+        # valid research instrument through its expiry DATE and stops
+        # contributing from the following calendar date. Expiry lives on the
+        # instrument's greeks rows; rows without a parseable expiry are kept
+        # eligible ("unknown" never silently drops a contract).
+        eligible_expiry: dict[str, date | None] = {}
+        for selection in greeks_by_decision.values():
+            for instrument_key, row in selection.items():
+                if instrument_key not in eligible_expiry:
+                    eligible_expiry[instrument_key] = _expiry_date(row.expiry)
+
         result: dict[datetime, dict] = {}
         for ts in sorted(greeks_by_decision):
             allowed_keys = set(greeks_by_decision[ts])
@@ -515,11 +547,17 @@ class GexResearchEngine:
             call_vol = 0.0
             put_vol = 0.0
 
-            decision_selection = {
-                instrument_key: row
-                for instrument_key, row in selection_by_decision.get(ts, {}).items()
-                if instrument_key in allowed_keys
-            }
+            decision_selection = {}
+            for instrument_key, row in selection_by_decision.get(ts, {}).items():
+                if instrument_key not in allowed_keys:
+                    continue
+                expiry = eligible_expiry.get(instrument_key)
+                if expiry is not None and ts.date() > expiry:
+                    # The research date is past this contract's expiry date:
+                    # it is no longer an active research instrument, so its
+                    # carried state (OI or volume) must not contribute.
+                    continue
+                decision_selection[instrument_key] = row
             if not decision_selection:
                 # No OI observation was visible to this decision: omit the
                 # timestamp rather than invent a zero observation (matches the
@@ -527,7 +565,15 @@ class GexResearchEngine:
                 continue
             for row in decision_selection.values():
                 oi_val = float(row.open_interest or 0)
-                vol_val = float(row.volume or 0)
+                # Traded volume is event-scoped: only a candle whose SOURCE
+                # open_time equals this research timestamp carries fresh
+                # volume. Fallback candles keep OI (state) but contribute no
+                # volume — old traded volume is never relabeled as current.
+                vol_val = (
+                    float(row.volume or 0)
+                    if row.open_time == ts
+                    else 0.0
+                )
                 opt_type = ik_to_type.get(row.instrument_key, "")
                 total_oi += oi_val
                 total_vol += vol_val
