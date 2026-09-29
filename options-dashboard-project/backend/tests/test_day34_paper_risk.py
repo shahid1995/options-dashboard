@@ -416,17 +416,24 @@ class TestCandidateRequiredRejections:
             }],
         }
         before = _counts(db_session)
-        # Market/chain resolution is valid (per mandate ordering: market-data
-        # resolution precedes candidate resolution), so the request reaches
-        # the Day-34 mutation choke point where the missing genuine
-        # Strategy Candidate is rejected pre-write.
+        # Day 50 / Issue #118 Slice A: the route produces the genuine
+        # candidate SERVER-SIDE before execution. A bare manual entry can no
+        # longer reach the choke point at all: it fails closed at the
+        # producer boundary (this test identity carries no broker
+        # market-data credential, so the producer rejects with
+        # MARKET_DATA_UNAUTHORIZED before acquiring any evidence). The
+        # fail-closed guarantee and zero mutation are unchanged; the
+        # choke-point-level STRATEGY_CANDIDATE_REQUIRED invariant for direct
+        # service calls remains covered by the Day-50 suite.
         with patch("app.routers.paper.resolve_market_prices",
                    new_callable=AsyncMock) as mock_prices:
             mock_prices.return_value = {(EXPIRY, 20000.0, "call"): 100.0}
             resp = client.post("/paper/executions",
                                headers=_headers(logged_in), json=payload)
         assert resp.status_code == 409
-        assert "STRATEGY_CANDIDATE_REQUIRED" in resp.json()["detail"]
+        detail = resp.json()["detail"]
+        assert ("MARKET_DATA_UNAUTHORIZED" in detail
+                or "STRATEGY_CANDIDATE_REQUIRED" in detail)
         assert _counts(db_session) == before
 
     def test_template_entry_rejected_with_zero_mutation(
