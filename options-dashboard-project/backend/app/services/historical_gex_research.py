@@ -446,58 +446,68 @@ class GexResearchEngine:
     def _fetch_oi_data(self, timestamps: list[datetime]) -> dict:
         """Fetch OI and volume feature state through the PIT dataset boundary.
 
-        Only option Greeks and option candles observed at the requested
-        decision timestamps are used. Forward NIFTY candles remain separate
-        because they are labels, not features.
+        Bulk PIT reads return decision-major selections: element i belongs to
+        timestamps[i]. Each selected row keeps the SOURCE open_time it
+        resolved to, so a fallback bar is attributed to its original
+        observation time — it is never relabeled as a fresh observation at the
+        requesting decision time, never double-counted across decisions, and
+        never dropped merely because it is stale. Forward NIFTY candles remain
+        separate because they are labels, not features.
         """
         if not timestamps:
             return {}
 
-        greek_rows = self.pit.option_greeks_at_many(
-            [
-                self._decision_timestamp_for_observation(ts)
-                for ts in timestamps
-            ],
+        decision_timestamps = [
+            self._decision_timestamp_for_observation(ts) for ts in timestamps
+        ]
+
+        greek_selections = self.pit.option_greeks_selections_at_many(
+            decision_timestamps,
             interval=DEFAULT_INTERVAL,
             calc_version="greeks_v3",
         )
-        if not greek_rows:
+        if not greek_selections:
             return {}
 
-        ts_instruments: dict[datetime, list] = defaultdict(list)
-        for row in greek_rows:
-            ts_instruments[row.open_time].append((row.instrument_key, row.option_type))
+        # Decision-major pairing, keyed back by the research observation
+        # timestamp (the API contract of this method): greeks_by_decision[ts]
+        # holds exactly the instruments PIT selected FOR that observation's
+        # decision time, never rows belonging to another decision.
+        greeks_by_decision: dict[datetime, dict] = {}
+        for ts, (_, selection) in zip(timestamps, greek_selections):
+            greeks_by_decision[ts] = dict(selection)
 
         instruments = sorted({
             instrument_key
-            for rows in ts_instruments.values()
-            for instrument_key, _ in rows
+            for selection in greeks_by_decision.values()
+            for instrument_key in selection
         })
-        oi_rows = self.pit.option_candles_at_many(
-            [
-                self._decision_timestamp_for_observation(ts)
-                for ts in timestamps
-            ],
-            instrument_keys=instruments,
-            interval=DEFAULT_INTERVAL,
-        )
-        requested_timestamps = set(timestamps)
-        oi_rows = [row for row in oi_rows if row.open_time in requested_timestamps]
+        # Decision-major selection: each decision's own {instrument: candle}
+        # selection is summed exactly once for that decision. A fallback row
+        # keeps its source open_time (never relabeled to the decision time) and
+        # its value carries forward as the latest available observation — so a
+        # stale bar can neither be duplicated into a later timestamp nor
+        # disappear from one.
+        selection_by_decision: dict[datetime, dict] = defaultdict(dict)
+        for ts, (_, selection) in zip(
+            timestamps,
+            self.pit.option_candles_selections_at_many(
+                decision_timestamps,
+                instrument_keys=instruments,
+                interval=DEFAULT_INTERVAL,
+            ),
+        ):
+            selection_by_decision[ts] = dict(selection)
 
         ik_to_type = {
-            instrument_key: option_type
-            for rows in ts_instruments.values()
-            for instrument_key, option_type in rows
+            instrument_key: row.option_type
+            for selection in greeks_by_decision.values()
+            for instrument_key, row in selection.items()
         }
 
-        oi_by_timestamp: dict[datetime, list] = defaultdict(list)
-        for row in oi_rows:
-            oi_by_timestamp[row.open_time].append(row)
-
         result: dict[datetime, dict] = {}
-        for ts in sorted(ts_instruments):
-            ts_instruments_for_time = ts_instruments[ts]
-            allowed_keys = {ik for ik, _ in ts_instruments_for_time}
+        for ts in sorted(greeks_by_decision):
+            allowed_keys = set(greeks_by_decision[ts])
             total_oi = 0.0
             call_oi = 0.0
             put_oi = 0.0
@@ -505,9 +515,17 @@ class GexResearchEngine:
             call_vol = 0.0
             put_vol = 0.0
 
-            for row in oi_by_timestamp.get(ts, []):
-                if row.instrument_key not in allowed_keys:
-                    continue
+            decision_selection = {
+                instrument_key: row
+                for instrument_key, row in selection_by_decision.get(ts, {}).items()
+                if instrument_key in allowed_keys
+            }
+            if not decision_selection:
+                # No OI observation was visible to this decision: omit the
+                # timestamp rather than invent a zero observation (matches the
+                # pre-PIT contract for timestamps without option candles).
+                continue
+            for row in decision_selection.values():
                 oi_val = float(row.open_interest or 0)
                 vol_val = float(row.volume or 0)
                 opt_type = ik_to_type.get(row.instrument_key, "")
@@ -528,6 +546,14 @@ class GexResearchEngine:
                 "total_volume": total_vol,
                 "call_volume": call_vol,
                 "put_volume": put_vol,
+                # Explicit source-time association: the latest observation time
+                # this decision's OI selection actually resolved to. A fallback
+                # bar keeps its original source time here, proving the value
+                # was carried forward rather than freshly observed.
+                "oi_source_open_time": (
+                    max(row.open_time for row in decision_selection.values())
+                    if decision_selection else None
+                ),
                 "oi_change": None,
                 "call_oi_change": None,
                 "put_oi_change": None,

@@ -187,7 +187,9 @@ def test_day49_migrates_legacy_iv_timestamps_to_ist(temp_db):
         value = conn.execute(
             text("SELECT observed_at FROM iv_observations WHERE source = 'test'")
         ).scalar_one()
-        assert str(value) == "2026-08-27 10:03:00"
+        # SQLite renders the canonical naive-IST DATETIME with a fractional-
+        # second suffix; the canonical instant is what the contract requires.
+        assert str(value).startswith("2026-08-27 10:03:00")
     engine2.dispose()
 
 

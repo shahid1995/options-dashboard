@@ -287,7 +287,9 @@ class TestRegimeClassification:
         assert "POSITIVE_GAMMA" in regimes[ts2]["transition"]
 
     def test_enhanced_regime_granularity(self, db_session):
-        """Enhanced regime should have detailed classification."""
+        """Detailed regime classification is intact under the Day 49 causal
+        (past-only) percentile rule: a timestamp's thresholds come from its own
+        history, never from future observations."""
         engine = GexResearchEngine(db_session)
         regimes = engine._compute_regimes({
             datetime(2025, 1, 1): {"net_gex": -10000},
@@ -295,8 +297,20 @@ class TestRegimeClassification:
             datetime(2025, 1, 3): {"net_gex": 0.0},
             datetime(2025, 1, 4): {"net_gex": 100},
             datetime(2025, 1, 5): {"net_gex": 10000},
+            datetime(2025, 1, 6): {"net_gex": -20000},
         })
 
+        # At 2025-01-01 only -10000 is known, so it IS the entire historical
+        # distribution and cannot be extreme relative to itself (WEAK, not
+        # STRONG) — the old future-inclusive test relied on the leak.
+        assert regimes[datetime(2025, 1, 1)]["detailed_regime"] == "WEAK_NEGATIVE"
+        # By 2025-01-05 the past-only distribution is
+        # [-10000, -100, 0, 100, 10000]; 10000 exceeds its 75th percentile.
+        assert regimes[datetime(2025, 1, 5)]["detailed_regime"] == "STRONG_POSITIVE"
+        # By 2025-01-06 the past includes [-10000, -100, 0, 100, 10000], so
+        # -20000 is below its 25th percentile and classifies STRONG_NEGATIVE
+        # from its own history alone.
+        assert regimes[datetime(2025, 1, 6)]["detailed_regime"] == "STRONG_NEGATIVE"
         detailed = [regimes[ts]["detailed_regime"] for ts in sorted(regimes.keys())]
         assert "STRONG_NEGATIVE" in detailed
         assert "STRONG_POSITIVE" in detailed
@@ -739,3 +753,48 @@ def test_regime_percentiles_do_not_use_future_gex_values():
     # With only t1 known, +100 is the full historical distribution and is not
     # made "strong positive" by the unseen -1000 future observation.
     assert regimes[t1]["detailed_regime"] == "WEAK_POSITIVE"
+
+
+def test_fallback_oi_is_attributed_to_its_source_timestamp(db_session):
+    """Greptile P1 regression: when the only option candle is the 10:00 bar and
+    research decisions fall at 10:00/10:03/10:06, the same stale observation is
+    neither relabeled as a fresh 10:03/10:06 observation, duplicated into later
+    timestamps, nor dropped — and no OI change is fabricated between research
+    timestamps whose source observation never changed."""
+    ts_1000 = datetime(2026, 8, 27, 10, 0)
+    ts_1003 = datetime(2026, 8, 27, 10, 3)
+    ts_1006 = datetime(2026, 8, 27, 10, 6)
+
+    db_session.add(OptionCandle(
+        instrument_key="TEST|CE", interval="3min", open_time=ts_1000,
+        open=100, high=105, low=95, close=102, volume=10,
+        open_interest=700, fetched_at=ts_1000,
+    ))
+    for ts in (ts_1000, ts_1003, ts_1006):
+        db_session.add(OptionGreeks(
+            instrument_key="TEST|CE", interval="3min", open_time=ts,
+            spot=24500, strike=24500, expiry="2026-09-03", option_type="CE",
+            option_price=100, lot_size=65, time_to_expiry=0.1,
+            risk_free_rate=0.065, intrinsic_value=0, implied_volatility=0.2,
+            delta=0.5, gamma=0.001, vega=10, theta=-5,
+            calc_model="BLACK_SCHOLES_EUROPEAN", calc_version="greeks_v3",
+            calculated_at=ts, status="SUCCESS",
+        ))
+    db_session.commit()
+
+    engine = GexResearchEngine(db_session)
+    oi_data = engine._fetch_oi_data([ts_1000, ts_1003, ts_1006])
+
+    # Every research timestamp receives its own decision-major selection: the
+    # 10:00 source observation is the latest completed bar for all three.
+    assert set(oi_data) == {ts_1000, ts_1003, ts_1006}
+    for ts in (ts_1000, ts_1003, ts_1006):
+        assert oi_data[ts]["total_oi"] == 700
+        assert oi_data[ts]["total_volume"] == 10
+
+    # No fresh observation arrived, so no OI change may be fabricated between
+    # research timestamps — the fallback attribution keeps OI flat.
+    assert oi_data[ts_1003]["oi_change"] == 0
+    assert oi_data[ts_1006]["oi_change"] == 0
+    assert oi_data[ts_1003]["call_oi_change"] == 0
+    assert oi_data[ts_1006]["call_oi_change"] == 0
