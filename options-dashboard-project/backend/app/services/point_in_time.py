@@ -11,6 +11,7 @@ has completed by the decision time is eligible. Forward labels are intentionally
 from __future__ import annotations
 
 from bisect import bisect_right
+from collections.abc import Callable
 from datetime import datetime, timedelta
 
 from sqlalchemy import Select, func, select
@@ -288,6 +289,72 @@ class PointInTimeDataset:
         statement = statement.order_by(OptionGreeks.instrument_key)
         return list(self.db.scalars(statement))
 
+    def _load_bounded_histories(
+        self,
+        model,
+        targets: list[datetime],
+        histories: dict[str, list[tuple[datetime, object]]],
+        eligibility_filters: Callable[[type], list],
+    ) -> None:
+        """CodeRabbit #3: bounded bulk history load.
+
+        Loads exactly what the selection algorithm can use — no more:
+
+        1. the latest eligible row per instrument at or before
+           ``lower = min(targets)`` (the fallback seed for the earliest
+           decision), via one portable GROUP BY/max-join bulk query —
+           the eligibility filters apply inside the max subquery so the
+           seed timestamp always comes from an eligible row;
+        2. all eligible rows for the relevant instruments in the window
+           ``(lower, upper]`` via one bulk query.
+
+        Rows strictly below the seed or above ``upper`` can never be
+        selected and are never fetched.  Histories are appended per
+        instrument in ascending ``open_time`` order (seed row first, then
+        window rows), matching the in-memory index the binary-search
+        resolver expects.  Selection semantics are identical to the
+        previous ``open_time <= max(targets)`` load; only how much history
+        is materialized changes.
+        """
+        if not targets:
+            return
+        lower = min(targets)
+        upper = max(targets)
+
+        # 1. Fallback seed: the latest eligible row per instrument at or
+        #    before the earliest target (one GROUP BY/max-join bulk query).
+        candidate = aliased(model)
+        latest_open_time = (
+            select(func.max(candidate.open_time))
+            .where(
+                candidate.instrument_key == model.instrument_key,
+                candidate.open_time <= lower,
+                *eligibility_filters(candidate),
+            )
+            .correlate(model)
+            .scalar_subquery()
+        )
+        seed_statement = select(model).where(
+            model.open_time == latest_open_time,
+            *eligibility_filters(model),
+        )
+        for row in self.db.scalars(seed_statement):
+            histories.setdefault(row.instrument_key, []).append(
+                (row.open_time, row))
+
+        # 2. Window rows strictly after the floor up to the latest target
+        #    (one bulk query).
+        window_statement = select(model).where(
+            model.open_time > lower,
+            model.open_time <= upper,
+            *eligibility_filters(model),
+        )
+        for row in self.db.scalars(window_statement.order_by(
+            model.instrument_key, model.open_time
+        )):
+            histories.setdefault(row.instrument_key, []).append(
+                (row.open_time, row))
+
     @staticmethod
     def _resolve_bulk_selections(
         histories: dict[str, list[tuple[datetime, object]]],
@@ -344,22 +411,22 @@ class PointInTimeDataset:
             return []
 
         targets = [_completed_bar_open_time(cutoff, interval) for cutoff in cutoffs]
-        statement = select(OptionGreeks).where(
-            OptionGreeks.interval == interval,
-            OptionGreeks.open_time <= max(targets),
-            OptionGreeks.status == "SUCCESS",
-            OptionGreeks.calc_version == (calc_version or DEFAULT_GREEKS_CALC_VERSION),
-        )
-        if instrument_keys is not None:
-            statement = statement.where(OptionGreeks.instrument_key.in_(instrument_keys))
 
-        # One bounded load covers the latest requested decision; rows that
-        # cannot serve any requested decision are never fetched.
+        def _greeks_eligibility(entity):
+            predicates = [
+                entity.interval == interval,
+                entity.status == "SUCCESS",
+                entity.calc_version
+                == (calc_version or DEFAULT_GREEKS_CALC_VERSION),
+            ]
+            if instrument_keys is not None:
+                predicates.append(
+                    entity.instrument_key.in_(instrument_keys))
+            return predicates
+
         histories: dict[str, list[tuple[datetime, OptionGreeks]]] = {}
-        for row in self.db.scalars(statement.order_by(
-            OptionGreeks.instrument_key, OptionGreeks.open_time
-        )):
-            histories.setdefault(row.instrument_key, []).append((row.open_time, row))
+        self._load_bounded_histories(
+            OptionGreeks, targets, histories, _greeks_eligibility)
 
         return list(
             zip(cutoffs, self._resolve_bulk_selections(histories, targets))
@@ -387,20 +454,17 @@ class PointInTimeDataset:
             return []
 
         targets = [_completed_bar_open_time(cutoff, interval) for cutoff in cutoffs]
-        statement = select(OptionCandle).where(
-            OptionCandle.interval == interval,
-            OptionCandle.open_time <= max(targets),
-        )
-        if instrument_keys is not None:
-            statement = statement.where(OptionCandle.instrument_key.in_(instrument_keys))
 
-        # One bounded load covers the latest requested decision; rows that
-        # cannot serve any requested decision are never fetched.
+        def _candle_eligibility(entity):
+            predicates = [entity.interval == interval]
+            if instrument_keys is not None:
+                predicates.append(
+                    entity.instrument_key.in_(instrument_keys))
+            return predicates
+
         histories: dict[str, list[tuple[datetime, OptionCandle]]] = {}
-        for row in self.db.scalars(statement.order_by(
-            OptionCandle.instrument_key, OptionCandle.open_time
-        )):
-            histories.setdefault(row.instrument_key, []).append((row.open_time, row))
+        self._load_bounded_histories(
+            OptionCandle, targets, histories, _candle_eligibility)
 
         return list(
             zip(cutoffs, self._resolve_bulk_selections(histories, targets))

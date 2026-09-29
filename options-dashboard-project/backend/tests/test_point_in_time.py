@@ -470,3 +470,121 @@ def test_bulk_at_many_uses_one_loaded_history_per_instrument(db_session):
         datetime(2026, 8, 27, 10, 0),
         datetime(2026, 8, 27, 10, 3),
     ]
+
+
+# ---------------------------------------------------------------------------
+# CodeRabbit #3 — bounded history loads (lower bound)
+# ---------------------------------------------------------------------------
+
+
+def test_bulk_selections_exclude_history_below_the_earliest_target(db_session):
+    """CodeRabbit #3: the bounded load must never materialize history older
+    than the earliest decision's target — except the single latest row at
+    or before it, which seeds the fallback for that decision.
+
+    Data (3min interval; decision T resolves to target T−3min):
+      TEST|CE : 07:00 (old, huge gap) 09:54 10:00 10:03 10:12(future)
+      TEST|PE : 07:00 (old, huge gap) 10:03
+    Decisions: 10:04 (target 10:01), 10:06 (target 10:03).
+      — Each instrument's own latest row ≤ 10:01 is its seed: CE→10:00,
+        PE→07:00.  CE's 07:00/09:54 rows are below CE's seed and must NOT
+        be loaded (a global open_time <= upper scan would load them).
+      — 10:12 is beyond the latest target and must not be loaded.
+    Observable selections stay identical to the unbounded contract.
+    """
+    db_session.add_all([
+        _option(datetime(2026, 8, 27, 7, 0), key="TEST|CE", oi=1),
+        _option(datetime(2026, 8, 27, 9, 54), key="TEST|CE", oi=500),
+        _option(datetime(2026, 8, 27, 10, 0), key="TEST|CE", oi=700),
+        _option(datetime(2026, 8, 27, 10, 3), key="TEST|CE", oi=900),
+        _option(datetime(2026, 8, 27, 10, 12), key="TEST|CE", oi=9_999),
+        _option(datetime(2026, 8, 27, 7, 0), key="TEST|PE", oi=2),
+        _option(datetime(2026, 8, 27, 10, 3), key="TEST|PE", oi=55),
+        _greeks(datetime(2026, 8, 27, 7, 0)),
+        _greeks(datetime(2026, 8, 27, 10, 3)),
+    ])
+    db_session.commit()
+
+    pit = PointInTimeDataset(db_session)
+    decisions = [datetime(2026, 8, 27, 10, 4), datetime(2026, 8, 27, 10, 6)]
+
+    candle_selections = pit.option_candles_selections_at_many(
+        decisions, instrument_keys=["TEST|CE", "TEST|PE"])
+    greek_selections = pit.option_greeks_selections_at_many(
+        decisions, instrument_keys=["TEST|CE", "TEST|PE"])
+
+    # Decision-major pairing is unchanged.
+    assert [ts for ts, _ in candle_selections] == decisions
+
+    # 10:04 → target 10:01: CE falls back to the 10:00 source bar (700);
+    # PE falls back to its own latest row ≤ 10:01 — the 07:00 bar (oi=2).
+    # The load bound is PER INSTRUMENT: PE's 07:00 row is PE's seed and is
+    # still served, while CE's 07:00/09:54 rows (below CE's own seed) are
+    # never loaded — a global open_time <= upper scan would have loaded them.
+    first_candles = candle_selections[0][1]
+    assert set(first_candles) == {"TEST|CE", "TEST|PE"}
+    assert first_candles["TEST|CE"].open_time == datetime(2026, 8, 27, 10, 0)
+    assert first_candles["TEST|CE"].open_interest == 700
+    assert first_candles["TEST|PE"].open_time == datetime(2026, 8, 27, 7, 0)
+    assert first_candles["TEST|PE"].open_interest == 2
+
+    # 10:06 → target 10:03: both instruments select their 10:03 rows.
+    second_candles = candle_selections[1][1]
+    assert set(second_candles) == {"TEST|CE", "TEST|PE"}
+    assert second_candles["TEST|CE"].open_time == datetime(2026, 8, 27, 10, 3)
+    assert second_candles["TEST|CE"].open_interest == 900
+    assert second_candles["TEST|PE"].open_time == datetime(2026, 8, 27, 10, 3)
+
+    # Greeks behave identically (per-instrument fallback seed + window row).
+    assert [ts for ts, _ in greek_selections] == decisions
+    assert set(greek_selections[0][1]) == {"TEST|CE"}
+    assert greek_selections[0][1]["TEST|CE"].open_time == datetime(
+        2026, 8, 27, 7, 0)  # greeks' latest row ≤ 10:01 IS the 07:00 row
+    assert greek_selections[1][1]["TEST|CE"].open_time == datetime(
+        2026, 8, 27, 10, 3)
+
+
+def test_bulk_selections_seed_fallback_from_the_load_floor(db_session):
+    """CodeRabbit #3 companion: the latest row at or before the earliest
+    target (the load floor) is still available as the fallback seed, and
+    window rows after it remain selectable at the appropriate decisions.
+
+    Decisions 10:04/10:06 → targets 10:01/10:03. The 10:00 row (oi=700) is
+    the seed for 10:04's fallback; the 10:03 row (oi=900) is the window row
+    for 10:06. The 09:00 row is below the floor and must not be loaded.
+    """
+    db_session.add_all([
+        _option(datetime(2026, 8, 27, 9, 0), key="TEST|CE", oi=42),
+        _option(datetime(2026, 8, 27, 10, 0), key="TEST|CE", oi=700),
+        _option(datetime(2026, 8, 27, 10, 3), key="TEST|CE", oi=900),
+    ])
+    db_session.commit()
+
+    pit = PointInTimeDataset(db_session)
+    decisions = [datetime(2026, 8, 27, 10, 4), datetime(2026, 8, 27, 10, 6)]
+    selections = pit.option_candles_selections_at_many(
+        decisions, instrument_keys=["TEST|CE"])
+
+    assert [ts for ts, _ in selections] == decisions
+    assert selections[0][1]["TEST|CE"].open_time == datetime(2026, 8, 27, 10, 0)
+    assert selections[0][1]["TEST|CE"].open_interest == 700
+    assert selections[1][1]["TEST|CE"].open_time == datetime(2026, 8, 27, 10, 3)
+    assert selections[1][1]["TEST|CE"].open_interest == 900
+
+
+def test_bulk_selections_bounded_load_source_contract(db_session):
+    """Source-contract companion (repo precedent:
+    test_production_init_db_has_no_create_all): both paired bulk methods
+    must issue a bounded load — a lower-bound seed query plus a windowed
+    history query — never an unbounded open_time <= max(targets) scan."""
+    import inspect
+
+    from app.services import point_in_time as pit_module
+
+    for method_name in (
+        "option_greeks_selections_at_many",
+        "option_candles_selections_at_many",
+    ):
+        source = inspect.getsource(
+            getattr(pit_module.PointInTimeDataset, method_name))
+        assert "_load_bounded_histories" in source

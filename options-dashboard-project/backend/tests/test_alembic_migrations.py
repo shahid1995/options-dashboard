@@ -268,3 +268,158 @@ def test_auth_callback_does_not_call_ensure_identity_schema(monkeypatch):
     # Test /auth/logout without session - idempotent (200), no DDL
     resp = client.post("/auth/logout")
     assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Day 49 — CodeRabbit correction pass (d49aa0000001)
+# ---------------------------------------------------------------------------
+
+
+def _run_d49_migration(temp_db, rows):
+    """Stamp a create_all database at d48aa0000001, seed IVObservation rows,
+    run the d49aa0000001 migration, and return the persisted values."""
+    from alembic import command
+    from alembic.config import Config
+    from app.db import Base
+    from app import models  # noqa: F401  (registers iv_observations metadata)
+
+    engine = create_engine(temp_db, connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS alembic_version "
+                "(version_num VARCHAR(32) NOT NULL)"
+            )
+        )
+        conn.execute(
+            text("INSERT INTO alembic_version (version_num) VALUES ('d48aa0000001')")
+        )
+        for index, observed_at in enumerate(rows):
+            conn.execute(
+                text(
+                    "INSERT INTO iv_observations "
+                    "(symbol, expiry, strike, option_type, iv, spot, source, observed_at) "
+                    "VALUES (:symbol, '2026-09-03', 24500, 'call', 0.18, 24500, "
+                    ":source, :observed_at)"
+                ),
+                {
+                    "symbol": "NIFTY",
+                    "source": f"row-{index}",
+                    "observed_at": observed_at,
+                },
+            )
+    engine.dispose()
+
+    alembic_cfg = Config(os.path.join(os.path.dirname(__file__), "..", "alembic.ini"))
+    alembic_cfg.set_main_option("sqlalchemy.url", temp_db)
+    command.upgrade(alembic_cfg, "head")
+
+    engine2 = create_engine(temp_db, connect_args={"check_same_thread": False})
+    with engine2.connect() as conn:
+        values = conn.execute(
+            text("SELECT source, observed_at FROM iv_observations ORDER BY source")
+        ).fetchall()
+    engine2.dispose()
+    return values
+
+
+def test_day49_migration_converts_legacy_utc_rows(temp_db):
+    """CodeRabbit #1/#4: legacy naive-UTC rows convert to naive IST and
+    multiple rows convert independently.
+
+    NULL handling fact: ``iv_observations.observed_at`` is NOT NULL at the
+    schema level, so a NULL row is unrepresentable in storage; the
+    migration's NULL skip (``observed_at.isnot(None)`` in every paged
+    batch) is defensive parity with the original per-row ``continue`` and
+    is asserted by the source-contract test below.
+    """
+    values = _run_d49_migration(
+        temp_db,
+        [
+            "2026-08-27 04:33:00",  # naive UTC → 10:03 IST
+            "2026-08-27 05:00:00",  # naive UTC → 10:30 IST
+        ],
+    )
+    by_source = {source: value for source, value in values}
+    assert str(by_source["row-0"]).startswith("2026-08-27 10:03:00")
+    assert str(by_source["row-1"]).startswith("2026-08-27 10:30:00")
+
+
+def test_day49_migration_processes_large_history_in_batches(temp_db):
+    """CodeRabbit #1: the migration must not materialize the whole history.
+
+    620 synthetic rows exceed ``IV_MIGRATION_BATCH_SIZE`` (500), so the
+    upgrade provably runs at least two bounded paged batches while keeping
+    the exact per-row transformation semantics — batch-boundary rows and a
+    mid-batch row are all converted correctly.
+    """
+    rows = []
+    for index in range(620):
+        # Deterministic legacy UTC stamps spread across days/minutes.
+        day = 20 + (index % 5)
+        hour = (index // 5) % 24
+        minute = (index * 7) % 60
+        rows.append(f"2026-08-{day:02d} {hour:02d}:{minute:02d}:00")
+    assert len(rows) == 620
+
+    values = _run_d49_migration(temp_db, rows)
+
+    assert len(values) == 620
+    by_source = {source: value for source, value in values}
+    # Batch 1 first row, batch boundary, and batch 2 row.  Legacy UTC
+    # stamps shift +5:30 to naive IST (e.g. 00:00 UTC → 05:30 IST).
+    assert str(by_source["row-0"]).startswith("2026-08-20 05:30:00")
+    assert str(by_source["row-249"]).startswith("2026-08-24 06:33:00")
+    assert str(by_source["row-500"]).startswith("2026-08-20 09:50:00")
+    assert str(by_source["row-619"]).startswith("2026-08-24 08:43:00")
+
+
+def test_day49_migration_downgrade_is_refused(temp_db):
+    """CodeRabbit #2: downgrade must fail loudly — the UTC→IST normalization
+    is intentionally irreversible (rows written post-migration are already
+    canonical IST; a blind reverse conversion would corrupt them)."""
+    from alembic import command
+    from alembic.config import Config
+    from app.db import Base
+
+    engine = create_engine(temp_db, connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS alembic_version "
+                "(version_num VARCHAR(32) NOT NULL)"
+            )
+        )
+        conn.execute(
+            text("INSERT INTO alembic_version (version_num) VALUES ('d48aa0000001')")
+        )
+    engine.dispose()
+
+    alembic_cfg = Config(os.path.join(os.path.dirname(__file__), "..", "alembic.ini"))
+    alembic_cfg.set_main_option("sqlalchemy.url", temp_db)
+    command.upgrade(alembic_cfg, "head")
+
+    with pytest.raises(Exception) as excinfo:
+        command.downgrade(alembic_cfg, "d48aa0000001")
+    message = str(excinfo.value).lower()
+    assert "irreversible" in message
+    assert "ist" in message or "timestamp" in message
+
+
+def test_day49_migration_module_declares_batching_contract():
+    """Source-contract companion (repo precedent:
+    test_production_init_db_has_no_create_all): the upgrade must page its
+    input through the batch-size limit and keep the defensive NULL filter;
+    the downgrade must refuse (no silent pass)."""
+    migration_path = os.path.join(
+        os.path.dirname(__file__), "..", "alembic", "versions",
+        "d49aa0000001_normalize_iv_observation_timestamps_to_ist.py",
+    )
+    with open(migration_path, encoding="utf-8") as handle:
+        source = handle.read()
+    assert "IV_MIGRATION_BATCH_SIZE" in source
+    assert ".limit(IV_MIGRATION_BATCH_SIZE)" in source
+    assert "observed_at.isnot(None)" in source
+    assert "NotImplementedError" in source
