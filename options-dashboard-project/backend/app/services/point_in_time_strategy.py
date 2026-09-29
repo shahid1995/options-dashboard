@@ -42,15 +42,17 @@ def build_point_in_time_strategy_inputs(
 
     pit = PointInTimeDataset(db)
     decision = pit.nifty_candles_at(normalized_decision)
-    candles = pit.option_candles_at_many(
+    candle_selections = pit.option_candles_selections_at_many(
         [normalized_decision],
         instrument_keys=instrument_keys,
     )
-    greeks = pit.option_greeks_at_many(
+    candle_selection = candle_selections[0][1] if candle_selections else {}
+    greek_selections = pit.option_greeks_selections_at_many(
         [normalized_decision],
         instrument_keys=instrument_keys,
         calc_version=greeks_calc_version,
     )
+    greek_selection = greek_selections[0][1] if greek_selections else {}
     gex = pit.historical_gex_at(
         normalized_decision,
         calc_version=gex_calc_version,
@@ -59,7 +61,11 @@ def build_point_in_time_strategy_inputs(
     return PointInTimeStrategyInputs(
         decision_timestamp=normalized_decision,
         spot=decision[0].close if decision else None,
-        option_candles=tuple(candles),
-        option_greeks=tuple(greeks),
+        option_candles=tuple(
+            row for _, row in sorted(candle_selection.items())
+        ),
+        option_greeks=tuple(
+            row for _, row in sorted(greek_selection.items())
+        ),
         historical_gex=tuple(gex),
     )

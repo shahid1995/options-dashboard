@@ -1,7 +1,30 @@
 from datetime import datetime
 
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from app.db import Base
 from app.models import HistoricalGexSnapshot, NiftyCandle, OptionCandle, OptionGreeks
 from app.services.point_in_time_strategy import build_point_in_time_strategy_inputs
+
+
+@pytest.fixture
+def db_session():
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    session = Session()
+    try:
+        yield session
+    finally:
+        session.close()
+        Base.metadata.drop_all(engine)
 
 
 def test_build_point_in_time_strategy_inputs_uses_completed_bar(db_session):

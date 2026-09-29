@@ -288,6 +288,124 @@ class PointInTimeDataset:
         statement = statement.order_by(OptionGreeks.instrument_key)
         return list(self.db.scalars(statement))
 
+    @staticmethod
+    def _resolve_bulk_selections(
+        histories: dict[str, list[tuple[datetime, object]]],
+        targets: list[datetime],
+    ) -> list[dict[str, object]]:
+        """Pair each decision target with its selected source rows.
+
+        ``histories`` maps each instrument to its (open_time, row) history
+        sorted ascending. The result is decision-major: element i belongs to
+        ``targets[i]`` and maps each instrument to its selected row. A fallback
+        bar is selected with its ORIGINAL source open_time — it is never
+        relabeled to the requesting decision time. Histories are indexed once
+        and probed with binary search, so a bulk request traverses each
+        instrument's history a single time.
+        """
+        per_instrument_opens = {
+            instrument_key: [open_time for open_time, _ in history]
+            for instrument_key, history in histories.items()
+        }
+
+        selections: list[dict[str, object]] = []
+        for target in targets:
+            selection: dict[str, object] = {}
+            for instrument_key in sorted(per_instrument_opens):
+                opens = per_instrument_opens[instrument_key]
+                index = bisect_right(opens, target) - 1
+                if index >= 0:
+                    selection[instrument_key] = histories[instrument_key][index][1]
+            selections.append(selection)
+        return selections
+
+    def option_greeks_selections_at_many(
+        self,
+        decision_timestamps: list[datetime | str],
+        *,
+        instrument_keys: list[str] | None = None,
+        interval: str = "3min",
+        calc_version: str = DEFAULT_GREEKS_CALC_VERSION,
+    ) -> list[tuple[datetime, dict[str, OptionGreeks]]]:
+        """Pair each decision timestamp with its selected Greeks per instrument.
+
+        Element i is ``(decision_timestamps[i], {instrument_key: row})`` where
+        row is the latest completed SUCCESS row (of the requested calc version)
+        available by that decision. A missing entry means no completed row
+        existed for that pair yet. When no fresh bar exists, the latest earlier
+        completed bar is selected with its original source ``open_time``
+        intact, so consumers can distinguish the requested decision timestamp
+        from the source observation timestamp.
+        """
+        cutoffs = [_require_cutoff(ts) for ts in decision_timestamps]
+        if not cutoffs:
+            return []
+        if instrument_keys is not None and not instrument_keys:
+            return []
+
+        targets = [_completed_bar_open_time(cutoff, interval) for cutoff in cutoffs]
+        statement = select(OptionGreeks).where(
+            OptionGreeks.interval == interval,
+            OptionGreeks.open_time <= max(targets),
+            OptionGreeks.status == "SUCCESS",
+            OptionGreeks.calc_version == (calc_version or DEFAULT_GREEKS_CALC_VERSION),
+        )
+        if instrument_keys is not None:
+            statement = statement.where(OptionGreeks.instrument_key.in_(instrument_keys))
+
+        # One bounded load covers the latest requested decision; rows that
+        # cannot serve any requested decision are never fetched.
+        histories: dict[str, list[tuple[datetime, OptionGreeks]]] = {}
+        for row in self.db.scalars(statement.order_by(
+            OptionGreeks.instrument_key, OptionGreeks.open_time
+        )):
+            histories.setdefault(row.instrument_key, []).append((row.open_time, row))
+
+        return list(
+            zip(cutoffs, self._resolve_bulk_selections(histories, targets))
+        )
+
+    def option_candles_selections_at_many(
+        self,
+        decision_timestamps: list[datetime | str],
+        *,
+        instrument_keys: list[str] | None = None,
+        interval: str = "3min",
+    ) -> list[tuple[datetime, dict[str, OptionCandle]]]:
+        """Pair each decision timestamp with its selected candles per instrument.
+
+        Element i is ``(decision_timestamps[i], {instrument_key: row})`` where
+        row is the latest completed candle available by that decision. A
+        fallback bar keeps its original source ``open_time`` — consumers must
+        attribute it to that source observation time, never to the requesting
+        decision time.
+        """
+        cutoffs = [_require_cutoff(ts) for ts in decision_timestamps]
+        if not cutoffs:
+            return []
+        if instrument_keys is not None and not instrument_keys:
+            return []
+
+        targets = [_completed_bar_open_time(cutoff, interval) for cutoff in cutoffs]
+        statement = select(OptionCandle).where(
+            OptionCandle.interval == interval,
+            OptionCandle.open_time <= max(targets),
+        )
+        if instrument_keys is not None:
+            statement = statement.where(OptionCandle.instrument_key.in_(instrument_keys))
+
+        # One bounded load covers the latest requested decision; rows that
+        # cannot serve any requested decision are never fetched.
+        histories: dict[str, list[tuple[datetime, OptionCandle]]] = {}
+        for row in self.db.scalars(statement.order_by(
+            OptionCandle.instrument_key, OptionCandle.open_time
+        )):
+            histories.setdefault(row.instrument_key, []).append((row.open_time, row))
+
+        return list(
+            zip(cutoffs, self._resolve_bulk_selections(histories, targets))
+        )
+
     def option_greeks_at_many(
         self,
         decision_timestamps: list[datetime | str],
@@ -296,37 +414,28 @@ class PointInTimeDataset:
         interval: str = "3min",
         calc_version: str = DEFAULT_GREEKS_CALC_VERSION,
     ) -> list[OptionGreeks]:
-        """Return completed Greeks for supplied decision timestamps."""
+        """Return completed Greeks paired with the supplied decision timestamps.
+
+        Element i is the latest completed SUCCESS row (of the requested calc
+        version) for decision_timestamps[i], one entry per instrument. When no
+        fresh bar exists by a decision time, the latest earlier completed bar is
+        returned with its original source ``open_time`` intact.
+        """
         cutoffs = [_require_cutoff(ts) for ts in decision_timestamps]
         if not cutoffs:
             return []
-        if instrument_keys is not None and not instrument_keys:
-            return []
-        targets = [_completed_bar_open_time(cutoff, interval) for cutoff in cutoffs]
-        max_target = max(targets)
-        statement = select(OptionGreeks).where(
-            OptionGreeks.interval == interval,
-            OptionGreeks.open_time <= max_target,
-            OptionGreeks.status == "SUCCESS",
-            OptionGreeks.calc_version == (calc_version or DEFAULT_GREEKS_CALC_VERSION),
-        )
-        if instrument_keys is not None:
-            statement = statement.where(OptionGreeks.instrument_key.in_(instrument_keys))
-        source_rows = list(self.db.scalars(statement.order_by(
-            OptionGreeks.instrument_key, OptionGreeks.open_time
-        )))
-        by_instrument: dict[str, list[OptionGreeks]] = {}
-        for row in source_rows:
-            by_instrument.setdefault(row.instrument_key, []).append(row)
 
-        rows: list[OptionGreeks] = []
-        for target in targets:
-            for instrument_rows in by_instrument.values():
-                opens = [row.open_time for row in instrument_rows]
-                index = bisect_right(opens, target) - 1
-                if index >= 0:
-                    rows.append(instrument_rows[index])
-        return rows
+        selections = self.option_greeks_selections_at_many(
+            decision_timestamps,
+            instrument_keys=instrument_keys,
+            interval=interval,
+            calc_version=calc_version,
+        )
+        return [
+            row
+            for _, selection in selections
+            for _, row in sorted(selection.items())
+        ]
 
     def option_candles_at_many(
         self,
@@ -335,33 +444,28 @@ class PointInTimeDataset:
         instrument_keys: list[str] | None = None,
         interval: str = "3min",
     ) -> list[OptionCandle]:
-        """Return option candles observed at any supplied decision timestamp."""
+        """Return option candles paired with the supplied decision timestamps.
+
+        Element i is the latest completed candle for decision_timestamps[i],
+        one entry per instrument. When no fresh bar exists by a decision time,
+        the latest earlier completed bar is        returned with its original source
+        ``open_time`` intact — consumers must attribute it to that source
+        observation time, never to the requesting decision time.
+        """
         cutoffs = [_require_cutoff(ts) for ts in decision_timestamps]
         if not cutoffs:
             return []
-        targets = [_completed_bar_open_time(cutoff, interval) for cutoff in cutoffs]
-        max_target = max(targets)
-        statement = select(OptionCandle).where(
-            OptionCandle.interval == interval,
-            OptionCandle.open_time <= max_target,
-        )
-        if instrument_keys is not None:
-            statement = statement.where(OptionCandle.instrument_key.in_(instrument_keys))
-        source_rows = list(self.db.scalars(statement.order_by(
-            OptionCandle.instrument_key, OptionCandle.open_time
-        )))
-        by_instrument: dict[str, list[OptionCandle]] = {}
-        for row in source_rows:
-            by_instrument.setdefault(row.instrument_key, []).append(row)
 
-        rows: list[OptionCandle] = []
-        for target in targets:
-            for instrument_rows in by_instrument.values():
-                opens = [row.open_time for row in instrument_rows]
-                index = bisect_right(opens, target) - 1
-                if index >= 0:
-                    rows.append(instrument_rows[index])
-        return rows
+        selections = self.option_candles_selections_at_many(
+            decision_timestamps,
+            instrument_keys=instrument_keys,
+            interval=interval,
+        )
+        return [
+            row
+            for _, selection in selections
+            for _, row in sorted(selection.items())
+        ]
 
     def historical_gex_at(
         self,

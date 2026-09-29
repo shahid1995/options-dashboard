@@ -278,6 +278,147 @@ def test_empty_instrument_selection_returns_no_option_features(db_session):
     assert pit.option_greeks_at_many(
         [decision], instrument_keys=[],
     ) == []
+    assert pit.option_candles_selections_at_many(
+        [decision], instrument_keys=[],
+    ) == []
+    assert pit.option_greeks_selections_at_many(
+        [decision], instrument_keys=[],
+    ) == []
+
+
+def test_bulk_fallback_preserves_decision_to_source_association(db_session):
+    """A fallback 10:00 candle selected by two later decisions keeps its 10:00
+    source observation time for each decision — the bulk pairing must expose
+    which decision requested which source row so research can never relabel a
+    stale bar as a fresh observation."""
+    db_session.add(_option(datetime(2026, 8, 27, 10, 0), oi=700))
+    db_session.commit()
+
+    pit = PointInTimeDataset(db_session)
+    decisions = [
+        datetime(2026, 8, 27, 10, 3),
+        datetime(2026, 8, 27, 10, 4),
+    ]
+    selections = pit.option_candles_selections_at_many(
+        decisions, instrument_keys=None,
+    )
+
+    assert [decision for decision, _ in selections] == decisions
+    for decision, selection in selections:
+        assert set(selection) == {"TEST|CE"}
+        assert selection["TEST|CE"].open_time == datetime(2026, 8, 27, 10, 0)
+        assert selection["TEST|CE"].open_interest == 700
+
+
+def test_bulk_selection_honors_completed_bar_boundaries(db_session):
+    """Decision 10:04 selects the 10:00 bar, 10:06 selects 10:03 when it
+    exists, and a future bar (10:06) stays invisible to earlier decisions."""
+    db_session.add_all([
+        _option(datetime(2026, 8, 27, 10, 0), oi=700),
+        _option(datetime(2026, 8, 27, 10, 3), oi=900),
+        _option(datetime(2026, 8, 27, 10, 6), oi=1200),
+    ])
+    db_session.commit()
+
+    pit = PointInTimeDataset(db_session)
+    by_decision = dict(pit.option_candles_selections_at_many(
+        [
+            datetime(2026, 8, 27, 10, 4),
+            datetime(2026, 8, 27, 10, 5),
+            datetime(2026, 8, 27, 10, 6),
+        ],
+        instrument_keys=None,
+    ))
+
+    # 10:03 is not yet completed at 10:04 or 10:05; the 10:06 bar is future.
+    assert by_decision[datetime(2026, 8, 27, 10, 4)]["TEST|CE"].open_time == datetime(2026, 8, 27, 10, 0)
+    assert by_decision[datetime(2026, 8, 27, 10, 4)]["TEST|CE"].open_interest == 700
+    assert by_decision[datetime(2026, 8, 27, 10, 5)]["TEST|CE"].open_time == datetime(2026, 8, 27, 10, 0)
+    # At 10:06 the 10:03 bar has completed and is selected; 10:06 is still future.
+    assert by_decision[datetime(2026, 8, 27, 10, 6)]["TEST|CE"].open_time == datetime(2026, 8, 27, 10, 3)
+    assert by_decision[datetime(2026, 8, 27, 10, 6)]["TEST|CE"].open_interest == 900
+
+
+def test_bulk_selections_are_decision_major_when_instruments_appear_later(db_session):
+    """An instrument with no completed row yet is absent from that decision's
+    selection instead of shifting rows across decisions."""
+    db_session.add_all([
+        _option(datetime(2026, 8, 27, 10, 3), key="TEST|PE", oi=60),
+        _option(datetime(2026, 8, 27, 10, 3), oi=900),
+    ])
+    db_session.commit()
+
+    pit = PointInTimeDataset(db_session)
+    decisions = [
+        datetime(2026, 8, 27, 10, 4),
+        datetime(2026, 8, 27, 10, 6),
+    ]
+    selections = pit.option_candles_selections_at_many(
+        decisions, instrument_keys=None,
+    )
+
+    assert [decision for decision, _ in selections] == decisions
+    # At 10:04 no 3-minute bar has completed yet (10:03 completes at 10:06),
+    # so the first decision's selection is empty — rows from later decisions
+    # must not shift backwards into it.
+    assert selections[0][1] == {}
+    assert set(selections[1][1]) == {"TEST|CE", "TEST|PE"}
+    assert selections[1][1]["TEST|CE"].open_time == datetime(2026, 8, 27, 10, 3)
+    assert selections[1][1]["TEST|PE"].open_time == datetime(2026, 8, 27, 10, 3)
+
+
+def test_bulk_equivalence_between_paired_and_flat_reads(db_session):
+    """The paired bulk API and the flat bulk API must agree exactly."""
+    db_session.add_all([
+        _option(datetime(2026, 8, 27, 9, 57), key="TEST|PE", oi=50),
+        _option(datetime(2026, 8, 27, 10, 0), oi=700),
+        _option(datetime(2026, 8, 27, 10, 3), oi=900),
+        _greeks(datetime(2026, 8, 27, 10, 0)),
+        _greeks(datetime(2026, 8, 27, 10, 3)),
+    ])
+    db_session.commit()
+
+    pit = PointInTimeDataset(db_session)
+    decisions = [
+        datetime(2026, 8, 27, 10, 3),
+        datetime(2026, 8, 27, 10, 4),
+        datetime(2026, 8, 27, 10, 6),
+        datetime(2026, 8, 27, 10, 4),  # duplicate decision timestamp
+    ]
+
+    paired_candles = pit.option_candles_selections_at_many(
+        decisions, instrument_keys=None,
+    )
+    flat_candles = pit.option_candles_at_many(decisions, instrument_keys=None)
+    assert [row.open_time for row in flat_candles] == [
+        row.open_time
+        for _, selection in paired_candles
+        for _, row in sorted(selection.items())
+    ]
+    assert [row.open_interest for row in flat_candles] == [
+        row.open_interest
+        for _, selection in paired_candles
+        for _, row in sorted(selection.items())
+    ]
+
+    by_decision = dict(paired_candles)
+    assert by_decision[decisions[0]]["TEST|CE"].open_time == BASE_TS
+    assert by_decision[decisions[0]]["TEST|CE"].open_interest == 700
+    assert by_decision[decisions[1]]["TEST|CE"].open_time == BASE_TS
+    # 10:06 resolves to the freshly completed 10:03 bar plus the stale 09:57
+    # PE bar with its original source observation time intact.
+    assert by_decision[decisions[2]]["TEST|CE"].open_time == FUTURE_TS
+    assert by_decision[decisions[2]]["TEST|CE"].open_interest == 900
+    assert by_decision[decisions[2]]["TEST|PE"].open_time == datetime(2026, 8, 27, 9, 57)
+    assert by_decision[decisions[3]] == by_decision[decisions[1]]
+
+    by_greek_decision = dict(pit.option_greeks_selections_at_many(
+        decisions, instrument_keys=None,
+    ))
+    assert by_greek_decision[decisions[0]]["TEST|CE"].open_time == BASE_TS
+    assert by_greek_decision[decisions[1]]["TEST|CE"].open_time == BASE_TS
+    assert by_greek_decision[decisions[2]]["TEST|CE"].open_time == FUTURE_TS
+    assert by_greek_decision[decisions[3]] == by_greek_decision[decisions[1]]
 
 
 def test_iv_timestamp_is_normalized_before_pit_comparison(db_session):
