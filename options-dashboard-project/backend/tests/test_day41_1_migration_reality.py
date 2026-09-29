@@ -108,8 +108,13 @@ def migrated_pg():
     cfg = _alembic_cfg()
     command.upgrade(cfg, "head")
     yield
-    # Downgrade-consistency proof: the Day41 chain must reverse cleanly.
-    command.downgrade(cfg, PRE_DAY41_BASE)
+    # CodeRabbit #2 (Day 49): the head revision d49aa0000001 refuses
+    # downgrade (intentionally irreversible UTC→IST data normalization),
+    # so the old head→PRE_DAY41_BASE teardown teardown would fail.  The
+    # refusal is the accepted contract; the fixture leaves the disposable
+    # database at head instead of rewinding it.
+    with pytest.raises(NotImplementedError):
+        command.downgrade(cfg, PRE_DAY41_BASE)
 
 
 # ---------------------------------------------------------------------------
