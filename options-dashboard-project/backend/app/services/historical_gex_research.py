@@ -620,17 +620,23 @@ class GexResearchEngine:
     # ==================================================================
 
     def _build_gex_series(self, timestamps: list[datetime]) -> dict:
-        """Build per-timestamp GEX aggregation from historical_gex."""
+        """Build per-timestamp GEX aggregation from historical_gex.
+
+        One bounded bulk PIT load serves every timestamp (Codacy Finding
+        B): the per-timestamp ``open_time == ts`` filter and all downstream
+        aggregation are unchanged."""
         result = {}
 
-        for ts in timestamps:
-            rows = self.pit.historical_gex_at(
-                self._decision_timestamp_for_observation(ts),
-                interval=DEFAULT_INTERVAL,
-                calc_version=self.calc_version,
-            )
+        decisions = [self._decision_timestamp_for_observation(ts) for ts in timestamps]
+        rows_by_decision = dict(self.pit.historical_gex_selections_at_many(
+            decisions,
+            interval=DEFAULT_INTERVAL,
+            calc_version=self.calc_version,
+        ))
 
-            rows = [row for row in rows if row.open_time == ts]
+        for ts, decision in zip(timestamps, decisions):
+            selection = rows_by_decision.get(decision, {})
+            rows = [row for row in selection.values() if row.open_time == ts]
             if not rows:
                 continue
 
