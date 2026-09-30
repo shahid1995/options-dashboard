@@ -1030,3 +1030,113 @@ def test_build_gex_series_reads_the_bounded_gex_load_once(db_session, monkeypatc
     assert series[timestamps[0]]["instrument_count"] == 2
     assert series[timestamps[1]]["net_gex"] == pytest.approx(600.0)
     assert series[timestamps[1]]["instrument_count"] == 2
+
+
+def _add_gex_snapshot(db_session, key, option_type, strike, ts, signed, spot):
+    db_session.add(HistoricalGexSnapshot(
+        instrument_key=key,
+        interval="3min",
+        open_time=ts,
+        spot=spot,
+        strike=strike,
+        expiry="2026-09-03",
+        option_type=option_type,
+        gamma=0.001,
+        open_interest=100,
+        option_price=100.0,
+        lot_size=65,
+        raw_gex=abs(signed),
+        signed_gex=signed,
+        calc_version="h_gex_v1",
+        calculated_at=ts,
+        status="SUCCESS",
+    ))
+
+
+def test_flip_excludes_stale_fallback_rows_from_timestamp_signal(db_session):
+    """Greptile/CodeRabbit mixed-time finding: a timestamp-level flip
+    snapshot must aggregate only rows whose source open_time is the
+    observation timestamp. TEST|PE has no 10:03 snapshot; its older 10:00
+    fallback is valid for the generic PIT accessor but must never enter
+    the 10:03 flip calculation."""
+    ts_1003 = datetime(2026, 8, 27, 10, 3)
+    _add_gex_snapshot(db_session, "TEST|CE", "CE", 24500.0, ts_1003, 1500.0, 24500.0)
+    _add_gex_snapshot(db_session, "TEST|PE", "PE", 24400.0, datetime(2026, 8, 27, 10, 0), -900.0, 24100.0)
+    db_session.commit()
+
+    flip = GexResearchEngine(db_session)._detect_gamma_flip_at_timestamp(ts_1003)
+
+    # Only the exact 10:03 CE row remains -> a single strike cannot produce
+    # a sign change, so the result must be INSUFFICIENT_DATA, not a flip
+    # computed against the stale 10:00 PE row.
+    assert flip["status"] == "INSUFFICIENT_DATA"
+
+
+def test_walls_use_exact_observation_rows_and_spot(db_session):
+    """Wall detection must rank strikes and derive spot from the exact
+    observation rows only: the stale 10:00 PE fallback (different spot)
+    must not contribute a negative wall or contaminate wall distances."""
+    ts_1003 = datetime(2026, 8, 27, 10, 3)
+    _add_gex_snapshot(db_session, "TEST|CE", "CE", 24500.0, ts_1003, 1500.0, 24500.0)
+    _add_gex_snapshot(db_session, "TEST|PE", "PE", 24400.0, datetime(2026, 8, 27, 10, 0), -900.0, 24100.0)
+    db_session.commit()
+
+    wall = GexResearchEngine(db_session)._detect_walls_at_timestamp(ts_1003)
+
+    # Only the exact 10:03 CE row: positive wall at its own strike with
+    # distance measured from that row's exact-time spot (== 24500 -> 0.0),
+    # and no negative wall from the stale fallback row.
+    assert set(wall) == {"pos_wall_strike", "pos_wall_distance", "pos_wall_gex"}
+    assert wall["pos_wall_strike"] == 24500.0
+    assert wall["pos_wall_distance"] == pytest.approx(0.0)
+    assert wall["pos_wall_gex"] == pytest.approx(1500.0)
+
+
+def test_compute_flips_and_walls_use_the_bounded_bulk_load_once(db_session, monkeypatch):
+    """The research flip/wall paths must reuse the bulk GEX selection seam
+    for the whole timestamp list — never one PIT query per timestamp."""
+    from app.services.point_in_time import PointInTimeDataset
+
+    spot = 24500.0
+    for ts in (datetime(2026, 8, 27, 10, 0), datetime(2026, 8, 27, 10, 3)):
+        _add_gex_snapshot(db_session, "A|CE", "CE", 24500.0, ts, 1500.0, spot)
+        _add_gex_snapshot(db_session, "A|PE", "PE", 24400.0, ts, -900.0, spot)
+    db_session.commit()
+
+    timestamps = [datetime(2026, 8, 27, 10, 0), datetime(2026, 8, 27, 10, 3)]
+    expected_decisions = [ts + timedelta(minutes=3) for ts in timestamps]
+    real_selections = PointInTimeDataset.historical_gex_selections_at_many
+    real_at = PointInTimeDataset.historical_gex_at
+    bulk_calls = []
+    at_calls = []
+
+    def _spy_bulk(self, decision_timestamps, **kwargs):
+        bulk_calls.append(list(decision_timestamps))
+        return real_selections(self, decision_timestamps, **kwargs)
+
+    def _spy_at(self, *args, **kwargs):
+        at_calls.append(args)
+        return real_at(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        PointInTimeDataset, "historical_gex_selections_at_many", _spy_bulk)
+    monkeypatch.setattr(PointInTimeDataset, "historical_gex_at", _spy_at)
+
+    engine = GexResearchEngine(db_session)
+    flips = engine._compute_flips(timestamps)
+    assert bulk_calls == [expected_decisions], (
+        "_compute_flips must issue exactly one bulk selection call"
+    )
+    walls = engine._compute_walls(timestamps)
+    assert bulk_calls == [expected_decisions, expected_decisions], (
+        "_compute_walls must issue exactly one bulk selection call"
+    )
+    assert at_calls == [], (
+        "research flip/wall paths must not call historical_gex_at per timestamp"
+    )
+
+    for ts in timestamps:
+        assert flips[ts]["status"] == "ESTIMATED"
+        assert walls[ts]["pos_wall_strike"] == 24500.0
+        assert walls[ts]["pos_wall_distance"] == pytest.approx(0.0)
+        assert walls[ts]["neg_wall_strike"] == 24400.0

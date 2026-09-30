@@ -54,7 +54,7 @@ import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Optional
+from typing import Iterable, Optional
 
 from sqlalchemy import select, func, and_, distinct
 from sqlalchemy.orm import Session
@@ -767,23 +767,42 @@ class GexResearchEngine:
     # ==================================================================
 
     def _compute_flips(self, timestamps: list[datetime]) -> dict:
-        """Compute gamma flip for each timestamp."""
-        result = {}
+        """Compute gamma flip for each timestamp.
 
-        for ts in timestamps:
-            flip = self._detect_gamma_flip_at_timestamp(ts)
+        One bounded bulk PIT load serves every timestamp (Greptile /
+        CodeRabbit mixed-time finding); each per-timestamp detection
+        receives only rows whose source open_time is that observation."""
+        decisions = [self._decision_timestamp_for_observation(ts) for ts in timestamps]
+        rows_by_decision = dict(self.pit.historical_gex_selections_at_many(
+            decisions,
+            interval=DEFAULT_INTERVAL,
+            calc_version=self.calc_version,
+        ))
+
+        result = {}
+        for ts, decision in zip(timestamps, decisions):
+            flip = self._detect_gamma_flip_at_timestamp(
+                ts, rows=rows_by_decision.get(decision, {}).values())
             result[ts] = flip
 
         return result
 
-    def _detect_gamma_flip_at_timestamp(self, ts: datetime) -> dict:
-        """Detect gamma flip at a single timestamp using strike-level GEX."""
-        # Get strike-level GEX
-        rows = self.pit.historical_gex_at(
-            self._decision_timestamp_for_observation(ts),
-            interval=DEFAULT_INTERVAL,
-            calc_version=self.calc_version,
-        )
+    def _detect_gamma_flip_at_timestamp(
+        self, ts: datetime, rows: Iterable[HistoricalGexSnapshot] | None = None,
+    ) -> dict:
+        """Detect gamma flip at a single timestamp using strike-level GEX.
+
+        ``rows`` defaults to the per-instrument-latest PIT accessor for the
+        one-off path. Either way, only rows whose source ``open_time`` is
+        the observation timestamp are aggregated — a stale fallback row is
+        valid for the generic PIT accessor but never enters this snapshot."""
+        if rows is None:
+            rows = self.pit.historical_gex_at(
+                self._decision_timestamp_for_observation(ts),
+                interval=DEFAULT_INTERVAL,
+                calc_version=self.calc_version,
+            )
+        rows = [row for row in rows if row.open_time == ts]
 
         if len(rows) < 2:
             return {"status": "INSUFFICIENT_DATA"}
@@ -841,22 +860,42 @@ class GexResearchEngine:
     # ==================================================================
 
     def _compute_walls(self, timestamps: list[datetime]) -> dict:
-        """Compute gamma walls for each timestamp."""
-        result = {}
+        """Compute gamma walls for each timestamp.
 
-        for ts in timestamps:
-            wall = self._detect_walls_at_timestamp(ts)
+        One bounded bulk PIT load serves every timestamp; each detection
+        receives only rows whose source open_time is that observation, so
+        spot and wall distances come from exact observation-time rows."""
+        decisions = [self._decision_timestamp_for_observation(ts) for ts in timestamps]
+        rows_by_decision = dict(self.pit.historical_gex_selections_at_many(
+            decisions,
+            interval=DEFAULT_INTERVAL,
+            calc_version=self.calc_version,
+        ))
+
+        result = {}
+        for ts, decision in zip(timestamps, decisions):
+            wall = self._detect_walls_at_timestamp(
+                ts, rows=rows_by_decision.get(decision, {}).values())
             result[ts] = wall
 
         return result
 
-    def _detect_walls_at_timestamp(self, ts: datetime) -> dict:
-        """Detect gamma walls at a single timestamp."""
-        rows = self.pit.historical_gex_at(
-            self._decision_timestamp_for_observation(ts),
-            interval=DEFAULT_INTERVAL,
-            calc_version=self.calc_version,
-        )
+    def _detect_walls_at_timestamp(
+        self, ts: datetime, rows: Iterable[HistoricalGexSnapshot] | None = None,
+    ) -> dict:
+        """Detect gamma walls at a single timestamp.
+
+        ``rows`` defaults to the per-instrument-latest PIT accessor for the
+        one-off path. Either way, spot and wall distances derive only from
+        rows whose source ``open_time`` is the observation timestamp — a
+        stale fallback row never enters this snapshot."""
+        if rows is None:
+            rows = self.pit.historical_gex_at(
+                self._decision_timestamp_for_observation(ts),
+                interval=DEFAULT_INTERVAL,
+                calc_version=self.calc_version,
+            )
+        rows = [row for row in rows if row.open_time == ts]
 
         if not rows:
             return {}
