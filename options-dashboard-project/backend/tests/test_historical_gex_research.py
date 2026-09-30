@@ -970,3 +970,63 @@ def test_mixed_fresh_and_fallback_instruments_split_volume_by_source(db_session)
     assert row["put_volume"] == 0
     # Source-time association is visible through the audit mechanism.
     assert row["oi_source_open_time"] == ts_1000
+
+
+def test_build_gex_series_reads_the_bounded_gex_load_once(db_session, monkeypatch):
+    """Codacy Finding B: the GEX series must be built through the bulk PIT
+    seam — one bounded load for the whole timestamp list, never one query
+    per timestamp."""
+    from app.services.point_in_time import PointInTimeDataset
+
+    spot = 24500.0
+    rows = []
+    for ts in (datetime(2026, 8, 27, 10, 0), datetime(2026, 8, 27, 10, 3)):
+        for key, option_type, signed in (
+            ("A|CE", "CE", 1500.0),
+            ("A|PE", "PE", -900.0),
+        ):
+            rows.append(HistoricalGexSnapshot(
+                instrument_key=key,
+                interval="3min",
+                open_time=ts,
+                spot=spot,
+                strike=24500.0,
+                expiry="2026-09-03",
+                option_type=option_type,
+                gamma=0.001,
+                open_interest=100,
+                option_price=100.0,
+                lot_size=65,
+                raw_gex=abs(signed),
+                signed_gex=signed,
+                calc_version="h_gex_v1",
+                calculated_at=ts,
+                status="SUCCESS",
+            ))
+    db_session.add_all(rows)
+    db_session.commit()
+
+    timestamps = [datetime(2026, 8, 27, 10, 0), datetime(2026, 8, 27, 10, 3)]
+    expected_decisions = [ts + timedelta(minutes=3) for ts in timestamps]
+    real_selections = PointInTimeDataset.historical_gex_selections_at_many
+    bulk_calls = []
+
+    def _spy(self, decision_timestamps, **kwargs):
+        bulk_calls.append(list(decision_timestamps))
+        return real_selections(self, decision_timestamps, **kwargs)
+
+    monkeypatch.setattr(
+        PointInTimeDataset, "historical_gex_selections_at_many", _spy)
+
+    engine = GexResearchEngine(db_session)
+    series = engine._build_gex_series(timestamps)
+
+    assert bulk_calls == [expected_decisions], (
+        "the GEX series must be built with one bulk selection call for all "
+        "decision timestamps, not one PIT query per timestamp"
+    )
+    assert set(series) == set(timestamps)
+    assert series[timestamps[0]]["net_gex"] == pytest.approx(600.0)
+    assert series[timestamps[0]]["instrument_count"] == 2
+    assert series[timestamps[1]]["net_gex"] == pytest.approx(600.0)
+    assert series[timestamps[1]]["instrument_count"] == 2

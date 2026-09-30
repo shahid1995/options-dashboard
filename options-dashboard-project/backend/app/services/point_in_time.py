@@ -550,17 +550,32 @@ class PointInTimeDataset:
         calc_version: str = "h_gex_v1",
         successful_only: bool = True,
     ) -> list[HistoricalGexSnapshot]:
-        """Return completed historical GEX whose source candle precedes T."""
+        """Return completed historical GEX whose source candle precedes T.
+
+        Selection is per instrument (Codacy Finding A): each instrument
+        contributes its own latest eligible snapshot at or before the
+        completed-bar target, mirroring ``option_greeks_at``. A global
+        maximum would drop every instrument whose freshest eligible
+        snapshot predates another instrument's.
+        """
         cutoff = _require_cutoff(decision_timestamp)
         target = _completed_bar_open_time(cutoff, interval)
-        latest_open_time = select(func.max(HistoricalGexSnapshot.open_time)).where(
-            HistoricalGexSnapshot.interval == interval,
-            HistoricalGexSnapshot.open_time <= target,
-            HistoricalGexSnapshot.calc_version == calc_version,
+
+        candidate = aliased(HistoricalGexSnapshot)
+        latest_open_time = (
+            select(func.max(candidate.open_time))
+            .where(
+                candidate.instrument_key == HistoricalGexSnapshot.instrument_key,
+                candidate.interval == interval,
+                candidate.open_time <= target,
+                candidate.calc_version == calc_version,
+            )
         )
         if successful_only:
-            latest_open_time = latest_open_time.where(HistoricalGexSnapshot.status == "SUCCESS")
-        latest_open_time = latest_open_time.scalar_subquery()
+            latest_open_time = latest_open_time.where(
+                candidate.status == "SUCCESS")
+        latest_open_time = latest_open_time.correlate(
+            HistoricalGexSnapshot).scalar_subquery()
 
         statement = select(HistoricalGexSnapshot).where(
             HistoricalGexSnapshot.interval == interval,
@@ -570,6 +585,87 @@ class PointInTimeDataset:
         if successful_only:
             statement = statement.where(HistoricalGexSnapshot.status == "SUCCESS")
         return list(self.db.scalars(statement))
+
+    def historical_gex_selections_at_many(
+        self,
+        decision_timestamps: list[datetime | str],
+        *,
+        instrument_keys: list[str] | None = None,
+        interval: str = "3min",
+        calc_version: str = "h_gex_v1",
+        successful_only: bool = True,
+    ) -> list[tuple[datetime, dict[str, HistoricalGexSnapshot]]]:
+        """Pair each decision timestamp with its selected GEX per instrument.
+
+        Element i is ``(decision_timestamps[i], {instrument_key: row})``
+        where row is the latest eligible snapshot at or before that
+        decision's completed-bar target — the same per-instrument contract
+        as the candle and greeks selections accessors, served by the same
+        bounded bulk load. A missing entry means no eligible snapshot
+        existed for that pair yet; a fallback snapshot keeps its original
+        source ``open_time`` — consumers must attribute it to that source
+        observation time, never to the requesting decision time.
+        """
+        cutoffs = [_require_cutoff(ts) for ts in decision_timestamps]
+        if not cutoffs:
+            return []
+        if instrument_keys is not None and not instrument_keys:
+            return []
+
+        targets = [_completed_bar_open_time(cutoff, interval) for cutoff in cutoffs]
+
+        def _gex_eligibility(entity):
+            predicates = [
+                entity.interval == interval,
+                entity.calc_version == calc_version,
+            ]
+            if successful_only:
+                predicates.append(entity.status == "SUCCESS")
+            if instrument_keys is not None:
+                predicates.append(
+                    entity.instrument_key.in_(instrument_keys))
+            return predicates
+
+        histories: dict[str, list[tuple[datetime, HistoricalGexSnapshot]]] = {}
+        self._load_bounded_histories(
+            HistoricalGexSnapshot, targets, histories, _gex_eligibility)
+
+        return list(
+            zip(cutoffs, self._resolve_bulk_selections(histories, targets))
+        )
+
+    def historical_gex_at_many(
+        self,
+        decision_timestamps: list[datetime | str],
+        *,
+        instrument_keys: list[str] | None = None,
+        interval: str = "3min",
+        calc_version: str = "h_gex_v1",
+        successful_only: bool = True,
+    ) -> list[HistoricalGexSnapshot]:
+        """Return historical GEX paired with the supplied decision timestamps.
+
+        Element i is the latest eligible snapshot for decision_timestamps[i],
+        one entry per instrument. When no fresh snapshot exists by a decision
+        time, the latest earlier eligible snapshot is returned with its
+        original source ``open_time`` intact.
+        """
+        cutoffs = [_require_cutoff(ts) for ts in decision_timestamps]
+        if not cutoffs:
+            return []
+
+        selections = self.historical_gex_selections_at_many(
+            decision_timestamps,
+            instrument_keys=instrument_keys,
+            interval=interval,
+            calc_version=calc_version,
+            successful_only=successful_only,
+        )
+        return [
+            row
+            for _, selection in selections
+            for _, row in sorted(selection.items())
+        ]
 
     def historical_gex(
         self,

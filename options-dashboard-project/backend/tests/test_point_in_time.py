@@ -105,9 +105,9 @@ def _greeks(ts):
     )
 
 
-def _gex(ts):
+def _gex(ts, key="TEST|CE", signed=1000):
     return HistoricalGexSnapshot(
-        instrument_key="TEST|CE",
+        instrument_key=key,
         interval="3min",
         open_time=ts,
         spot=24500,
@@ -118,8 +118,8 @@ def _gex(ts):
         open_interest=100,
         option_price=100,
         lot_size=65,
-        raw_gex=1000,
-        signed_gex=1000,
+        raw_gex=signed,
+        signed_gex=signed,
         calc_version="h_gex_v1",
         calculated_at=ts,
         status="SUCCESS",
@@ -187,6 +187,129 @@ def test_off_grid_lookup_uses_latest_completed_bar(db_session):
     )] == [BASE_TS]
     assert [row.open_time for row in pit.historical_gex_at(decision)] == [BASE_TS]
 
+
+def test_historical_gex_at_selects_latest_snapshot_per_instrument(db_session):
+    """The chain accessor must be per-instrument-latest like its candle and
+    greeks siblings (Codacy Finding A): an instrument whose freshest
+    completed snapshot predates another's must still be returned — not
+    dropped by a global maximum timestamp."""
+    decision = datetime(2026, 8, 27, 10, 6)  # target 10:03
+    db_session.add_all([
+        _gex(datetime(2026, 8, 27, 10, 0)),
+        _gex(datetime(2026, 8, 27, 10, 3), key="TEST|PE", signed=-3000),
+    ])
+    db_session.commit()
+
+    pit = PointInTimeDataset(db_session)
+
+    assert {row.instrument_key: row.open_time
+            for row in pit.historical_gex_at(decision)} == {
+        "TEST|CE": datetime(2026, 8, 27, 10, 0),
+        "TEST|PE": datetime(2026, 8, 27, 10, 3),
+    }
+
+
+def test_historical_gex_at_excludes_snapshots_beyond_the_completed_target(db_session):
+    """The per-instrument selection stays bounded by the completed-bar
+    target: a snapshot beyond the target must never be returned even when
+    it would otherwise dominate its instrument's history."""
+    decision = datetime(2026, 8, 27, 10, 6)  # target 10:03
+    db_session.add_all([
+        _gex(datetime(2026, 8, 27, 10, 0)),
+        _gex(datetime(2026, 8, 27, 10, 12), key="TEST|PE", signed=-3000),
+    ])
+    db_session.commit()
+
+    pit = PointInTimeDataset(db_session)
+
+    assert [(row.instrument_key, row.open_time)
+            for row in pit.historical_gex_at(decision)] == [
+        ("TEST|CE", datetime(2026, 8, 27, 10, 0)),
+    ]
+
+
+def test_historical_gex_selections_at_many_pairs_per_instrument_selections(db_session):
+    """Bulk GEX seam (Codacy Finding B): decision-major
+    (decision_timestamp, {instrument_key: row}) pairs with per-instrument
+    fallback bars keeping their original source open_time — the same
+    contract as the candle and greeks selections accessors."""
+    decisions = [
+        datetime(2026, 8, 27, 10, 4),   # target 10:01 -> both fall back
+        datetime(2026, 8, 27, 10, 6),   # target 10:03 -> fresh rows
+    ]
+    db_session.add_all([
+        _gex(datetime(2026, 8, 27, 10, 0)),
+        _gex(datetime(2026, 8, 27, 10, 3), signed=2000),
+        _gex(datetime(2026, 8, 27, 9, 57), key="TEST|PE", signed=-3000),
+        _gex(datetime(2026, 8, 27, 10, 3), key="TEST|PE", signed=-3000),
+    ])
+    db_session.commit()
+
+    pit = PointInTimeDataset(db_session)
+    selections = pit.historical_gex_selections_at_many(
+        decisions, instrument_keys=["TEST|CE", "TEST|PE"])
+
+    assert [ts for ts, _ in selections] == decisions
+
+    first = selections[0][1]
+    assert set(first) == {"TEST|CE", "TEST|PE"}
+    assert first["TEST|CE"].open_time == datetime(2026, 8, 27, 10, 0)
+    # PE falls back to its own 09:57 seed with its source open_time intact.
+    assert first["TEST|PE"].open_time == datetime(2026, 8, 27, 9, 57)
+
+    second = selections[1][1]
+    assert set(second) == {"TEST|CE", "TEST|PE"}
+    assert second["TEST|CE"].open_time == datetime(2026, 8, 27, 10, 3)
+    assert second["TEST|PE"].open_time == datetime(2026, 8, 27, 10, 3)
+
+    # Flattened convenience view: decision-major, sorted by instrument key.
+    flattened = pit.historical_gex_at_many(
+        decisions, instrument_keys=["TEST|CE", "TEST|PE"])
+    assert [(row.instrument_key, row.open_time) for row in flattened] == [
+        ("TEST|CE", datetime(2026, 8, 27, 10, 0)),
+        ("TEST|PE", datetime(2026, 8, 27, 9, 57)),
+        ("TEST|CE", datetime(2026, 8, 27, 10, 3)),
+        ("TEST|PE", datetime(2026, 8, 27, 10, 3)),
+    ]
+
+
+def test_historical_gex_selections_at_many_uses_one_bounded_load(
+    db_session, monkeypatch,
+):
+    """Finding B structural proof: any number of decision timestamps must be
+    served by the shared bounded loader — one grouped seed plus one window
+    query — never one query per decision timestamp."""
+    from sqlalchemy import Select
+
+    decisions = [
+        datetime(2026, 8, 27, 10, 4),
+        datetime(2026, 8, 27, 10, 6),
+        datetime(2026, 8, 27, 10, 12),
+    ]
+    db_session.add_all([
+        _gex(datetime(2026, 8, 27, 10, 0)),
+        _gex(datetime(2026, 8, 27, 10, 3), signed=2000),
+        _gex(datetime(2026, 8, 27, 10, 3), key="TEST|PE", signed=-3000),
+    ])
+    db_session.commit()
+
+    captured = []
+    real_scalars = db_session.scalars
+
+    def _capturing_scalars(statement, *args, **kwargs):
+        if isinstance(statement, Select):
+            captured.append(statement)
+        return real_scalars(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db_session, "scalars", _capturing_scalars)
+    pit = PointInTimeDataset(db_session)
+    pit.historical_gex_selections_at_many(
+        decisions, instrument_keys=["TEST|CE", "TEST|PE"])
+
+    assert len(captured) == 2, (
+        "the bulk GEX read must be one bounded load (grouped seed + window), "
+        f"not one query per decision timestamp (got {len(captured)})"
+    )
 
 
 @pytest.mark.parametrize(
