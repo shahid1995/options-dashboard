@@ -360,6 +360,44 @@ class TestGammaWalls:
         walls = engine.detect_walls(ts, top_n=5)
         assert len(walls.positive_walls) == 5
 
+    def test_wall_spot_uses_exact_observation_timestamp(self, db):
+        """Mixed-time wall-spot regression (CodeRabbit): strike_data is
+        restricted to the observation timestamp, but the spot lookup took
+        the first row of the per-instrument-fallback PIT accessor, so a
+        stale fallback row's spot could drive wall distances. The wall
+        spot must come from an exact ``open_time == ts`` row."""
+        ts = datetime(2024, 10, 3, 9, 15)
+        stale = datetime(2024, 10, 3, 9, 12)
+        # Stale PE row (inserted first): no 9:15 PE row exists, so the
+        # per-instrument fallback returns this 9:12 row with spot 24100.
+        _insert_gex(db, stale, 24900, "PE", -3000000.0, 24100)
+        # Exact 9:15 CE row supplies the true current spot 25000.
+        _insert_gex(db, ts, 25500, "CE", 5000000.0, 25000)
+
+        engine = GexAnalyticsEngine(db)
+        walls = engine.detect_walls(ts)
+
+        # Strike from the exact 9:15 observation; distance measured from
+        # the exact 9:15 spot (25500 - 25000), never the stale 24100 spot.
+        assert walls.strongest_positive.strike == 25500
+        assert walls.spot == pytest.approx(25000.0)
+        assert walls.strongest_positive.distance_from_spot == pytest.approx(500.0)
+        assert walls.strongest_positive.distance_pct == pytest.approx(2.0)
+
+    def test_wall_spot_without_exact_rows_stays_empty(self, db):
+        """No exact-timestamp rows: the stale fallback row must not become
+        the wall spot for timestamp T."""
+        stale = datetime(2024, 10, 3, 9, 12)
+        _insert_gex(db, stale, 24900, "PE", -3000000.0, 24100)
+
+        engine = GexAnalyticsEngine(db)
+        walls = engine.detect_walls(datetime(2024, 10, 3, 9, 15))
+
+        # No 9:15 strike data at all: existing empty-result behavior.
+        assert walls.strongest_positive is None
+        assert walls.strongest_negative is None
+        assert walls.spot == pytest.approx(0.0)
+
 
 # ---------------------------------------------------------------------------
 # F. Forward returns tests
