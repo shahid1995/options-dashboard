@@ -557,11 +557,16 @@ class GexAnalyticsEngine:
             return GammaWallsResult(timestamp=ts, spot=0.0)
 
         spot = 0.0
+        # Timestamp-level signal: the spot must come from an exact
+        # ``open_time == ts`` row. ``historical_gex_at`` intentionally
+        # falls back per instrument, so filter before slicing — a stale
+        # fallback row's spot must never drive wall distances.
         rows = self.pit.historical_gex_at(
             self._decision_timestamp_for_observation(ts),
             interval=DEFAULT_INTERVAL,
             calc_version=self.calc_version,
-        )[:1]
+        )
+        rows = [row for row in rows if row.open_time == ts][:1]
         if rows:
             spot = rows[0].spot
 
