@@ -808,9 +808,6 @@ def test_bounded_seed_uses_grouped_max_join_not_correlated_scan(db_session):
     )
     assert "group_by(" in source
     assert "func.max(" in source
-    # The outer seed scan itself is explicitly bounded by the earliest
-    # target — it can never consider rows newer than lower.
-    assert "model.open_time <= lower" in source
     # The (lower, upper] window query is retained.
     assert "> lower" in source and "<= upper" in source
 
@@ -839,6 +836,66 @@ def test_bounded_seed_uses_grouped_max_join_not_correlated_scan(db_session):
     max_statements = [s for s in statements if "MAX(" in s.upper()]
     assert len(max_statements) == len(grouped)
     assert all("GROUP BY" in s.upper() for s in max_statements)
+
+
+def test_bounded_seed_outer_scan_explicitly_bounded_by_lower(
+    db_session, monkeypatch
+):
+    """Structural regression (Greptile P2): the OUTER ``seed_statement``
+    itself must carry a direct ``model.open_time <= lower`` criterion.
+
+    The grouped subquery's own ``open_time <= lower`` bound does not prove
+    the outer model scan is bounded, so this inspects the captured
+    ``Select`` object's top-level whereclause criteria — never recursively
+    through the grouped subquery. Removing only the outer predicate while
+    leaving the grouped subquery intact must fail this test.
+    """
+    from sqlalchemy import Select
+    from sqlalchemy.sql import operators as sa_operators
+    from sqlalchemy.sql.elements import BooleanClauseList
+
+    _seed_matrix_setup(db_session)
+    captured = []
+    real_scalars = db_session.scalars
+
+    def _capturing_scalars(statement, *args, **kwargs):
+        if isinstance(statement, Select):
+            captured.append(statement)
+        return real_scalars(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db_session, "scalars", _capturing_scalars)
+    pit = PointInTimeDataset(db_session)
+    pit.option_candles_selections_at_many(
+        SEED_MATRIX_DECISIONS, instrument_keys=["TEST|CE", "TEST|PE"])
+
+    # One grouped seed query plus one window query — the seed runs first.
+    assert len(captured) == 2
+    seed_statement = captured[0]
+
+    whereclause = seed_statement.whereclause
+    criteria = (
+        list(whereclause.clauses)
+        if isinstance(whereclause, BooleanClauseList)
+        else [whereclause]
+    )
+
+    def _as_column(expr):
+        return (expr.__clause_element__()
+                if hasattr(expr, "__clause_element__") else expr)
+
+    direct_bounds = [
+        criterion
+        for criterion in criteria
+        if criterion.operator is sa_operators.le
+        and _as_column(criterion.left).name == "open_time"
+        and _as_column(criterion.left).table is OptionCandle.__table__
+    ]
+    assert len(direct_bounds) == 1, (
+        "the outer seed_statement must contain exactly one direct "
+        "model.open_time <= lower criterion at its top level"
+    )
+    # The bound is the earliest requested target, not some other constant.
+    assert direct_bounds[0].right.value == datetime(2026, 8, 27, 10, 1)
 
 
 @pytest.mark.parametrize("use_grouped", [False, True])
