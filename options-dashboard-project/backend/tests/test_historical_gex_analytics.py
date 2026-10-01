@@ -42,13 +42,13 @@ def db(engine):
     session.close()
 
 
-def _insert_gex(db, timestamp, strike, option_type, signed_gex, spot, expiry="2024-10-03", calc_version="h_gex_v1"):
+def _insert_gex(db, timestamp, strike, option_type, signed_gex, spot, expiry="2024-10-03", calc_version="h_gex_v1", interval="3min"):
     """Insert a historical GEX row."""
     # Use unique instrument_key per strike+type to avoid unique constraint conflicts
     suffix = "CE" if option_type == "CE" else "PE"
     db.add(HistoricalGexSnapshot(
         instrument_key=f"NSE_FO|{int(strike)}{suffix}|{expiry}",
-        interval="3min",
+        interval=interval,
         open_time=timestamp,
         spot=spot,
         strike=strike,
@@ -220,6 +220,44 @@ class TestTimeSeries:
         engine = GexAnalyticsEngine(db)
         timestamps = engine.get_timestamps(start=t2)
         assert timestamps == [t2, t3]
+
+    def test_get_timestamps_only_returns_analytics_interval(self, db):
+        """Interval contract (Greptile P1, Day 49): the engine is a
+        3-minute analytics engine -- DEFAULT_INTERVAL drives every read
+        and FORWARD_RETURN_INTERVALS is expressed in 3-minute candles --
+        so timestamp discovery must never surface snapshots from another
+        interval. A 5-minute snapshot would otherwise be discovered and
+        then silently dropped by the exact-observation PIT accessor.
+        """
+        t_3min = datetime(2024, 10, 3, 9, 15)
+        t_5min = datetime(2024, 10, 3, 9, 25)
+        _insert_gex(db, t_3min, 25000, "CE", 1000000.0, 25000)
+        _insert_gex(db, t_5min, 25000, "CE", 1000000.0, 25000, interval="5min")
+        engine = GexAnalyticsEngine(db)
+
+        assert engine.get_timestamps() == [t_3min]
+        assert engine.aggregate_timestamp(t_5min) is None
+
+    def test_get_timestamps_interval_contract_is_insert_order_independent(self, db):
+        """Inverse insertion order: a 5-minute snapshot inserted before
+        any 3-minute row must not change interval-correct discovery."""
+        t_5min = datetime(2024, 10, 3, 9, 25)
+        t_3min = datetime(2024, 10, 3, 9, 15)
+        _insert_gex(db, t_5min, 25000, "CE", 1000000.0, 25000, interval="5min")
+        _insert_gex(db, t_3min, 25000, "CE", 1000000.0, 25000)
+        engine = GexAnalyticsEngine(db)
+
+        assert engine.get_timestamps() == [t_3min]
+
+    def test_get_timestamps_range_honors_interval_contract(self, db):
+        """Ranged discovery applies the same interval predicate."""
+        t_3min = datetime(2024, 10, 3, 9, 15)
+        t_5min = datetime(2024, 10, 3, 9, 25)
+        _insert_gex(db, t_3min, 25000, "CE", 1000000.0, 25000)
+        _insert_gex(db, t_5min, 25000, "CE", 1000000.0, 25000, interval="5min")
+        engine = GexAnalyticsEngine(db)
+
+        assert engine.get_timestamps(start=t_3min) == [t_3min]
 
 
 # ---------------------------------------------------------------------------
