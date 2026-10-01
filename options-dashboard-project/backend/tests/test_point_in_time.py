@@ -105,10 +105,10 @@ def _greeks(ts):
     )
 
 
-def _gex(ts, key="TEST|CE", signed=1000):
+def _gex(ts, key="TEST|CE", signed=1000, interval="3min"):
     return HistoricalGexSnapshot(
         instrument_key=key,
-        interval="3min",
+        interval=interval,
         open_time=ts,
         spot=24500,
         strike=24500,
@@ -1121,6 +1121,45 @@ def test_historical_gex_observed_at_issues_one_exact_query_no_fallback_shape(db_
     assert "open_time >" not in sql
     assert "GROUP BY" not in sql.upper()
     assert "MAX(" not in sql.upper()
+
+
+def test_historical_gex_observed_at_is_interval_generic_primitive(db_session):
+    """The exact-observation accessor is a generic PIT primitive: a
+    non-default interval is served when explicitly requested (nothing is
+    "lost" from the system), while the analytics engine deliberately
+    constrains itself to the 3-minute contract.
+    """
+    db_session.add_all([
+        _gex(datetime(2026, 8, 27, 10, 0), signed=1000),
+        _gex(datetime(2026, 8, 27, 10, 5), key="FIVE|CE", signed=5000, interval="5min"),
+    ])
+    db_session.commit()
+
+    pit = PointInTimeDataset(db_session)
+
+    # The analytics default (3min) never serves a 5-minute snapshot.
+    assert pit.historical_gex_observed_at(
+        datetime(2026, 8, 27, 10, 11), datetime(2026, 8, 27, 10, 5),
+    ) == []
+    # The primitive serves it when the interval is explicit, and the
+    # completed-bar bound follows the requested interval: the 5-minute
+    # bar opening at 10:05 is invisible at a 10:08 decision (bar not
+    # completed) and visible exactly from 10:10 (inclusive boundary).
+    assert pit.historical_gex_observed_at(
+        datetime(2026, 8, 27, 10, 8), datetime(2026, 8, 27, 10, 5),
+        interval="5min",
+    ) == []
+    rows = pit.historical_gex_observed_at(
+        datetime(2026, 8, 27, 10, 10), datetime(2026, 8, 27, 10, 5),
+        interval="5min",
+    )
+    assert [(r.instrument_key, r.open_time) for r in rows] == [
+        ("FIVE|CE", datetime(2026, 8, 27, 10, 5)),
+    ]
+    # The 3-minute snapshot keeps its own completed-bar bound.
+    assert [(r.instrument_key, r.open_time) for r in pit.historical_gex_observed_at(
+        datetime(2026, 8, 27, 10, 3), datetime(2026, 8, 27, 10, 0),
+    )] == [("TEST|CE", datetime(2026, 8, 27, 10, 0))]
 
 
 @pytest.mark.parametrize("use_grouped", [False, True])
