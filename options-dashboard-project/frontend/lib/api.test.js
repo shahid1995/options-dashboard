@@ -24,7 +24,7 @@ describe("isAuthError", () => {
 describe("chainWsUrl", () => {
   // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
   it("derives a ws:// URL from the API base and encodes the expiry", () => {
-    expect(chainWsUrl("NIFTY", "2026-08-27")).toBe("ws://localhost:8000/chains/ws/NIFTY?expiry_date=2026-08-27");
+    expect(chainWsUrl("NIFTY", "2026-08-27")).toBe("ws://localhost:8000/chains/ws/NIFTY?expiry_date=2026-08-27"); // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
   });
 
   it("maps https to wss", () => {
