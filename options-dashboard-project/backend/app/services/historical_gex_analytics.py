@@ -237,18 +237,27 @@ class GexAnalyticsEngine:
         """Return the decision time at the end of the three-minute source bar."""
         return timestamp + timedelta(minutes=3)
 
+    def _exact_rows(self, ts: datetime) -> list[HistoricalGexSnapshot]:
+        """Snapshots whose source bar is exactly ``ts`` (no fallback).
+
+        PIT seam for the exact-observation reads: the decision time is
+        the end of ``ts``'s three-minute source bar, and the accessor
+        returns rows only for instruments that reported ``ts`` itself.
+        """
+        return self.pit.historical_gex_observed_at(
+            self._decision_timestamp_for_observation(ts),
+            ts,
+            interval=DEFAULT_INTERVAL,
+            calc_version=self.calc_version,
+        )
+
     # ------------------------------------------------------------------
     # Phase 2: Time-series aggregation
     # ------------------------------------------------------------------
 
     def aggregate_timestamp(self, ts: datetime) -> Optional[TimestampGex]:
         """Aggregate GEX at a single timestamp across all instruments."""
-        rows = self.pit.historical_gex_at(
-            self._decision_timestamp_for_observation(ts),
-            interval=DEFAULT_INTERVAL,
-            calc_version=self.calc_version,
-        )
-        rows = [row for row in rows if row.open_time == ts]
+        rows = self._exact_rows(ts)
 
         if not rows:
             return None
@@ -302,12 +311,7 @@ class GexAnalyticsEngine:
 
     def aggregate_strike(self, ts: datetime) -> list[StrikeGex]:
         """Aggregate GEX by strike at a single timestamp."""
-        rows = self.pit.historical_gex_at(
-            self._decision_timestamp_for_observation(ts),
-            interval=DEFAULT_INTERVAL,
-            calc_version=self.calc_version,
-        )
-        rows = [row for row in rows if row.open_time == ts]
+        rows = self._exact_rows(ts)
 
         strike_map: dict[float, StrikeGex] = {}
         for r in rows:
@@ -330,12 +334,7 @@ class GexAnalyticsEngine:
 
     def aggregate_expiry(self, ts: datetime) -> list[ExpiryGex]:
         """Aggregate GEX by expiry at a single timestamp."""
-        rows = self.pit.historical_gex_at(
-            self._decision_timestamp_for_observation(ts),
-            interval=DEFAULT_INTERVAL,
-            calc_version=self.calc_version,
-        )
-        rows = [row for row in rows if row.open_time == ts]
+        rows = self._exact_rows(ts)
 
         expiry_map: dict[str, ExpiryGex] = {}
         total_abs = 0.0
@@ -462,12 +461,7 @@ class GexAnalyticsEngine:
 
         # Get spot from first row
         spot = 0.0
-        rows = self.pit.historical_gex_at(
-            self._decision_timestamp_for_observation(ts),
-            interval=DEFAULT_INTERVAL,
-            calc_version=self.calc_version,
-        )
-        rows = [row for row in rows if row.open_time == ts][:1]
+        rows = self._exact_rows(ts)[:1]
         if rows:
             spot = rows[0].spot
 
@@ -558,15 +552,10 @@ class GexAnalyticsEngine:
 
         spot = 0.0
         # Timestamp-level signal: the spot must come from an exact
-        # ``open_time == ts`` row. ``historical_gex_at`` intentionally
-        # falls back per instrument, so filter before slicing — a stale
-        # fallback row's spot must never drive wall distances.
-        rows = self.pit.historical_gex_at(
-            self._decision_timestamp_for_observation(ts),
-            interval=DEFAULT_INTERVAL,
-            calc_version=self.calc_version,
-        )
-        rows = [row for row in rows if row.open_time == ts][:1]
+        # ``open_time == ts`` row. The exact-observation PIT seam
+        # guarantees no stale fallback row ever reaches the filter
+        # (and never drives wall distances).
+        rows = self._exact_rows(ts)[:1]
         if rows:
             spot = rows[0].spot
 

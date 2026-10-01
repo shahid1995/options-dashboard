@@ -627,6 +627,46 @@ class PointInTimeDataset:
         )
         return list(self.db.scalars(statement))
 
+    def historical_gex_observed_at(
+        self,
+        decision_timestamp: datetime | str,
+        observation_time: datetime | str,
+        *,
+        interval: str = "3min",
+        calc_version: str = "h_gex_v1",
+        successful_only: bool = True,
+    ) -> list[HistoricalGexSnapshot]:
+        """Return rows whose source bar is exactly ``observation_time``.
+
+        This is the exact-observation seam for analytics (Codacy
+        performance follow-up, Day 49): unlike ``historical_gex_at``
+        there is deliberately no per-instrument fallback - an
+        instrument without a snapshot at exactly ``observation_time``
+        contributes nothing.
+
+        Visibility still follows the PIT contract: the request is
+        served only while ``observation_time`` is a completed
+        observation by the decision cutoff (``observation_time <=
+        _completed_bar_open_time(cutoff, interval)``); otherwise, or
+        when no row matches, the result is empty.
+        """
+        cutoff = _require_cutoff(decision_timestamp)
+        observation = _require_cutoff(observation_time)
+        target = _completed_bar_open_time(cutoff, interval)
+        if observation > target:
+            return []
+
+        statement = select(HistoricalGexSnapshot).where(
+            HistoricalGexSnapshot.interval == interval,
+            HistoricalGexSnapshot.open_time == observation,
+            HistoricalGexSnapshot.calc_version == calc_version,
+        )
+        if successful_only:
+            statement = statement.where(
+                HistoricalGexSnapshot.status == "SUCCESS")
+        statement = statement.order_by(HistoricalGexSnapshot.instrument_key)
+        return list(self.db.scalars(statement))
+
     def historical_gex_selections_at_many(
         self,
         decision_timestamps: list[datetime | str],

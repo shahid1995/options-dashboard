@@ -1000,6 +1000,128 @@ def test_point_lookup_matrix_covers_no_future_data(db_session):
         "TEST|PE": datetime(2026, 8, 27, 10, 3),
     }
 
+def test_historical_gex_observed_at_returns_exact_observation(db_session):
+    """Exact-observation contract: at decision time T+3m the observation
+    whose source bar opened at T is available and returned for every
+    instrument that reported it -- without any per-instrument fallback.
+    """
+    db_session.add_all([
+        _gex(datetime(2026, 8, 27, 10, 0), signed=1000),
+        _gex(datetime(2026, 8, 27, 10, 0), key="TEST|PE", signed=-3000),
+    ])
+    db_session.commit()
+
+    pit = PointInTimeDataset(db_session)
+    rows = pit.historical_gex_observed_at(
+        datetime(2026, 8, 27, 10, 3), datetime(2026, 8, 27, 10, 0),
+    )
+
+    assert [(row.instrument_key, row.open_time) for row in rows] == [
+        ("TEST|CE", datetime(2026, 8, 27, 10, 0)),
+        ("TEST|PE", datetime(2026, 8, 27, 10, 0)),
+    ]
+
+
+def test_historical_gex_observed_at_rejects_observations_beyond_decision(db_session):
+    """An observation later than the completed bar permitted by the decision
+    cutoff must return no rows even when such snapshots exist in the
+    database -- the decision cutoff is the visibility boundary.
+    """
+    db_session.add_all([
+        _gex(datetime(2026, 8, 27, 10, 3, 1), signed=777),
+        _gex(datetime(2026, 8, 27, 10, 6), signed=888),
+    ])
+    db_session.commit()
+
+    pit = PointInTimeDataset(db_session)
+    decision = datetime(2026, 8, 27, 10, 6)  # completed target 10:03
+
+    assert pit.historical_gex_observed_at(
+        decision, datetime(2026, 8, 27, 10, 3, 1),
+    ) == []
+    assert pit.historical_gex_observed_at(
+        decision, datetime(2026, 8, 27, 10, 6),
+    ) == []
+
+
+def test_historical_gex_observed_at_does_not_fall_back_to_stale_rows(db_session):
+    """Unlike ``historical_gex_at`` (per-instrument latest), the
+    exact-observation accessor must return only rows whose source bar is
+    exactly the requested observation time -- never a stale fallback row.
+    """
+    db_session.add_all([
+        _gex(datetime(2026, 8, 27, 10, 0), signed=1000),
+        _gex(datetime(2026, 8, 27, 9, 57), signed=7000),
+    ])
+    db_session.commit()
+
+    pit = PointInTimeDataset(db_session)
+    rows = pit.historical_gex_observed_at(
+        datetime(2026, 8, 27, 10, 3), datetime(2026, 8, 27, 10, 0),
+    )
+
+    assert [(row.instrument_key, row.open_time, row.signed_gex) for row in rows] == [
+        ("TEST|CE", datetime(2026, 8, 27, 10, 0), 1000),
+    ]
+
+
+def test_historical_gex_observed_at_returns_no_rows_without_exact_observation(db_session):
+    """When no instrument reported the requested observation time the
+    accessor returns an empty list instead of the latest earlier snapshot
+    that ``historical_gex_at`` would fall back to.
+    """
+    db_session.add(_gex(datetime(2026, 8, 27, 9, 57), signed=7000))
+    db_session.commit()
+
+    pit = PointInTimeDataset(db_session)
+
+    assert pit.historical_gex_observed_at(
+        datetime(2026, 8, 27, 10, 3), datetime(2026, 8, 27, 10, 0),
+    ) == []
+
+
+def test_historical_gex_observed_at_issues_one_exact_query_no_fallback_shape(db_session):
+    """Behavioral + structural guard: the exact-observation accessor runs a
+    single SQL statement, selects on exact ``open_time`` equality, and does
+    not carry the per-instrument fallback machinery (no GROUP BY/MAX
+    greatest-n-per-group shape, no range probe).
+    """
+    db_session.add_all([
+        _gex(datetime(2026, 8, 27, 10, 0), signed=1000),
+        _gex(datetime(2026, 8, 27, 10, 0), key="TEST|PE", signed=-3000),
+        _gex(datetime(2026, 8, 27, 9, 57), signed=7000),
+    ])
+    db_session.commit()
+
+    statements = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(db_session.bind, "before_cursor_execute", _record)
+    try:
+        pit = PointInTimeDataset(db_session)
+        rows = pit.historical_gex_observed_at(
+            datetime(2026, 8, 27, 10, 3), datetime(2026, 8, 27, 10, 0),
+        )
+    finally:
+        event.remove(db_session.bind, "before_cursor_execute", _record)
+
+    assert [(row.instrument_key, row.open_time) for row in rows] == [
+        ("TEST|CE", datetime(2026, 8, 27, 10, 0)),
+        ("TEST|PE", datetime(2026, 8, 27, 10, 0)),
+    ]
+    select_sql = [s for s in statements
+                  if s.lstrip().upper().startswith("SELECT")]
+    assert len(select_sql) == 1
+    sql = select_sql[0]
+    assert "historical_gex" in sql
+    assert "open_time =" in sql  # equality, any paramstyle (?, :, %s)
+    assert "open_time <=" not in sql
+    assert "open_time >" not in sql
+    assert "GROUP BY" not in sql.upper()
+    assert "MAX(" not in sql.upper()
+
 
 @pytest.mark.parametrize("use_grouped", [False, True])
 def test_bounded_seed_matrix_identical_selections(
