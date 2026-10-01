@@ -423,3 +423,89 @@ def test_day49_migration_module_declares_batching_contract():
     assert ".limit(IV_MIGRATION_BATCH_SIZE)" in source
     assert "observed_at.isnot(None)" in source
     assert "NotImplementedError" in source
+
+
+def test_day49_migration_never_reexecutes_over_post_day49_rows(temp_db):
+    """Codacy MEDIUM adjudication: the migration can never run against rows
+    written by the post-Day-49 application.
+
+    Alembic executes d49aa0000001 exactly once per database: the version
+    stamp advances to head inside the upgrade, and every supported
+    re-invocation — ``alembic upgrade head`` (what ``init_db()`` runs on
+    every application startup) — is a no-op once the stamp equals head.
+    A post-Day-49 canonical naive-IST row (what ``record_iv_observations``
+    writes after the switch) therefore cannot pass through the
+    UTC→IST conversion via any supported deployment path: replaying the
+    startup command leaves it unchanged, and the only lower-revision
+    command (downgrade) refuses. Reaching the double-shift requires an
+    unsupported out-of-band ``alembic stamp d48aa0000001`` before an
+    upgrade — an operator action no workflow, script, or document in this
+    repository performs.
+    """
+    from datetime import datetime
+
+    from alembic import command
+    from alembic.config import Config
+    from app.db import Base
+    from app import models  # noqa: F401  (registers iv_observations metadata)
+
+    engine = create_engine(temp_db, connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS alembic_version "
+                "(version_num VARCHAR(32) NOT NULL)"
+            )
+        )
+        conn.execute(
+            text("INSERT INTO alembic_version (version_num) VALUES ('d48aa0000001')")
+        )
+    engine.dispose()
+
+    alembic_cfg = Config(os.path.join(os.path.dirname(__file__), "..", "alembic.ini"))
+    alembic_cfg.set_main_option("sqlalchemy.url", temp_db)
+    # Bind Alembic to THIS database through the official Config.attributes
+    # mechanism (same contract as app.db._run_alembic_migrations): the
+    # conftest engine override never touches Alembic's own engine, so the
+    # URL alone is not enough under the test override.
+    alembic_cfg.attributes["connectable"] = engine
+    command.upgrade(alembic_cfg, "head")
+
+    # Post-Day-49 application write: canonical naive IST, exactly what
+    # record_iv_observations persists after the Day 49 switch.
+    ist_row = datetime(2026, 9, 30, 10, 0, 0)
+    engine = create_engine(temp_db, connect_args={"check_same_thread": False})
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO iv_observations "
+                "(symbol, expiry, strike, option_type, iv, spot, source, observed_at) "
+                "VALUES ('NIFTY', '2026-10-01', 24500, 'call', 0.18, 24500, "
+                "'post-day49-ist', :observed_at)"
+            ),
+            {"observed_at": ist_row},
+        )
+    engine.dispose()
+
+    # Every application startup replays exactly this command.
+    command.upgrade(alembic_cfg, "head")
+
+    engine = create_engine(temp_db, connect_args={"check_same_thread": False})
+    with engine.connect() as conn:
+        stored = conn.execute(
+            text(
+                "SELECT observed_at FROM iv_observations "
+                "WHERE source = 'post-day49-ist'"
+            )
+        ).scalar_one()
+        revision = conn.execute(
+            text("SELECT version_num FROM alembic_version")
+        ).scalar_one()
+    engine.dispose()
+
+    assert revision == "d49aa0000001"
+    # Startup replay is a no-op: the canonical IST value is untouched
+    # (no +5:30 double shift).
+    assert str(stored).startswith("2026-09-30 10:00:00")
+    assert str(stored) != "2026-09-30 15:30:00"  # the +5:30 double shift
