@@ -295,11 +295,20 @@ class GexAnalyticsEngine:
         return results
 
     def get_timestamps(self, start: Optional[datetime] = None, end: Optional[datetime] = None) -> list[datetime]:
-        """Get all unique timestamps in the historical GEX data."""
+        """Get all unique 3-minute analytics timestamps in the GEX data.
+
+        Snapshots from other intervals exist in storage but belong to
+        no analytics pipeline; they are excluded here so they can
+        neither be aggregated nor silently dropped later.
+        """
         stmt = (
             select(HistoricalGexSnapshot.open_time)
             .where(HistoricalGexSnapshot.calc_version == self.calc_version)
             .where(HistoricalGexSnapshot.status == "SUCCESS")
+            # Interval contract (Greptile P1, Day 49): this is a
+            # 3-minute analytics engine; discovery must honor the
+            # same DEFAULT_INTERVAL every read uses.
+            .where(HistoricalGexSnapshot.interval == DEFAULT_INTERVAL)
             .distinct()
             .order_by(HistoricalGexSnapshot.open_time)
         )
