@@ -781,6 +781,226 @@ def _seed_matrix_setup(db_session):
     db_session.commit()
 
 
+# Codacy HIGH (Day 49): the point lookups must be grouped max-joins.
+CORRELATED_SEED_LOAD_SNIPPET = '''
+        candidate = aliased(OptionCandle)
+        latest_open_time = (
+            select(func.max(candidate.open_time))
+            .where(
+                candidate.instrument_key == OptionCandle.instrument_key,
+                candidate.interval == interval,
+                candidate.open_time <= target,
+            )
+            .correlate(OptionCandle)
+            .scalar_subquery()
+        )
+'''
+
+
+def _assert_grouped_point_lookup_source(source, name):
+    """Structural half of the Codacy HIGH guard, applied to one source.
+
+    Repository precedent:
+    test_bounded_seed_uses_grouped_max_join_not_correlated_scan (added
+    for the Greptile P2 seed finding, commit c2299eb) inspects the
+    production source directly. The same guard now covers the three
+    point-accessor implementations: each must be a portable GROUP BY /
+    max-join selection with no correlated scalar MAX subquery.
+    """
+    assert ".correlate(" not in source, (
+        f"{name} must not use a correlated scalar subquery"
+    )
+    assert "group_by(" in source, (
+        f"{name} must be a grouped max-join selection"
+    )
+    assert "func.max(" in source, (
+        f"{name}: must aggregate MAX(open_time) per instrument"
+    )
+
+
+def test_point_lookups_use_grouped_max_join_not_correlated_scan():
+    import inspect
+
+    for name in ("option_candles_at", "option_greeks_at",
+                 "historical_gex_at"):
+        _assert_grouped_point_lookup_source(
+            inspect.getsource(getattr(PointInTimeDataset, name)), name)
+
+
+def test_point_lookup_guard_rejects_the_correlated_shape():
+    """The guard is not vacuous: applied to the exact pre-fix correlated
+    scalar-MAX shape (preserved verbatim above), it must fail.
+    """
+    with pytest.raises(AssertionError):
+        _assert_grouped_point_lookup_source(
+            CORRELATED_SEED_LOAD_SNIPPET, "correlated_reference")
+
+
+def test_point_lookup_matrix_identical_to_correlated_reference(db_session):
+    """Behavioral half of the Codacy HIGH guard: for identical data the
+    production point lookups must select EXACTLY what the pre-fix
+    correlated scalar-MAX reference selects — same instruments, same
+    rows, same SOURCE open_time — across fallback targets, window
+    targets, and per-instrument asymmetric history.
+
+    The correlated reference is the verbatim pre-fix implementation
+    (repo precedent: _correlated_seed_load), so any semantic drift of
+    the rewrite fails this test.
+    """
+    from app.services.point_in_time import _completed_bar_open_time
+    from sqlalchemy import func as sa_func, select as sa_select
+    from sqlalchemy.orm import aliased as sa_aliased
+
+    _seed_matrix_setup(db_session)
+    # The seed-matrix Greeks have only TEST|CE rows; add TEST|PE rows so
+    # per-instrument asymmetry is covered for option_greeks_at too.
+    pe_greeks_seed = _greeks(datetime(2026, 8, 27, 7, 0))
+    pe_greeks_seed.instrument_key = "TEST|PE"
+    pe_greeks_window = _greeks(datetime(2026, 8, 27, 10, 3))
+    pe_greeks_window.instrument_key = "TEST|PE"
+    db_session.add_all([pe_greeks_seed, pe_greeks_window])
+    # GEX matrix rows: CE at 10:00 and 10:03; PE only at 07:00 (below the
+    # earliest target, exercising the seed fallback); a 10:12 CE row
+    # beyond the latest target (future-data exclusion); and one EXCLUDED
+    # PE row at 10:03 — with successful_only=True the PE 07:00 row is the
+    # latest eligible, with successful_only=False the EXCLUDED 10:03 row
+    # becomes PE's selection, so both status regimes are discriminated.
+    gex_rows = [
+        _gex(datetime(2026, 8, 27, 10, 0)),
+        _gex(datetime(2026, 8, 27, 10, 3)),
+        _gex(datetime(2026, 8, 27, 7, 0), key="TEST|PE", signed=7),
+        _gex(datetime(2026, 8, 27, 10, 12), signed=999),
+    ]
+    excluded_pe = _gex(
+        datetime(2026, 8, 27, 10, 3), key="TEST|PE", signed=-77)
+    excluded_pe.status = "EXCLUDED"
+    excluded_pe.exclusion_reason = "TEST"
+    gex_rows.append(excluded_pe)
+    db_session.add_all(gex_rows)
+    db_session.commit()
+
+    decisions = [
+        datetime(2026, 8, 27, 10, 4),   # target 10:01 -> fallback for both
+        datetime(2026, 8, 27, 10, 6),   # target 10:03 -> window rows
+        datetime(2026, 8, 27, 10, 12),  # target 10:09 -> fallback to 10:03
+    ]
+
+    def _correlated_at(model, *, success=False, calc_version=None):
+        """The pre-fix correlated scalar-MAX selection, kept as the
+        behavioral reference the grouped implementation must equal.
+        """
+        def _run(target, interval="3min"):
+            candidate = sa_aliased(model)
+            predicates = [
+                candidate.instrument_key == model.instrument_key,
+                candidate.interval == interval,
+                candidate.open_time <= target,
+            ]
+            if success:
+                predicates.append(candidate.status == "SUCCESS")
+            if calc_version is not None:
+                predicates.append(candidate.calc_version == calc_version)
+            latest = (
+                sa_select(sa_func.max(candidate.open_time))
+                .where(*predicates)
+                .correlate(model)
+                .scalar_subquery()
+            )
+            outer = [
+                model.interval == interval,
+                model.open_time == latest,
+            ]
+            if success:
+                outer.append(model.status == "SUCCESS")
+            if calc_version is not None:
+                outer.append(model.calc_version == calc_version)
+            return sorted(
+                db_session.scalars(sa_select(model).where(*outer)),
+                key=lambda row: row.instrument_key,
+            )
+
+        return _run
+
+    correlated_candles = _correlated_at(OptionCandle)
+    correlated_greeks = _correlated_at(
+        OptionGreeks, success=True, calc_version="greeks_v3")
+    correlated_gex = _correlated_at(
+        HistoricalGexSnapshot, success=True, calc_version="h_gex_v1")
+    correlated_gex_all = _correlated_at(
+        HistoricalGexSnapshot, success=False, calc_version="h_gex_v1")
+
+    pit = PointInTimeDataset(db_session)
+
+    def _fp(rows):
+        return [(r.instrument_key, r.open_time) for r in rows]
+
+    for decision in decisions:
+        target = _completed_bar_open_time(decision, "3min")
+        produced = pit.option_candles_at(
+            decision, instrument_keys=["TEST|CE", "TEST|PE"])
+        assert _fp(produced) == _fp(correlated_candles(target)), (
+            f"candles mismatch at {decision}"
+        )
+
+        produced = pit.option_greeks_at(
+            decision, instrument_keys=["TEST|CE", "TEST|PE"])
+        assert _fp(produced) == _fp(correlated_greeks(target)), (
+            f"greeks mismatch at {decision}"
+        )
+        # calc_version=None must keep resolving to the default version.
+        produced = pit.option_greeks_at(decision, calc_version=None)
+        assert _fp(produced) == _fp(correlated_greeks(target)), (
+            f"greeks (default calc_version) mismatch at {decision}"
+        )
+
+        produced = pit.historical_gex_at(decision)
+        assert _fp(produced) == _fp(correlated_gex(target)), (
+            f"gex mismatch at {decision}"
+        )
+        # successful_only=False must include ineligible (non-SUCCESS)
+        # snapshots in the selection, exactly as the correlated form did.
+        produced = pit.historical_gex_at(decision, successful_only=False)
+        assert _fp(produced) == _fp(correlated_gex_all(target)), (
+            f"gex (successful_only=False) mismatch at {decision}"
+        )
+
+    # No eligible row yet for one instrument: it must be absent while the
+    # other still contributes (per-instrument fallback).
+    early = datetime(2026, 8, 27, 7, 6)  # target 07:03
+    produced = pit.option_candles_at(
+        early, instrument_keys=["TEST|CE", "TEST|PE"])
+    assert _fp(produced) == _fp(correlated_candles(
+        _completed_bar_open_time(early, "3min")))
+    assert {k for k, _ in _fp(produced)} == {"TEST|PE"}
+
+    # Empty explicit selection stays a short-circuit for candles/greeks.
+    assert pit.option_candles_at(decisions[0], instrument_keys=[]) == []
+    assert pit.option_greeks_at(decisions[0], instrument_keys=[]) == []
+
+
+def test_point_lookup_matrix_covers_no_future_data(db_session):
+    """PIT invariant spot check inside the seed-matrix fixture: a
+    snapshot beyond the completed-bar target never leaks into the
+    per-instrument selection.
+    """
+    db_session.add_all([
+        _gex(datetime(2026, 8, 27, 10, 0)),
+        _gex(datetime(2026, 8, 27, 10, 3)),
+        _gex(datetime(2026, 8, 27, 10, 3), key="TEST|PE", signed=-3000),
+        _gex(datetime(2026, 8, 27, 10, 12), signed=999),  # future
+    ])
+    db_session.commit()
+    decision = datetime(2026, 8, 27, 10, 6)  # target 10:03
+    pit = PointInTimeDataset(db_session)
+
+    rows = pit.historical_gex_at(decision)
+    assert all(row.open_time <= datetime(2026, 8, 27, 10, 3) for row in rows)
+    assert {row.instrument_key: row.open_time for row in rows} == {
+        "TEST|CE": datetime(2026, 8, 27, 10, 3),
+        "TEST|PE": datetime(2026, 8, 27, 10, 3),
+    }
+
+
 @pytest.mark.parametrize("use_grouped", [False, True])
 def test_bounded_seed_matrix_identical_selections(
     db_session, monkeypatch, use_grouped

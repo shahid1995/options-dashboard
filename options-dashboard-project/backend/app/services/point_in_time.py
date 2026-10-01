@@ -15,7 +15,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 
 from sqlalchemy import Select, func, select
-from sqlalchemy.orm import Session, aliased
+from sqlalchemy.orm import Session
 
 from app.models import (
     HistoricalGexSnapshot,
@@ -230,24 +230,37 @@ class PointInTimeDataset:
         if instrument_keys is not None and not instrument_keys:
             return []
 
-        candidate = aliased(OptionCandle)
-        latest_open_time = (
-            select(func.max(candidate.open_time))
-            .where(
-                candidate.instrument_key == OptionCandle.instrument_key,
-                candidate.interval == interval,
-                candidate.open_time <= target,
+        # Grouped greatest-n-per-group selection (Codacy HIGH, Day 49):
+        # one GROUP BY/max-join — no correlated scalar MAX. The
+        # eligibility predicates apply inside the aggregation, and the
+        # outer scan re-applies them (plus the explicit target bound) so
+        # the selected row is itself eligible. Uniqueness of
+        # (instrument_key, interval, open_time) makes the join-back
+        # unambiguous.
+        latest_opens = (
+            select(
+                OptionCandle.instrument_key.label("latest_instrument_key"),
+                func.max(OptionCandle.open_time).label("latest_open_time"),
             )
-            .correlate(OptionCandle)
-            .scalar_subquery()
+            .where(
+                OptionCandle.interval == interval,
+                OptionCandle.open_time <= target,
+                *(
+                    [OptionCandle.instrument_key.in_(instrument_keys)]
+                    if instrument_keys is not None
+                    else []
+                ),
+            )
+            .group_by(OptionCandle.instrument_key)
+            .subquery()
         )
 
         statement = select(OptionCandle).where(
             OptionCandle.interval == interval,
-            OptionCandle.open_time == latest_open_time,
+            OptionCandle.open_time <= target,
+            OptionCandle.instrument_key == latest_opens.c.latest_instrument_key,
+            OptionCandle.open_time == latest_opens.c.latest_open_time,
         )
-        if instrument_keys is not None:
-            statement = statement.where(OptionCandle.instrument_key.in_(instrument_keys))
         statement = statement.order_by(OptionCandle.instrument_key)
         return list(self.db.scalars(statement))
 
@@ -265,27 +278,41 @@ class PointInTimeDataset:
         if instrument_keys is not None and not instrument_keys:
             return []
 
-        candidate = aliased(OptionGreeks)
-        latest_open_time = (
-            select(func.max(candidate.open_time))
-            .where(
-                candidate.instrument_key == OptionGreeks.instrument_key,
-                candidate.interval == interval,
-                candidate.open_time <= target,
-                candidate.status == "SUCCESS",
-                candidate.calc_version == (calc_version or DEFAULT_GREEKS_CALC_VERSION),
+        version = calc_version or DEFAULT_GREEKS_CALC_VERSION
+        # Grouped greatest-n-per-group selection (Codacy HIGH, Day 49):
+        # one GROUP BY/max-join — no correlated scalar MAX. Eligibility
+        # predicates apply inside the aggregation and are mirrored on the
+        # outer scan (plus the explicit target bound); uniqueness of
+        # (instrument_key, interval, open_time, calc_version) makes the
+        # join-back unambiguous.
+        latest_opens = (
+            select(
+                OptionGreeks.instrument_key.label("latest_instrument_key"),
+                func.max(OptionGreeks.open_time).label("latest_open_time"),
             )
-            .correlate(OptionGreeks)
-            .scalar_subquery()
+            .where(
+                OptionGreeks.interval == interval,
+                OptionGreeks.open_time <= target,
+                OptionGreeks.status == "SUCCESS",
+                OptionGreeks.calc_version == version,
+                *(
+                    [OptionGreeks.instrument_key.in_(instrument_keys)]
+                    if instrument_keys is not None
+                    else []
+                ),
+            )
+            .group_by(OptionGreeks.instrument_key)
+            .subquery()
         )
+
         statement = select(OptionGreeks).where(
             OptionGreeks.interval == interval,
-            OptionGreeks.open_time == latest_open_time,
+            OptionGreeks.open_time <= target,
             OptionGreeks.status == "SUCCESS",
-            OptionGreeks.calc_version == (calc_version or DEFAULT_GREEKS_CALC_VERSION),
+            OptionGreeks.calc_version == version,
+            OptionGreeks.instrument_key == latest_opens.c.latest_instrument_key,
+            OptionGreeks.open_time == latest_opens.c.latest_open_time,
         )
-        if instrument_keys is not None:
-            statement = statement.where(OptionGreeks.instrument_key.in_(instrument_keys))
         statement = statement.order_by(OptionGreeks.instrument_key)
         return list(self.db.scalars(statement))
 
@@ -557,33 +584,47 @@ class PointInTimeDataset:
         completed-bar target, mirroring ``option_greeks_at``. A global
         maximum would drop every instrument whose freshest eligible
         snapshot predates another instrument's.
+
+        Implementation note (Codacy HIGH, Day 49): the per-instrument
+        maximum is a portable GROUP BY / max-join selection — the same
+        shape as ``_load_bounded_histories`` — instead of a correlated
+        scalar MAX, which re-executes a bounded top-1 probe for every
+        scanned row and degrades linearly with history size on
+        PostgreSQL and CockroachDB alike.
         """
         cutoff = _require_cutoff(decision_timestamp)
         target = _completed_bar_open_time(cutoff, interval)
 
-        candidate = aliased(HistoricalGexSnapshot)
-        latest_open_time = (
-            select(func.max(candidate.open_time))
-            .where(
-                candidate.instrument_key == HistoricalGexSnapshot.instrument_key,
-                candidate.interval == interval,
-                candidate.open_time <= target,
-                candidate.calc_version == calc_version,
-            )
-        )
+        # Grouped greatest-n-per-group selection (Codacy HIGH, Day 49):
+        # one GROUP BY/max-join — no correlated scalar MAX. Eligibility
+        # predicates apply inside the aggregation and are mirrored on the
+        # outer scan (plus the explicit target bound); uniqueness of
+        # (instrument_key, interval, open_time, calc_version) makes the
+        # join-back unambiguous.
+        eligibility = [
+            HistoricalGexSnapshot.interval == interval,
+            HistoricalGexSnapshot.open_time <= target,
+            HistoricalGexSnapshot.calc_version == calc_version,
+        ]
         if successful_only:
-            latest_open_time = latest_open_time.where(
-                candidate.status == "SUCCESS")
-        latest_open_time = latest_open_time.correlate(
-            HistoricalGexSnapshot).scalar_subquery()
+            eligibility.append(HistoricalGexSnapshot.status == "SUCCESS")
+        latest_opens = (
+            select(
+                HistoricalGexSnapshot.instrument_key.label(
+                    "latest_instrument_key"),
+                func.max(HistoricalGexSnapshot.open_time).label(
+                    "latest_open_time"),
+            )
+            .where(*eligibility)
+            .group_by(HistoricalGexSnapshot.instrument_key)
+            .subquery()
+        )
 
         statement = select(HistoricalGexSnapshot).where(
-            HistoricalGexSnapshot.interval == interval,
-            HistoricalGexSnapshot.open_time == latest_open_time,
-            HistoricalGexSnapshot.calc_version == calc_version,
+            *eligibility,
+            HistoricalGexSnapshot.instrument_key == latest_opens.c.latest_instrument_key,
+            HistoricalGexSnapshot.open_time == latest_opens.c.latest_open_time,
         )
-        if successful_only:
-            statement = statement.where(HistoricalGexSnapshot.status == "SUCCESS")
         return list(self.db.scalars(statement))
 
     def historical_gex_selections_at_many(
