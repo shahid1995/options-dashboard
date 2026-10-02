@@ -113,6 +113,16 @@ RISK_FREE_RATE = 0.065
 #: Raw broker IV values are percentages (e.g. 12.5); model IV is a fraction.
 IV_PERCENT_THRESHOLD = 3.0
 
+#: Slice A (Issue #118) is deliberately NIFTY-only.  The Day-28/30 regime and
+#: spot-move evidence is sourced from ``NiftyCandle`` — the ONLY stored spot
+#: candle series in the schema (``app/models.py``: NiftyCandle + OptionCandle)
+#: — and every evidence contract below is labelled with this underlying.
+#: ``UPSTOX_INSTRUMENTS`` lists further indices, so an unsupported symbol must
+#: fail closed at the producer boundary rather than be processed under NIFTY
+#: evidence.  Parameterising Slice A would require a new historical evidence
+#: model, which is explicitly out of scope.
+SLICE_A_UNDERLYING = "NIFTY"
+
 _SIDE_TO_MARKET = {"call": "call", "put": "put"}
 _SIDE_TO_SIDE = {"call": Side.CALL, "put": Side.PUT}
 _SIDE_TO_OPTION_TYPE = {"call": OptionType.CE, "put": OptionType.PE}
@@ -214,24 +224,85 @@ def _provenance(received_at: datetime) -> Provenance:
     )
 
 
-def _quality() -> QualityResult:
-    """A recorded EXCELLENT quality result for the producer's canonical
-    chain evidence (dimensions: the Day-12 vocabulary applied to a broker
-    chain snapshot with all required fields present)."""
-    from app.market_data.quality import DimensionResult
+def _chain_observation(
+    chain: dict, *, symbol: str, expiry: str, received_at: datetime,
+):
+    """The canonical Day-9 chain observation for this exact snapshot.
 
-    return QualityResult(
-        quality_score=100,
-        quality_state=QualityState.EXCELLENT,
-        critical_failure=False,
-        issues=(),
-        dimensions=(),
-        evaluated_at=None,
-        observation_time=None,
-        observation_type="chain",
-        contract_version="1",
-        reference_time=None,
+    Built from the adapter's ALREADY-canonical rows, so nothing is
+    re-derived or invented here: a field the broker did not report stays
+    missing (``None``), exactly as the Day-9 contracts require.  This is
+    the input the Day-12 quality engine evaluates, so the producer's
+    quality result is measured from the same evidence the candidate uses.
+    """
+    from app.market_data.contracts import (
+        ContractVersion,
+        DataMode,
+        OptionChainObservation,
+        OptionChainRow,
+        PriceQuote,
     )
+
+    rows: list[OptionChainRow] = []
+    event_times: list[datetime] = []
+    for row in chain.get("chain", []):
+        strike = _finite(row.get("strike"))
+        if strike is None or strike <= 0:
+            continue
+        legs: dict[str, PriceQuote | None] = {}
+        for name in ("call", "put"):
+            raw = row.get(name) or {}
+            ltp = _finite(raw.get("ltp"))
+            if ltp is None:
+                legs[name] = None  # absent leg, never a fabricated zero
+                continue
+            stamp = _parse_broker_ts(raw.get("quote_timestamp"))
+            if stamp is not None:
+                event_times.append(stamp)
+            legs[name] = PriceQuote(
+                ltp=ltp,
+                bid=_finite(raw.get("bid_price")),
+                ask=_finite(raw.get("ask_price")),
+                volume=_finite(raw.get("volume")),
+                oi=_finite(raw.get("oi")),
+                iv=_scale_iv(_finite(raw.get("iv"))),
+                source="UPSTOX",
+                event_timestamp=stamp,
+            )
+        rows.append(OptionChainRow(
+            strike=strike, call=legs["call"], put=legs["put"]))
+    rows.sort(key=lambda item: item.strike)
+
+    return OptionChainObservation(
+        symbol=symbol,
+        expiry_date=str(expiry),
+        underlying_spot_price=_finite(chain.get("underlying_spot_price")),
+        chain=rows,
+        # The broker's own event time (max across legs) — never the receive
+        # time, and never synthesized when the payload carries none.
+        market_timestamp=max(event_times) if event_times else None,
+        received_timestamp=received_at,
+        source="UPSTOX",
+        data_mode=DataMode.BROKER_SNAPSHOT,
+        contract_version=ContractVersion.v1_0_0,
+    )
+
+
+def _quality(observation, *, reference_ts: datetime) -> QualityResult:
+    """Measure chain quality with the REAL Day-12 engine.
+
+    The previous implementation returned a hard-coded EXCELLENT/100 with no
+    dimensions, which is fabricated evidence: it asserted measured freshness,
+    completeness, validity and provenance that were never measured, and no
+    quality requirement could ever fail because of it.  The engine is
+    deterministic and takes an explicit ``reference_time``, so the producer's
+    own authoritative reference timestamp is used — this introduces no second
+    wall-clock read.
+    """
+    from app.market_data.quality import MarketDataQualityEngine
+
+    return MarketDataQualityEngine().evaluate(
+        observation, reference_time=reference_ts)
 
 
 def _extract_sides(chain: dict) -> list[ChainSide]:
@@ -262,15 +333,6 @@ def _extract_sides(chain: dict) -> list[ChainSide]:
                 quote_ts=_parse_broker_ts(side.get("quote_timestamp")),
             ))
     return out
-
-
-def _side_index(sides: list[ChainSide]) -> dict[tuple[float, str], ChainSide]:
-    return {(s.strike, name): s
-            for s in sides
-            for name in ("call", "put")
-            if (s.strike, name) in {(s.strike, "call"), (s.strike, "put")}
-            and ((name == "call") == (s.instrument_key is not None or True))
-            and False} or {}
 
 
 def _reference_ts(sides: list[ChainSide], received_at: datetime) -> datetime:
@@ -592,6 +654,7 @@ def produce_candidate_core(
     id_seed: str,
     strategy_id: str,
     legs: list[dict],
+    underlying: str = SLICE_A_UNDERLYING,
 ) -> ProducedCandidate:
     """Assemble genuine evidence and run the existing Day-20 → Day-32 chain.
 
@@ -613,10 +676,21 @@ def produce_candidate_core(
     side_index = _build_side_index(chain)
 
     provenance = _provenance(received_at)
-    quality = _quality()
     reference_ts = _reference_ts(sides, received_at)
     spot_change = (spot - prev_spot) if prev_spot is not None else None
     expiry = str(legs[0]["expiration_date"]) if legs else None
+    # Quality is MEASURED over this snapshot by the real Day-12 engine
+    # (never asserted).  The engine is bounded by the producer's own
+    # authoritative reference timestamp, so no second clock read is added.
+    quality = _quality(
+        _chain_observation(
+            chain,
+            symbol=underlying,
+            expiry=expiry or "",
+            received_at=received_at,
+        ),
+        reference_ts=reference_ts,
+    )
 
     # -- measured per-strike rows with D1 ΔOI --------------------------------
     key_by_market_side: dict[tuple[float, str], str | None] = {}
@@ -661,7 +735,7 @@ def produce_candidate_core(
         ))
 
     positioning_input = PositioningInput(
-        underlying="NIFTY",
+        underlying=underlying,
         rows=tuple(rows),
         reference_timestamp=reference_ts,
         provenance=provenance,
@@ -676,7 +750,7 @@ def produce_candidate_core(
         positioning_metrics.net_chain_oi_change, spot_change)
 
     flow_result = evaluate_flow(FlowInput(
-        underlying="NIFTY",
+        underlying=underlying,
         reference_timestamp=reference_ts,
         provenance=provenance,
         expiry=expiry,
@@ -690,7 +764,7 @@ def produce_candidate_core(
     ))
 
     level_input = LevelInput(
-        underlying="NIFTY",
+        underlying=underlying,
         rows=tuple(rows),
         reference_timestamp=reference_ts,
         provenance=provenance,
@@ -702,7 +776,7 @@ def produce_candidate_core(
     classifications = classify_levels(level_input)
 
     institutional_result = evaluate_institutional(InstitutionalInput(
-        underlying="NIFTY",
+        underlying=underlying,
         reference_timestamp=reference_ts,
         provenance=provenance,
         expiry=expiry,
@@ -719,7 +793,7 @@ def produce_candidate_core(
     ))
 
     regime_result = evaluate_regime(RegimeInput(
-        underlying="NIFTY",
+        underlying=underlying,
         reference_timestamp=reference_ts,
         provenance=provenance,
         expiry=expiry,
@@ -737,7 +811,7 @@ def produce_candidate_core(
     ))
 
     synthesis_result = evaluate_synthesis(SynthesisInput(
-        underlying="NIFTY",
+        underlying=underlying,
         reference_timestamp=reference_ts,
         provenance=provenance,
         expiry=expiry,
@@ -757,7 +831,7 @@ def produce_candidate_core(
 
     observation = Observation(
         observation_id=f"obs-{id_seed}",
-        underlying="NIFTY",
+        underlying=underlying,
         upstream=synthesis_result,
         expiry=expiry,
         kind=ObservationKind.INTELLIGENCE_RESULT,
@@ -784,7 +858,7 @@ def produce_candidate_core(
             continue  # no genuine ΔOI ⇒ unrankable ⇒ suppressed (D1)
         candidates.append(StrikeCandidateInput(
             candidate_id=f"strike:{strike:g}:{side_name}",
-            underlying="NIFTY",
+            underlying=underlying,
             option_type=_SIDE_TO_OPTION_TYPE[side_name],
             strike=strike,
             expiry=expiry,
@@ -841,7 +915,9 @@ def produce_candidate_core(
                        else PositionDirection.SHORT),
             entry_price=side.ltp,
             implied_volatility=_scale_iv(side.iv) or _atm_iv(sides, spot),
-            quality=QualityState.EXCELLENT,
+            # The MEASURED Day-12 state for this snapshot — never a
+            # hard-coded EXCELLENT.
+            quality=quality.quality_state,
             provenance=provenance,
         )
         quant_legs.append(quant_leg)
@@ -982,6 +1058,7 @@ async def produce_candidate_and_execute(
     request,
     prices: dict,
     *,
+    chains: dict | None = None,
     token_resolver: Callable[[Session, str], str] | None = None,
     fetch_chain: Callable[[str, str, str], Any] | None = None,
     resolve_keys: Callable[[list[dict], str], Any] | None = None,
@@ -1019,6 +1096,20 @@ async def produce_candidate_and_execute(
     received_at = (moment if moment.tzinfo
                    else moment.replace(tzinfo=timezone.utc))
 
+    # 0b. Slice A is NIFTY-only.  The evidence chain is wired to NIFTY spot
+    #     history (NiftyCandle) and every evidence contract is labelled with
+    #     that underlying, so any other supported instrument must fail closed
+    #     here — before any broker/session work — rather than be processed
+    #     and mislabelled under NIFTY evidence.
+    symbol = str(request.symbol).upper()
+    if symbol != SLICE_A_UNDERLYING:
+        raise _fail(
+            "UNSUPPORTED_SYMBOL",
+            f"Slice A candidate production supports {SLICE_A_UNDERLYING} "
+            f"only; the Day-28→Day-33 evidence chain is sourced from "
+            f"{SLICE_A_UNDERLYING} history, so {symbol} cannot produce a "
+            "genuine candidate. Order was not executed.")
+
     # 1. Server-side broker market-data authorization (existing mechanism).
     try:
         market_data_token = (token_resolver or _default_token_resolver)(
@@ -1046,19 +1137,26 @@ async def produce_candidate_and_execute(
             "Slice A supports single-expiry entries only; order was not "
             "executed")
     expiry = expiries[0]
-    symbol = str(request.symbol).upper()
 
-    # 2. ONE canonical chain fetch via the existing adapter path (D2).
-    try:
-        chain = await (fetch_chain or _default_fetch_chain)(
-            symbol, expiry, market_data_token)
-    except PaperExecutionError:
-        raise
-    except Exception as exc:
-        raise _fail(
-            "CHAIN_DATA_MISSING",
-            "the live option chain could not be acquired; order was not "
-            "executed") from exc
+    # 2. ONE canonical chain snapshot via the existing adapter path (D2).
+    #    When the caller already fetched this expiry's chain for execution
+    #    pricing, that SAME payload is reused: the candidate's evidence and
+    #    the execution fill prices then come from one authoritative broker
+    #    read, so the recorded reference timestamp cannot describe a
+    #    different snapshot than the prices that actually fill.
+    snapshot = (chains or {}).get(expiry)
+    if snapshot is None:
+        try:
+            snapshot = await (fetch_chain or _default_fetch_chain)(
+                symbol, expiry, market_data_token)
+        except PaperExecutionError:
+            raise
+        except Exception as exc:
+            raise _fail(
+                "CHAIN_DATA_MISSING",
+                "the live option chain could not be acquired; order was not "
+                "executed") from exc
+    chain = snapshot
 
     # 3. Broker instrument keys (existing adapter rule).
     try:
@@ -1096,6 +1194,7 @@ async def produce_candidate_and_execute(
             id_seed=request.client_order_id.replace(":", "-"),
             strategy_id=strategy_id,
             legs=legs,
+            underlying=symbol,
         )
     except ProducerError as exc:
         raise _fail(exc.code, str(exc)) from exc

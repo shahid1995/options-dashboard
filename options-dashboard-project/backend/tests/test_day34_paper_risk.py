@@ -38,6 +38,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.db import Base, get_db
 from app.main import app
+from app.routers.deps import SESSION_COOKIE_NAME
 from app.models import (
     Leg,
     PaperAccount,
@@ -121,11 +122,17 @@ def client(db_session):
 def logged_in(client, db_session):
     from tests.test_helpers import create_test_identity
     session_id, _ = create_test_identity(db_session, "tok-day34")
+    # Canonical transport: the HttpOnly session cookie — never a header.
+    client.cookies.set(SESSION_COOKIE_NAME, session_id)
     return session_id
 
 
 def _headers(session_id):
-    return {"X-Session-Id": session_id}
+    """Session credentials never travel in headers (repo AGENTS.md).  The
+    canonical browser transport is the HttpOnly session cookie, which the
+    ``logged_in`` fixture sets on the client; this stays a no-op so call
+    sites read explicitly."""
+    return {}
 
 
 def _counts(db):
@@ -432,8 +439,16 @@ class TestCandidateRequiredRejections:
                                headers=_headers(logged_in), json=payload)
         assert resp.status_code == 409
         detail = resp.json()["detail"]
-        assert ("MARKET_DATA_UNAUTHORIZED" in detail
-                or "STRATEGY_CANDIDATE_REQUIRED" in detail)
+        # Day 50 / Issue #118 Slice A: the route produces the genuine candidate
+        # SERVER-SIDE before execution, so a bare manual entry can no longer
+        # reach the choke point at all — it fails closed at the producer
+        # boundary, because this identity carries no broker market-data
+        # credential.  Pinned exactly, not as a disjunction: the earlier guard
+        # is deterministic.  The fail-closed guarantee and zero mutation are
+        # unchanged, and the choke-point-level STRATEGY_CANDIDATE_REQUIRED
+        # invariant for direct service calls is covered by
+        # test_candidate_production.py::test_choke_point_still_rejects_missing_candidate_directly.
+        assert "MARKET_DATA_UNAUTHORIZED" in detail, detail
         assert _counts(db_session) == before
 
     def test_template_entry_rejected_with_zero_mutation(
