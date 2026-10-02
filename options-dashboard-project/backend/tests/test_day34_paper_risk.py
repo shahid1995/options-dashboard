@@ -38,6 +38,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.db import Base, get_db
 from app.main import app
+from app.routers.deps import SESSION_COOKIE_NAME
 from app.models import (
     Leg,
     PaperAccount,
@@ -121,11 +122,46 @@ def client(db_session):
 def logged_in(client, db_session):
     from tests.test_helpers import create_test_identity
     session_id, _ = create_test_identity(db_session, "tok-day34")
+    # Canonical transport: the HttpOnly session cookie — never a header.
+    client.cookies.set(SESSION_COOKIE_NAME, session_id)
     return session_id
 
 
+@pytest.fixture(autouse=True)
+def authoritative_lot_sizes():
+    """Day 49: paper entries resolve broker-authoritative lot sizes before any
+    candidate work.  Stub that broker call so this suite exercises Day-34
+    enforcement, never the network."""
+
+    async def fake_lot_sizes(access_token, symbol, legs):
+        return {
+            (
+                str(leg.expiration_date),
+                float(leg.strike_price),
+                str(leg.option_type).lower(),
+            ): LOT
+            for leg in legs
+        }
+
+    # Both entry surfaces resolve lot sizes before any candidate work: the
+    # custom route binds the name at import time, the template route imports
+    # it inside the handler — so both seams are stubbed.
+    with patch(
+        "app.routers.paper.resolve_authoritative_lot_sizes",
+        new=AsyncMock(side_effect=fake_lot_sizes),
+    ), patch(
+        "app.services.paper_contracts.resolve_authoritative_lot_sizes",
+        new=AsyncMock(side_effect=fake_lot_sizes),
+    ):
+        yield
+
+
 def _headers(session_id):
-    return {"X-Session-Id": session_id}
+    """Session credentials never travel in headers (repo AGENTS.md).  The
+    canonical browser transport is the HttpOnly session cookie, which the
+    ``logged_in`` fixture sets on the client; this stays a no-op so call
+    sites read explicitly."""
+    return {}
 
 
 def _counts(db):
@@ -416,17 +452,32 @@ class TestCandidateRequiredRejections:
             }],
         }
         before = _counts(db_session)
-        # Market/chain resolution is valid (per mandate ordering: market-data
-        # resolution precedes candidate resolution), so the request reaches
-        # the Day-34 mutation choke point where the missing genuine
-        # Strategy Candidate is rejected pre-write.
+        # Day 50 / Issue #118 Slice A: the route produces the genuine
+        # candidate SERVER-SIDE before execution. A bare manual entry can no
+        # longer reach the choke point at all: it fails closed at the
+        # producer boundary (this test identity carries no broker
+        # market-data credential, so the producer rejects with
+        # MARKET_DATA_UNAUTHORIZED before acquiring any evidence). The
+        # fail-closed guarantee and zero mutation are unchanged; the
+        # choke-point-level STRATEGY_CANDIDATE_REQUIRED invariant for direct
+        # service calls remains covered by the Day-50 suite.
         with patch("app.routers.paper.resolve_market_prices",
                    new_callable=AsyncMock) as mock_prices:
             mock_prices.return_value = {(EXPIRY, 20000.0, "call"): 100.0}
             resp = client.post("/paper/executions",
                                headers=_headers(logged_in), json=payload)
         assert resp.status_code == 409
-        assert "STRATEGY_CANDIDATE_REQUIRED" in resp.json()["detail"]
+        detail = resp.json()["detail"]
+        # Day 50 / Issue #118 Slice A: the route produces the genuine candidate
+        # SERVER-SIDE before execution, so a bare manual entry can no longer
+        # reach the choke point at all — it fails closed at the producer
+        # boundary, because this identity carries no broker market-data
+        # credential.  Pinned exactly, not as a disjunction: the earlier guard
+        # is deterministic.  The fail-closed guarantee and zero mutation are
+        # unchanged, and the choke-point-level STRATEGY_CANDIDATE_REQUIRED
+        # invariant for direct service calls is covered by
+        # test_candidate_production.py::test_choke_point_still_rejects_missing_candidate_directly.
+        assert "MARKET_DATA_UNAUTHORIZED" in detail, detail
         assert _counts(db_session) == before
 
     def test_template_entry_rejected_with_zero_mutation(
