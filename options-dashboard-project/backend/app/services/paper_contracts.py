@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from app.brokers import gateway
+from app.brokers.domain.enums import BROKER_ID_UPSTOX
 from app.brokers.domain.errors import BrokerError
-from app.config import BROKER_ID_UPSTOX
 from app.services.paper_execution import PaperExecutionError
 
 
