@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from math import isfinite
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -169,13 +170,20 @@ class ProducedCandidate:
 # ---------------------------------------------------------------------------
 
 def _finite(value: Any) -> float | None:
+    """Measured float, else None.
+
+    NaN and the infinities are NOT measured quantities, so they stay missing
+    exactly like an absent field: letting ``inf`` through would carry a
+    non-finite price into the evidence chain, and the name promises a
+    genuinely finite value.
+    """
     if value is None:
         return None
     try:
         out = float(value)
     except (TypeError, ValueError):
         return None
-    return out if out == out else None  # NaN → missing
+    return out if isfinite(out) else None
 
 
 def _scale_iv(raw_iv: float | None) -> float | None:
@@ -470,6 +478,21 @@ def _time_to_expiry_years(expiry: str, reference_ts: datetime) -> float:
     return max(seconds / (365.0 * 24 * 3600), 0.0)
 
 
+def _pnl_sign(pnl: float) -> int:
+    """Sign bucket of a grid P&L: ``-1``, ``0`` or ``+1``.
+
+    Bucketing keeps the breakeven scan free of raw float-equality tests
+    while preserving the exact semantics: a grid point whose P&L is exactly
+    zero is itself a breakeven.  Non-finite P&Ls never reach this helper
+    (the payoff scan drops them as PARTIAL), so ``0`` is unambiguous.
+    """
+    if pnl > 0.0:
+        return 1
+    if pnl < 0.0:
+        return -1
+    return 0
+
+
 def _expiry_payoff(
     legs: list[dict], spot: float, reference_ts: datetime,
     provenance: Provenance,
@@ -480,13 +503,16 @@ def _expiry_payoff(
     ``evaluate_portfolio`` at ``time_to_expiry = 0`` (the engine's intrinsic
     convention) over a deterministic spot grid around the observed spot.
     Entry premium per leg is the measured chain LTP signed by direction —
-    no independent payoff formula is implemented here.  Raises
-    ``ProducerError`` when no grid point prices completely (fail closed).
+    no independent payoff formula is implemented here.  A grid point the
+    engine cannot price completely — or that comes back non-finite — is
+    dropped as genuinely missing (the result is then PARTIAL), never
+    zero-filled.  Raises ``ProducerError`` when no grid point prices
+    completely (fail closed).
     """
     context = _calc_context(reference_ts)
     grid = [spot * (1.0 + frac) for frac in
             (-0.10, -0.075, -0.05, -0.025, 0.0, 0.025, 0.05, 0.075, 0.10)]
-    pnls: list[float] = []
+    samples: list[tuple[float, float]] = []
     partial = False
     for grid_spot in grid:
         port = evaluate_portfolio(
@@ -496,27 +522,35 @@ def _expiry_payoff(
             time_to_expiry=0.0,
             implied_volatility=None,
         )
-        if port.partial or port.total_pnl is None:
+        if (port.partial or port.total_pnl is None
+                or not isfinite(port.total_pnl)):
             partial = True
             continue
-        pnls.append(port.total_pnl)
-    if not pnls:
+        samples.append((grid_spot, port.total_pnl))
+    if not samples:
         raise ProducerError(
             "EVIDENCE_INSUFFICIENT",
             "the expiry payoff could not be derived from the shared quant "
             "engine; entry fails closed",
         )
 
+    pnls = [pnl for _, pnl in samples]
+
     net = 0.0
     for leg in legs:
         net += _SIDE_SIGN[leg["direction"]] * leg["ltp"] * float(leg["quantity"])
 
+    # Each sample carries its own spot label: when a grid point is dropped
+    # the P&L series is shorter than the grid, so pairing the two by
+    # position would attribute a breakeven to a spot that was never sampled
+    # (fabricated evidence).
     breakevens: list[float] = []
-    for lo_pnl, hi_pnl, lo_spot, hi_spot in zip(
-            pnls, pnls[1:], grid, grid[1:]):
-        if lo_pnl == 0.0:
+    for (lo_spot, lo_pnl), (hi_spot, hi_pnl) in zip(samples, samples[1:]):
+        lo_sign = _pnl_sign(lo_pnl)
+        if lo_sign == 0:
+            # Exactly flat at this grid point: that spot IS a breakeven.
             breakevens.append(lo_spot)
-        elif (lo_pnl > 0) != (hi_pnl > 0):
+        elif lo_sign != _pnl_sign(hi_pnl):
             span = abs(lo_pnl) + abs(hi_pnl)
             frac = abs(lo_pnl) / span if span else 0.0
             breakevens.append(lo_spot + (hi_spot - lo_spot) * frac)

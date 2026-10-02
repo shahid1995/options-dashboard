@@ -48,6 +48,10 @@ from app.services.candidate_production import (
 )
 from app.routers.deps import SESSION_COOKIE_NAME
 from app.services.paper_execution import PaperExecutionError
+from app.strategy_evaluation.contracts import (
+    DimensionState,
+    PayoffExpirySemantics,
+)
 
 #: Broker-authoritative index option lot size used by the route-level stubs.
 BROKER_LOT = 65
@@ -979,6 +983,130 @@ class TestMeasuredEvidenceQuality:
         )
         assert _usable_quality(unusable) is False
         assert _usable_quality(None) is False
+
+
+# ---------------------------------------------------------------------------
+# Expiry-payoff scan: measured P&L only, and breakevens keep their own spot
+# ---------------------------------------------------------------------------
+
+class TestExpiryPayoffScan:
+    """The Day-18 payoff scan must report measured P&L only, and every
+    breakeven must stay attached to the spot it was measured at.  The shared
+    quant engine is replaced with a scripted stand-in so the scan's own
+    semantics are what is under test."""
+
+    SPOT = 100.0
+    GRID = tuple(100.0 * (1.0 + frac) for frac in
+                 (-0.10, -0.075, -0.05, -0.025, 0.0, 0.025, 0.05, 0.075, 0.10))
+
+    def _legs(self):
+        """Short 100 call / long 105 call (the fixture's spread shape)."""
+        return [
+            {"expiration_date": "2026-10-29", "strike_price": 100.0,
+             "option_type": "call", "action": "sell", "quantity": 1.0,
+             "direction": "sell", "ltp": 4.0, "quant_leg": object()},
+            {"expiration_date": "2026-10-29", "strike_price": 105.0,
+             "option_type": "call", "action": "buy", "quantity": 1.0,
+             "direction": "buy", "ltp": 10.0, "quant_leg": object()},
+        ]
+
+    def _payoff(self, pnl_for_spot, drop=None):
+        from app.market_data.contracts import Provenance
+        from app.services.candidate_production import _expiry_payoff
+
+        provenance = Provenance(
+            source="UPSTOX",
+            collection_mode="live",
+            received_at=REF_TS,
+            normalization_version="test",
+            contract_version="1",
+            transformation_id="day50-payoff-scan-test",
+        )
+
+        class _Portfolio:
+            def __init__(self, total_pnl, partial=False):
+                self.total_pnl = total_pnl
+                self.partial = partial
+
+        def scripted(legs, context, *, spot, time_to_expiry,
+                     implied_volatility):
+            if drop is not None and drop(spot):
+                return _Portfolio(None, partial=True)
+            return _Portfolio(pnl_for_spot(spot))
+
+        with patch("app.services.candidate_production.evaluate_portfolio",
+                   scripted):
+            return _expiry_payoff(self._legs(), self.SPOT, REF_TS, provenance)
+
+    def test_exactly_flat_grid_spots_are_breakevens(self):
+        """A measured P&L of exactly zero at a grid spot IS a breakeven
+        there; the scan must not require a sign change to report it."""
+        payoff = self._payoff(
+            lambda spot: 30.0 if spot <= 97.5 else
+            (0.0 if spot <= 102.5 else -20.0))
+
+        # 97.5 → 100.0 interpolates onto exactly 100.0; 102.5 is measured flat.
+        assert payoff.breakevens == (100.0, 102.5)
+        assert payoff.state is DimensionState.AVAILABLE
+        assert payoff.expiry_semantics is \
+            PayoffExpirySemantics.SAME_EXPIRY_EXACT
+        assert payoff.net_debit_credit == 6.0
+        assert payoff.premium_outlay == 6.0
+
+    def test_non_finite_grid_pnl_never_becomes_evidence(self):
+        """``nan``/``inf`` are not measurements: those grid spots are dropped
+        (PARTIAL) instead of entering max/min or a breakeven."""
+        scripted = {spot: -50.0 for spot in self.GRID}
+        scripted[self.GRID[2]] = float("inf")
+        scripted[self.GRID[4]] = float("nan")
+        scripted[self.GRID[8]] = float("-inf")
+        for spot in self.GRID[5:8]:
+            scripted[spot] = 20.0
+
+        payoff = self._payoff(lambda spot: scripted[spot])
+
+        assert payoff.state is DimensionState.PARTIAL
+        assert payoff.max_profit == 20.0
+        assert payoff.max_loss == -50.0
+        assert payoff.breakevens
+
+    def test_all_grid_spots_unpriceable_fails_closed(self):
+        from app.services.candidate_production import ProducerError
+
+        with pytest.raises(ProducerError) as excinfo:
+            self._payoff(lambda spot: float("nan"))
+
+        assert excinfo.value.code == "EVIDENCE_INSUFFICIENT"
+
+    def test_dropped_grid_spot_does_not_shift_breakeven_labels(self):
+        """A dropped grid spot leaves a shorter P&L series; a breakeven must
+        still be labelled with the spots it was really interpolated between,
+        never with a spot that was never sampled."""
+        scripted = {spot: -100.0 for spot in self.GRID}
+        scripted[self.GRID[4]] = -80.0
+        for spot in self.GRID[5:]:
+            scripted[spot] = 50.0
+
+        payoff = self._payoff(
+            lambda spot: scripted[spot],
+            drop=lambda spot: spot == self.GRID[3],
+        )
+
+        # The sign change is between the measured 100.0 (-80) and 102.5 (+50)
+        # levels: 100.0 + 2.5 * 80/130.
+        assert payoff.breakevens == (101.54,)
+        assert payoff.state is DimensionState.PARTIAL
+
+    def test_sign_bucket_is_exact_not_tolerant(self):
+        """The bucket is exact: a tiny non-zero P&L is a real sign, and only
+        a measured zero is flat."""
+        from app.services.candidate_production import _pnl_sign
+
+        assert _pnl_sign(0.0) == 0
+        assert _pnl_sign(5.0) == 1
+        assert _pnl_sign(-5.0) == -1
+        assert _pnl_sign(1e-18) == 1
+        assert _pnl_sign(-1e-18) == -1
 
 
 async def _produce(db_session, *, fetch_chain=None):
