@@ -10,7 +10,7 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
 from app.db import get_db
@@ -567,12 +567,12 @@ def _persist_execution_metadata(db: Session, execution_id: str, metadata: dict) 
     """
     from app.models import StrategyExecution
 
-    db.execute(
-        update(StrategyExecution)
-        .where(StrategyExecution.execution_id == execution_id)
-        .values(execution_metadata=json.dumps(metadata))
+    execution = db.scalar(
+        select(StrategyExecution).where(StrategyExecution.execution_id == execution_id)
     )
-    db.commit()
+    if execution is not None:
+        execution.execution_metadata = json.dumps(metadata)
+        db.commit()
 
 
 @router.post(
