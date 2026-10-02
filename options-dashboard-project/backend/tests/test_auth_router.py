@@ -122,9 +122,11 @@ def test_durable_session_can_start_broker_reauthorization_after_token_cache_loss
 
     token_store.clear_token(session_id)
 
+    # The browser session transport is the canonical HttpOnly cookie — the
+    # session credential is never sent in a header (repo AGENTS.md).
     resp = client.get(
         "/auth/login?broker=UPSTOX",
-        headers={"X-Session-Id": session_id},
+        cookies={SESSION_COOKIE_NAME: session_id},
         follow_redirects=False,
     )
     assert resp.status_code == 307
