@@ -291,14 +291,18 @@ class UpstoxAdapter:
         return results
 
     async def get_option_contracts(self, symbol: str) -> dict:
-        """Canonical ``{"symbol": ..., "expiries": [...]}`` contract."""
+        """Canonical expiry discovery plus live execution-contract metadata."""
         identity = self.resolve_instrument(symbol)
         key = mapper.broker_key_for(identity.symbol)
         try:
             raw = await self._fetch_contracts(key)
         except UpstoxError as exc:
             raise self._map_error(exc) from exc
-        return {"symbol": identity.symbol, "expiries": mapper.contracts_from_payload(raw)}
+        return {
+            "symbol": identity.symbol,
+            "expiries": mapper.contracts_from_payload(raw),
+            "contracts": mapper.execution_contracts_from_payload(raw),
+        }
 
     async def resolve_instrument_keys(self, instruments: list[dict]) -> list[dict]:
         """Resolve broker instrument keys for margin instruments.

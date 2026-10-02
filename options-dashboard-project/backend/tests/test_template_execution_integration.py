@@ -45,6 +45,34 @@ EXPIRY = "2026-08-27"
 EXPIRY_OTHER = "2026-09-24"
 
 
+@pytest.fixture(autouse=True)
+def authoritative_lot_sizes():
+    """Day 49: template execution resolves broker-authoritative lot sizes.
+
+    ``execute_template`` now loads contract metadata through
+    ``resolve_authoritative_lot_sizes`` before resolving chain prices. These
+    tests stub ``resolve_market_prices`` but must not reach the real broker for
+    the contract lookup either, so the lot sizes are stubbed the same way the
+    paper-execution suite stubs contract metadata.
+    """
+
+    async def fake_lot_sizes(access_token, symbol, legs):
+        return {
+            (
+                str(leg.expiration_date),
+                float(leg.strike_price),
+                str(leg.option_type).lower(),
+            ): LOT
+            for leg in legs
+        }
+
+    with patch(
+        "app.services.paper_contracts.resolve_authoritative_lot_sizes",
+        new=AsyncMock(side_effect=fake_lot_sizes),
+    ):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------

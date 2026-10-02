@@ -16,7 +16,7 @@ This module provides a single authoritative check used by:
 # Prefixes used by auth.py for platform-only session tokens.
 # Broker access tokens (from Upstox OAuth) are opaque strings that
 # never start with these prefixes.
-PLATFORM_TOKEN_PREFIXES = ("email:", "google:")
+PLATFORM_TOKEN_PREFIXES = ("email:", "google:", "account:")
 
 
 def is_platform_session_token(token: str | None) -> bool:
@@ -25,9 +25,10 @@ def is_platform_session_token(token: str | None) -> bool:
     Platform session tokens are created by:
     - POST /auth/login-email  →  "email:<user_id>:<random>"
     - POST /auth/google        →  "google:<user_id>:<random>"
+    - POST /auth/account/login →  "account:<user_id>:<random>"
 
     Broker tokens from Upstox OAuth are base64-encoded strings that
-    never start with ``email:`` or ``google:``.
+    never start with ``email:``, ``google:``, or ``account:``.
     """
     if not isinstance(token, str):
         return False

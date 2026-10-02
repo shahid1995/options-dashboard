@@ -48,7 +48,15 @@ async def list_expiries(
         source=credential.source,
         session_id=session_id,
     )
-    return payload
+    # Day 49: the adapter also returns internal execution-contract metadata
+    # ("contracts") used by resolve_authoritative_lot_sizes(). That field is
+    # deliberately NOT part of the public expiry contract, and ExpiriesOut
+    # forbids extras, so project the documented fields explicitly instead of
+    # letting the raw adapter dict reach the response model.
+    return ExpiriesOut(
+        symbol=payload.get("symbol", symbol),
+        expiries=list(payload.get("expiries") or []),
+    )
 
 
 @router.get("/{symbol}", response_model=OptionChainOut)

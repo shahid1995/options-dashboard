@@ -238,13 +238,21 @@ async def list_expiries(
     symbol = resolve_symbol(symbol)
     credential, user_id = require_market_data_token(session_id, db=db)
     adapter = gateway.create(BROKER_ID_UPSTOX, access_token=credential.token)
-    return await call_upstox(
+    payload = await call_upstox(
         adapter.get_option_contracts(symbol),
         source=credential.source,
         session_id=session_id,
         db=db,
         user_scope=user_id,
     )
+    # Day 49: the adapter also returns internal execution-contract metadata
+    # ("contracts") used by resolve_authoritative_lot_sizes(). It is not part
+    # of this public expiry contract — keep it internal and return only the
+    # documented fields.
+    return {
+        "symbol": payload.get("symbol", symbol),
+        "expiries": list(payload.get("expiries") or []),
+    }
 
 
 @router.get("/{symbol}")
