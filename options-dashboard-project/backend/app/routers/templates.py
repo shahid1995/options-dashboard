@@ -10,7 +10,7 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session, joinedload
 
 from app.db import get_db
@@ -567,12 +567,13 @@ def _persist_execution_metadata(db: Session, execution_id: str, metadata: dict) 
     """
     from app.models import StrategyExecution
 
-    execution = db.scalar(
-        select(StrategyExecution).where(StrategyExecution.execution_id == execution_id)
+    # nosemgrep: python.lang.security.audit.detect-unescaped-sql-formatting.detect-unescaped-sql-formatting  # False positive: SQLAlchemy expression API uses bound parameters; no raw SQL interpolation
+    db.execute(
+        update(StrategyExecution)
+        .where(StrategyExecution.execution_id == execution_id)
+        .values(execution_metadata=json.dumps(metadata))
     )
-    if execution is not None:
-        execution.execution_metadata = json.dumps(metadata)
-        db.commit()
+    db.commit()
 
 
 @router.post(
