@@ -38,6 +38,7 @@ from sqlalchemy import select, func, and_, text
 from sqlalchemy.orm import Session
 
 from app.models import HistoricalGexSnapshot, NiftyCandle
+from app.services.point_in_time import PointInTimeDataset
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +231,25 @@ class GexAnalyticsEngine:
     def __init__(self, db: Session, calc_version: str = DEFAULT_CALC_VERSION):
         self.db = db
         self.calc_version = calc_version
+        self.pit = PointInTimeDataset(db)
+
+    def _decision_timestamp_for_observation(self, timestamp: datetime) -> datetime:
+        """Return the decision time at the end of the three-minute source bar."""
+        return timestamp + timedelta(minutes=3)
+
+    def _exact_rows(self, ts: datetime) -> list[HistoricalGexSnapshot]:
+        """Snapshots whose source bar is exactly ``ts`` (no fallback).
+
+        PIT seam for the exact-observation reads: the decision time is
+        the end of ``ts``'s three-minute source bar, and the accessor
+        returns rows only for instruments that reported ``ts`` itself.
+        """
+        return self.pit.historical_gex_observed_at(
+            self._decision_timestamp_for_observation(ts),
+            ts,
+            interval=DEFAULT_INTERVAL,
+            calc_version=self.calc_version,
+        )
 
     # ------------------------------------------------------------------
     # Phase 2: Time-series aggregation
@@ -237,14 +257,7 @@ class GexAnalyticsEngine:
 
     def aggregate_timestamp(self, ts: datetime) -> Optional[TimestampGex]:
         """Aggregate GEX at a single timestamp across all instruments."""
-        rows = self.db.execute(
-            select(HistoricalGexSnapshot)
-            .where(
-                HistoricalGexSnapshot.open_time == ts,
-                HistoricalGexSnapshot.calc_version == self.calc_version,
-                HistoricalGexSnapshot.status == "SUCCESS",
-            )
-        ).scalars().all()
+        rows = self._exact_rows(ts)
 
         if not rows:
             return None
@@ -282,11 +295,20 @@ class GexAnalyticsEngine:
         return results
 
     def get_timestamps(self, start: Optional[datetime] = None, end: Optional[datetime] = None) -> list[datetime]:
-        """Get all unique timestamps in the historical GEX data."""
+        """Get all unique 3-minute analytics timestamps in the GEX data.
+
+        Snapshots from other intervals exist in storage but belong to
+        no analytics pipeline; they are excluded here so they can
+        neither be aggregated nor silently dropped later.
+        """
         stmt = (
             select(HistoricalGexSnapshot.open_time)
             .where(HistoricalGexSnapshot.calc_version == self.calc_version)
             .where(HistoricalGexSnapshot.status == "SUCCESS")
+            # Interval contract (Greptile P1, Day 49): this is a
+            # 3-minute analytics engine; discovery must honor the
+            # same DEFAULT_INTERVAL every read uses.
+            .where(HistoricalGexSnapshot.interval == DEFAULT_INTERVAL)
             .distinct()
             .order_by(HistoricalGexSnapshot.open_time)
         )
@@ -298,14 +320,7 @@ class GexAnalyticsEngine:
 
     def aggregate_strike(self, ts: datetime) -> list[StrikeGex]:
         """Aggregate GEX by strike at a single timestamp."""
-        rows = self.db.execute(
-            select(HistoricalGexSnapshot)
-            .where(
-                HistoricalGexSnapshot.open_time == ts,
-                HistoricalGexSnapshot.calc_version == self.calc_version,
-                HistoricalGexSnapshot.status == "SUCCESS",
-            )
-        ).scalars().all()
+        rows = self._exact_rows(ts)
 
         strike_map: dict[float, StrikeGex] = {}
         for r in rows:
@@ -328,14 +343,7 @@ class GexAnalyticsEngine:
 
     def aggregate_expiry(self, ts: datetime) -> list[ExpiryGex]:
         """Aggregate GEX by expiry at a single timestamp."""
-        rows = self.db.execute(
-            select(HistoricalGexSnapshot)
-            .where(
-                HistoricalGexSnapshot.open_time == ts,
-                HistoricalGexSnapshot.calc_version == self.calc_version,
-                HistoricalGexSnapshot.status == "SUCCESS",
-            )
-        ).scalars().all()
+        rows = self._exact_rows(ts)
 
         expiry_map: dict[str, ExpiryGex] = {}
         total_abs = 0.0
@@ -462,15 +470,7 @@ class GexAnalyticsEngine:
 
         # Get spot from first row
         spot = 0.0
-        rows = self.db.execute(
-            select(HistoricalGexSnapshot)
-            .where(
-                HistoricalGexSnapshot.open_time == ts,
-                HistoricalGexSnapshot.calc_version == self.calc_version,
-                HistoricalGexSnapshot.status == "SUCCESS",
-            )
-            .limit(1)
-        ).scalars().all()
+        rows = self._exact_rows(ts)[:1]
         if rows:
             spot = rows[0].spot
 
@@ -560,15 +560,11 @@ class GexAnalyticsEngine:
             return GammaWallsResult(timestamp=ts, spot=0.0)
 
         spot = 0.0
-        rows = self.db.execute(
-            select(HistoricalGexSnapshot)
-            .where(
-                HistoricalGexSnapshot.open_time == ts,
-                HistoricalGexSnapshot.calc_version == self.calc_version,
-                HistoricalGexSnapshot.status == "SUCCESS",
-            )
-            .limit(1)
-        ).scalars().all()
+        # Timestamp-level signal: the spot must come from an exact
+        # ``open_time == ts`` row. The exact-observation PIT seam
+        # guarantees no stale fallback row ever reaches the filter
+        # (and never drives wall distances).
+        rows = self._exact_rows(ts)[:1]
         if rows:
             spot = rows[0].spot
 
