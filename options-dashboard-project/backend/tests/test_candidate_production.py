@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -52,6 +52,7 @@ from app.strategy_evaluation.contracts import (
     DimensionState,
     PayoffExpirySemantics,
 )
+from app.utils.market_time import is_market_hours, to_ist_naive
 
 #: Broker-authoritative index option lot size used by the route-level stubs.
 BROKER_LOT = 65
@@ -99,6 +100,21 @@ EXPIRY = "2026-09-24"
 #: reference ts; 10:05 IST == 04:35 UTC.
 QUOTE_TS = "24-Sep-2026 10:05:00"
 REF_TS = datetime(2026, 9, 24, 4, 35, 0, tzinfo=timezone.utc)
+
+
+def _ist_clock(moment):
+    """The STORED candle clock (naive IST) for ``moment``.
+
+    Phase 7.24.4 convention through the repository's canonical conversion:
+    ``NiftyCandle.open_time`` and ``OptionCandle.open_time`` are written as
+    naive IST by ``nifty_candles.record_candles`` /
+    ``option_candles.record_option_candles``, so test history must be seeded
+    on that clock (10:05 IST, not 04:35 UTC) — otherwise the window tests
+    would pass against a naive-UTC comparison they are meant to catch.
+    """
+    converted = to_ist_naive(moment)
+    assert converted is not None and converted.tzinfo is None
+    return converted
 
 
 def _side(ltp, oi, chg_oi, volume, iv, key, bid=None, ask=None):
@@ -170,8 +186,10 @@ def make_legs(direction="sell", strike=25000.0, option_type="call",
 
 
 def prior_candles(keys, oi, *, reference_ts=REF_TS, age=timedelta(minutes=6)):
-    """OptionCandle rows for each key at ``reference_ts - age``."""
-    open_time = reference_ts - age
+    """OptionCandle rows for each key at ``reference_ts - age``, written on
+    the stored naive-IST candle clock (as the ingestion service writes
+    them)."""
+    open_time = _ist_clock(reference_ts) - age
     rows = []
     for index, key in enumerate(keys):
         rows.append(OptionCandle(
@@ -184,9 +202,10 @@ def prior_candles(keys, oi, *, reference_ts=REF_TS, age=timedelta(minutes=6)):
 
 
 def spot_closes(count=8, *, reference_ts=REF_TS, base=24800.0, step=15.0):
-    """Stored NIFTY closes ending just before the reference timestamp."""
+    """Stored NIFTY closes ending just before the reference timestamp, on
+    the stored naive-IST candle clock."""
     rows = []
-    start = reference_ts - timedelta(minutes=3 * (count + 1))
+    start = _ist_clock(reference_ts) - timedelta(minutes=3 * (count + 1))
     for index in range(count):
         rows.append(NiftyCandle(
             symbol="NIFTY", interval="3min",
@@ -298,6 +317,78 @@ class TestD1PriorOiRule:
         # positioning evidence; the candidate carries the reference ts.
         assert produced.candidate.reference_timestamp == REF_TS
         assert produced.candidate.legs[0].strike == 25000.0
+
+
+# ---------------------------------------------------------------------------
+# Stored candle clock: the D1 window and the spot cutoff are naive IST
+# ---------------------------------------------------------------------------
+
+class TestStoredCandleClock:
+    """History is stored as naive IST (Phase 7.24.4), so the D1 window and
+    the ``_spot_history`` cutoff must be projected onto that clock.
+    Comparing them in naive UTC shifted every boundary by +05:30 and made
+    same-session history invisible to the producer."""
+
+    def test_history_fixture_is_naive_ist_not_utc(self):
+        """Guards the fixtures themselves: seeded history must be naive IST
+        and visibly displaced from the UTC wall clock, so the alignment
+        tests below cannot pass by accident."""
+        row = prior_candles(all_keys(), 900_000.0)[0]
+        assert row.open_time.tzinfo is None
+        assert to_ist_naive(REF_TS) - row.open_time == timedelta(minutes=6)
+        assert row.open_time - REF_TS.replace(tzinfo=None) > timedelta(hours=5)
+
+    def test_six_minute_old_same_session_candle_is_eligible(self, db_session):
+        """A 3-min candle 6 minutes before the reference, inside the same
+        NSE session, is genuine eligible history."""
+        db_session.add_all(prior_candles(all_keys(), 900_000.0))
+        db_session.commit()
+
+        (stored,) = db_session.scalars(
+            select(OptionCandle.open_time).limit(1)).all()
+        assert is_market_hours(stored)  # same session as the reference
+
+        result = prior_oi_map(db_session, all_keys())
+        assert result[KEY_25000_CE] == 900_000.0
+        assert result[KEY_25100_PE] == 900_000.0
+
+    def test_candle_inside_exclusion_window_is_not_history(self, db_session):
+        """A same-session candle only 30 s before the reference sits inside
+        the 90 s alignment exclusion: it is same-window, not prior."""
+        db_session.add_all(prior_candles(
+            all_keys(), 900_000.0, age=timedelta(seconds=30)))
+        db_session.commit()
+
+        (stored,) = db_session.scalars(
+            select(OptionCandle.open_time).limit(1)).all()
+        assert is_market_hours(stored)
+        assert prior_oi_map(db_session, all_keys())[KEY_25000_CE] is None
+
+    def test_candle_older_than_24h_is_not_history(self, db_session):
+        """One minute beyond the 24 h window is stale — missing, not prior."""
+        db_session.add_all(prior_candles(
+            all_keys(), 900_000.0,
+            age=OI_HISTORY_MAX_AGE + timedelta(minutes=1)))
+        db_session.commit()
+
+        assert prior_oi_map(db_session, all_keys())[KEY_25000_CE] is None
+
+    def test_spot_history_includes_same_session_closes(self, db_session):
+        """``_spot_history`` must read the same-session closes stored
+        strictly before the reference timestamp on the IST clock."""
+        db_session.add_all(spot_closes(count=8))
+        db_session.commit()
+
+        closes, prev = _spot_closes_tuple(db_session)
+        assert len(closes) == 8
+        assert prev == closes[-1]
+
+        stamps = list(db_session.scalars(
+            select(NiftyCandle.open_time).order_by(NiftyCandle.open_time)))
+        assert len(stamps) == 8
+        assert all(stamp.tzinfo is None for stamp in stamps)
+        assert all(is_market_hours(stamp) for stamp in stamps)
+        assert stamps[-1] < to_ist_naive(REF_TS)  # strictly before the reference
 
 
 # ---------------------------------------------------------------------------
@@ -758,6 +849,84 @@ class TestRoute:
             db_session.query(StrategyExecution).count()
             + db_session.query(PaperOrder).count()
             + db_session.query(Position).count()
+            + db_session.query(PaperTransaction).count()
+        ) == 0
+
+    def test_live_contract_without_live_oi_history_fails_closed(
+            self, client, db_session, monkeypatch):
+        """PRODUCTION-REALISTIC (Issue #118, Path B): a currently
+        tradable (unexpired) contract has NO stored prior-OI observation in
+        this architecture, so the production path must fail closed with
+        zero writes and must not fabricate ΔOI.
+
+        Repository evidence: ``OptionCandle`` is populated only from the
+        Upstox EXPIRED-instruments API — ``app/models.py`` OptionCandle
+        docstring, ``app/services/option_candles.py`` module docstring, and
+        every production caller (``daily_ingestion._ingest_option_candles``
+        selecting ``ContractSpec.expiry <= today``,
+        ``backfill_orchestrator``, ``app/tools/option_candle_backfill``)
+        which all call ``get_expired_historical_candles``.  Seeding
+        live-key OptionCandle rows (elsewhere in this file) tests the D1
+        RULE; it is not production capability, and this test asserts what
+        production actually does today.
+        """
+        from app.services import candidate_production as cp
+
+        # The real ingested series (spot closes) exists; the OI history for
+        # the live instrument keys does not and cannot be assumed.
+        db_session.add_all(spot_closes())
+        db_session.commit()
+        assert db_session.query(OptionCandle).count() == 0
+
+        session_id, _ = _identity(db_session)
+        monkeypatch.setattr(
+            token_store, "get_token", lambda sid: "tok-xyz", raising=False)
+
+        async def fake_fetch(symbol, expiry, token):
+            return make_chain()
+
+        async def fake_keys(legs, token):
+            return all_keys()
+
+        async def fake_resolve_prices(access_token, symbol, legs, **_kwargs):
+            return _prices()
+
+        def fake_token(db, user_id):
+            return "test-md-token"
+
+        monkeypatch.setattr(cp, "_default_fetch_chain", fake_fetch)
+        monkeypatch.setattr(cp, "_default_resolve_keys", fake_keys)
+        monkeypatch.setattr(
+            "app.routers.paper.resolve_market_prices", fake_resolve_prices)
+        monkeypatch.setattr(cp, "_default_token_resolver", fake_token)
+
+        response = client.post(
+            "/paper/executions",
+            json={
+                "client_order_id": "route-day50-order-3",
+                "symbol": "NIFTY",
+                "legs": [
+                    {"symbol": "NIFTY", "expiration_date": EXPIRY,
+                     "strike_price": 25000, "option_type": "call",
+                     "action": "sell", "quantity": 1, "lot_size": 65},
+                    {"symbol": "NIFTY", "expiration_date": EXPIRY,
+                     "strike_price": 25100, "option_type": "call",
+                     "action": "buy", "quantity": 1, "lot_size": 65},
+                ],
+            },
+            cookies={SESSION_COOKIE_NAME: session_id},
+        )
+
+        assert response.status_code in (409, 422), response.text
+        detail = response.json()["detail"]
+        # The gate that stops it is named: no eligible prior-OI evidence.
+        assert "EVIDENCE_INSUFFICIENT" in detail
+        assert "ΔOI" in detail
+        assert (
+            db_session.query(StrategyExecution).count()
+            + db_session.query(PaperOrder).count()
+            + db_session.query(Position).count()
+            + db_session.query(PaperTransaction).count()
         ) == 0
 
 
