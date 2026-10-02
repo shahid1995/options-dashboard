@@ -238,7 +238,12 @@ def test_client_lot_size_cannot_change_server_accounting(client, logged_in, db_s
     position = db_session.query(Position).one()
     assert order.lot_size == LOT
     assert position.lot_size == LOT
-    assert response.json()["order"]["lot_size"] == LOT
+    # The response is an ExecutionOut (a group of orders), not a single
+    # order — read the returned orders through the real API contract.
+    body = response.json()
+    assert len(body["orders"]) == 1
+    # The client submitted lot_size=1; the broker-authoritative LOT must win.
+    assert body["orders"][0]["lot_size"] == LOT
 
 # ---- Order lifecycle (§5) ----------------------------------------------------
 
@@ -606,7 +611,12 @@ def test_partial_strategy_failure_is_atomic(client, logged_in, db_session, chain
     chain_quotes[EXPIRY] = {24350: {"call": 125.25, "put": 90.0}}  # 24550 gone
     resp = execute(client, logged_in, exec_payload())
     assert resp.status_code == 409
-    assert "CHAIN_DATA_MISSING" in resp.json()["detail"]
+    # Day 49: broker-authoritative contract metadata is resolved BEFORE chain
+    # prices, and both guards are fail-closed. Dropping strike 24550 from the
+    # fixture also drops its contract metadata, so CONTRACT_DATA_MISSING is
+    # the first guard to fire. The ordering is intentional: an unknown lot size
+    # must never reach the price/quantity computation at all.
+    assert "CONTRACT_DATA_MISSING" in resp.json()["detail"]
     # Zero writes — never a misleading partial success.
     assert db_session.query(StrategyExecution).count() == 0
     assert db_session.query(PaperOrder).count() == 0
