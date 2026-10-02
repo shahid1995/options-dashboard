@@ -11,10 +11,11 @@ Verified here, from the ACTUAL PostgreSQL schema:
   fill_eq_key, all alias columns, all lineage columns
 - every index and PK on the five Day41 tables
 - ORM ↔ actual-PostgreSQL agreement for columns/indexes/PKs (the full matrix)
-- alembic_version is a single row at the Day41 head (b3e5f8a1c7d2)
+- alembic_version is a single row at the CURRENT chain head (d49aa0000001)
 - the fill-ledger functions WORK against the migrated schema (the missing
   duplicate_of column would break Lane-C duplicate classification INSERTs)
-- upgrade AND downgrade of the Day41 chain both succeed on PostgreSQL
+- upgrade of the full chain succeeds on PostgreSQL; the head revision is
+  intentionally irreversible and therefore refuses to rewind
 
 Skipped unless TEST_DATABASE_URL points at PostgreSQL.  The database must
 already exist and be EMPTY (the harness creates a disposable one); tests run
@@ -39,10 +40,14 @@ if not DB_URL or not DB_URL.startswith(("postgresql+psycopg://", "postgresql://"
 ENGINE = create_engine(DB_URL, pool_pre_ping=True)
 TestSession = sessionmaker(bind=ENGINE, expire_on_commit=False)
 
-# Tracks the ACTUAL current chain head.  Day41.2 (cross-D1 family lock +
-# S2 evidence) extended the chain: b3e5f8a1c7d2 (Day41.1) is now an ancestor.
-DAY41_HEAD = "e2b4c6d8f0a1"
-PRE_DAY41_BASE = "f7aa24156f6d"  # revision the Day41 chain extends
+# The ACTUAL current chain head — the single revision a full ``upgrade head``
+# must land on.  Earlier heads (Day41.1 b3e5f8a1c7d2, Day41.2 e2b4c6d8f0a1)
+# are ancestors of it, not the head.  This constant must be refreshed whenever
+# a new head is added; ``alembic heads`` prints the authoritative value.
+CURRENT_ALEMBIC_HEAD = "d49aa0000001"
+# Revision the Day41 chain extends.  Retained only so the fixture can prove
+# the head refuses to rewind past the irreversible Day49 normalization.
+PRE_DAY41_BASE = "f7aa24156f6d"
 
 DAY41_TABLES = (
     "broker_raw_observation",
@@ -110,9 +115,9 @@ def migrated_pg():
     yield
     # CodeRabbit #2 (Day 49): the head revision d49aa0000001 refuses
     # downgrade (intentionally irreversible UTC→IST data normalization),
-    # so the old head→PRE_DAY41_BASE teardown teardown would fail.  The
-    # refusal is the accepted contract; the fixture leaves the disposable
-    # database at head instead of rewinding it.
+    # so the old head→PRE_DAY41_BASE teardown would fail.  The refusal is
+    # the accepted contract; the fixture leaves the disposable database at
+    # head instead of rewinding it.
     with pytest.raises(NotImplementedError):
         command.downgrade(cfg, PRE_DAY41_BASE)
 
@@ -121,13 +126,14 @@ def migrated_pg():
 # Actual-PostgreSQL schema verification (from the catalog, not the ORM)
 # ---------------------------------------------------------------------------
 
-def test_alembic_head_is_day41_single_row(migrated_pg) -> None:
+def test_alembic_head_is_current_single_row(migrated_pg) -> None:
+    """The chain lands on exactly one row, and that row is the current head."""
     with ENGINE.connect() as conn:
         rows = conn.execute(
             text("SELECT version_num FROM alembic_version")
         ).fetchall()
     assert len(rows) == 1, f"expected a single alembic_version row, got {rows}"
-    assert rows[0][0] == DAY41_HEAD
+    assert rows[0][0] == CURRENT_ALEMBIC_HEAD
 
 
 def test_day41_tables_exist_in_actual_pg_schema(migrated_pg) -> None:
