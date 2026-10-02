@@ -593,3 +593,66 @@ def test_legacy_auth_status_and_me_survive_token_cache_loss(client, db_session):
     me = client.get("/auth/me", cookies={SESSION_COOKIE_NAME: session_id})
     assert me.status_code == 200, me.text
     assert me.json()["user_id"] == user.id
+
+
+def test_auth_status_never_lets_a_cached_platform_token_override_revocation(
+    client, db_session
+):
+    """Day 49: the durable UserSession is the sole authority for platform sessions.
+
+    ``/auth/status`` checks the durable UserSession first and only then falls
+    back to the in-memory token store. That fallback exists only for *legacy
+    broker* sessions, which predate accounts and have no UserSession to check.
+    For a platform session ("email:"/"google:"/"account:") the UserSession is
+    authoritative, so a stale cache entry must never resurrect a revoked,
+    expired or unknown durable session.
+    """
+    from app.identity import User, revoke_session
+
+    user = User(
+        id=str(uuid4()),
+        email="status-authority@example.com",
+        display_name="Status Authority",
+        status="active",
+        identity_source="email",
+    )
+    db_session.add(user)
+    db_session.commit()
+
+    def status(session_id):
+        resp = client.get("/auth/status", cookies={SESSION_COOKIE_NAME: session_id})
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    # (a) Active durable session with its platform token cached → logged in.
+    session_id = token_store.set_token(
+        f"account:{user.id}:{uuid4()}", persist_to_db=False
+    )
+    create_session_record(db_session, user.id, session_id)
+    db_session.commit()
+    assert status(session_id) == {"logged_in": True}
+
+    # (b) Losing the in-memory token must NOT log out a durable session —
+    #     the backend restart / cache-loss path stays working.
+    token_store.clear_token(session_id)
+    assert status(session_id) == {"logged_in": True}
+
+    # (c) Revocation must WIN over a cached platform token. A fresh session id
+    #     is used so the cache entry is genuinely present at revoke time.
+    revoked_id = token_store.set_token(
+        f"account:{user.id}:{uuid4()}", persist_to_db=False
+    )
+    create_session_record(db_session, user.id, revoked_id)
+    db_session.commit()
+    assert status(revoked_id) == {"logged_in": True}
+
+    assert revoke_session(db_session, revoked_id) is True
+    db_session.commit()
+    # The platform token is still cached — only the durable session was revoked.
+    assert token_store.get_token(revoked_id) is not None
+    assert status(revoked_id) == {"logged_in": False}
+
+    # The legacy broker-session fallback is preserved: an opaque broker access
+    # token with no durable UserSession still reports logged in.
+    broker_session_id = token_store.set_token("opaque-upstox-access-token")
+    assert status(broker_session_id) == {"logged_in": True}

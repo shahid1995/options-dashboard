@@ -42,6 +42,7 @@ from sqlalchemy.exc import IntegrityError
 from fastapi import Request as FastAPIRequest
 from app.routers.deps import CurrentUser, AuthenticatedUser, get_session_id
 from app.services.broker_authorization import persist_connection_authorization
+from app.services.platform_session import is_platform_session_token
 from app.services import token_store
 from app.services import account_security
 from app.services.rate_limiter import rate_limiter, RateLimitRule
@@ -1033,12 +1034,29 @@ def status(
     Durable UserSession is authoritative when available. The token-store
     fallback preserves compatibility for legacy broker/session clients while
     allowing account sessions to survive a backend restart.
+
+    Day 49 security fix: the fallback is NOT an override of the durable
+    session. A platform-only token ("email:"/"google:"/"account:") is a
+    *derived* credential — the durable UserSession is its sole authority —
+    so a cached one must never resurrect a revoked, expired or unknown
+    durable session. Without this, revocation was bypassable: logout
+    revokes the UserSession but left the platform token in the cache, and
+    /auth/status answered logged_in=true. Only opaque broker access tokens
+    (never platform-prefixed) keep the legacy cache fallback, because
+    pre-account clients have no UserSession to check against.
     """
     if not session_id:
         return {"logged_in": False}
     if get_active_session(db, session_id) is not None:
         return {"logged_in": True}
-    return {"logged_in": token_store.get_token(session_id) is not None}
+    cached = token_store.get_token(session_id)
+    if cached is None:
+        return {"logged_in": False}
+    if is_platform_session_token(cached):
+        # Durable UserSession already said "revoked / absent / expired" —
+        # that verdict is authoritative and final for platform sessions.
+        return {"logged_in": False}
+    return {"logged_in": True}
 
 
 @router.get("/me")
