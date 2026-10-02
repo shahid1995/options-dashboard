@@ -83,3 +83,15 @@ Architecture detail: [`ARCHITECTURE.md`](ARCHITECTURE.md) · Security:
 [`SECURITY.md`](SECURITY.md) · Data: [`DATA.md`](DATA.md) · Testing:
 [`TESTING.md`](TESTING.md) · Decisions: [`DECISIONS.md`](DECISIONS.md) ·
 Invariants: [`INVARIANTS.md`](INVARIANTS.md)
+
+## 6. Known capability gaps (open prerequisites)
+
+- **Live option-OI history for unexpired contracts.** `OptionCandle` is
+  populated exclusively from the Upstox *expired*-instruments API (see
+  `options-dashboard-project/docs/PHASE_7_13_OPTION_CANDLE_PERSISTENCE.md`
+  and `docs/PHASE_7_15_LIVE_BACKFILL_PILOT.md`), so no stored prior-OI
+  observation exists for a currently tradable instrument key. The Day-50
+  paper-entry candidate producer (Issue #118) needs exactly that observation
+  to compute ΔOI, so the production paper-entry path fails closed at that
+  gate until live option-OI ingestion lands as separate architecture work.
+  Invariant 17a forbids substituting anything else for it.

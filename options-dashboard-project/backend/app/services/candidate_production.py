@@ -17,6 +17,23 @@ Founder-approved Slice A decisions implemented here:
         reference timestamp is recorded once from the evidence and
         preserved through every contract.
 
+Production prerequisite (Issue #118 — OPEN, not satisfied today):
+    D1 needs a STORED prior-OI observation for the exact live broker
+    instrument key.  ``OptionCandle`` — the only OI-bearing per-key series —
+    is populated exclusively from the Upstox EXPIRED-instruments API: see
+    the ``OptionCandle`` docstring in ``app/models.py``, the module docstring
+    of ``app/services/option_candles.py``, ``daily_ingestion.
+    _ingest_option_candles`` (selects ``ContractSpec.expiry <= today`` and
+    calls ``get_expired_historical_candles``), ``backfill_orchestrator`` and
+    ``app/tools/option_candle_backfill`` (same expired path).  Nothing in the
+    current architecture persists OI for a still-unexpired contract, so in
+    production this producer cannot compute ΔOI and fails closed
+    (``EVIDENCE_INSUFFICIENT`` / ``CHAIN_DATA_MISSING``) with zero writes.
+    That is intended until live option-OI history is ingested as separate
+    architecture work — never widen the window, never reuse expired-contract
+    history as if it were live, never match by strike text, never substitute
+    current OI for prior OI, and never coerce missing history to zero.
+
 The producer is orchestration only: it duplicates no payoff/risk/candidate
 math (Day-18 quant, Day-31, Day-32 gate, Day-33 engine run verbatim),
 creates no DB model, no second candidate representation, and no second
@@ -96,6 +113,7 @@ from app.strategy_evaluation.contracts import (
 )
 from app.strategy_evaluation.evaluation import evaluate_strategy
 from app.strategy_lifecycle.lifecycle import evaluate_strategy_gate
+from app.utils.market_time import to_ist_naive
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -214,11 +232,27 @@ def _parse_broker_ts(raw: Any) -> datetime | None:
         return None
 
 
-def _utc_naive(moment: datetime) -> datetime:
-    """Naive-UTC projection for comparisons against stored candle clocks."""
-    if moment.tzinfo is None:
-        return moment
-    return moment.astimezone(timezone.utc).replace(tzinfo=None)
+def _candle_clock(moment: datetime) -> datetime:
+    """Project a moment onto the STORED candle clock (naive IST).
+
+    Phase 7.24.4 convention, through the repository's single canonical
+    conversion (``app.utils.market_time.to_ist_naive``): every persisted
+    market-data timestamp — ``NiftyCandle.open_time`` and
+    ``OptionCandle.open_time`` alike — is naive IST, written by
+    ``nifty_candles.record_candles`` and
+    ``option_candles.record_option_candles``.  The D1 window and the
+    spot-history cutoff are therefore computed on that same clock;
+    comparing them in naive UTC (the previous behaviour) shifted every
+    boundary by +05:30 against the stored rows.
+    """
+    converted = to_ist_naive(moment)
+    if converted is None:  # pragma: no cover - moment is always a datetime
+        raise ProducerError(
+            "EVIDENCE_INSUFFICIENT",
+            "the reference timestamp cannot be expressed on the stored "
+            "candle clock; entry fails closed",
+        )
+    return converted
 
 
 def _provenance(received_at: datetime) -> Provenance:
@@ -365,16 +399,17 @@ def _prior_oi_state(
     Eligible = latest ``OptionCandle`` row (``OC_INTERVAL``) for the exact
     key whose ``open_time`` satisfies
     ``reference_ts - OI_HISTORY_MAX_AGE <= open_time <
-    reference_ts - OI_HISTORY_MIN_LAG`` (UTC comparisons against the stored
-    candle clock).  A row with NULL ``open_interest`` is missing history,
-    not zero.  Keys without eligible history map to ``None`` — a later ΔOI
-    of ``None`` suppresses the strike instead of inventing evidence.
+    reference_ts - OI_HISTORY_MIN_LAG`` (both boundaries projected onto the
+    stored naive-IST candle clock).  A row with NULL ``open_interest`` is
+    missing history, not zero.  Keys without eligible history map to
+    ``None`` — a later ΔOI of ``None`` suppresses the strike instead of
+    inventing evidence.
     """
     out: dict[str, float | None] = {key: None for key in instrument_keys}
     if not instrument_keys:
         return out
-    newest_allowed = _utc_naive(reference_ts - OI_HISTORY_MIN_LAG)
-    oldest_allowed = _utc_naive(reference_ts - OI_HISTORY_MAX_AGE)
+    newest_allowed = _candle_clock(reference_ts - OI_HISTORY_MIN_LAG)
+    oldest_allowed = _candle_clock(reference_ts - OI_HISTORY_MAX_AGE)
     rows = db.execute(
         select(OptionCandle)
         .where(
@@ -409,8 +444,10 @@ def _spot_history(
 ) -> tuple[tuple[float, ...], float | None]:
     """Prior stored NIFTY closes strictly before the reference timestamp
     (oldest→newest) plus the immediately-prior close.  Real stored candles
-    only — nothing interpolated."""
-    cutoff = _utc_naive(reference_ts)
+    only — nothing interpolated.  The cutoff is expressed on the stored
+    naive-IST candle clock, the clock ``NiftyCandle.open_time`` is written
+    in."""
+    cutoff = _candle_clock(reference_ts)
     candles = db.execute(
         select(NiftyCandle)
         .where(

@@ -80,6 +80,18 @@ Founder acceptance.
 17. **Timezone handling is standardized** (IST market context; UTC storage
     conventions per `docs/PHASE_7_24_4_TIMEZONE_STANDARDIZATION.md`); no naive
     `datetime.now()` in production paths.
+17a. **ΔOI evidence is measured, never manufactured.** A paper entry's
+    prior-OI observation must be a stored candle for the exact broker
+    instrument key, strictly older than the live snapshot by at least the
+    approved minimum lag and no older than the approved maximum age, compared
+    on the stored candle clock (naive IST —
+    `docs/PHASE_7_24_4_TIMEZONE_STANDARDIZATION.md`;
+    `nifty_candles.open_time` / `option_candles.open_time`). Reusing
+    expired-contract history as if it were live, matching by strike text,
+    widening the freshness window, substituting current OI for prior OI,
+    accepting same-window observations, and coercing missing history to zero
+    are all forbidden; when no eligible observation exists the entry fails
+    closed with zero writes.
 
 ## Process
 
