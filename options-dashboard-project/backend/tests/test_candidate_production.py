@@ -18,6 +18,7 @@ an entry needing them fails closed.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -45,7 +46,11 @@ from app.services.candidate_production import (
     produce_candidate_and_execute,
     produce_candidate_core,
 )
+from app.routers.deps import SESSION_COOKIE_NAME
 from app.services.paper_execution import PaperExecutionError
+
+#: Broker-authoritative index option lot size used by the route-level stubs.
+BROKER_LOT = 65
 
 
 @pytest.fixture
@@ -611,6 +616,31 @@ def _route_market_open_gate():
 
 
 class TestRoute:
+    @pytest.fixture(autouse=True)
+    def authoritative_lot_sizes(self):
+        """Day 49: the entry route resolves broker-authoritative lot sizes
+        before producing a candidate.  Route tests stub that broker call so
+        they exercise the producer and the choke point, never the network
+        (mirrors tests/test_template_execution_integration.py)."""
+
+        async def fake_lot_sizes(access_token, symbol, legs):
+            # A broker-authoritative value INDEPENDENT of the client payload,
+            # so the route's normalization is genuinely exercised.
+            return {
+                (
+                    str(leg.expiration_date),
+                    float(leg.strike_price),
+                    str(leg.option_type).lower(),
+                ): BROKER_LOT
+                for leg in legs
+            }
+
+        with patch(
+            "app.routers.paper.resolve_authoritative_lot_sizes",
+            new=AsyncMock(side_effect=fake_lot_sizes),
+        ):
+            yield
+
     def test_route_reaches_choke_point_only_through_producer(
             self, client, db_session, monkeypatch):
         """Happy path: route → real producer → real choke point (fake chain)."""
@@ -630,7 +660,9 @@ class TestRoute:
         async def fake_keys(legs, token):
             return all_keys()
 
-        async def fake_resolve_prices(access_token, symbol, legs):
+        async def fake_resolve_prices(access_token, symbol, legs, **_kwargs):
+            # ``chain_sink`` (Issue #118) is accepted and left empty here so
+            # the producer falls back to its own injected chain fetch.
             return _prices()
 
         def fake_token(db, user_id):
@@ -658,7 +690,7 @@ class TestRoute:
                      "action": "buy", "quantity": 1, "lot_size": 65},
                 ],
             },
-            headers={"X-Session-Id": session_id},
+            cookies={SESSION_COOKIE_NAME: session_id},
         )
         assert response.status_code == 200, response.text
         body = response.json()
@@ -687,7 +719,9 @@ class TestRoute:
         async def fake_keys(legs, token):
             return all_keys()
 
-        async def fake_resolve_prices(access_token, symbol, legs):
+        async def fake_resolve_prices(access_token, symbol, legs, **_kwargs):
+            # ``chain_sink`` (Issue #118) is accepted and left empty here so
+            # the producer falls back to its own injected chain fetch.
             return _prices()
 
         def fake_token(db, user_id):
@@ -713,7 +747,7 @@ class TestRoute:
                      "action": "buy", "quantity": 1, "lot_size": 65},
                 ],
             },
-            headers={"X-Session-Id": session_id},
+            cookies={SESSION_COOKIE_NAME: session_id},
         )
         assert response.status_code in (409, 422)
         assert (
@@ -727,3 +761,236 @@ def _identity(db_session):
     from tests.test_helpers import create_test_identity
 
     return create_test_identity(db_session, "tok-xyz")
+
+
+# ---------------------------------------------------------------------------
+# Issue #118 audit findings — symbol scope, snapshot binding, evidence quality
+# ---------------------------------------------------------------------------
+
+
+async def _injected_keys(legs, token):
+    """Injected broker instrument-key resolver (async, like the real one)."""
+    return all_keys()
+
+
+class TestSliceASymbolScope:
+    """Finding A — Slice A is NIFTY-only, and must say so.
+
+    ``UPSTOX_INSTRUMENTS`` carries several indices, but the producer's
+    evidence chain is wired to NIFTY spot history (``NiftyCandle``, the only
+    stored spot series) and every evidence contract is labelled with that
+    underlying.  A supported-but-different symbol must therefore fail closed
+    BEFORE any broker work, never be processed and mislabelled as NIFTY.
+    """
+
+    @pytest.mark.anyio
+    async def test_unsupported_symbol_fails_closed_before_any_broker_work(
+            self, db_session):
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+
+        def exploding_token(db, user_id):
+            raise AssertionError(
+                "no session/broker work for an unsupported symbol")
+
+        async def exploding_fetch(symbol, expiry, token):
+            raise AssertionError(
+                "no evidence may be acquired for an unsupported symbol")
+
+        request = _request()
+        request.symbol = "BANKNIFTY"
+        for leg in request.legs:
+            leg.symbol = "BANKNIFTY"
+
+        with pytest.raises(PaperExecutionError) as excinfo:
+            await produce_candidate_and_execute(
+                "user-day50", db_session, request, _prices(),
+                token_resolver=exploding_token,
+                fetch_chain=exploding_fetch,
+                resolve_keys=_injected_keys,
+                now_fn=lambda: REF_TS,
+            )
+
+        assert excinfo.value.code == "UNSUPPORTED_SYMBOL"
+        assert "BANKNIFTY" in str(excinfo.value)
+        # Zero mutation — the fail-closed guarantee is unchanged.
+        assert db_session.query(StrategyExecution).count() == 0
+        assert db_session.query(PaperOrder).count() == 0
+        assert db_session.query(Position).count() == 0
+
+    @pytest.mark.anyio
+    async def test_nifty_still_produces_and_is_labelled_nifty(self, db_session):
+        """The enforcement must not change the supported path."""
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+
+        result = await _produce(db_session)
+        assert result.status in ("FILLED", "PENDING")
+        assert result.symbol == "NIFTY"
+        assert db_session.query(StrategyExecution).one().symbol == "NIFTY"
+
+        # And the core's evidence is genuinely labelled with the supported
+        # underlying it was produced for.
+        produced = run_core(db_session)
+        assert produced.opportunity.underlying == "NIFTY"
+        assert produced.ranked_strikes.ranked
+        assert all(item.underlying == "NIFTY"
+                   for item in produced.ranked_strikes.ranked)
+        # The measured Day-12 quality rides the ranked evidence (the fabrication
+        # this replaced could not supply an assessment at all).
+        assert all(item.quality is not None
+                   for item in produced.ranked_strikes.ranked)
+
+
+class TestSingleEvidenceSnapshot:
+    """Finding B — candidate evidence and fill prices share ONE broker read.
+
+    The entry route resolves fill prices from a chain it fetches; the producer
+    used to fetch a SECOND chain for candidate evidence.  The candidate's
+    reference timestamp and its prices could then describe different
+    snapshots.  The route now hands its priced snapshot to the producer, and
+    the producer must reuse it rather than fetch again.
+    """
+
+    @pytest.mark.anyio
+    async def test_producer_reuses_the_priced_snapshot(self, db_session):
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+
+        snapshot = make_chain()
+        priced = _prices()
+
+        async def must_not_fetch(symbol, expiry, token):
+            raise AssertionError(
+                "the priced snapshot must be reused, not re-fetched")
+
+        result = await produce_candidate_and_execute(
+            "user-day50", db_session, _request(), priced,
+            chains={EXPIRY: snapshot},
+            token_resolver=lambda db, user_id: "test-md-token",
+            fetch_chain=must_not_fetch,
+            resolve_keys=_injected_keys,
+            now_fn=lambda: REF_TS,
+        )
+        assert result.status in ("FILLED", "PENDING")
+
+        # The audit reference carried into the execution is the snapshot's own
+        # broker quote time, so the recorded reference describes exactly the
+        # chain those fill prices came from.
+        row = db_session.query(StrategyExecution).one()
+        assert "risk_reference_timestamp" in (row.execution_metadata or "")
+        assert REF_TS.isoformat() in row.execution_metadata
+
+    @pytest.mark.anyio
+    async def test_missing_snapshot_falls_back_to_one_fetch(self, db_session):
+        """Without a supplied snapshot the producer fetches exactly once."""
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+
+        calls: list[str] = []
+
+        async def counting_fetch(symbol, expiry, token):
+            calls.append(symbol)
+            return make_chain()
+
+        await _produce(db_session, fetch_chain=counting_fetch)
+        assert calls == ["NIFTY"]
+
+
+class TestMeasuredEvidenceQuality:
+    """Finding C — quality is MEASURED by the Day-12 engine, not asserted.
+
+    The producer previously returned a hard-coded EXCELLENT/100 with no
+    dimensions.  Because the opportunity contract admits only usable evidence
+    (``state != INSUFFICIENT``), that constant silently disabled a real gate.
+    """
+
+    def test_quality_records_real_dimensions_and_reference_time(self):
+        from app.services.candidate_production import (
+            _chain_observation,
+            _quality,
+        )
+
+        quality = _quality(
+            _chain_observation(
+                make_chain(), symbol="NIFTY", expiry=EXPIRY,
+                received_at=REF_TS),
+            reference_ts=REF_TS,
+        )
+
+        # The fabrication this replaced had no dimensions at all and never
+        # recorded the reference time it was supposedly evaluated at.
+        assert quality.dimensions, "quality must be measured, not asserted"
+        assert quality.evaluated_at == REF_TS
+        assert any(
+            dim.status == "EVALUATED" and dim.score is not None
+            for dim in quality.dimensions
+        )
+        assert quality.observation_time is not None
+
+    def test_defective_book_cannot_be_labelled_excellent(self):
+        """A crossed book must not come back EXCELLENT.
+
+        The engine downgrades EXCELLENT to GOOD whenever an ERROR-severity
+        issue exists, so this is precisely the discrimination the constant
+        (always EXCELLENT) could never make.
+        """
+        from app.market_data.quality import QualityState
+        from app.services.candidate_production import (
+            _chain_observation,
+            _quality,
+        )
+
+        crossed = make_chain(bid=300.0, ask=100.0,
+                             pe_bid=400.0, pe_ask=90.0)
+        quality = _quality(
+            _chain_observation(
+                crossed, symbol="NIFTY", expiry=EXPIRY, received_at=REF_TS),
+            reference_ts=REF_TS,
+        )
+
+        assert quality.quality_state is not QualityState.EXCELLENT
+        assert any(
+            issue.code.value == "BID_ASK_INCONSISTENT"
+            for issue in quality.issues
+        )
+
+    def test_quality_gate_is_live_for_the_opportunity_contract(self):
+        """The measured state is what the opportunity contract gates on:
+        an unusable state must be rejected there (a constant never could be)."""
+        from app.market_data.quality import QualityResult, QualityState
+        from app.opportunity.contracts import _usable_quality
+
+        unusable = QualityResult(
+            quality_score=0,
+            quality_state=QualityState.INSUFFICIENT,
+            critical_failure=True,
+            issues=(),
+            dimensions=(),
+            evaluated_at=REF_TS,
+            observation_time=REF_TS,
+            observation_type="chain",
+            contract_version="1.0.0",
+            reference_time=REF_TS,
+        )
+        assert _usable_quality(unusable) is False
+        assert _usable_quality(None) is False
+
+
+async def _produce(db_session, *, fetch_chain=None):
+    """Drive the production wrapper over the fixture with broker boundaries
+    injected (the sanctioned test seam)."""
+    async def default_fetch(symbol, expiry, token):
+        return make_chain()
+
+    return await produce_candidate_and_execute(
+        "user-day50", db_session, _request(), _prices(),
+        token_resolver=lambda db, user_id: "test-md-token",
+        fetch_chain=fetch_chain or default_fetch,
+        resolve_keys=_injected_keys,
+        now_fn=lambda: REF_TS,
+    )
