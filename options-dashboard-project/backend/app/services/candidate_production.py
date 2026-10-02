@@ -19,20 +19,25 @@ Founder-approved Slice A decisions implemented here:
 
 Production prerequisite (Issue #118 — OPEN, not satisfied today):
     D1 needs a STORED prior-OI observation for the exact live broker
-    instrument key.  ``OptionCandle`` — the only OI-bearing per-key series —
+    instrument key.  The production persistence prerequisite is currently
+    UNSATISFIED: ``OptionCandle`` — the only OI-bearing per-key series —
     is populated exclusively from the Upstox EXPIRED-instruments API: see
     the ``OptionCandle`` docstring in ``app/models.py``, the module docstring
     of ``app/services/option_candles.py``, ``daily_ingestion.
     _ingest_option_candles`` (selects ``ContractSpec.expiry <= today`` and
     calls ``get_expired_historical_candles``), ``backfill_orchestrator`` and
-    ``app/tools/option_candle_backfill`` (same expired path).  Nothing in the
-    current architecture persists OI for a still-unexpired contract, so in
+    ``app/tools/option_candle_backfill`` (same expired path).  No production
+    persistence path stores prior OI for a still-unexpired contract, so in
     production this producer cannot compute ΔOI and fails closed
     (``EVIDENCE_INSUFFICIENT`` / ``CHAIN_DATA_MISSING``) with zero writes.
-    That is intended until live option-OI history is ingested as separate
-    architecture work — never widen the window, never reuse expired-contract
-    history as if it were live, never match by strike text, never substitute
-    current OI for prior OI, and never coerce missing history to zero.
+    UPSTREAM UPSTOX CAPABILITY IS UNVERIFIED: no safe authenticated
+    live-option probe could be performed from the development environment, so
+    nothing here asserts that the broker cannot serve such data — only that
+    this repository does not currently obtain or persist it.  That stays true
+    until live option-OI persistence lands as separate architecture work —
+    never widen the window, never reuse expired-contract history as if it
+    were live, never match by strike text, never substitute current OI for
+    prior OI, and never coerce missing history to zero.
 
 The producer is orchestration only: it duplicates no payoff/risk/candidate
 math (Day-18 quant, Day-31, Day-32 gate, Day-33 engine run verbatim),
