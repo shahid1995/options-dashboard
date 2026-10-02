@@ -97,10 +97,17 @@ def client(db_session):
         auth_mod.SessionLocal = _orig_session_local
 
 
+# Canonical local-account password for these tests. Keeping it in one named
+# constant means a login test can never drift away from the credential the
+# fixture actually hashed (which silently turned a valid-login test into a
+# 401 test).
+LOCAL_PASSWORD = "Sup3rSecret!"
+
+
 def _local_user(
     db,
     email="trader@example.com",
-    password="Sup3rSecret!",
+    password=LOCAL_PASSWORD,
     status="active",
 ):
     """Create a local (email/password) StrikeNova user."""
@@ -136,7 +143,7 @@ class TestAccountLogin:
 
         resp = client.post(
             f"{ACCOUNT}/login",
-            json={"email": user.email, "password": "Test" + "Password" + str(12345) + "!"},
+            json={"email": user.email, "password": LOCAL_PASSWORD},
         )
 
         assert resp.status_code == 200, resp.text
