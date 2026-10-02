@@ -604,25 +604,53 @@ def test_individual_leg_positions(client, logged_in, db_session):
     assert positions[1].strike == 24550 and positions[1].net_quantity == -1
 
 
-def test_partial_strategy_failure_is_atomic(client, logged_in, db_session, chain_quotes):
+def _assert_no_partial_writes(db_session):
+    """Zero writes — never a misleading partial success."""
     from app.models import PaperOrder, PaperTransaction, Position, StrategyExecution, Trade
 
-    # One leg's strike is missing from its expiry chain → whole execution blocks.
-    chain_quotes[EXPIRY] = {24350: {"call": 125.25, "put": 90.0}}  # 24550 gone
-    resp = execute(client, logged_in, exec_payload())
-    assert resp.status_code == 409
-    # Day 49: broker-authoritative contract metadata is resolved BEFORE chain
-    # prices, and both guards are fail-closed. Dropping strike 24550 from the
-    # fixture also drops its contract metadata, so CONTRACT_DATA_MISSING is
-    # the first guard to fire. The ordering is intentional: an unknown lot size
-    # must never reach the price/quantity computation at all.
-    assert "CONTRACT_DATA_MISSING" in resp.json()["detail"]
-    # Zero writes — never a misleading partial success.
     assert db_session.query(StrategyExecution).count() == 0
     assert db_session.query(PaperOrder).count() == 0
     assert db_session.query(Position).count() == 0
     assert db_session.query(PaperTransaction).count() == 0
     assert db_session.query(Trade).count() == 0
+
+
+def test_partial_strategy_failure_is_atomic(client, logged_in, db_session, chain_quotes):
+    # Day 49: broker-authoritative contract metadata is resolved BEFORE chain
+    # prices, and both guards are fail-closed. Dropping strike 24550 from the
+    # fixture removes its price AND its contract metadata, so the metadata
+    # guard fires first. That ordering is intentional: an unknown lot size
+    # must never reach the price/quantity computation at all.
+    chain_quotes[EXPIRY] = {24350: {"call": 125.25, "put": 90.0}}  # 24550 gone
+    resp = execute(client, logged_in, exec_payload())
+    assert resp.status_code == 409
+    assert "CONTRACT_DATA_MISSING" in resp.json()["detail"]
+    _assert_no_partial_writes(db_session)
+
+
+def test_missing_price_for_valid_contract_is_atomic(client, logged_in, db_session, chain_quotes):
+    """The chain-price guard stays covered on its own.
+
+    ``chain_mock`` derives BOTH the chain payload and the contract payload
+    from ``chain_quotes``, so removing a strike from the fixture loses its
+    contract metadata too and the metadata guard masks the price guard. Here
+    the contracts are left fully intact and only the market price for strike
+    24550 is withheld, so execution reaches ``resolve_market_prices`` and the
+    CHAIN_DATA_MISSING path is genuinely exercised.
+    """
+    async def chain_without_24550(token, instrument_key, expiry):
+        quotes = {k: v for k, v in chain_quotes.get(expiry, {}).items() if k != 24550}
+        return chain_payload(expiry, quotes)
+
+    with patch(
+        "app.services.upstox.get_option_chain",
+        new=AsyncMock(side_effect=chain_without_24550),
+    ):
+        resp = execute(client, logged_in, exec_payload())
+
+    assert resp.status_code == 409
+    assert "CHAIN_DATA_MISSING" in resp.json()["detail"]
+    _assert_no_partial_writes(db_session)
 
 
 def test_multi_expiry_execution_uses_each_expirys_chain(client, logged_in, db_session):
