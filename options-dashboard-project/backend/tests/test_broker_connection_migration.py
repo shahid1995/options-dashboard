@@ -65,19 +65,26 @@ class TestBrokerConnectionMigration:
         print("PASS: upgrade — tables, indexes, server_defaults, FK verified")
 
         # --- 2. Downgrade to base ---
-        command.downgrade(alembic_cfg, "base")
+        # CodeRabbit #2 (Day 49): the head revision d49aa0000001 refuses
+        # downgrade (intentionally irreversible UTC→IST data normalization).
+        # The refusal is atomic — raised before any revision rewinds — so the
+        # database stays at head with the schema fully intact.
+        with pytest.raises(NotImplementedError) as excinfo:
+            command.downgrade(alembic_cfg, "base")
+        assert "irreversible" in str(excinfo.value).lower()
 
         engine2 = create_engine(db_url)
         insp2 = inspect(engine2)
         tables2 = set(insp2.get_table_names())
 
-        assert "broker_connections" not in tables2
-        assert "broker_tokens" not in tables2
+        # Refused downgrade must not have dropped anything.
+        assert "broker_connections" in tables2
+        assert "broker_tokens" in tables2
 
         engine2.dispose()
-        print("PASS: downgrade — broker tables removed")
+        print("PASS: downgrade refused — schema intact")
 
-        # --- 3. Re-upgrade to head ---
+        # --- 3. Re-upgrade to head (idempotent after refusal) ---
         command.upgrade(alembic_cfg, "head")
 
         engine3 = create_engine(db_url)

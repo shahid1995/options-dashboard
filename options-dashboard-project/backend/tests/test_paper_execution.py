@@ -88,7 +88,18 @@ def chain_mock(chain_quotes):
     async def fake(token, instrument_key, expiry):
         return chain_payload(expiry, chain_quotes.get(expiry, {}))
 
-    with patch("app.services.upstox.get_option_chain", new=AsyncMock(side_effect=fake)) as m:
+    async def fake_contracts(token, instrument_key):
+        data = []
+        for expiry, strikes in chain_quotes.items():
+            for strike in strikes:
+                data.extend((
+                    {"expiry": expiry, "strike_price": strike, "instrument_type": "CE", "lot_size": LOT},
+                    {"expiry": expiry, "strike_price": strike, "instrument_type": "PE", "lot_size": LOT},
+                ))
+        return {"data": data}
+
+    with patch("app.services.upstox.get_option_chain", new=AsyncMock(side_effect=fake)) as m, \
+         patch("app.services.upstox.get_option_contracts", new=AsyncMock(side_effect=fake_contracts)):
         yield m
 
 
@@ -202,6 +213,37 @@ def first_position(db_session):
 
     return db_session.query(Position).order_by(Position.id).first()
 
+
+
+def test_client_lot_size_cannot_change_server_accounting(client, logged_in, db_session):
+    """Persist the broker lot size even when the client submits a false value."""
+    from app.models import PaperOrder, Position
+
+    payload = single_leg_payload(
+        client_order_id="exec-authoritative-lot-size",
+        legs=[{
+            "symbol": "NIFTY",
+            "expiration_date": EXPIRY,
+            "strike_price": 24350,
+            "option_type": "call",
+            "action": "buy",
+            "quantity": 1,
+            "lot_size": 1,
+        }],
+    )
+    response = execute(client, logged_in, payload)
+    assert response.status_code == 200, response.text
+
+    order = db_session.query(PaperOrder).one()
+    position = db_session.query(Position).one()
+    assert order.lot_size == LOT
+    assert position.lot_size == LOT
+    # The response is an ExecutionOut (a group of orders), not a single
+    # order — read the returned orders through the real API contract.
+    body = response.json()
+    assert len(body["orders"]) == 1
+    # The client submitted lot_size=1; the broker-authoritative LOT must win.
+    assert body["orders"][0]["lot_size"] == LOT
 
 # ---- Order lifecycle (§5) ----------------------------------------------------
 
@@ -562,20 +604,53 @@ def test_individual_leg_positions(client, logged_in, db_session):
     assert positions[1].strike == 24550 and positions[1].net_quantity == -1
 
 
-def test_partial_strategy_failure_is_atomic(client, logged_in, db_session, chain_quotes):
+def _assert_no_partial_writes(db_session):
+    """Zero writes — never a misleading partial success."""
     from app.models import PaperOrder, PaperTransaction, Position, StrategyExecution, Trade
 
-    # One leg's strike is missing from its expiry chain → whole execution blocks.
-    chain_quotes[EXPIRY] = {24350: {"call": 125.25, "put": 90.0}}  # 24550 gone
-    resp = execute(client, logged_in, exec_payload())
-    assert resp.status_code == 409
-    assert "CHAIN_DATA_MISSING" in resp.json()["detail"]
-    # Zero writes — never a misleading partial success.
     assert db_session.query(StrategyExecution).count() == 0
     assert db_session.query(PaperOrder).count() == 0
     assert db_session.query(Position).count() == 0
     assert db_session.query(PaperTransaction).count() == 0
     assert db_session.query(Trade).count() == 0
+
+
+def test_partial_strategy_failure_is_atomic(client, logged_in, db_session, chain_quotes):
+    # Day 49: broker-authoritative contract metadata is resolved BEFORE chain
+    # prices, and both guards are fail-closed. Dropping strike 24550 from the
+    # fixture removes its price AND its contract metadata, so the metadata
+    # guard fires first. That ordering is intentional: an unknown lot size
+    # must never reach the price/quantity computation at all.
+    chain_quotes[EXPIRY] = {24350: {"call": 125.25, "put": 90.0}}  # 24550 gone
+    resp = execute(client, logged_in, exec_payload())
+    assert resp.status_code == 409
+    assert "CONTRACT_DATA_MISSING" in resp.json()["detail"]
+    _assert_no_partial_writes(db_session)
+
+
+def test_missing_price_for_valid_contract_is_atomic(client, logged_in, db_session, chain_quotes):
+    """The chain-price guard stays covered on its own.
+
+    ``chain_mock`` derives BOTH the chain payload and the contract payload
+    from ``chain_quotes``, so removing a strike from the fixture loses its
+    contract metadata too and the metadata guard masks the price guard. Here
+    the contracts are left fully intact and only the market price for strike
+    24550 is withheld, so execution reaches ``resolve_market_prices`` and the
+    CHAIN_DATA_MISSING path is genuinely exercised.
+    """
+    async def chain_without_24550(token, instrument_key, expiry):
+        quotes = {k: v for k, v in chain_quotes.get(expiry, {}).items() if k != 24550}
+        return chain_payload(expiry, quotes)
+
+    with patch(
+        "app.services.upstox.get_option_chain",
+        new=AsyncMock(side_effect=chain_without_24550),
+    ):
+        resp = execute(client, logged_in, exec_payload())
+
+    assert resp.status_code == 409
+    assert "CHAIN_DATA_MISSING" in resp.json()["detail"]
+    _assert_no_partial_writes(db_session)
 
 
 def test_multi_expiry_execution_uses_each_expirys_chain(client, logged_in, db_session):
@@ -1044,3 +1119,30 @@ def test_open_positions_are_user_isolated(client, logged_in, db_session):
     assert all(p["strategy_execution_id"] is not None for p in active)
     assert all(p["strike"] != 24600 for p in active)
     assert len(active) == 2
+
+def test_position_mutation_queries_use_row_locking_for_postgresql():
+    """Paper position mutations must request row locks on PG/CRDB paths."""
+    from sqlalchemy.dialects.postgresql import dialect
+
+    from app.services.paper_execution import _get_position
+
+    captured = {}
+
+    class ScalarProbe:
+        def scalar(self, statement):
+            captured["statement"] = statement
+            return None
+
+    _get_position(
+        ScalarProbe(),
+        "user-1",
+        "NIFTY",
+        EXPIRY,
+        24350,
+        "call",
+        for_update=True,
+    )
+
+    statement = captured["statement"]
+    assert "FOR UPDATE" in str(statement.compile(dialect=dialect())).upper()
+    assert statement.get_execution_options()["populate_existing"] is True

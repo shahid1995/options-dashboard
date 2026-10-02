@@ -108,14 +108,23 @@ def test_upgrade_head_succeeds_on_fresh_db():
 
 
 def test_upgrade_head_then_downgrade_round_trip():
+    """CodeRabbit #2 (Day 49): downgrading from head must be REFUSED.
+
+    Since d49aa0000001, the UTC→IST IV normalization is intentionally
+    irreversible: a downgrade crossing it would falsely imply the legacy
+    data representation was restored (or corrupt canonical IST rows written
+    post-migration).  The refusal is atomic — it raises before any revision
+    rewinds, so the database stays at head and a repeated upgrade is a
+    no-op."""
     cfg, path = _fresh_db()
     try:
         command.upgrade(cfg, "head")
-        # Downgrade exactly the merge node's DDL depth is impractical to
-        # compute here; instead prove the pipeline can step back one full
-        # merge branch and return: downgrade to the branchpoint and up again.
-        command.downgrade(cfg, "5e2a7b9c3f4d")
-        command.upgrade(cfg, "head")
+        with pytest.raises(NotImplementedError) as excinfo:
+            command.downgrade(cfg, "5e2a7b9c3f4d")
+        assert "irreversible" in str(excinfo.value).lower()
+
+        # Zero partial rewind: still exactly one version row, at head.
+        command.upgrade(cfg, "head")  # idempotent no-op
         engine = create_engine(f"sqlite:///{path}")
         with engine.connect() as conn:
             rows = conn.execute(text("SELECT version_num FROM alembic_version")).fetchall()

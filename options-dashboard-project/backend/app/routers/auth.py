@@ -42,6 +42,7 @@ from sqlalchemy.exc import IntegrityError
 from fastapi import Request as FastAPIRequest
 from app.routers.deps import CurrentUser, AuthenticatedUser, get_session_id
 from app.services.broker_authorization import persist_connection_authorization
+from app.services.platform_session import is_platform_session_token
 from app.services import token_store
 from app.services import account_security
 from app.services.rate_limiter import rate_limiter, RateLimitRule
@@ -191,7 +192,7 @@ def login(
     # on first presentation (never replays); the session itself is still
     # fully validated below, and the token never creates or extends one.
     kick_session_id = _consume_popup_kick_session(popup_kick_cookie, broker_id)
-    if not session_id or token_store.get_token(session_id) is None:
+    if not session_id:
         if kick_session_id is None:
             raise HTTPException(
                 status_code=401,
@@ -677,12 +678,21 @@ def register(
                 extra={"event": "auth.register.existing_email", "email_domain": email.split("@")[-1]},
             )
             return {"ok": True, "message": "If this email is not already registered, your account has been created."}
-        # OAuth-created account with same email — link the password
-        existing.password_hash = hash_password(password)
-        if display_name:
-            existing.display_name = display_name
-        db.commit()
-        return {"ok": True, "message": "Password set for existing account", "user_id": existing.id}
+        # Existing OAuth/broker identities are never converted into local
+        # password accounts by an unauthenticated registration request.
+        # Account linking must occur through an authenticated, explicit flow.
+        logger.info(
+            "Registration attempted for existing OAuth identity",
+            extra={
+                "event": "auth.register.existing_oauth_identity",
+                "email_domain": email.split("@")[-1],
+                "identity_source": existing.identity_source,
+            },
+        )
+        return {
+            "ok": True,
+            "message": "If this email is not already registered, your account has been created.",
+        }
 
     user = User(
         id=str(uuid4()),
@@ -1015,9 +1025,38 @@ def _verify_google_token(credential: str, expected_nonce: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 @router.get("/status")
-def status(session_id: str | None = Depends(get_session_id)):
-    """Frontend calls this to check if the current session is valid."""
-    return {"logged_in": token_store.get_token(session_id) is not None}
+def status(
+    session_id: str | None = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    """Frontend calls this to check whether the current session is valid.
+
+    Durable UserSession is authoritative when available. The token-store
+    fallback preserves compatibility for legacy broker/session clients while
+    allowing account sessions to survive a backend restart.
+
+    Day 49 security fix: the fallback is NOT an override of the durable
+    session. A platform-only token ("email:"/"google:"/"account:") is a
+    *derived* credential — the durable UserSession is its sole authority —
+    so a cached one must never resurrect a revoked, expired or unknown
+    durable session. Without this, revocation was bypassable: logout
+    revokes the UserSession but left the platform token in the cache, and
+    /auth/status answered logged_in=true. Only opaque broker access tokens
+    (never platform-prefixed) keep the legacy cache fallback, because
+    pre-account clients have no UserSession to check against.
+    """
+    if not session_id:
+        return {"logged_in": False}
+    if get_active_session(db, session_id) is not None:
+        return {"logged_in": True}
+    cached = token_store.get_token(session_id)
+    if cached is None:
+        return {"logged_in": False}
+    if is_platform_session_token(cached):
+        # Durable UserSession already said "revoked / absent / expired" —
+        # that verdict is authoritative and final for platform sessions.
+        return {"logged_in": False}
+    return {"logged_in": True}
 
 
 @router.get("/me")
@@ -1027,9 +1066,6 @@ def me(
     db: Session = Depends(get_db),
 ):
     """Return the authenticated StrikeNova account without broker secrets."""
-    if token_store.get_token(session_id) is None:
-        raise HTTPException(status_code=401, detail="Not logged in")
-
     session = get_active_session(db, session_id)
     if session is None:
         raise HTTPException(status_code=401, detail="StrikeNova session is invalid or expired")
@@ -1512,13 +1548,13 @@ def account_register(
                 "ok": True,
                 "message": "Check your email to verify your account.",
             }
-        # OAuth-linked account (google/upstox) without a local password:
-        # setting a password follows the legacy /auth/register contract.
-        existing.password_hash = hash_password(password)
-        if display_name:
-            existing.display_name = display_name
-        db.commit()
-        return {"ok": True, "message": "Check your email to verify your account."}
+        # Existing OAuth/broker identities are never converted into local
+        # password accounts by an unauthenticated registration request.
+        # Account linking must occur through an authenticated, explicit flow.
+        return {
+            "ok": True,
+            "message": "Check your email to verify your account.",
+        }
 
     user = User(
         id=str(uuid4()),

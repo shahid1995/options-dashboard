@@ -97,6 +97,42 @@ def test_login_redirects_to_upstox_with_state(client, db_session):
     assert "client_id=user-api-key" in location
 
 
+def test_durable_session_can_start_broker_reauthorization_after_token_cache_loss(client, db_session):
+    """A durable account session can reconnect its broker after cache loss."""
+    from app.identity import User, store_credentials
+
+    user_id = str(uuid4())
+    session_id = token_store.set_token("durable-reauth")
+    user = User(
+        id=user_id,
+        status="active",
+        identity_source="email",
+    )
+    db_session.add(user)
+    db_session.flush()
+    create_session_record(db_session, user_id, session_id)
+    store_credentials(
+        db_session,
+        user_id,
+        "UPSTOX",
+        "reauth-api-key",
+        "reauth-api-secret",
+    )
+    db_session.commit()
+
+    token_store.clear_token(session_id)
+
+    # The browser session transport is the canonical HttpOnly cookie — the
+    # session credential is never sent in a header (repo AGENTS.md).
+    resp = client.get(
+        "/auth/login?broker=UPSTOX",
+        cookies={SESSION_COOKIE_NAME: session_id},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 307
+    assert "client_id=reauth-api-key" in resp.headers["location"]
+
+
 def test_callback_with_error_redirects_to_frontend(client, db_session):
     """Error without popup flag → redirect (dashboard mode)."""
     # Create a valid state (non-popup) so the error can be processed
@@ -496,3 +532,129 @@ def test_register_response_exposes_no_secrets(client):
     assert "password" not in body
     assert "password_hash" not in body
     assert body["ok"] is True
+
+def test_register_cannot_attach_password_to_existing_oauth_user(client, db_session):
+    """Unauthenticated registration must not take over an OAuth identity."""
+    from app.identity import User
+
+    user = User(
+        id=str(uuid4()),
+        email="oauth-victim@example.com",
+        password_hash=None,
+        display_name="OAuth User",
+        status="active",
+        identity_source="google",
+    )
+    db_session.add(user)
+    db_session.commit()
+
+    resp = client.post(
+        "/auth/register",
+        json={"email": user.email, "password": "Attack" + "er" + str(12345) + "!"},
+    )
+    assert resp.status_code == 200
+
+    db_session.refresh(user)
+    assert user.password_hash is None
+
+    login = client.post(
+        "/auth/login-email",
+        json={"email": user.email, "password": "Attack" + "er" + str(12345) + "!"},
+    )
+    assert login.status_code == 401
+
+
+def test_legacy_auth_status_and_me_survive_token_cache_loss(client, db_session):
+    """Durable UserSession remains authoritative after in-memory token loss."""
+    from app.identity import User, hash_password
+
+    user = User(
+        id=str(uuid4()),
+        email="durable-session@example.com",
+        password_hash=hash_password("Test" + "Password" + str(12345) + "!"),
+        display_name="Durable Session",
+        status="active",
+        identity_source="email",
+    )
+    db_session.add(user)
+    db_session.commit()
+
+    login = client.post(
+        "/auth/account/login",
+        json={"email": user.email, "password": "Test" + "Password" + str(12345) + "!"},
+    )
+    assert login.status_code == 200, login.text
+    session_id = login.cookies.get(SESSION_COOKIE_NAME)
+    assert session_id
+
+    token_store.clear_token(session_id)
+
+    status = client.get("/auth/status", cookies={SESSION_COOKIE_NAME: session_id})
+    assert status.json() == {"logged_in": True}
+
+    me = client.get("/auth/me", cookies={SESSION_COOKIE_NAME: session_id})
+    assert me.status_code == 200, me.text
+    assert me.json()["user_id"] == user.id
+
+
+def test_auth_status_never_lets_a_cached_platform_token_override_revocation(
+    client, db_session
+):
+    """Day 49: the durable UserSession is the sole authority for platform sessions.
+
+    ``/auth/status`` checks the durable UserSession first and only then falls
+    back to the in-memory token store. That fallback exists only for *legacy
+    broker* sessions, which predate accounts and have no UserSession to check.
+    For a platform session ("email:"/"google:"/"account:") the UserSession is
+    authoritative, so a stale cache entry must never resurrect a revoked,
+    expired or unknown durable session.
+    """
+    from app.identity import User, revoke_session
+
+    user = User(
+        id=str(uuid4()),
+        email="status-authority@example.com",
+        display_name="Status Authority",
+        status="active",
+        identity_source="email",
+    )
+    db_session.add(user)
+    db_session.commit()
+
+    def status(session_id):
+        resp = client.get("/auth/status", cookies={SESSION_COOKIE_NAME: session_id})
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    # (a) Active durable session with its platform token cached → logged in.
+    session_id = token_store.set_token(
+        f"account:{user.id}:{uuid4()}", persist_to_db=False
+    )
+    create_session_record(db_session, user.id, session_id)
+    db_session.commit()
+    assert status(session_id) == {"logged_in": True}
+
+    # (b) Losing the in-memory token must NOT log out a durable session —
+    #     the backend restart / cache-loss path stays working.
+    token_store.clear_token(session_id)
+    assert status(session_id) == {"logged_in": True}
+
+    # (c) Revocation must WIN over a cached platform token. A fresh session id
+    #     is used so the cache entry is genuinely present at revoke time.
+    revoked_id = token_store.set_token(
+        f"account:{user.id}:{uuid4()}", persist_to_db=False
+    )
+    create_session_record(db_session, user.id, revoked_id)
+    db_session.commit()
+    assert status(revoked_id) == {"logged_in": True}
+
+    assert revoke_session(db_session, revoked_id) is True
+    db_session.commit()
+    # The platform token is still cached — only the durable session was revoked.
+    assert token_store.get_token(revoked_id) is not None
+    assert status(revoked_id) == {"logged_in": False}
+
+    # The legacy broker-session fallback is preserved: an opaque broker access
+    # token with no durable UserSession still reports logged in.
+    broker_session_id = token_store.set_token("opaque-upstox-access-token")
+    assert status(broker_session_id) == {"logged_in": True}

@@ -391,6 +391,50 @@ def contracts_from_payload(raw: dict) -> list[str]:
     return sorted({c["expiry"] for c in raw.get("data", []) if "expiry" in c})
 
 
+def execution_contracts_from_payload(raw: dict) -> list[dict]:
+    """Normalize live option-contract metadata needed by paper execution.
+
+    The broker payload is intentionally reduced to broker-neutral fields.  The
+    current contract lot size is authoritative for the resolved instrument and
+    must never be inferred from client input or a hard-coded market default.
+    Malformed rows are omitted so callers can fail closed for any requested
+    instrument that cannot be authoritatively resolved.
+    """
+    contracts: list[dict] = []
+    seen: set[tuple[str, float, str]] = set()
+    option_type_map = {"CE": "call", "PE": "put", "CALL": "call", "PUT": "put"}
+
+    for item in raw.get("data", []):
+        expiry = item.get("expiry")
+        strike = item.get("strike_price")
+        lot_size = item.get("lot_size")
+        option_type = option_type_map.get(str(item.get("instrument_type") or "").upper())
+        if not expiry or strike is None or option_type is None or lot_size is None:
+            continue
+        try:
+            strike_value = float(strike)
+            lot_value = int(lot_size)
+        except (TypeError, ValueError):
+            continue
+        if strike_value <= 0 or lot_value <= 0:
+            continue
+        key = (str(expiry), strike_value, option_type)
+        if key in seen:
+            continue
+        seen.add(key)
+        contracts.append({
+            "expiry": str(expiry),
+            "strike": strike_value,
+            "option_type": option_type,
+            "lot_size": lot_value,
+        })
+
+    contracts.sort(key=lambda item: (
+        item["expiry"], item["strike"], item["option_type"]
+    ))
+    return contracts
+
+
 # ---- V3 order request payload (prepared, NOT wired) ---------------------------
 
 
