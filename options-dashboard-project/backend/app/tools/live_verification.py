@@ -1031,7 +1031,9 @@ def _assess_option_instrument_freshness(
             if naive_last is not None:
                 current_session = naive_last.date() == current_date
 
-    # Trusted authoritative expiry (server-side contract resolution only).
+    # Caller-supplied authoritative expiry. The CALLER is responsible for
+    # resolving trusted metadata; this function only validates the ISO shape
+    # and cannot verify where the value came from.
     authoritative_supplied = bool(
         isinstance(authoritative_expiry_date, str) and authoritative_expiry_date.strip()
     )
