@@ -946,6 +946,28 @@ async def _probe_option_endpoint(label: str, request_description: str, fetch: An
     return result
 
 
+def _normalize_authoritative_expiry(value: Any) -> str | None:
+    """Normalize a trusted authoritative expiry to an ISO ``YYYY-MM-DD`` string.
+
+    Only a strict ISO calendar date is accepted.  Anything else (free text, a
+    different date format, an unparseable value) returns ``None`` so the caller
+    fails closed instead of treating untrusted text as metadata.
+
+    The value is only authoritative when it originates from a server-side
+    contract-resolution path (broker option-chain / contract metadata), never
+    from operator-supplied free text.
+    """
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    try:
+        return date.fromisoformat(candidate).isoformat()
+    except ValueError:
+        return None
+
+
 def _assess_option_instrument_freshness(
     instrument_key: str,
     current_ist_date: str,
@@ -953,6 +975,7 @@ def _assess_option_instrument_freshness(
     intraday: dict,
     candles_returned: bool,
     api_accepted: bool,
+    authoritative_expiry_date: str | None = None,
 ) -> dict:
     """Assess whether the supplied key is unexpired/current as of today.
 
@@ -969,6 +992,12 @@ def _assess_option_instrument_freshness(
       - intraday candles timestamped in the current IST session are corroboration
         only, and are read solely from a structurally valid ("ok") intraday
         result. They never establish unexpired status on their own.
+
+    A trusted authoritative expiry (supplied by a server-side contract-resolution
+    path, because live ``NSE_FO|<id>`` keys embed no expiry) is evaluated with
+    the same fail-closed rules: compared against the CURRENT IST date, decisive
+    when already expired, requiring a usable candle response for the exact
+    instrument, and rejected outright when malformed.
     """
     expiry_from_key = _parse_expiry_from_option_key(instrument_key)
     try:
@@ -994,20 +1023,59 @@ def _assess_option_instrument_freshness(
             if naive_last is not None:
                 current_session = naive_last.date() == current_date
 
+    # Trusted authoritative expiry (server-side contract resolution only).
+    authoritative_supplied = bool(
+        isinstance(authoritative_expiry_date, str) and authoritative_expiry_date.strip()
+    )
+    authoritative_expiry = _normalize_authoritative_expiry(authoritative_expiry_date)
+    authoritative_implies_unexpired: bool | None = None
+    if authoritative_expiry is not None and current_date is not None:
+        authoritative_implies_unexpired = (
+            date.fromisoformat(authoritative_expiry) >= current_date
+        )
+
     verified: bool | None = None
     if key_implies_unexpired is False:
         # Decisive and evaluated FIRST: an expiry already in the past can never
         # be overridden by an intraday timestamp the probe does not trust.
         verified = False
         reason = f"the key embeds an expiry before the current IST date ({current_ist_date})"
+    elif authoritative_supplied and authoritative_expiry is None:
+        # Untrusted/malformed metadata never establishes anything.
+        verified = None
+        reason = (
+            "an authoritative expiry was supplied but is not a valid ISO date; "
+            "freshness could not be verified"
+        )
+    elif authoritative_implies_unexpired is False:
+        # Decisive, exactly like an expired embedded expiry.
+        verified = False
+        reason = (
+            f"the authoritative expiry ({authoritative_expiry}) is before the "
+            f"current IST date ({current_ist_date})"
+        )
     elif not api_accepted:
         verified = None
         reason = "no usable upstream response; freshness could not be verified"
+    elif authoritative_implies_unexpired is True and candles_returned:
+        verified = True
+        reason = (
+            "candles were returned for an instrument whose authoritative expiry "
+            f"({authoritative_expiry}) is on/after the current IST date "
+            f"({current_ist_date})"
+        )
     elif key_implies_unexpired is True and candles_returned:
         verified = True
         reason = (
             "candles were returned for a key whose embedded expiry is on/after "
             f"the current IST date ({current_ist_date})"
+        )
+    elif authoritative_supplied:
+        verified = None
+        reason = (
+            f"the authoritative expiry ({authoritative_expiry}) is on/after the "
+            f"current IST date ({current_ist_date}) but no usable candle response "
+            "was received for the exact instrument"
         )
     elif key_implies_unexpired is None:
         # No expiry is embedded in the key and this probe resolves no
@@ -1025,14 +1093,22 @@ def _assess_option_instrument_freshness(
     return {
         "expiry_from_instrument_key": expiry_from_key,
         "key_implies_unexpired": key_implies_unexpired,
+        "authoritative_expiry_date": authoritative_expiry,
+        "authoritative_expiry_supplied": authoritative_supplied,
+        "authoritative_expiry_valid": (
+            authoritative_supplied and authoritative_expiry is not None
+        ),
+        "authoritative_expiry_implies_unexpired": authoritative_implies_unexpired,
         "current_ist_date": current_ist_date,
         "probe_date_ist": probe_date_ist,
         "intraday_returned_current_session_candle": current_session,
         "verified_unexpired": verified,
         "verified_reason": reason,
         "method": (
-            "instrument-key expiry parse vs current IST date + optional "
-            "intraday current-session timestamp check"
+            "authoritative expiry (when supplied) else instrument-key expiry "
+            "parse, compared against the current IST date, always requiring a "
+            "usable candle response for the exact instrument; current-session "
+            "intraday timestamps are corroboration only"
         ),
     }
 
@@ -1077,12 +1153,21 @@ async def verify_option_candle_api(
     instrument_key: str,
     candle_date: str | None = None,
     dry_run: bool = False,
+    authoritative_expiry_date: str | None = None,
 ) -> dict:
     """Probe Upstox V3 for 3-minute candles of a live option instrument key.
 
     Exercises ``get_intraday_candles`` (current session) and
     ``get_historical_candles`` (a single bounded date) with
     ``unit="minutes", interval=3``.
+
+    ``authoritative_expiry_date`` is OPTIONAL trusted metadata: it may only be
+    supplied by an existing server-side contract-resolution path (the broker's
+    option-chain / contract metadata for that exact instrument), never as
+    operator free text.  Live option keys of the form ``NSE_FO|<id>`` carry no
+    embedded expiry, so without it freshness cannot be established outside a
+    live session.  A malformed value fails closed.  Omitting it preserves the
+    existing key-parsing behavior, so the ``--option-key`` CLI is unchanged.
 
     Read-only: no data is persisted and no credential material is printed.
     The four claims are reported separately and endpoint acceptance alone is
@@ -1100,6 +1185,14 @@ async def verify_option_candle_api(
         "probe_date_ist": probe_date,
         "current_ist_date": current_date,
         "open_interest_field_index": 6,
+        "authoritative_expiry_date": _normalize_authoritative_expiry(
+            authoritative_expiry_date
+        ),
+        "authoritative_expiry_source": (
+            "server-side contract resolution"
+            if _normalize_authoritative_expiry(authoritative_expiry_date)
+            else None
+        ),
     }
 
     print(f"\n{'='*70}")
@@ -1110,6 +1203,11 @@ async def verify_option_candle_api(
     print(f"  Instrument key: {instrument_key}")
     print(f"  Probe date (IST, historical request): {probe_date}")
     print(f"  Current IST date (freshness): {current_date}")
+    _auth_expiry = _normalize_authoritative_expiry(authoritative_expiry_date)
+    print(
+        "  Authoritative expiry (server-side contract resolution): "
+        + (f"{_auth_expiry}" if _auth_expiry else "not supplied")
+    )
     print("  Probe 1: get_intraday_candles (current session, 3-minute)")
     print(f"  Probe 2: get_historical_candles (single date {probe_date}, 3-minute)")
     print()
@@ -1216,6 +1314,7 @@ async def verify_option_candle_api(
         intraday,
         candles_returned=claim_2,
         api_accepted=claim_1,
+        authoritative_expiry_date=authoritative_expiry_date,
     )
 
     claims = {
