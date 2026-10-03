@@ -726,6 +726,10 @@ async def verify_db_roundtrip(token: str, candle_date: str, dry_run: bool = Fals
 #   3. returned candles contained a non-null Open Interest at index 6;
 #   4. the instrument was verified unexpired/current.
 #
+# Freshness (claim 4) is evaluated against the CURRENT IST date, never the
+# historical probe date: a key that expired between the probe date and today
+# can never be reported as unexpired.
+#
 # Endpoint acceptance alone does NOT establish live option OI support.
 
 _OPTION_KEY_EXPIRY_PATTERNS = (
@@ -900,37 +904,44 @@ async def _probe_option_endpoint(label: str, request_description: str, fetch: An
 
 def _assess_option_instrument_freshness(
     instrument_key: str,
+    current_ist_date: str,
     probe_date_ist: str,
     intraday: dict,
     candles_returned: bool,
     api_accepted: bool,
 ) -> dict:
-    """Assess whether the supplied key is an unexpired/current instrument.
+    """Assess whether the supplied key is unexpired/current as of today.
+
+    Freshness is evaluated against the CURRENT IST date, never the historical
+    probe date: a key that expired between the probe date and today must never
+    be reported as unexpired.
 
     Evidence combination (fail closed):
       - expiry embedded in the instrument key (key-format evidence only);
-      - intraday candles timestamped in the current IST session (server evidence);
-      - endpoint acceptance is required before any verification is reported.
+      - the key expiry is on/after the current IST date;
+      - a usable candle response was received for the exact key;
+      - intraday candles timestamped in the current IST session are additional
+        (not required) evidence, since the probe may run outside an NSE session.
     """
     expiry_from_key = _parse_expiry_from_option_key(instrument_key)
     try:
-        probe_date = date.fromisoformat(probe_date_ist)
+        current_date = date.fromisoformat(current_ist_date)
     except ValueError:
-        probe_date = None
+        current_date = None
 
     key_implies_unexpired: bool | None = None
-    if expiry_from_key is not None and probe_date is not None:
+    if expiry_from_key is not None and current_date is not None:
         try:
-            key_implies_unexpired = date.fromisoformat(expiry_from_key) >= probe_date
+            key_implies_unexpired = date.fromisoformat(expiry_from_key) >= current_date
         except ValueError:
             key_implies_unexpired = None
 
     current_session: bool | None = None
     last_timestamp = intraday.get("last_timestamp")
-    if isinstance(last_timestamp, str) and probe_date is not None:
+    if isinstance(last_timestamp, str) and current_date is not None:
         naive_last = to_ist_naive(last_timestamp)
         if naive_last is not None:
-            current_session = naive_last.date() == probe_date
+            current_session = naive_last.date() == current_date
 
     if not api_accepted:
         verified: bool | None = None
@@ -940,10 +951,13 @@ def _assess_option_instrument_freshness(
         reason = "intraday endpoint returned a candle in the current IST session"
     elif key_implies_unexpired is True and candles_returned:
         verified = True
-        reason = "candles were returned for a key whose embedded expiry is on/after the probe date"
+        reason = (
+            "candles were returned for a key whose embedded expiry is on/after "
+            f"the current IST date ({current_ist_date})"
+        )
     elif key_implies_unexpired is False:
         verified = False
-        reason = "the key embeds an expiry before the probe date"
+        reason = f"the key embeds an expiry before the current IST date ({current_ist_date})"
     else:
         verified = None
         reason = "no current-session candle and no embedded future expiry; not established"
@@ -951,10 +965,15 @@ def _assess_option_instrument_freshness(
     return {
         "expiry_from_instrument_key": expiry_from_key,
         "key_implies_unexpired": key_implies_unexpired,
+        "current_ist_date": current_ist_date,
+        "probe_date_ist": probe_date_ist,
         "intraday_returned_current_session_candle": current_session,
         "verified_unexpired": verified,
         "verified_reason": reason,
-        "method": "instrument-key expiry parse + intraday current-session timestamp check",
+        "method": (
+            "instrument-key expiry parse vs current IST date + optional "
+            "intraday current-session timestamp check"
+        ),
     }
 
 
@@ -979,16 +998,17 @@ def _option_probe_conclusion(claims: dict, freshness: dict) -> str:
     if claims["claim_4_instrument_verified_unexpired"] is not True:
         if freshness.get("verified_unexpired") is False:
             return (
-                "Open interest was observed, but the key embeds an expiry before the probe "
-                "date; this probe does NOT establish live option open interest support."
+                "Open interest was observed, but the key embeds an expiry before the "
+                "current IST date; this probe does NOT establish live option open interest support."
             )
         return (
             "Open interest was observed, but the instrument could not be verified as "
-            "unexpired/current; live option open interest support is therefore NOT established."
+            "unexpired/current as of the current IST date; live option open interest "
+            "support is therefore NOT established."
         )
     return (
         "Open interest was observed on candles returned for an instrument verified "
-        "unexpired/current on the Upstox V3 candle endpoints."
+        "unexpired/current as of the current IST date on the Upstox V3 candle endpoints."
     )
 
 
@@ -1009,6 +1029,7 @@ async def verify_option_candle_api(
     never reported as live option OI support.
     """
     probe_date = candle_date or _current_ist_date()
+    current_date = _current_ist_date()
 
     result: dict[str, Any] = {
         "section": "Live Option Instrument Candle Verification",
@@ -1017,6 +1038,7 @@ async def verify_option_candle_api(
         "instrument_key_source": "user-supplied CLI argument (--option-key)",
         "candle_interval": "3-minute (unit=minutes, interval=3)",
         "probe_date_ist": probe_date,
+        "current_ist_date": current_date,
         "open_interest_field_index": 6,
     }
 
@@ -1026,7 +1048,8 @@ async def verify_option_candle_api(
     print("  Upstream capability probe for an unexpired option instrument key")
     print("  Read-only: nothing is persisted; no credential material is printed")
     print(f"  Instrument key: {instrument_key}")
-    print(f"  Probe date (IST): {probe_date}")
+    print(f"  Probe date (IST, historical request): {probe_date}")
+    print(f"  Current IST date (freshness): {current_date}")
     print("  Probe 1: get_intraday_candles (current session, 3-minute)")
     print(f"  Probe 2: get_historical_candles (single date {probe_date}, 3-minute)")
     print()
@@ -1093,6 +1116,7 @@ async def verify_option_candle_api(
 
     freshness = _assess_option_instrument_freshness(
         instrument_key,
+        current_date,
         probe_date,
         intraday,
         candles_returned=claim_2,
