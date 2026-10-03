@@ -565,6 +565,10 @@ def _load_execution_metadata(
 
     Used on an idempotent replay, where the stored record — not the current
     attempt's resolution — is the authoritative history of what was executed.
+
+    Returns a ``dict`` only. Stored JSON that decodes to anything else
+    (``null``, a list, or a scalar) is not a usable audit trail and is treated
+    as absent rather than passed through to the caller.
     """
     from app.models import StrategyExecution
 
@@ -577,9 +581,10 @@ def _load_execution_metadata(
     if not raw:
         return None
     try:
-        return json.loads(raw)
+        metadata = json.loads(raw)
     except (TypeError, ValueError):
         return None
+    return metadata if isinstance(metadata, dict) else None
 
 
 def _persist_execution_metadata(db: Session, execution_id: str, metadata: dict) -> None:

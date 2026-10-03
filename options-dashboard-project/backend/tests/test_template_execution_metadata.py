@@ -28,6 +28,7 @@ from app.main import app
 from app.models import PaperOrder, Position, StrategyExecution
 from app.routers.templates import (
     _build_execution_metadata,
+    _load_execution_metadata,
     _persist_execution_metadata,
 )
 from app.services import token_store
@@ -538,6 +539,86 @@ class TestConcurrentExecution:
         assert after == before + 2  # two independent executions
 
 
+class TestLoadExecutionMetadataContract:
+    """``_load_execution_metadata`` must never return a non-dict.
+
+    The declared contract is ``dict | None``. Stored JSON that decodes to a
+    list, a scalar, or ``null`` is not an audit trail, so it must be reported
+    as absent instead of being handed to the replay response.
+    """
+
+    def _seed(self, db_session, raw, user_id="user-1"):
+        """Store ``raw`` verbatim as the execution's metadata (bypassing JSON
+        encoding so malformed / non-object payloads can be exercised)."""
+        import secrets
+
+        from app.models import StrategyExecution
+
+        exec_id = secrets.token_hex(16)
+        db_session.add(
+            StrategyExecution(
+                user_id=user_id,
+                execution_id=exec_id,
+                client_order_id="load-contract-coid",
+                symbol="NIFTY",
+                status="FILLED",
+            )
+        )
+        db_session.commit()
+        execution = (
+            db_session.query(StrategyExecution)
+            .filter_by(execution_id=exec_id)
+            .first()
+        )
+        execution.execution_metadata = raw
+        db_session.commit()
+        return exec_id
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            ('{"formula_version": 2, "formula": {"strike_mode": "atm"}}',
+             {"formula_version": 2, "formula": {"strike_mode": "atm"}}),
+            ('{"formula_version": 2}', {"formula_version": 2}),
+        ],
+    )
+    def test_json_object_returns_dict(self, db_session, raw, expected):
+        """A valid JSON object is returned as the metadata dict."""
+        exec_id = self._seed(db_session, raw)
+        assert _load_execution_metadata(db_session, "user-1", exec_id) == expected
+
+    @pytest.mark.parametrize("raw", ["[]", '[{"strike_mode": "atm"}]'])
+    def test_json_array_returns_none(self, db_session, raw):
+        """A JSON array is NOT a valid audit trail."""
+        exec_id = self._seed(db_session, raw)
+        assert _load_execution_metadata(db_session, "user-1", exec_id) is None
+
+    @pytest.mark.parametrize("raw", ['"atm"', "42", "3.14", "true", "false"])
+    def test_json_scalar_returns_none(self, db_session, raw):
+        """A JSON string / number / bool is NOT a valid audit trail."""
+        exec_id = self._seed(db_session, raw)
+        assert _load_execution_metadata(db_session, "user-1", exec_id) is None
+
+    def test_json_null_returns_none(self, db_session):
+        """JSON ``null`` decodes to None and stays None."""
+        exec_id = self._seed(db_session, "null")
+        assert _load_execution_metadata(db_session, "user-1", exec_id) is None
+
+    @pytest.mark.parametrize(
+        "raw", ['{"formula_version": 2', "not json at all", "{,}"]
+    )
+    def test_malformed_json_returns_none(self, db_session, raw):
+        """Malformed JSON is reported as absent, never raised or guessed."""
+        exec_id = self._seed(db_session, raw)
+        assert _load_execution_metadata(db_session, "user-1", exec_id) is None
+
+    def test_missing_row_and_null_column_return_none(self, db_session):
+        """No row, or a NULL column, both mean 'no metadata'."""
+        assert _load_execution_metadata(db_session, "user-1", "no-such-id") is None
+        exec_id = self._seed(db_session, None)
+        assert _load_execution_metadata(db_session, "user-1", exec_id) is None
+
+
 class TestIdempotentReplayMetadata:
     """An idempotent replay must never rewrite the stored audit trail.
 
@@ -668,6 +749,51 @@ class TestIdempotentReplayMetadata:
             .first()
         )
         assert record.execution_metadata is not None
+
+
+    def test_replay_response_never_carries_non_dict_metadata(
+        self, client, logged_in, db_session
+    ):
+        """End-to-end: a stored non-object never reaches the replay response.
+
+        ``execution_metadata`` is declared ``dict | None``, so a stored JSON
+        array (or any other non-object) must surface as ``null`` on the replay,
+        not as the decoded value.
+        """
+        tid = _create_template(client, logged_in, name="Replay Non Dict")
+
+        first = self._execute(
+            client, logged_in, tid, "exec-replay-md-004", 25000.0, 100.0, 25000.0
+        )
+        assert first.status_code == 200
+        exec_id = first.json()["execution_id"]
+
+        # Corrupt the stored trail into a JSON array (outside the API — the
+        # write path only ever stores dicts).
+        record = (
+            db_session.query(StrategyExecution)
+            .filter_by(execution_id=exec_id)
+            .first()
+        )
+        record.execution_metadata = '[{"resolved_strike": 99999.0}]'
+        db_session.commit()
+
+        replay = self._execute(
+            client, logged_in, tid, "exec-replay-md-004", 25000.0, 100.0, 25000.0
+        )
+        assert replay.status_code == 200
+        assert replay.json()["duplicated"] is True
+        assert replay.json()["execution_metadata"] is None
+
+        # The replay still never rewrites the stored record.
+        db_session.expire_all()
+        assert (
+            db_session.query(StrategyExecution)
+            .filter_by(execution_id=exec_id)
+            .first()
+            .execution_metadata
+            == '[{"resolved_strike": 99999.0}]'
+        )
 
 
 class TestMetadataPersistenceFailure:
