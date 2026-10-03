@@ -21,6 +21,7 @@ from app.utils.market_time import IST
 from app.tools.live_verification import (
     _sanitize,
     _type_matches,
+    _instrument_key_error,
     generate_report,
     verify_candle_api,
     verify_contract_api,
@@ -862,3 +863,164 @@ class TestVerifyOptionCandleFreshnessDates:
         assert result["claims"]["claim_4_instrument_verified_unexpired"] is True
         assert result["live_option_oi_established"] is True
         assert "current IST date" in result["conclusion"]
+
+
+class TestOptionProbeFailClosedHardening:
+    """Regression coverage for the four defects found in independent review.
+
+    Each test pins a defect that the original suite could not observe:
+    an expired key losing to a current-session timestamp, a malformed
+    intraday payload contributing freshness, an unvalidated key reaching the
+    URL path, and unexpired status being claimed from a timestamp alone.
+    """
+
+    @staticmethod
+    def _ok(day: str, oi=2450000.0):
+        return {
+            "status": "success",
+            "data": {"candles": [
+                [f"{day}T09:15:00+05:30", 105.5, 108.0, 104.0, 107.2, 120000.0, oi],
+            ]},
+        }
+
+    # -- Defect 1: an expired key must always fail freshness ----------------
+    @pytest.mark.asyncio
+    async def test_expired_key_with_current_session_candle_is_not_unexpired(self):
+        """An expiry already past outranks a candle dated today."""
+        today = _ist_date_offset(0)
+        expiry_key = "NSE_FO|47983|" + datetime.fromisoformat(
+            _ist_date_offset(-5)).strftime("%d-%m-%Y")
+        current_session = self._ok(today)
+
+        with patch("app.tools.live_verification.get_intraday_candles",
+                   new_callable=AsyncMock, return_value=current_session), \
+             patch("app.tools.live_verification.get_historical_candles",
+                   new_callable=AsyncMock, return_value=current_session):
+            result = await verify_option_candle_api("test-token", expiry_key, today)
+
+        # Precondition: the intraday evidence really is a current-session candle.
+        assert result["intraday"]["status"] == "ok"
+        assert result["instrument_freshness"]["intraday_returned_current_session_candle"] is True
+        assert result["instrument_freshness"]["key_implies_unexpired"] is False
+        assert result["claims"]["claim_3_candles_contained_open_interest"] is True
+        assert result["claims"]["claim_4_instrument_verified_unexpired"] is False
+        assert result["live_option_oi_established"] is False
+        assert "does NOT establish" in result["conclusion"]
+
+    # -- Defect 2: malformed intraday must not establish freshness ----------
+    @pytest.mark.asyncio
+    async def test_malformed_intraday_cannot_establish_freshness(self):
+        """One valid row plus one malformed row yields no freshness evidence."""
+        today = _ist_date_offset(0)
+        mixed = {
+            "status": "success",
+            "data": {"candles": [
+                [f"{today}T09:15:00+05:30", 105.5, 108.0, 104.0, 107.2, 120000.0, 2450000.0],
+                ["not-a-candle-row"],
+            ]},
+        }
+
+        with patch("app.tools.live_verification.get_intraday_candles",
+                   new_callable=AsyncMock, return_value=mixed), \
+             patch("app.tools.live_verification.get_historical_candles",
+                   new_callable=AsyncMock, return_value=self._ok(_ist_date_offset(-1))):
+            result = await verify_option_candle_api("test-token", "NSE_FO|53806", today)
+
+        assert result["intraday"]["status"] == "malformed"
+        assert result["intraday"]["malformed_row_count"] == 1
+        assert result["intraday"]["last_timestamp"] == f"{today}T09:15:00+05:30"
+        # The malformed classification must suppress the timestamp it still carries.
+        assert result["instrument_freshness"]["intraday_returned_current_session_candle"] is None
+        assert result["claims"]["claim_4_instrument_verified_unexpired"] is None
+        assert result["live_option_oi_established"] is False
+
+    # -- Defect 4: no timestamp-only unexpired claim ------------------------
+    @pytest.mark.asyncio
+    async def test_active_key_without_expiry_is_not_unexpired_from_timestamp(self):
+        """A clean current-session candle is corroboration, not proof."""
+        today = _ist_date_offset(0)
+        current_session = self._ok(today)
+
+        with patch("app.tools.live_verification.get_intraday_candles",
+                   new_callable=AsyncMock, return_value=current_session), \
+             patch("app.tools.live_verification.get_historical_candles",
+                   new_callable=AsyncMock, return_value=current_session):
+            result = await verify_option_candle_api("test-token", "NSE_FO|53806", today)
+
+        assert result["intraday"]["status"] == "ok"
+        assert result["instrument_freshness"]["intraday_returned_current_session_candle"] is True
+        assert result["instrument_freshness"]["expiry_from_instrument_key"] is None
+        assert result["instrument_freshness"]["key_implies_unexpired"] is None
+        assert result["claims"]["claim_3_candles_contained_open_interest"] is True
+        assert result["claims"]["claim_4_instrument_verified_unexpired"] is not True
+        assert result["live_option_oi_established"] is False
+
+    # -- Defect 3: instrument-key validation -------------------------------
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_key", [
+        "NSE_FO|X|../../user/profile",
+        "NSE_FO|X/../../user/profile",
+        "NSE_FO|X\\..\\admin",
+        "NSE_FO|X?foo=bar",
+        "NSE_FO|X#frag",
+        "NSE_FO|X%2f..%2fadmin",
+        "NSE_FO|X%252f..%252fadmin",
+        "NSE_FO|X\r\nX-Evil: 1",
+        "NSE_FO|X\nGET /v2/user/profile",
+        "NSE_FO|X\r/admin",
+        "NSE_FO|../../etc/passwd",
+        "NSE_FO|47983|31-12-2099/../admin",
+        "NSE_FO|47983|../../secret",
+        "N" * 200,
+        "",
+        "   ",
+    ])
+    async def test_adversarial_keys_never_reach_the_http_builder(self, bad_key):
+        """Rejected keys must fail closed before any upstream request exists."""
+        with patch("app.tools.live_verification.get_intraday_candles",
+                   new_callable=AsyncMock) as mock_intraday, \
+             patch("app.tools.live_verification.get_historical_candles",
+                   new_callable=AsyncMock) as mock_historical:
+            result = await verify_option_candle_api("test-token", bad_key)
+
+        mock_intraday.assert_not_called()
+        mock_historical.assert_not_called()
+        assert result["status"] == "error"
+        assert result["instrument_key_error"]
+        assert result["intraday"]["status"] == "rejected"
+        assert result["historical"]["status"] == "rejected"
+        assert result["claims"]["claim_1_endpoint_accepted_live_option_key"] is False
+        assert result["claims"]["claim_4_instrument_verified_unexpired"] is None
+        assert result["live_option_oi_established"] is False
+
+    @pytest.mark.parametrize("good_key", [
+        "NSE_FO|53806",
+        "NSE_FO|47983|31-12-2099",
+        "NSE_FO|47983|2099-12-31",
+        "NSE_FO|TEST_A|2025-04-17",
+    ])
+    def test_supported_key_forms_are_accepted(self, good_key):
+        """Validation must not be broader than the supported grammar."""
+        assert _instrument_key_error(good_key) is None
+
+    def test_whitespace_is_normalized_but_never_injected(self):
+        assert _instrument_key_error("  NSE_FO|53806  ") is None
+        assert _instrument_key_error("NSE_FO|53806\r\n") is None  # stripped, not embedded
+        assert _instrument_key_error("NSE_FO|53806\nX-Evil: 1") is not None
+
+    def test_non_string_keys_are_rejected(self):
+        assert _instrument_key_error(None) is not None
+        assert _instrument_key_error(47983) is not None
+        assert _instrument_key_error(["NSE_FO|53806"]) is not None
+
+    @pytest.mark.asyncio
+    async def test_rejection_message_leaks_no_credential(self, capsys):
+        with patch("app.tools.live_verification.get_intraday_candles",
+                   new_callable=AsyncMock) as mock_intraday:
+            result = await verify_option_candle_api(
+                "super-secret-token", "NSE_FO|X?foo=bar")
+        mock_intraday.assert_not_called()
+        assert result["live_option_oi_established"] is False
+        out = capsys.readouterr().out
+        assert "super-secret-token" not in out
+        assert "super-secret-token" not in result["conclusion"]
