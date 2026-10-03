@@ -862,3 +862,184 @@ class TestVerifyOptionCandleFreshnessDates:
         assert result["claims"]["claim_4_instrument_verified_unexpired"] is True
         assert result["live_option_oi_established"] is True
         assert "current IST date" in result["conclusion"]
+
+
+# ---------------------------------------------------------------------------
+# Option-key freshness: malformed intraday evidence and active keys
+# ---------------------------------------------------------------------------
+#
+# Two properties are pinned here, both of which a reviewer flagged:
+#
+#   * ``_analyse_option_candles`` can populate ``last_timestamp`` from the rows
+#     that survived while other rows are malformed, so the intraday endpoint is
+#     classified "malformed" yet still carries a usable-looking timestamp. That
+#     payload must not be able to establish current-session freshness.
+#   * a current option key such as ``NSE_FO|53806`` carries no expiry, so it
+#     cannot prove "unexpired" from key format alone. Unknown expiry must stay
+#     unconfirmed rather than defaulting to unexpired.
+#
+# All dates are derived from the real current IST date so the tests never
+# depend on a stale fixture date.
+
+ACTIVE_OPTION_KEY = "NSE_FO|53806"  # current option: no expiry suffix
+
+
+def _today_ist() -> str:
+    from app.tools.live_verification import _current_ist_date
+    return _current_ist_date()
+
+
+def _today_session_payload(*, extra_malformed_row: bool) -> dict:
+    """Current-session candles, optionally with one malformed row appended."""
+    today = _today_ist()
+    rows = [
+        [f"{today}T09:15:00+05:30", 105.5, 108.0, 104.0, 107.2, 120000.0, 2450000.0],
+        [f"{today}T09:18:00+05:30", 107.2, 109.0, 106.5, 108.4, 90000.0, 2481000.0],
+    ]
+    if extra_malformed_row:
+        # Too few fields -> counted as malformed, but last_timestamp survives.
+        rows.append([f"{today}T09:21:00+05:30", 108.4])
+    return {"status": "success", "data": {"candles": rows}}
+
+
+def _historical_oi_payload(day: str) -> dict:
+    return {
+        "status": "success",
+        "data": {"candles": [
+            [f"{day}T09:15:00+05:30", 105.5, 108.0, 104.0, 107.2, 120000.0, 2450000.0],
+        ]},
+    }
+
+
+class TestMalformedIntradayCannotEstablishFreshness:
+    """Finding B — malformed intraday evidence must fail closed."""
+
+    @pytest.mark.asyncio
+    async def test_malformed_intraday_never_sets_current_session(self):
+        with patch("app.tools.live_verification.get_intraday_candles",
+                    new_callable=AsyncMock,
+                    return_value=_today_session_payload(extra_malformed_row=True)), \
+             patch("app.tools.live_verification.get_historical_candles",
+                    new_callable=AsyncMock,
+                    return_value=_historical_oi_payload(_today_ist())):
+            result = await verify_option_candle_api(
+                "test-token", ACTIVE_OPTION_KEY, _today_ist(),
+            )
+
+        # The payload really is malformed, and really does carry a timestamp.
+        assert result["intraday"]["status"] == "malformed"
+        assert result["intraday"]["malformed_row_count"] == 1
+        assert isinstance(result["intraday"]["last_timestamp"], str)
+        # ...and yet it must not be treated as current-session evidence.
+        freshness = result["instrument_freshness"]
+        assert freshness["intraday_returned_current_session_candle"] is None
+        assert freshness["verified_unexpired"] is None
+        assert result["claims"]["claim_4_instrument_verified_unexpired"] is None
+        assert result["live_option_oi_established"] is False
+        assert "NOT established" in result["conclusion"]
+        assert "current IST date" in result["conclusion"]
+
+    @pytest.mark.asyncio
+    async def test_malformed_intraday_cannot_indirectly_establish_live_oi(self):
+        """OI comes from the (ok) historical endpoint; claim 4 must still fail."""
+        with patch("app.tools.live_verification.get_intraday_candles",
+                    new_callable=AsyncMock,
+                    return_value=_today_session_payload(extra_malformed_row=True)), \
+             patch("app.tools.live_verification.get_historical_candles",
+                    new_callable=AsyncMock,
+                    return_value=_historical_oi_payload(_today_ist())):
+            result = await verify_option_candle_api(
+                "test-token", ACTIVE_OPTION_KEY, _today_ist(),
+            )
+
+        # Claim 3 is legitimately established by the healthy historical endpoint.
+        assert result["claims"]["claim_2_endpoint_returned_candles"] is True
+        assert result["claims"]["claim_3_candles_contained_open_interest"] is True
+        # ...but the overall live-OI claim still requires all four.
+        assert result["live_option_oi_established"] is False
+
+    @pytest.mark.asyncio
+    async def test_errored_intraday_never_sets_current_session(self):
+        from app.services.upstox import UpstoxError
+
+        with patch("app.tools.live_verification.get_intraday_candles",
+                    new_callable=AsyncMock,
+                    side_effect=UpstoxError(500, "boom")), \
+             patch("app.tools.live_verification.get_historical_candles",
+                    new_callable=AsyncMock,
+                    return_value=_historical_oi_payload(_today_ist())):
+            result = await verify_option_candle_api(
+                "test-token", ACTIVE_OPTION_KEY, _today_ist(),
+            )
+
+        assert result["intraday"]["status"] == "error"
+        assert result["instrument_freshness"][
+            "intraday_returned_current_session_candle"] is None
+        assert result["live_option_oi_established"] is False
+
+    @pytest.mark.asyncio
+    async def test_valid_current_session_intraday_still_establishes(self):
+        """The fix must not over-block: a clean intraday payload still counts."""
+        with patch("app.tools.live_verification.get_intraday_candles",
+                    new_callable=AsyncMock,
+                    return_value=_today_session_payload(extra_malformed_row=False)), \
+             patch("app.tools.live_verification.get_historical_candles",
+                    new_callable=AsyncMock,
+                    return_value=_historical_oi_payload(_today_ist())):
+            result = await verify_option_candle_api(
+                "test-token", ACTIVE_OPTION_KEY, _today_ist(),
+            )
+
+        freshness = result["instrument_freshness"]
+        assert result["intraday"]["status"] == "ok"
+        assert freshness["intraday_returned_current_session_candle"] is True
+        assert freshness["verified_unexpired"] is True
+        assert result["claims"]["claim_4_instrument_verified_unexpired"] is True
+        assert result["live_option_oi_established"] is True
+
+
+class TestActiveOptionKeyExpiryIsUnconfirmed:
+    """Finding C — an active key encodes no expiry; that must stay unconfirmed."""
+
+    @pytest.mark.asyncio
+    async def test_active_key_without_expiry_is_not_treated_as_unexpired(self):
+        empty = {"status": "success", "data": {"candles": []}}
+        with patch("app.tools.live_verification.get_intraday_candles",
+                    new_callable=AsyncMock, return_value=empty), \
+             patch("app.tools.live_verification.get_historical_candles",
+                    new_callable=AsyncMock,
+                    return_value=_historical_oi_payload(_today_ist())):
+            result = await verify_option_candle_api(
+                "test-token", ACTIVE_OPTION_KEY, _today_ist(),
+            )
+
+        freshness = result["instrument_freshness"]
+        assert freshness["expiry_from_instrument_key"] is None
+        assert freshness["key_implies_unexpired"] is None
+        assert freshness["verified_unexpired"] is None
+        assert result["claims"]["claim_3_candles_contained_open_interest"] is True
+        assert result["live_option_oi_established"] is False
+        assert "NOT established" in result["conclusion"]
+        assert "current IST date" in result["conclusion"]
+
+    @pytest.mark.asyncio
+    async def test_historical_probe_date_cannot_revive_an_expired_instrument(self):
+        """A caller-supplied past date must not make an expired key look live."""
+        expired_key = "NSE_FO|47983|17-04-2020"
+        past_day = _ist_date_offset(-400)
+        with patch("app.tools.live_verification.get_intraday_candles",
+                    new_callable=AsyncMock,
+                    return_value=_historical_oi_payload(past_day)), \
+             patch("app.tools.live_verification.get_historical_candles",
+                    new_callable=AsyncMock,
+                    return_value=_historical_oi_payload(past_day)):
+            result = await verify_option_candle_api(
+                "test-token", expired_key, past_day,
+            )
+
+        freshness = result["instrument_freshness"]
+        assert freshness["current_ist_date"] == _today_ist()
+        assert freshness["probe_date_ist"] == past_day
+        assert freshness["key_implies_unexpired"] is False
+        assert result["live_option_oi_established"] is False
+        assert "current IST date" in result["conclusion"]
