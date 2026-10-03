@@ -596,6 +596,12 @@ def _persist_execution_metadata(db: Session, execution_id: str, metadata: dict) 
     """
     from app.models import StrategyExecution
 
+    # False positive: SQLAlchemy's expression API compiles this to bound
+    # parameters (`WHERE execution_id = ?`); the statement carries no
+    # interpolated SQL, and execution_id is server-generated
+    # (secrets.token_hex(16)), never a request field. Verified by the
+    # parameter-binding regression tests in test_template_execution_metadata.py.
+    # nosemgrep: python.fastapi.db.generic-sql-fastapi.generic-sql-fastapi
     db.execute(
         update(StrategyExecution)
         .where(StrategyExecution.execution_id == execution_id)

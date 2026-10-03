@@ -339,6 +339,141 @@ class TestPersistExecutionMetadata:
 
 
 # ---------------------------------------------------------------------------
+# Tests: hostile input is bound, never interpolated (Issue: PR #121 finding)
+# ---------------------------------------------------------------------------
+
+#: Classic SQL-injection payloads. None of these may influence SQL structure.
+HOSTILE_EXECUTION_IDS = [
+    "x' OR '1'='1",
+    "'; DROP TABLE strategy_executions; --",
+    "1) OR 1=1 --",
+    "abc'--",
+    "abc\nUNION SELECT 1",
+    "abc/*comment*/",
+    "%27%20OR%201%3D1",
+]
+
+#: Hostile metadata value; JSON encoding must neutralise it before storage.
+HOSTILE_METADATA = {
+    "note": "'; DROP TABLE strategy_executions; --",
+    "expr": "1 OR 1=1",
+}
+
+
+def _execution_row(db_session, execution_id: str, coid: str):
+    from app.models import StrategyExecution
+
+    db_session.add(StrategyExecution(
+        user_id="user-1", execution_id=execution_id,
+        client_order_id=coid, symbol="NIFTY", status="FILLED",
+    ))
+    db_session.commit()
+
+
+class TestExecutionMetadataIsParameterBound:
+    """The UPDATE must bind every value — never build SQL from input.
+
+    These tests assert observable behaviour (which rows changed, and how the
+    value round-trips), not the presence of a suppression comment.
+    """
+
+    def test_statement_compiles_to_bound_parameters(self):
+        """SQL structure is fixed; hostile values appear only as parameters."""
+        from sqlalchemy import update
+        from sqlalchemy.dialects import sqlite
+
+        from app.models import StrategyExecution
+
+        for hostile in HOSTILE_EXECUTION_IDS:
+            stmt = (
+                update(StrategyExecution)
+                .where(StrategyExecution.execution_id == hostile)
+                .values(execution_metadata=json.dumps(HOSTILE_METADATA))
+            )
+            compiled = stmt.compile(dialect=sqlite.dialect())
+            sql = str(compiled)
+            # Structure is invariant across every payload...
+            assert sql == (
+                "UPDATE strategy_executions SET updated_at=?, "
+                "execution_metadata=? WHERE strategy_executions.execution_id = ?"
+            ), sql
+            # ...and the hostile string is a parameter value, never SQL text.
+            assert hostile not in sql
+            assert compiled.params["execution_id_1"] == hostile
+            assert "OR '1'='1'" not in sql
+            assert ";" not in sql
+
+    @pytest.mark.parametrize("hostile", HOSTILE_EXECUTION_IDS)
+    def test_hostile_execution_id_updates_no_rows(self, db_session, hostile):
+        """A hostile execution_id must not match, widen, or create anything."""
+        from app.models import StrategyExecution
+
+        target = "target-exec-0001"
+        decoy_a = "decoy-exec-a"
+        decoy_b = "decoy-exec-b"
+        for eid, coid in ((target, "c1"), (decoy_a, "c2"), (decoy_b, "c3")):
+            _execution_row(db_session, eid, coid)
+
+        _persist_execution_metadata(db_session, hostile, HOSTILE_METADATA)
+        db_session.expire_all()
+
+        rows = db_session.query(StrategyExecution).all()
+        assert len(rows) == 3  # nothing created
+        assert all(r.execution_metadata is None for r in rows)  # nothing updated
+        assert {r.execution_id for r in rows} == {target, decoy_a, decoy_b}
+
+    def test_hostile_metadata_is_stored_opaquely_and_only_touches_its_row(
+        self, db_session
+    ):
+        """Hostile metadata round-trips as data and reaches exactly one row."""
+        from app.models import StrategyExecution
+
+        target = "target-exec-0002"
+        decoy = "decoy-exec-c"
+        _execution_row(db_session, target, "c4")
+        _execution_row(db_session, decoy, "c5")
+
+        _persist_execution_metadata(db_session, target, HOSTILE_METADATA)
+        db_session.expire_all()
+
+        rows = {r.execution_id: r.execution_metadata
+                for r in db_session.query(StrategyExecution).all()}
+        # Unrelated rows are untouched.
+        assert rows[decoy] is None
+        # The hostile payload is stored verbatim and decodes back exactly.
+        assert rows[target] is not None
+        assert json.loads(rows[target]) == HOSTILE_METADATA
+        assert db_session.query(StrategyExecution).count() == 2
+
+    def test_intended_row_update_is_preserved(self, db_session):
+        """The legitimate write path is unchanged by the hardening."""
+        from app.models import StrategyExecution
+
+        target = "target-exec-0003"
+        _execution_row(db_session, target, "c6")
+        _persist_execution_metadata(db_session, target, {"formula_version": 2})
+
+        db_session.expire_all()
+        row = db_session.query(StrategyExecution).filter_by(
+            execution_id=target).first()
+        assert json.loads(row.execution_metadata) == {"formula_version": 2}
+
+    def test_source_contains_no_raw_sql_interpolation(self):
+        """Guard against reintroducing f-string/text() SQL in the helper."""
+        import inspect
+
+        from app.routers import templates
+
+        source = inspect.getsource(templates._persist_execution_metadata)
+        assert "text(" not in source
+        assert "raw_connection" not in source
+        assert ".execute(f\"" not in source
+        # The statement is the SQLAlchemy expression API, not a SQL literal.
+        assert "update(StrategyExecution)" in source
+        assert "db.execute(" in source
+
+
+# ---------------------------------------------------------------------------
 # Tests: V2 integration with metadata
 # ---------------------------------------------------------------------------
 
