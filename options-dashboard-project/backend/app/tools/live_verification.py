@@ -9,6 +9,7 @@ This tool:
   - Reuses the existing token_store and Upstox adapter functions
   - Never prints, logs, or stores access tokens or credentials
   - Performs deliberately small, controlled API calls
+  - Probes a live option instrument key on request (--option-key, read-only)
   - Generates a comprehensive verification report
 
 Usage::
@@ -22,7 +23,11 @@ Usage::
     python -m app.tools.live_verification --lot-sizes
     python -m app.tools.live_verification --round-trip
     python -m app.tools.live_verification --backfill
+
     python -m app.tools.live_verification --coverage
+
+    # Probe a single unexpired option instrument key (intraday + bounded historical)
+    python -m app.tools.live_verification --option-key "NSE_FO|<token>|<expiry dd-mm-yyyy>"
 
     # Dry-run (check auth only, don't call API)
     python -m app.tools.live_verification --dry-run
@@ -43,6 +48,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, date, timedelta, timezone
@@ -95,6 +101,7 @@ def _get_access_token() -> str:
 
 from app.services.upstox import (
     get_historical_candles,
+    get_intraday_candles,
     get_expired_expiries,
     get_expired_option_contracts,
     UpstoxError,
@@ -105,6 +112,7 @@ from app.services.candle_ingestion import (
     normalize_candle_timestamp,
 )
 from app.services.candle_validation import validate_candle_batch
+from app.utils.market_time import IST, to_ist_naive
 from app.services.contract_metadata import (
     upsert_contract_spec,
     get_contract_specification,
@@ -702,6 +710,438 @@ async def verify_db_roundtrip(token: str, candle_date: str, dry_run: bool = Fals
 # Report Generation
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Section 4: Live Option Instrument Candle Verification
+# ---------------------------------------------------------------------------
+#
+# Upstream capability probe for an UNEXPIRED option instrument key.
+#
+# Read-only: nothing is persisted, no new credential path is introduced, and
+# the access token is never printed or stored.  Only the client functions
+# already exported by app.services.upstox are used.
+#
+# The probe keeps FOUR claims independent and never conflates them:
+#   1. the endpoint accepted the live instrument key;
+#   2. the endpoint returned candles;
+#   3. returned candles contained a non-null Open Interest at index 6;
+#   4. the instrument was verified unexpired/current.
+#
+# Endpoint acceptance alone does NOT establish live option OI support.
+
+_OPTION_KEY_EXPIRY_PATTERNS = (
+    re.compile(r"\|(\d{2})-(\d{2})-(\d{4})$"),  # NSE_FO|<token>|dd-mm-yyyy
+    re.compile(r"\|(\d{4})-(\d{2})-(\d{2})$"),  # NSE_FO|<token>|yyyy-mm-dd
+)
+
+
+def _current_ist_date() -> str:
+    """Current calendar date in IST (bounds the historical probe window)."""
+    return datetime.now(timezone.utc).astimezone(IST).date().isoformat()
+
+
+def _parse_expiry_from_option_key(instrument_key: str) -> str | None:
+    """Best-effort extraction of the expiry embedded in an option key.
+
+    Returns an ISO ``YYYY-MM-DD`` string, or ``None`` when the key carries no
+    recognizable expiry.  This is key-format evidence only; it does not by
+    itself prove that the instrument is live upstream.
+    """
+    if not instrument_key:
+        return None
+    key = instrument_key.strip()
+    for pattern in _OPTION_KEY_EXPIRY_PATTERNS:
+        match = pattern.search(key)
+        if match is None:
+            continue
+        try:
+            first, second, third = (int(group) for group in match.groups())
+            if len(str(first)) == 4:
+                return date(first, second, third).isoformat()  # yyyy-mm-dd
+            return date(third, second, first).isoformat()  # dd-mm-yyyy
+        except ValueError:
+            return None
+    return None
+
+
+def _timestamp_offset_label(timestamp: str) -> str:
+    """Classify the timezone encoding of a raw Upstox timestamp string."""
+    if timestamp.endswith("Z"):
+        return "Z"
+    match = re.search(r"([+-]\d{2}:\d{2})$", timestamp)
+    if match:
+        return match.group(1)
+    return "no-offset"
+
+
+def _extract_option_candles(response: Any) -> tuple[list, str | None]:
+    """Extract raw candles while keeping a credential-free failure reason.
+
+    Unlike :func:`extract_candles_from_response`, an empty candle list and a
+    malformed payload stay distinguishable ("empty" vs "malformed").
+    """
+    if not isinstance(response, dict):
+        return [], f"response is {type(response).__name__}, expected object"
+    status = response.get("status")
+    if status != "success":
+        return [], f"response status is {status!r}"
+    data = response.get("data")
+    if not isinstance(data, dict):
+        return [], f"'data' is {type(data).__name__}, expected object"
+    candles = data.get("candles")
+    if not isinstance(candles, list):
+        return [], f"'data.candles' is {type(candles).__name__}, expected list"
+    return candles, None
+
+
+def _analyse_option_candles(candles: list) -> dict:
+    """Structural, non-sensitive evidence from a raw option candle array."""
+    evidence: dict[str, Any] = {
+        "candle_count": len(candles),
+        "candle_array_length": None,
+        "candle_array_lengths_observed": [],
+        "malformed_row_count": 0,
+        "open_interest_field_present": False,
+        "open_interest_non_null_count": 0,
+        "open_interest_sample": [],
+        "timestamp_format_sample": None,
+        "timezone_offsets_observed": [],
+        "first_timestamp": None,
+        "last_timestamp": None,
+        "naive_ist_last_timestamp": None,
+    }
+    if not candles:
+        return evidence
+
+    row_lengths: list[int] = []
+    timestamps: list[str] = []
+    oi_values: list[Any] = []
+    offsets: set[str] = set()
+
+    for row in candles:
+        if not isinstance(row, (list, tuple)) or len(row) < 6:
+            evidence["malformed_row_count"] += 1
+            continue
+        timestamp = row[0]
+        if not isinstance(timestamp, str) or not timestamp:
+            evidence["malformed_row_count"] += 1
+            continue
+        if to_ist_naive(timestamp) is None:
+            evidence["malformed_row_count"] += 1
+            continue
+        row_lengths.append(len(row))
+        timestamps.append(timestamp)
+        offsets.add(_timestamp_offset_label(timestamp))
+        if len(row) > 6:
+            evidence["open_interest_field_present"] = True
+            if row[6] is not None:
+                oi_values.append(row[6])
+
+    if row_lengths:
+        evidence["candle_array_length"] = row_lengths[0]
+        evidence["candle_array_lengths_observed"] = sorted(set(row_lengths))
+    if timestamps:
+        evidence["timestamp_format_sample"] = timestamps[0]
+        evidence["first_timestamp"] = timestamps[0]
+        evidence["last_timestamp"] = timestamps[-1]
+        naive_last = to_ist_naive(timestamps[-1])
+        evidence["naive_ist_last_timestamp"] = naive_last.isoformat() if naive_last else None
+    evidence["timezone_offsets_observed"] = sorted(offsets)
+    evidence["open_interest_non_null_count"] = len(oi_values)
+    evidence["open_interest_sample"] = oi_values[:3]
+    return evidence
+
+
+def _classify_option_endpoint(
+    candles: list,
+    extraction_error: str | None,
+    malformed_row_count: int,
+) -> str:
+    """Classify one endpoint outcome; anything unexpected fails closed."""
+    if extraction_error:
+        return "malformed"
+    if not candles:
+        return "empty"
+    if malformed_row_count:
+        return "malformed"
+    return "ok"
+
+
+async def _probe_option_endpoint(label: str, request_description: str, fetch: Any) -> dict:
+    """Run one read-only option candle request and analyse the response."""
+    result: dict[str, Any] = {
+        "label": label,
+        "request": request_description,
+        "status": "pending",
+        "http_status": None,
+        "error": None,
+        "extraction_error": None,
+    }
+    result.update(_analyse_option_candles([]))
+    try:
+        response = await fetch()
+        candles, extraction_error = _extract_option_candles(response)
+        analysis = _analyse_option_candles(candles)
+        result.update(analysis)
+        result["extraction_error"] = extraction_error
+        result["status"] = _classify_option_endpoint(
+            candles, extraction_error, analysis["malformed_row_count"],
+        )
+        result["http_status"] = "success (200)"
+    except UpstoxError as e:
+        result["status"] = "error"
+        result["http_status"] = f"UpstoxError({e.status_code})"
+        result["error"] = _sanitize(str(e))
+    except Exception as e:  # noqa: BLE001 - must never crash on a vendor response
+        result["status"] = "error"
+        result["http_status"] = None
+        result["error"] = _sanitize(f"{type(e).__name__}: {e}")
+    return result
+
+
+def _assess_option_instrument_freshness(
+    instrument_key: str,
+    probe_date_ist: str,
+    intraday: dict,
+    candles_returned: bool,
+    api_accepted: bool,
+) -> dict:
+    """Assess whether the supplied key is an unexpired/current instrument.
+
+    Evidence combination (fail closed):
+      - expiry embedded in the instrument key (key-format evidence only);
+      - intraday candles timestamped in the current IST session (server evidence);
+      - endpoint acceptance is required before any verification is reported.
+    """
+    expiry_from_key = _parse_expiry_from_option_key(instrument_key)
+    try:
+        probe_date = date.fromisoformat(probe_date_ist)
+    except ValueError:
+        probe_date = None
+
+    key_implies_unexpired: bool | None = None
+    if expiry_from_key is not None and probe_date is not None:
+        try:
+            key_implies_unexpired = date.fromisoformat(expiry_from_key) >= probe_date
+        except ValueError:
+            key_implies_unexpired = None
+
+    current_session: bool | None = None
+    last_timestamp = intraday.get("last_timestamp")
+    if isinstance(last_timestamp, str) and probe_date is not None:
+        naive_last = to_ist_naive(last_timestamp)
+        if naive_last is not None:
+            current_session = naive_last.date() == probe_date
+
+    if not api_accepted:
+        verified: bool | None = None
+        reason = "no usable upstream response; freshness could not be verified"
+    elif current_session is True:
+        verified = True
+        reason = "intraday endpoint returned a candle in the current IST session"
+    elif key_implies_unexpired is True and candles_returned:
+        verified = True
+        reason = "candles were returned for a key whose embedded expiry is on/after the probe date"
+    elif key_implies_unexpired is False:
+        verified = False
+        reason = "the key embeds an expiry before the probe date"
+    else:
+        verified = None
+        reason = "no current-session candle and no embedded future expiry; not established"
+
+    return {
+        "expiry_from_instrument_key": expiry_from_key,
+        "key_implies_unexpired": key_implies_unexpired,
+        "intraday_returned_current_session_candle": current_session,
+        "verified_unexpired": verified,
+        "verified_reason": reason,
+        "method": "instrument-key expiry parse + intraday current-session timestamp check",
+    }
+
+
+def _option_probe_conclusion(claims: dict, freshness: dict) -> str:
+    """Interpretation that keeps the four claims strictly separate."""
+    if claims["claim_1_endpoint_accepted_live_option_key"] is not True:
+        return (
+            "Upstox V3 did not accept the supplied option instrument key with a usable "
+            "response (see the per-endpoint status and error fields); no upstream "
+            "capability conclusion can be drawn from this probe."
+        )
+    if claims["claim_2_endpoint_returned_candles"] is not True:
+        return (
+            "The endpoint accepted the key but returned no candles; this does NOT establish "
+            "that Upstox V3 serves live option candles or live option open interest."
+        )
+    if claims["claim_3_candles_contained_open_interest"] is not True:
+        return (
+            "Candles were returned but contained no usable open interest value; this does "
+            "NOT establish that Upstox V3 serves live option open interest."
+        )
+    if claims["claim_4_instrument_verified_unexpired"] is not True:
+        if freshness.get("verified_unexpired") is False:
+            return (
+                "Open interest was observed, but the key embeds an expiry before the probe "
+                "date; this probe does NOT establish live option open interest support."
+            )
+        return (
+            "Open interest was observed, but the instrument could not be verified as "
+            "unexpired/current; live option open interest support is therefore NOT established."
+        )
+    return (
+        "Open interest was observed on candles returned for an instrument verified "
+        "unexpired/current on the Upstox V3 candle endpoints."
+    )
+
+
+async def verify_option_candle_api(
+    token: str,
+    instrument_key: str,
+    candle_date: str | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Probe Upstox V3 for 3-minute candles of a live option instrument key.
+
+    Exercises ``get_intraday_candles`` (current session) and
+    ``get_historical_candles`` (a single bounded date) with
+    ``unit="minutes", interval=3``.
+
+    Read-only: no data is persisted and no credential material is printed.
+    The four claims are reported separately and endpoint acceptance alone is
+    never reported as live option OI support.
+    """
+    probe_date = candle_date or _current_ist_date()
+
+    result: dict[str, Any] = {
+        "section": "Live Option Instrument Candle Verification",
+        "status": "pending",
+        "instrument_key": instrument_key,
+        "instrument_key_source": "user-supplied CLI argument (--option-key)",
+        "candle_interval": "3-minute (unit=minutes, interval=3)",
+        "probe_date_ist": probe_date,
+        "open_interest_field_index": 6,
+    }
+
+    print(f"\n{'='*70}")
+    print("SECTION 4: Live Option Instrument Candle Verification")
+    print(f"{'='*70}")
+    print("  Upstream capability probe for an unexpired option instrument key")
+    print("  Read-only: nothing is persisted; no credential material is printed")
+    print(f"  Instrument key: {instrument_key}")
+    print(f"  Probe date (IST): {probe_date}")
+    print("  Probe 1: get_intraday_candles (current session, 3-minute)")
+    print(f"  Probe 2: get_historical_candles (single date {probe_date}, 3-minute)")
+    print()
+
+    if dry_run:
+        print("  [DRY RUN] Would probe the option instrument key on Upstox V3.")
+        result["status"] = "dry_run"
+        return result
+
+    async def _fetch_intraday() -> dict:
+        return await get_intraday_candles(
+            token, instrument_key=instrument_key, unit="minutes", interval=3,
+        )
+
+    async def _fetch_historical() -> dict:
+        return await get_historical_candles(
+            token,
+            instrument_key=instrument_key,
+            to_date=probe_date,
+            from_date=probe_date,
+            unit="minutes",
+            interval=3,
+        )
+
+    intraday = await _probe_option_endpoint(
+        "intraday",
+        f"get_intraday_candles({instrument_key}, unit=minutes, interval=3)",
+        _fetch_intraday,
+    )
+    historical = await _probe_option_endpoint(
+        "historical",
+        f"get_historical_candles({instrument_key}, to_date={probe_date}, "
+        f"from_date={probe_date}, unit=minutes, interval=3)",
+        _fetch_historical,
+    )
+
+    for endpoint in (intraday, historical):
+        if endpoint["status"] in ("ok", "empty", "malformed"):
+            print(
+                f"  [{endpoint['status'].upper()}] {endpoint['label']}: "
+                f"candles={endpoint['candle_count']}, "
+                f"OI_non_null={endpoint['open_interest_non_null_count']}, "
+                f"offsets={endpoint['timezone_offsets_observed']}"
+            )
+        else:
+            print(f"  [FAIL] {endpoint['label']}: {endpoint['http_status']}")
+
+    statuses = [intraday["status"], historical["status"]]
+    usable = [status for status in statuses if status in ("ok", "empty")]
+    if len(usable) == len(statuses):
+        result["status"] = "success"
+    elif usable:
+        result["status"] = "partial"
+    else:
+        result["status"] = "error"
+
+    claim_1 = bool(usable)
+    claim_2 = any(endpoint["status"] == "ok" for endpoint in (intraday, historical))
+    claim_3 = any(
+        endpoint["open_interest_non_null_count"] > 0
+        for endpoint in (intraday, historical)
+        if endpoint["status"] == "ok"
+    )
+
+    freshness = _assess_option_instrument_freshness(
+        instrument_key,
+        probe_date,
+        intraday,
+        candles_returned=claim_2,
+        api_accepted=claim_1,
+    )
+
+    claims = {
+        "claim_1_endpoint_accepted_live_option_key": claim_1,
+        "claim_2_endpoint_returned_candles": claim_2,
+        "claim_3_candles_contained_open_interest": claim_3,
+        "claim_4_instrument_verified_unexpired": freshness["verified_unexpired"],
+    }
+
+    if intraday["status"] == historical["status"]:
+        endpoint_consistency = "consistent"
+    else:
+        endpoint_consistency = "inconsistent"
+
+    intraday_has_oi = intraday["open_interest_non_null_count"] > 0
+    historical_has_oi = historical["open_interest_non_null_count"] > 0
+    if intraday["status"] == "ok" and historical["status"] == "ok":
+        open_interest_consistency = (
+            "consistent" if intraday_has_oi == historical_has_oi else "inconsistent"
+        )
+    else:
+        open_interest_consistency = "not_comparable"
+
+    result["intraday"] = intraday
+    result["historical"] = historical
+    result["endpoint_consistency"] = endpoint_consistency
+    result["open_interest_consistency"] = open_interest_consistency
+    result["instrument_freshness"] = freshness
+    result["claims"] = claims
+    result["live_option_oi_established"] = bool(
+        claim_3 and freshness["verified_unexpired"] is True
+    )
+    result["conclusion"] = _option_probe_conclusion(claims, freshness)
+
+    print()
+    print("  Claims (each must be established independently):")
+    for claim_name, claim_value in claims.items():
+        print(f"    {claim_name}: {claim_value}")
+    print(f"  Instrument freshness: {freshness['verified_unexpired']} ({freshness['verified_reason']})")
+    print(f"  Live option OI established: {result['live_option_oi_established']}")
+    print(f"  Conclusion: {result['conclusion']}")
+
+    return result
+
+
 def generate_report(results: list[dict]) -> str:
     """Generate the Phase 7.9 verification report in markdown."""
     lines = [
@@ -787,6 +1227,7 @@ Examples:
   python -m app.tools.live_verification --candles
   python -m app.tools.live_verification --contracts
   python -m app.tools.live_verification --round-trip
+  python -m app.tools.live_verification --option-key "NSE_FO|47983|31-12-2099"
   python -m app.tools.live_verification --dry-run
         """,
     )
@@ -794,6 +1235,8 @@ Examples:
     parser.add_argument("--candles", action="store_true", help="Verify historical candle API")
     parser.add_argument("--contracts", action="store_true", help="Verify expired contract API")
     parser.add_argument("--round-trip", action="store_true", help="Verify database round-trip")
+    parser.add_argument("--option-key", default=None, help="Unexpired option instrument key to probe (read-only live option candle/OI capability probe)")
+    parser.add_argument("--option-candle-date", default=None, help="Single date for the historical option probe (default: current IST date)")
     parser.add_argument("--candle-date", default=DEFAULT_CANDLE_DATE, help=f"Candle verification date (default: {DEFAULT_CANDLE_DATE})")
     parser.add_argument("--expiry-date", default=DEFAULT_EXPIRY_DATE, help=f"Contract expiry date (default: {DEFAULT_EXPIRY_DATE})")
     parser.add_argument("--dry-run", action="store_true", help="Check authentication only, don't call API")
@@ -803,9 +1246,9 @@ Examples:
     args = parser.parse_args()
 
     # Require at least one action
-    if not any([args.all, args.candles, args.contracts, args.round_trip, args.dry_run]):
+    if not any([args.all, args.candles, args.contracts, args.round_trip, args.dry_run, args.option_key]):
         parser.print_help()
-        print("\nERROR: Specify at least one of --all, --candles, --contracts, --round-trip, or --dry-run")
+        print("\nERROR: Specify at least one of --all, --candles, --contracts, --round-trip, --option-key, or --dry-run")
         sys.exit(1)
 
     logging.basicConfig(level=logging.WARNING)
@@ -825,6 +1268,9 @@ Examples:
 
     print(f"  Candle date:  {args.candle_date}")
     print(f"  Expiry date:  {args.expiry_date}")
+    if args.option_key:
+        print(f"  Option key:   {args.option_key}")
+        print(f"  Option probe date: {args.option_candle_date or _current_ist_date()}")
     print()
 
     results = []
@@ -840,6 +1286,15 @@ Examples:
 
     if args.all or args.round_trip:
         r = await verify_db_roundtrip(token, args.candle_date, dry_run=args.dry_run)
+        results.append(r)
+
+    if (args.all or args.option_key) and args.option_key:
+        r = await verify_option_candle_api(
+            token,
+            args.option_key,
+            args.option_candle_date,
+            dry_run=args.dry_run,
+        )
         results.append(r)
 
     # Generate report
