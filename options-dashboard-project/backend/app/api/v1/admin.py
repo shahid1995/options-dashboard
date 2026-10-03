@@ -24,7 +24,6 @@ Operational views are read-only and admin-scoped:
 
 from __future__ import annotations
 
-import re
 from datetime import date
 from typing import Any
 
@@ -457,33 +456,6 @@ def audit(
 # probe semantics (no reinterpretation here).
 
 
-#: Upstox instrument-key grammar, derived from the key forms this repository
-#: actually uses (see ``NIFTY_INDEX_KEY``, ``EXPIRED_NIFTY_INSTRUMENT_KEY``,
-#: ``ContractSpec`` fixtures and ``_OPTION_KEY_EXPIRY_PATTERNS``):
-#:
-#:   ``NSE_INDEX|Nifty 50``          index — space in the name
-#:   ``NSE_INDEX|NIFTY MID SELECT``  index — multiple spaces
-#:   ``BSE_INDEX|SENSEX50``          index — bare alphanumeric name
-#:   ``NSE_FO|53806``                current option — no expiry suffix
-#:   ``NSE_FO|47983|31-12-2099``     expired option — dd-mm-yyyy suffix
-#:   ``NSE_FO|TEST_A|2025-04-17``    expired option — yyyy-mm-dd suffix
-#:
-#: The character set is an ALLOWLIST that cannot express a path separator,
-#: query delimiter, fragment, percent-encoding or ``..`` traversal: the probe
-#: places this value directly into the Upstox V3 request path while using the
-#: caller's own credential, so anything outside the grammar must be rejected
-#: rather than escaped.
-_INSTRUMENT_KEY_RE = re.compile(
-    r"[A-Z][A-Z0-9_]*"                      # exchange segment: NSE_FO, NSE_INDEX…
-    r"\|"                                    # required separator
-    r"[A-Za-z0-9_ ]+"                       # token or index name (spaces allowed)
-    r"(?:\|(?:\d{2}-\d{2}-\d{4}"            # optional dd-mm-yyyy expiry
-    r"|\d{4}-\d{2}-\d{2}))?"                # optional yyyy-mm-dd expiry
-)
-
-_MAX_INSTRUMENT_KEY_LEN = 128
-
-
 class OptionCandleProbeIn(BaseModel):
     """Read-only live option-candle verification request.
 
@@ -498,16 +470,21 @@ class OptionCandleProbeIn(BaseModel):
     @field_validator("instrument_key")
     @classmethod
     def _instrument_key_shape(cls, v: str) -> str:
-        v = v.strip()  # leading/trailing whitespace is normalized, never passed on
-        if not v or len(v) > _MAX_INSTRUMENT_KEY_LEN:
-            raise ValueError("instrument_key must be 1-128 characters")
-        if _INSTRUMENT_KEY_RE.fullmatch(v) is None:
-            raise ValueError(
-                "instrument_key must be a valid Upstox instrument key "
-                "(e.g. NSE_FO|53806, NSE_FO|47983|31-12-2099, "
-                "NSE_INDEX|Nifty 50)"
-            )
-        return v
+        """Apply the SAME grammar and normalization the probe itself requires.
+
+        The probe builds an authenticated Upstox URL path from this value, so
+        the request boundary reuses the probe's own validator instead of a
+        second, drifting copy: a traversal, query, fragment or control
+        character is rejected here, and the normalized (stripped) key is what
+        every downstream call receives.
+        """
+        from app.tools.live_verification import _instrument_key_error
+
+        normalized = v.strip() if isinstance(v, str) else v
+        error = _instrument_key_error(normalized)
+        if error is not None:
+            raise ValueError(error)
+        return normalized
 
     @field_validator("candle_date")
     @classmethod
@@ -548,6 +525,89 @@ def _endpoint_facts(endpoint: Any) -> dict:
     return {key: endpoint.get(key) for key in _ENDPOINT_FACT_KEYS}
 
 
+def _contract_expiry_iso(value: Any) -> str | None:
+    """Normalize a broker contract ``expiry`` value to ISO ``YYYY-MM-DD``.
+
+    The provider reports contract expiries in more than one calendar format;
+    only a value this function can parse to a real ISO date may be treated as
+    authoritative.  Anything else returns ``None`` so the caller fails closed.
+    """
+    from datetime import datetime as _dt
+
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y"):
+        try:
+            return _dt.strptime(candidate, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _instrument_identity(instrument_key: str) -> str:
+    """The broker's canonical instrument identity for a requested key.
+
+    Upstox contract metadata keys the SAME instrument by its two-segment form
+    (``NSE_FO|<id>``); the three-segment form the candle endpoint accepts
+    (``NSE_FO|<id>|<dd-mm-yyyy>``) only appends an expiry rendering to that
+    same identity.  Identity is therefore the first two segments, and the
+    third segment is untrusted key text that must be cross-checked, never
+    treated as authoritative.
+    """
+    return "|".join(instrument_key.split("|")[:2])
+
+
+async def _resolve_authoritative_expiry(access_token: str, instrument_key: str) -> str | None:
+    """Resolve the authoritative expiry for the EXACT requested instrument.
+
+    Uses the existing Upstox contract-metadata endpoint (the same server-side
+    path the probe's own contract section uses) and requires an exact match on
+    the broker's own instrument identity.  The returned expiry is ALWAYS the
+    broker's value: the request body, the key's own embedded expiry segment,
+    and operator input are never sources for it.
+
+    ``None`` is returned — so the caller fails closed — when the instrument is
+    absent from contract metadata, its expiry cannot be parsed to a real date,
+    or an expiry embedded in the requested key disagrees with the broker.
+    """
+    from app.services.upstox import get_option_contracts
+    from app.tools.live_verification import NIFTY_INDEX_KEY
+
+    payload = await get_option_contracts(access_token, NIFTY_INDEX_KEY)
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return None
+
+    identity = _instrument_identity(instrument_key)
+    row: dict | None = None
+    for candidate in rows:
+        if not isinstance(candidate, dict):
+            continue
+        row_key = candidate.get("instrument_key")
+        if isinstance(row_key, str) and row_key.strip() == identity:
+            row = candidate
+            break
+    if row is None:
+        return None
+
+    authoritative = _contract_expiry_iso(row.get("expiry"))
+    if authoritative is None:
+        return None
+
+    segments = instrument_key.split("|")
+    if len(segments) > 2:
+        # Key text carries its own expiry rendering.  Trusting it would be
+        # exactly the operator-supplied authority this seam must not have, and
+        # silently ignoring a disagreement would hide a wrong key.
+        embedded = _contract_expiry_iso(segments[2])
+        if embedded != authoritative:
+            return None
+    return authoritative
+
+
 def _freshness_facts(freshness: Any) -> dict:
     """Project the instrument-freshness evidence (no credential material)."""
     if not isinstance(freshness, dict):
@@ -555,12 +615,26 @@ def _freshness_facts(freshness: Any) -> dict:
     return {
         "expiry_from_instrument_key": freshness.get("expiry_from_instrument_key"),
         "key_implies_unexpired": freshness.get("key_implies_unexpired"),
+        "authoritative_expiry_date": freshness.get("authoritative_expiry_date"),
+        "authoritative_expiry_supplied": freshness.get("authoritative_expiry_supplied"),
+        "authoritative_expiry_valid": freshness.get("authoritative_expiry_valid"),
+        "authoritative_expiry_implies_unexpired": freshness.get(
+            "authoritative_expiry_implies_unexpired"
+        ),
         "intraday_returned_current_session_candle": freshness.get(
             "intraday_returned_current_session_candle"
         ),
         "verified_unexpired": freshness.get("verified_unexpired"),
         "verified_reason": freshness.get("verified_reason"),
     }
+
+
+#: Machine codes for the authoritative-expiry gate.  Identical strings are
+#: used for the HTTP error envelope and the durable audit reason, and both
+#: are kept below ``admin_audit.SECRETISH_VALUE``'s 28-character value shape
+#: so the audit record preserves the code instead of ``<redacted>``.
+EXPIRY_UNRESOLVED = "EXPIRY_UNRESOLVED"
+CONTRACT_METADATA_FAILED = "CONTRACT_METADATA_FAILED"
 
 
 @router.post("/live-verification/option-candle")
@@ -627,9 +701,73 @@ async def verify_option_candle(
     # --- Read-only probe, in-process; credential passed in memory only ---
     from app.tools.live_verification import verify_option_candle_api
 
+    # --- Authoritative expiry: broker contract metadata ONLY -------------
+    # The probe judges freshness from the instrument's real expiry, and a live
+    # ``NSE_FO|<id>`` key carries none.  It is resolved server-side from the
+    # broker's own contract metadata for that EXACT key; it is never taken from
+    # the request body, from key text, or from operator input.  A key that
+    # cannot be matched fails closed before any candle request is made.
+    #
+    # NOTE: the two machine codes below are kept shorter than
+    # ``admin_audit.SECRETISH_VALUE``'s 28-character value shape so the SAME
+    # code survives into the durable audit trail; a longer code would be
+    # scrubbed to ``<redacted>`` there and the failure would become
+    # undiagnosable (the pre-existing ``MARKET_DATA_NOT_CONNECTED`` reason
+    # follows the same bound).
+    try:
+        authoritative_expiry = await _resolve_authoritative_expiry(
+            credential.token, body.instrument_key
+        )
+    except Exception as exc:  # noqa: BLE001 - audited, then surfaced as 502
+        record_admin_action(
+            db,
+            actor_user_id=user.user_id,
+            action="live_verification.option_candle",
+            target={
+                "instrument_key": body.instrument_key,
+                "candle_date": body.candle_date,
+            },
+            result="failed",
+            detail={
+                "reason": CONTRACT_METADATA_FAILED,
+                "error_class": type(exc).__name__,
+            },
+        )
+        error = HTTPException(
+            status_code=502, detail="Upstox contract metadata lookup failed."
+        )
+        error.error_code = CONTRACT_METADATA_FAILED
+        raise error from exc
+
+    if authoritative_expiry is None:
+        record_admin_action(
+            db,
+            actor_user_id=user.user_id,
+            action="live_verification.option_candle",
+            target={
+                "instrument_key": body.instrument_key,
+                "candle_date": body.candle_date,
+            },
+            result="failed",
+            detail={"reason": EXPIRY_UNRESOLVED},
+        )
+        unresolved = HTTPException(
+            status_code=422,
+            detail=(
+                "No authoritative Upstox contract metadata matched this "
+                "instrument key, so its expiry could not be established; "
+                "live option freshness cannot be verified."
+            ),
+        )
+        unresolved.error_code = EXPIRY_UNRESOLVED
+        raise unresolved
+
     try:
         result = await verify_option_candle_api(
-            credential.token, body.instrument_key, body.candle_date
+            credential.token,
+            body.instrument_key,
+            body.candle_date,
+            authoritative_expiry_date=authoritative_expiry,
         )
     except Exception as exc:  # noqa: BLE001 — audited, then surfaced as 502
         record_admin_action(
@@ -657,6 +795,7 @@ async def verify_option_candle(
         "intraday": _endpoint_facts(result.get("intraday")),
         "historical": _endpoint_facts(result.get("historical")),
         "instrument_freshness": _freshness_facts(result.get("instrument_freshness")),
+        "authoritative_expiry_source": result.get("authoritative_expiry_source"),
         "claims": result.get("claims"),
         "live_option_oi_established": result.get("live_option_oi_established"),
         "conclusion": result.get("conclusion"),

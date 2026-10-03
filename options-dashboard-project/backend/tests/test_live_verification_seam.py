@@ -54,7 +54,55 @@ from app.services.market_data_authorization import MarketDataCredential
 ROUTE = "/api/v1/admin/live-verification/option-candle"
 LIVE_KEY = "NSE_FO|56930|09-10-2026"
 CANDLE_DATE = "2026-10-02"
-PROBE_TOKEN = "tok-day50-seam-live-secret"
+#: The broker's OWN identity for LIVE_KEY. Real Upstox contract metadata keys
+#: an instrument by its two-segment form and appends no expiry segment, so the
+#: seam must match on this identity and never trust the requested key's own
+#: embedded expiry text.
+LIVE_KEY_IDENTITY = "NSE_FO|56930"
+#: ISO form of LIVE_KEY's broker-reported expiry, as the seam normalizes it.
+LIVE_KEY_EXPIRY = "2026-10-09"
+#: A real live option key shape: two segments, no embedded expiry. Freshness
+#: for such a key is only establishable from server-side contract metadata.
+TWO_SEGMENT_KEY = "NSE_FO|53806"
+TWO_SEGMENT_EXPIRY = "2026-10-06"
+
+#: Contract-metadata payload the seam resolves the authoritative expiry from,
+#: mirroring the REAL provider shape observed against the staging broker:
+#: two-segment ``instrument_key`` values, expiries in ISO form.  One row is
+#: deliberately kept in the provider's ``dd-mm-yyyy`` form so both broker
+#: calendar formats stay covered.
+DEFAULT_CONTRACT_METADATA = {
+    "status": "success",
+    "data": [
+        {
+            "instrument_key": LIVE_KEY_IDENTITY,
+            "expiry": LIVE_KEY_EXPIRY,
+            "instrument_type": "CE",
+            "strike_price": 24000.0,
+            "lot_size": 65,
+        },
+        {
+            "instrument_key": TWO_SEGMENT_KEY,
+            "expiry": "06-10-2026",
+            "instrument_type": "CE",
+            "strike_price": 22400.0,
+            "lot_size": 65,
+        },
+    ],
+}
+
+
+def _contract_metadata_mock(monkeypatch, payload=None, side_effect=None):
+    """Patch the server-side contract-metadata lookup the seam relies on."""
+    mock = AsyncMock(
+        return_value=DEFAULT_CONTRACT_METADATA if payload is None else payload,
+        side_effect=side_effect,
+    )
+    monkeypatch.setattr("app.services.upstox.get_option_contracts", mock)
+    return mock
+# Synthetic fixture value. It is NOT a credential, is never sent anywhere,
+# and exists only so leak-detection assertions have a unique marker.
+PROBE_TOKEN = "unit-test-fixture-value-not-a-credential"
 
 EXPECTED_TOP_LEVEL_KEYS = {
     "status",
@@ -66,6 +114,7 @@ EXPECTED_TOP_LEVEL_KEYS = {
     "intraday",
     "historical",
     "instrument_freshness",
+    "authoritative_expiry_source",
     "claims",
     "live_option_oi_established",
     "conclusion",
@@ -126,7 +175,7 @@ def _mk_user(db, *, admin: bool = False) -> User:
 
 
 def _login(db, user: User) -> str:
-    session_id = token_store.set_token(f"tok-d50-{user.id[:8]}")
+    session_id = token_store.set_token(f"unit-test-session-{user.id[:8]}")
     create_session_record(db, user.id, session_id)
     return session_id
 
@@ -215,6 +264,9 @@ def _probe_result(
     current_session: bool | None = True,
     upstream_error: str | None = None,
     endpoint_http_status: str = "success (200)",
+    authoritative_expiry_date: str | None = None,
+    authoritative_expiry_source: str | None = None,
+    freshness_overrides: dict | None = None,
 ) -> dict:
     """A realistic ``verify_option_candle_api`` result (semantics verbatim)."""
     intraday = _endpoint_evidence(
@@ -247,6 +299,8 @@ def _probe_result(
         "probe_date_ist": CANDLE_DATE,
         "current_ist_date": "2026-10-03",
         "open_interest_field_index": 6,
+        "authoritative_expiry_date": authoritative_expiry_date,
+        "authoritative_expiry_source": authoritative_expiry_source,
         "intraday": intraday,
         "historical": historical,
         "endpoint_consistency": (
@@ -261,12 +315,17 @@ def _probe_result(
         "instrument_freshness": {
             "expiry_from_instrument_key": "2026-10-09",
             "key_implies_unexpired": verified_unexpired,
+            "authoritative_expiry_date": authoritative_expiry_date,
+            "authoritative_expiry_supplied": authoritative_expiry_date is not None,
+            "authoritative_expiry_valid": authoritative_expiry_date is not None,
+            "authoritative_expiry_implies_unexpired": verified_unexpired,
             "current_ist_date": "2026-10-03",
             "probe_date_ist": CANDLE_DATE,
             "intraday_returned_current_session_candle": current_session,
             "verified_unexpired": verified_unexpired,
             "verified_reason": verified_reason,
             "method": "instrument-key expiry parse vs current IST date",
+            **(freshness_overrides or {}),
         },
         "claims": claims,
         "live_option_oi_established": bool(has_oi and verified_unexpired is True),
@@ -290,6 +349,7 @@ def _install(monkeypatch, credential, *, probe_result=None, probe_side_effect=No
     monkeypatch.setattr(
         "app.tools.live_verification.verify_option_candle_api", probe
     )
+    _contract_metadata_mock(monkeypatch)
     return resolver, probe
 
 
@@ -411,7 +471,7 @@ class TestSeamAuthorization:
                 "actor_user_id": victim.id,
                 "connection_id": "conn-not-owned",
                 "session_id": "someone-elses-session",
-                "token": "attacker-supplied-token",
+                "token": "request-body-value-that-must-be-ignored",
             },
         )
         assert resp.status_code == 200
@@ -455,7 +515,12 @@ class TestCredentialResolution:
         assert args[1] == caller.id
         assert args[2] == "UPSTOX"
         assert kwargs == {}
-        probe.assert_awaited_once_with(PROBE_TOKEN, LIVE_KEY, CANDLE_DATE)
+        probe.assert_awaited_once_with(
+            PROBE_TOKEN,
+            LIVE_KEY,
+            CANDLE_DATE,
+            authoritative_expiry_date=LIVE_KEY_EXPIRY,
+        )
 
     def test_missing_credential_fails_closed(self, client, admin_session, monkeypatch):
         sid, _admin = admin_session
@@ -518,7 +583,12 @@ class TestProbeInvocation:
             {"instrument_key": f"  {LIVE_KEY}  ", "candle_date": CANDLE_DATE},
         )
         assert resp.status_code == 200
-        probe.assert_awaited_once_with(PROBE_TOKEN, LIVE_KEY, CANDLE_DATE)
+        probe.assert_awaited_once_with(
+            PROBE_TOKEN,
+            LIVE_KEY,
+            CANDLE_DATE,
+            authoritative_expiry_date=LIVE_KEY_EXPIRY,
+        )
 
     def test_omitted_or_blank_candle_date_passes_none(
         self, client, admin_session, monkeypatch
@@ -526,13 +596,23 @@ class TestProbeInvocation:
         sid, _admin = admin_session
         _resolver, probe = _install(monkeypatch, _credential())
         assert _post(client, sid, {"instrument_key": LIVE_KEY}).status_code == 200
-        probe.assert_awaited_once_with(PROBE_TOKEN, LIVE_KEY, None)
+        probe.assert_awaited_once_with(
+            PROBE_TOKEN,
+            LIVE_KEY,
+            None,
+            authoritative_expiry_date=LIVE_KEY_EXPIRY,
+        )
         probe.reset_mock()
         assert (
             _post(client, sid, {"instrument_key": LIVE_KEY, "candle_date": "  "}).status_code
             == 200
         )
-        probe.assert_awaited_once_with(PROBE_TOKEN, LIVE_KEY, None)
+        probe.assert_awaited_once_with(
+            PROBE_TOKEN,
+            LIVE_KEY,
+            None,
+            authoritative_expiry_date=LIVE_KEY_EXPIRY,
+        )
 
     def test_invalid_inputs_are_rejected_before_any_credential_work(
         self, client, admin_session, monkeypatch
@@ -703,7 +783,7 @@ class TestResultHandling:
     ):
         caplog.set_level(logging.DEBUG)
         sid, _admin = admin_session
-        secret = "tok-internal-secret-must-not-leak"
+        secret = "unit-test-leak-marker-not-a-credential"
         _resolver, _probe = _install(
             monkeypatch,
             _credential(),
@@ -873,3 +953,241 @@ class TestInstrumentKeyGrammar:
         resp = _post(client, sid, {"instrument_key": LIVE_KEY})
         assert resp.status_code == 200
         probe.assert_awaited_once()
+
+class TestAuthoritativeExpiryResolution:
+    """The expiry must come from broker contract metadata, never the request."""
+
+    def test_two_segment_key_resolves_expiry_from_server_side_metadata(
+        self, client, admin_session, monkeypatch
+    ):
+        """A key with no embedded expiry still reaches the probe with a real one."""
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        metadata = _contract_metadata_mock(monkeypatch)
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY, "candle_date": CANDLE_DATE})
+
+        assert resp.status_code == 200
+        metadata.assert_awaited_once()
+        probe.assert_awaited_once_with(
+            PROBE_TOKEN,
+            TWO_SEGMENT_KEY,
+            CANDLE_DATE,
+            authoritative_expiry_date=TWO_SEGMENT_EXPIRY,
+        )
+
+    def test_response_reports_the_resolved_expiry_without_claiming_provenance(
+        self, client, admin_session, monkeypatch
+    ):
+        sid, _admin = admin_session
+        _install(monkeypatch, _credential(), probe_result=_probe_result(
+            authoritative_expiry_date=TWO_SEGMENT_EXPIRY,
+            freshness_overrides={
+                "expiry_from_instrument_key": None,
+                "key_implies_unexpired": None,
+                "authoritative_expiry_date": TWO_SEGMENT_EXPIRY,
+                "authoritative_expiry_supplied": True,
+                "authoritative_expiry_valid": True,
+                "authoritative_expiry_implies_unexpired": True,
+                "intraday_returned_current_session_candle": None,
+                "verified_unexpired": True,
+                "verified_reason": "authoritative expiry is on/after today",
+                "method": "authoritative expiry vs current IST date",
+            },
+            authoritative_expiry_source=(
+                "caller-supplied (provenance not verified by this tool)"
+            ),
+        ))
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY})
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["instrument_freshness"]["authoritative_expiry_date"] == TWO_SEGMENT_EXPIRY
+        assert body["instrument_freshness"]["authoritative_expiry_valid"] is True
+        assert "provenance not verified" in body["authoritative_expiry_source"]
+
+    def test_unmatched_key_fails_closed_before_any_probe(
+        self, client, admin_session, db_session, monkeypatch
+    ):
+        """An unknown key can never be probed with a guessed expiry."""
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        _contract_metadata_mock(monkeypatch, payload={"status": "success", "data": []})
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY})
+
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "EXPIRY_UNRESOLVED"
+        probe.assert_not_called()
+        events = [
+            e for e in list_admin_audit(db_session)
+            if e["action"] == "live_verification.option_candle"
+        ]
+        assert events[-1]["result"] == "failed"
+        # The audit reason carries the same machine code and is NOT scrubbed
+        # by the audit sanitizer's 28-char value-shape rule.
+        assert events[-1]["detail"]["reason"] == "EXPIRY_UNRESOLVED"
+
+    def test_three_segment_key_matches_the_brokers_two_segment_identity(
+        self, client, admin_session, monkeypatch
+    ):
+        """The candle endpoint's 3-segment form must still resolve.
+
+        Real Upstox contract metadata keys the instrument by its two-segment
+        form; the requested key's third segment is untrusted expiry text that
+        is cross-checked, never used as the authority.
+        """
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        metadata = _contract_metadata_mock(monkeypatch)
+
+        resp = _post(client, sid, {"instrument_key": LIVE_KEY})
+
+        assert resp.status_code == 200, resp.text
+        metadata.assert_awaited_once()
+        probe.assert_awaited_once_with(
+            PROBE_TOKEN,
+            LIVE_KEY,
+            None,
+            authoritative_expiry_date=LIVE_KEY_EXPIRY,
+        )
+
+    def test_embedded_expiry_disagreeing_with_the_broker_fails_closed(
+        self, client, admin_session, monkeypatch
+    ):
+        """Key text that contradicts authoritative metadata is never trusted."""
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        _contract_metadata_mock(monkeypatch, payload={
+            "status": "success",
+            "data": [
+                {
+                    "instrument_key": LIVE_KEY_IDENTITY,
+                    "expiry": "2026-10-06",   # broker says 06-10
+                    "instrument_type": "CE",
+                },
+            ],
+        })
+
+        # LIVE_KEY claims 09-10-2026; the broker says 2026-10-06.
+        resp = _post(client, sid, {"instrument_key": LIVE_KEY})
+
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "EXPIRY_UNRESOLVED"
+        probe.assert_not_called()
+
+    def test_unparseable_broker_expiry_fails_closed(self, client, admin_session, monkeypatch
+    ):
+        """Only a real calendar date may become authoritative metadata."""
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        _contract_metadata_mock(monkeypatch, payload={
+            "status": "success",
+            "data": [{"instrument_key": TWO_SEGMENT_KEY, "expiry": "not-a-date"}],
+        })
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY})
+
+        assert resp.status_code == 422
+        probe.assert_not_called()
+
+    def test_contract_metadata_failure_is_surfaced_and_audited(
+        self, client, admin_session, db_session, monkeypatch
+    ):
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        _contract_metadata_mock(monkeypatch, side_effect=RuntimeError("upstream down"))
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY})
+
+        assert resp.status_code == 502
+        assert resp.json()["error"]["code"] == "CONTRACT_METADATA_FAILED"
+        probe.assert_not_called()
+        events = [
+            e for e in list_admin_audit(db_session)
+            if e["action"] == "live_verification.option_candle"
+        ]
+        assert events[-1]["result"] == "failed"
+        assert events[-1]["detail"]["reason"] == "CONTRACT_METADATA_FAILED"
+        assert events[-1]["detail"]["error_class"] == "RuntimeError"
+
+    def test_request_body_cannot_supply_or_override_an_expiry(
+        self, client, admin_session, monkeypatch
+    ):
+        """Operator-supplied expiry text is ignored; the broker value wins."""
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+
+        resp = _post(client, sid, {
+            "instrument_key": TWO_SEGMENT_KEY,
+            "authoritative_expiry_date": "2099-01-01",
+            "expiry": "2099-01-01",
+        })
+
+        assert resp.status_code == 200
+        probe.assert_awaited_once_with(
+            PROBE_TOKEN,
+            TWO_SEGMENT_KEY,
+            None,
+            authoritative_expiry_date=TWO_SEGMENT_EXPIRY,
+        )
+
+
+class TestInstrumentKeyControlCharacters:
+    """Control characters must never survive the request boundary."""
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "NSE_FO|53806" + chr(0),
+            "NSE_FO|53806" + chr(127),
+            "NSE_FO|53" + chr(9) + "806",
+            "NSE_FO|53" + chr(10) + "806",
+            "NSE_FO|53" + chr(13) + "806",
+        ],
+    )
+    def test_interior_control_character_keys_are_rejected(self, key):
+        """A control character inside the key can never be normalized away."""
+        with pytest.raises(ValidationError):
+            OptionCandleProbeIn(instrument_key=key)
+
+    @pytest.mark.parametrize(
+        "raw", ["NSE_FO|53806" + chr(13), chr(10) + "NSE_FO|53806", "NSE_FO|53806" + chr(9)]
+    )
+    def test_edge_whitespace_control_chars_are_stripped_not_rejected(self, raw):
+        """Leading/trailing whitespace is normalization, not acceptance of junk."""
+        model = OptionCandleProbeIn(instrument_key=raw)
+        assert model.instrument_key == "NSE_FO|53806"
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "NSE_FO|53806/../admin",
+            "NSE_FO|1?x=1",
+            "NSE_FO|1#frag",
+            "NSE_FO|53806%2f..",
+            "..%2fNSE_FO|53806",
+        ],
+    )
+    def test_traversal_query_and_fragment_keys_are_rejected(self, key):
+        with pytest.raises(ValidationError):
+            OptionCandleProbeIn(instrument_key=key)
+
+    @pytest.mark.parametrize(
+        "raw", ["  NSE_FO|53806  ", "NSE_FO|53806" + chr(13) + " ", chr(9) + "NSE_FO|53806"]
+    )
+    def test_padded_key_is_normalized_and_reaches_the_probe(
+        self, raw, client, admin_session, monkeypatch
+    ):
+        """The DOWNSTREAM call must receive the stripped key, not the raw one."""
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+
+        resp = _post(client, sid, {"instrument_key": raw})
+
+        assert resp.status_code == 200
+        # The downstream probe call must carry the STRIPPED key, positionally.
+        assert probe.call_args.args[1] == TWO_SEGMENT_KEY
+        assert "instrument_key" not in probe.call_args.kwargs
+        assert probe.call_args.kwargs["authoritative_expiry_date"] == TWO_SEGMENT_EXPIRY
+
