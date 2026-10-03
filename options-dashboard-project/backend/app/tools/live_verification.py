@@ -946,6 +946,13 @@ async def _probe_option_endpoint(label: str, request_description: str, fetch: An
     return result
 
 
+# Reported provenance for a supplied authoritative expiry. The tool CANNOT
+# verify where the value came from, so it never claims a stronger provenance
+# than it can prove; the caller is responsible for supplying trusted
+# server-side metadata.
+AUTHORITATIVE_EXPIRY_SOURCE = "caller-supplied (provenance not verified by this tool)"
+
+
 def _normalize_authoritative_expiry(value: Any) -> str | None:
     """Normalize a trusted authoritative expiry to an ISO ``YYYY-MM-DD`` string.
 
@@ -953,9 +960,10 @@ def _normalize_authoritative_expiry(value: Any) -> str | None:
     different date format, an unparseable value) returns ``None`` so the caller
     fails closed instead of treating untrusted text as metadata.
 
-    The value is only authoritative when it originates from a server-side
-    contract-resolution path (broker option-chain / contract metadata), never
-    from operator-supplied free text.
+    Provenance is the CALLER's responsibility: this tool cannot verify where
+    the value came from and therefore never reports a stronger provenance than
+    it can prove (see ``AUTHORITATIVE_EXPIRY_SOURCE``).  Only the strict ISO
+    shape is checked here.
     """
     if not isinstance(value, str):
         return None
@@ -1161,13 +1169,15 @@ async def verify_option_candle_api(
     ``get_historical_candles`` (a single bounded date) with
     ``unit="minutes", interval=3``.
 
-    ``authoritative_expiry_date`` is OPTIONAL trusted metadata: it may only be
-    supplied by an existing server-side contract-resolution path (the broker's
-    option-chain / contract metadata for that exact instrument), never as
-    operator free text.  Live option keys of the form ``NSE_FO|<id>`` carry no
-    embedded expiry, so without it freshness cannot be established outside a
-    live session.  A malformed value fails closed.  Omitting it preserves the
-    existing key-parsing behavior, so the ``--option-key`` CLI is unchanged.
+    ``authoritative_expiry_date`` is OPTIONAL trusted metadata.  Supplying it
+    is the CALLER's responsibility: an existing server-side caller (e.g. broker
+    contract resolution for that exact instrument) is expected to pass a value
+    it resolved itself.  This tool does NOT prove that provenance and reports
+    ``AUTHORITATIVE_EXPIRY_SOURCE`` accordingly; it validates only the strict
+    ISO shape and fails closed on anything else.  Live option keys of the form
+    ``NSE_FO|<id>`` carry no embedded expiry, so without it freshness cannot be
+    established outside a live session.  The standalone CLI supplies nothing
+    and is unchanged.
 
     Read-only: no data is persisted and no credential material is printed.
     The four claims are reported separately and endpoint acceptance alone is
@@ -1175,6 +1185,14 @@ async def verify_option_candle_api(
     """
     probe_date = candle_date or _current_ist_date()
     current_date = _current_ist_date()
+
+    # Validate ONCE and normalize exactly ONCE, before anything downstream.
+    # Every later use (result payload, console output, expiry parsing and both
+    # upstream requests) must receive the stripped key; the raw caller-supplied
+    # string must never reach an authenticated Upstox URL path.
+    key_error = _instrument_key_error(instrument_key)
+    if key_error is None:
+        instrument_key = instrument_key.strip()
 
     result: dict[str, Any] = {
         "section": "Live Option Instrument Candle Verification",
@@ -1189,7 +1207,7 @@ async def verify_option_candle_api(
             authoritative_expiry_date
         ),
         "authoritative_expiry_source": (
-            "server-side contract resolution"
+            AUTHORITATIVE_EXPIRY_SOURCE
             if _normalize_authoritative_expiry(authoritative_expiry_date)
             else None
         ),
@@ -1205,14 +1223,13 @@ async def verify_option_candle_api(
     print(f"  Current IST date (freshness): {current_date}")
     _auth_expiry = _normalize_authoritative_expiry(authoritative_expiry_date)
     print(
-        "  Authoritative expiry (server-side contract resolution): "
+        f"  Authoritative expiry ({AUTHORITATIVE_EXPIRY_SOURCE}): "
         + (f"{_auth_expiry}" if _auth_expiry else "not supplied")
     )
     print("  Probe 1: get_intraday_candles (current session, 3-minute)")
     print(f"  Probe 2: get_historical_candles (single date {probe_date}, 3-minute)")
     print()
 
-    key_error = _instrument_key_error(instrument_key)
     if key_error is not None:
         # Fail closed BEFORE any request is constructed: an unvalidated key
         # must never reach the authenticated Upstox URL path.
