@@ -24,6 +24,7 @@ Operational views are read-only and admin-scoped:
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -437,3 +438,208 @@ def audit(
 ):
     """Sanitized admin-audit activity (newest first)."""
     return {"events": list_admin_audit(db)}
+
+
+# ---------------------------------------------------------------------------
+# 6. Live option-candle verification (read-only capability probe)
+# ---------------------------------------------------------------------------
+#
+# In-process invocation seam for the existing Phase 7.9 probe
+# (``app.tools.live_verification.verify_option_candle_api``) on the Day-50
+# runtime.  The probe is credential-agnostic: this route supplies the
+# authenticated caller's OWN user-scoped market-data credential, resolved
+# through the canonical ``resolve_market_data_token`` path — never a
+# session token, a browser cookie, ``TokenBridge``, or the platform cache.
+#
+# The route is read-only against Upstox and persists nothing; the four
+# capability claims and ``live_option_oi_established`` keep their exact
+# probe semantics (no reinterpretation here).
+
+
+class OptionCandleProbeIn(BaseModel):
+    """Read-only live option-candle verification request.
+
+    Deliberately identity-free: no user id and no connection id are
+    accepted — the probe always runs against the authenticated caller's
+    own authorization.
+    """
+
+    instrument_key: str
+    candle_date: str | None = None
+
+    @field_validator("instrument_key")
+    @classmethod
+    def _instrument_key_shape(cls, v: str) -> str:
+        v = v.strip()
+        if not v or len(v) > 128:
+            raise ValueError("instrument_key must be 1-128 characters")
+        return v
+
+    @field_validator("candle_date")
+    @classmethod
+    def _candle_date_shape(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            return None
+        try:
+            date.fromisoformat(v)
+        except ValueError:
+            raise ValueError("candle_date must be YYYY-MM-DD")
+        return v
+
+
+_ENDPOINT_FACT_KEYS = (
+    "status",
+    "http_status",
+    "error",
+    "extraction_error",
+    "candle_count",
+    "candle_array_length",
+    "open_interest_field_present",
+    "open_interest_non_null_count",
+    "open_interest_sample",
+    "timestamp_format_sample",
+    "timezone_offsets_observed",
+    "naive_ist_last_timestamp",
+    "malformed_row_count",
+)
+
+
+def _endpoint_facts(endpoint: Any) -> dict:
+    """Project one probe endpoint result to non-sensitive facts only."""
+    if not isinstance(endpoint, dict):
+        return {}
+    return {key: endpoint.get(key) for key in _ENDPOINT_FACT_KEYS}
+
+
+def _freshness_facts(freshness: Any) -> dict:
+    """Project the instrument-freshness evidence (no credential material)."""
+    if not isinstance(freshness, dict):
+        return {}
+    return {
+        "expiry_from_instrument_key": freshness.get("expiry_from_instrument_key"),
+        "key_implies_unexpired": freshness.get("key_implies_unexpired"),
+        "intraday_returned_current_session_candle": freshness.get(
+            "intraday_returned_current_session_candle"
+        ),
+        "verified_unexpired": freshness.get("verified_unexpired"),
+        "verified_reason": freshness.get("verified_reason"),
+    }
+
+
+@router.post("/live-verification/option-candle")
+async def verify_option_candle(
+    body: OptionCandleProbeIn,
+    user: AuthenticatedUser = Depends(_admin_guarded("live_verification.option_candle")),
+    db: Session = Depends(get_db),
+):
+    """POST /api/v1/admin/live-verification/option-candle — read-only probe.
+
+    In-process invocation seam for ``verify_option_candle_api``:
+
+        admin request -> caller user_id -> resolve_market_data_token(...)
+            -> MarketDataCredential.token (in memory only)
+            -> verify_option_candle_api(...)
+
+    Authorization mirrors /acquisition/run: ``AdminUser`` at the HTTP
+    boundary plus the shared durable ``users.is_admin`` domain backstop.
+    The credential never leaves the process, is never returned, and no
+    probe data is persisted.  Only the sanitized verification facts are
+    returned, and the audit record carries safe metadata only.
+    """
+    # --- Durable admin backstop (shared with acquisition; no new gate) ---
+    try:
+        _authorize_acquisition_principal(db, user.user_id)
+    except PermissionError:
+        record_admin_action(
+            db,
+            actor_user_id=user.user_id,
+            action="live_verification.option_candle",
+            target={"instrument_key": body.instrument_key},
+            result="denied",
+            detail={"reason": "admin_required"},
+        )
+        raise HTTPException(status_code=403, detail="Admin privileges required.")
+
+    # --- Caller-scoped credential only: no session/header/cache/bridge ---
+    from app.brokers.domain.enums import BROKER_ID_UPSTOX
+    from app.services.market_data_authorization import resolve_market_data_token
+
+    credential = resolve_market_data_token(db, user.user_id, BROKER_ID_UPSTOX.value)
+    if credential is None or not getattr(credential, "token", None):
+        record_admin_action(
+            db,
+            actor_user_id=user.user_id,
+            action="live_verification.option_candle",
+            target={
+                "instrument_key": body.instrument_key,
+                "candle_date": body.candle_date,
+            },
+            result="failed",
+            detail={"reason": "MARKET_DATA_NOT_CONNECTED"},
+        )
+        error = HTTPException(
+            status_code=403,
+            detail=(
+                "Market data is not connected. Add your Upstox Analytics Token "
+                "in Settings to run live verification."
+            ),
+        )
+        error.error_code = "MARKET_DATA_NOT_CONNECTED"
+        raise error
+
+    # --- Read-only probe, in-process; credential passed in memory only ---
+    from app.tools.live_verification import verify_option_candle_api
+
+    try:
+        result = await verify_option_candle_api(
+            credential.token, body.instrument_key, body.candle_date
+        )
+    except Exception as exc:  # noqa: BLE001 — audited, then surfaced as 502
+        record_admin_action(
+            db,
+            actor_user_id=user.user_id,
+            action="live_verification.option_candle",
+            target={
+                "instrument_key": body.instrument_key,
+                "candle_date": body.candle_date,
+            },
+            result="failed",
+            detail={"error_class": type(exc).__name__},
+        )
+        raise HTTPException(
+            status_code=502, detail="Live option verification probe failed."
+        ) from exc
+
+    payload = {
+        "status": result.get("status"),
+        "instrument_key": result.get("instrument_key"),
+        "probe_date_ist": result.get("probe_date_ist"),
+        "current_ist_date": result.get("current_ist_date"),
+        "endpoint_consistency": result.get("endpoint_consistency"),
+        "open_interest_consistency": result.get("open_interest_consistency"),
+        "intraday": _endpoint_facts(result.get("intraday")),
+        "historical": _endpoint_facts(result.get("historical")),
+        "instrument_freshness": _freshness_facts(result.get("instrument_freshness")),
+        "claims": result.get("claims"),
+        "live_option_oi_established": result.get("live_option_oi_established"),
+        "conclusion": result.get("conclusion"),
+    }
+
+    record_admin_action(
+        db,
+        actor_user_id=user.user_id,
+        action="live_verification.option_candle",
+        target={
+            "instrument_key": body.instrument_key,
+            "candle_date": body.candle_date,
+        },
+        result="success",
+        detail={
+            "status": payload["status"],
+            "live_option_oi_established": payload["live_option_oi_established"],
+        },
+    )
+    return payload
