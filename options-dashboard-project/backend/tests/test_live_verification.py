@@ -9,7 +9,7 @@ No live API calls are made.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch, MagicMock
 import asyncio
 import io
@@ -17,6 +17,7 @@ import sys
 
 import pytest
 
+from app.utils.market_time import IST
 from app.tools.live_verification import (
     _sanitize,
     _type_matches,
@@ -792,3 +793,72 @@ class TestVerifyOptionCandleAPI:
         planted["debug_planted"] = "Bearer " + "eyJhbGciOiJIUzI1NiJ9." + "A" * 30 + "." + "B" * 31
         report = generate_report([planted])
         assert "eyJ" not in report
+
+
+def _ist_date_offset(days: int) -> str:
+    """IST calendar date offset from today (independent of the tool helper)."""
+    return (datetime.now(timezone.utc).astimezone(IST) + timedelta(days=days)).date().isoformat()
+
+
+class TestVerifyOptionCandleFreshnessDates:
+    """Freshness must be judged against today's IST date, not the probe date."""
+
+    @pytest.mark.asyncio
+    async def test_key_expiring_between_probe_date_and_today_is_not_unexpired(self):
+        """Regression: expiry after the probe date but before today fails."""
+        today = _ist_date_offset(0)
+        probe_date = _ist_date_offset(-3)
+        expiry = _ist_date_offset(-1)
+        expiry_key = "NSE_FO|47983|" + datetime.fromisoformat(expiry).strftime("%d-%m-%Y")
+        historical = {
+            "status": "success",
+            "data": {"candles": [
+                [f"{probe_date}T09:15:00+05:30", 105.5, 108.0, 104.0, 107.2, 120000.0, 2450000.0],
+            ]},
+        }
+        empty = {"status": "success", "data": {"candles": []}}
+        with patch("app.tools.live_verification.get_intraday_candles",
+                    new_callable=AsyncMock, return_value=empty), \
+             patch("app.tools.live_verification.get_historical_candles",
+                    new_callable=AsyncMock, return_value=historical):
+            result = await verify_option_candle_api("test-token", expiry_key, probe_date)
+
+        assert result["current_ist_date"] == today
+        assert result["probe_date_ist"] == probe_date
+        assert result["instrument_freshness"]["expiry_from_instrument_key"] == expiry
+        assert result["instrument_freshness"]["key_implies_unexpired"] is False
+        assert result["claims"]["claim_3_candles_contained_open_interest"] is True
+        assert result["claims"]["claim_4_instrument_verified_unexpired"] is False
+        assert result["live_option_oi_established"] is False
+        assert "current IST date" in result["conclusion"]
+
+    @pytest.mark.asyncio
+    async def test_historical_oi_with_future_expiry_establishes_capability(self):
+        """Historical OI evidence works even with no current-session intraday data."""
+        today = _ist_date_offset(0)
+        probe_date = _ist_date_offset(-2)
+        expiry = _ist_date_offset(30)
+        future_key = "NSE_FO|47983|" + datetime.fromisoformat(expiry).strftime("%d-%m-%Y")
+        historical = {
+            "status": "success",
+            "data": {"candles": [
+                [f"{probe_date}T09:15:00+05:30", 105.5, 108.0, 104.0, 107.2, 120000.0, 2450000.0],
+                [f"{probe_date}T09:18:00+05:30", 107.2, 109.0, 106.5, 108.4, 90000.0, 2481000.0],
+            ]},
+        }
+        empty = {"status": "success", "data": {"candles": []}}
+        with patch("app.tools.live_verification.get_intraday_candles",
+                    new_callable=AsyncMock, return_value=empty), \
+             patch("app.tools.live_verification.get_historical_candles",
+                    new_callable=AsyncMock, return_value=historical):
+            result = await verify_option_candle_api("test-token", future_key, probe_date)
+
+        assert result["current_ist_date"] == today
+        assert result["intraday"]["status"] == "empty"
+        assert result["instrument_freshness"]["intraday_returned_current_session_candle"] is None
+        assert result["historical"]["open_interest_non_null_count"] == 2
+        assert result["claims"]["claim_2_endpoint_returned_candles"] is True
+        assert result["claims"]["claim_3_candles_contained_open_interest"] is True
+        assert result["claims"]["claim_4_instrument_verified_unexpired"] is True
+        assert result["live_option_oi_established"] is True
+        assert "current IST date" in result["conclusion"]
