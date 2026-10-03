@@ -922,6 +922,8 @@ def _assess_option_instrument_freshness(
       - a usable candle response was received for the exact key;
       - intraday candles timestamped in the current IST session are additional
         (not required) evidence, since the probe may run outside an NSE session.
+        They count only when the intraday endpoint itself classified "ok";
+        malformed or errored intraday evidence never establishes freshness.
     """
     expiry_from_key = _parse_expiry_from_option_key(instrument_key)
     try:
@@ -938,7 +940,16 @@ def _assess_option_instrument_freshness(
 
     current_session: bool | None = None
     last_timestamp = intraday.get("last_timestamp")
-    if isinstance(last_timestamp, str) and current_date is not None:
+    # Only an intraday endpoint the probe itself classified "ok" may establish
+    # current-session freshness.  A malformed/error payload can still carry a
+    # parseable ``last_timestamp`` from its surviving rows, and treating that
+    # as evidence would let upstream data this probe rejected as malformed
+    # prove the instrument is currently live.
+    if (
+        intraday.get("status") == "ok"
+        and isinstance(last_timestamp, str)
+        and current_date is not None
+    ):
         naive_last = to_ist_naive(last_timestamp)
         if naive_last is not None:
             current_session = naive_last.date() == current_date

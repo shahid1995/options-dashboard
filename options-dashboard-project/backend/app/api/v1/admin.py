@@ -24,6 +24,7 @@ Operational views are read-only and admin-scoped:
 
 from __future__ import annotations
 
+import re
 from datetime import date
 from typing import Any
 
@@ -456,6 +457,33 @@ def audit(
 # probe semantics (no reinterpretation here).
 
 
+#: Upstox instrument-key grammar, derived from the key forms this repository
+#: actually uses (see ``NIFTY_INDEX_KEY``, ``EXPIRED_NIFTY_INSTRUMENT_KEY``,
+#: ``ContractSpec`` fixtures and ``_OPTION_KEY_EXPIRY_PATTERNS``):
+#:
+#:   ``NSE_INDEX|Nifty 50``          index — space in the name
+#:   ``NSE_INDEX|NIFTY MID SELECT``  index — multiple spaces
+#:   ``BSE_INDEX|SENSEX50``          index — bare alphanumeric name
+#:   ``NSE_FO|53806``                current option — no expiry suffix
+#:   ``NSE_FO|47983|31-12-2099``     expired option — dd-mm-yyyy suffix
+#:   ``NSE_FO|TEST_A|2025-04-17``    expired option — yyyy-mm-dd suffix
+#:
+#: The character set is an ALLOWLIST that cannot express a path separator,
+#: query delimiter, fragment, percent-encoding or ``..`` traversal: the probe
+#: places this value directly into the Upstox V3 request path while using the
+#: caller's own credential, so anything outside the grammar must be rejected
+#: rather than escaped.
+_INSTRUMENT_KEY_RE = re.compile(
+    r"[A-Z][A-Z0-9_]*"                      # exchange segment: NSE_FO, NSE_INDEX…
+    r"\|"                                    # required separator
+    r"[A-Za-z0-9_ ]+"                       # token or index name (spaces allowed)
+    r"(?:\|(?:\d{2}-\d{2}-\d{4}"            # optional dd-mm-yyyy expiry
+    r"|\d{4}-\d{2}-\d{2}))?"                # optional yyyy-mm-dd expiry
+)
+
+_MAX_INSTRUMENT_KEY_LEN = 128
+
+
 class OptionCandleProbeIn(BaseModel):
     """Read-only live option-candle verification request.
 
@@ -470,9 +498,15 @@ class OptionCandleProbeIn(BaseModel):
     @field_validator("instrument_key")
     @classmethod
     def _instrument_key_shape(cls, v: str) -> str:
-        v = v.strip()
-        if not v or len(v) > 128:
+        v = v.strip()  # leading/trailing whitespace is normalized, never passed on
+        if not v or len(v) > _MAX_INSTRUMENT_KEY_LEN:
             raise ValueError("instrument_key must be 1-128 characters")
+        if _INSTRUMENT_KEY_RE.fullmatch(v) is None:
+            raise ValueError(
+                "instrument_key must be a valid Upstox instrument key "
+                "(e.g. NSE_FO|53806, NSE_FO|47983|31-12-2099, "
+                "NSE_INDEX|Nifty 50)"
+            )
         return v
 
     @field_validator("candle_date")

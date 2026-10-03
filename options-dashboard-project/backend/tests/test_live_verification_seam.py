@@ -764,3 +764,112 @@ class TestAuditAndReadOnly:
         resp = _post(client, sid, {"instrument_key": LIVE_KEY, "candle_date": CANDLE_DATE})
         assert resp.status_code == 200
         assert db_session.query(OptionCandle).count() == 0
+
+
+# ---------------------------------------------------------------------------
+# 7. Instrument-key grammar (path-injection hardening)
+# ---------------------------------------------------------------------------
+#
+# ``instrument_key`` is placed verbatim into the Upstox V3 request path while
+# using the caller's own credential.  A value carrying ``/``, ``?``, ``#`` or a
+# ``..`` segment could therefore redirect that authenticated GET at another
+# endpoint.  These tests pin the accepted grammar to the key forms this
+# repository actually uses and prove nothing path-like gets through.
+
+from app.api.v1.admin import OptionCandleProbeIn  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
+
+#: Key forms that occur in this repository and must keep working.
+VALID_INSTRUMENT_KEYS = [
+    "NSE_FO|53806",                    # current option, no expiry suffix
+    "NSE_FO|47983|31-12-2099",         # expired option, dd-mm-yyyy
+    "NSE_FO|TEST_A|2025-04-17",        # expired option, yyyy-mm-dd
+    "NSE_INDEX|Nifty 50",              # index with a space
+    "NSE_INDEX|NIFTY MID SELECT",      # index with several spaces
+    "NSE_INDEX|Nifty Fin Service",
+    "BSE_INDEX|SENSEX",
+    "BSE_INDEX|SENSEX50",
+]
+
+#: Values that must never reach the upstream path builder.
+PATH_LIKE_INSTRUMENT_KEYS = [
+    "NSE_FO|53806/../../market-quote",
+    "NSE_FO|53806/intraday",
+    "..",
+    "../..",
+    "NSE_FO|../..",
+    "NSE_FO|53806?instrument_key=NSE_FO|1",
+    "NSE_FO|53806#fragment",
+    "NSE_FO|53806%2F..%2Fadmin",
+    "NSE_FO|53806?unit=minutes",
+    "/absolute/path",
+    "NSE_FO|53806\\..\\admin",
+    "NSE_FO",
+    "|53806",
+    "NSE_FO|",
+    "NSE_FO|53806|31-12-2099|extra",
+    "NSE_FO|53806|31-12-209x",
+    "lowercase_segment|53806",
+    "NSE FO|53806",
+    "NSE_FO|53806|not-a-date",
+    "A" * 200,
+    "NSE_FO|" + "9" * 200,
+]
+
+
+class TestInstrumentKeyGrammar:
+    """Finding A — the request model must reject path/query manipulation."""
+
+    def test_valid_repository_key_forms_are_accepted(self):
+        for key in VALID_INSTRUMENT_KEYS:
+            model = OptionCandleProbeIn(instrument_key=key)
+            assert model.instrument_key == key
+
+    @pytest.mark.parametrize("key", PATH_LIKE_INSTRUMENT_KEYS)
+    def test_path_and_query_manipulation_is_rejected(self, key):
+        with pytest.raises(ValidationError):
+            OptionCandleProbeIn(instrument_key=key)
+
+    def test_surrounding_whitespace_is_normalized_not_forwarded(self):
+        model = OptionCandleProbeIn(instrument_key="  NSE_FO|53806  ")
+        assert model.instrument_key == "NSE_FO|53806"
+
+    @pytest.mark.parametrize(
+        "raw", ["NSE_FO|53806\n", "  NSE_FO|53806  ", "NSE_FO|53806\t", "\nNSE_FO|53806\r\n"]
+    )
+    def test_whitespace_is_stripped_before_the_path_is_built(self, raw):
+        """Only the NORMALIZED value can ever reach the Upstox path builder."""
+        model = OptionCandleProbeIn(instrument_key=raw)
+        assert model.instrument_key == "NSE_FO|53806"
+        assert not any(c.isspace() and c != " " for c in model.instrument_key)
+
+    def test_whitespace_only_is_rejected(self):
+        for value in ("   ", "\t\n", ""):
+            with pytest.raises(ValidationError):
+                OptionCandleProbeIn(instrument_key=value)
+
+    def test_accepted_keys_contain_no_path_or_query_metacharacter(self):
+        """Belt-and-braces: the allowlist itself cannot express a delimiter."""
+        for key in VALID_INSTRUMENT_KEYS:
+            for bad in ("/", "\\", "?", "#", "%", ".."):
+                assert bad not in key
+
+    def test_route_rejects_path_like_key_before_any_credential_work(
+        self, client, admin_session, monkeypatch
+    ):
+        sid, _admin = admin_session
+        resolver, probe = _install(monkeypatch, _credential())
+        for key in ["NSE_FO|53806/../admin", "NSE_FO|1?x=1", "NSE_FO|1#f"]:
+            resp = _post(client, sid, {"instrument_key": key})
+            assert resp.status_code == 422, (key, resp.text)
+            assert resp.json()["error"]["code"] == "VALIDATION_ERROR"
+        # The upstream call must never have been reached.
+        resolver.assert_not_called()
+        probe.assert_not_called()
+
+    def test_route_still_accepts_a_valid_key(self, client, admin_session, monkeypatch):
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        resp = _post(client, sid, {"instrument_key": LIVE_KEY})
+        assert resp.status_code == 200
+        probe.assert_awaited_once()
