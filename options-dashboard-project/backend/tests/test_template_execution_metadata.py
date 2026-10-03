@@ -28,6 +28,7 @@ from app.main import app
 from app.models import PaperOrder, Position, StrategyExecution
 from app.routers.templates import (
     _build_execution_metadata,
+    _load_execution_metadata,
     _persist_execution_metadata,
 )
 from app.services import token_store
@@ -536,6 +537,263 @@ class TestConcurrentExecution:
         assert resp1.json()["execution_id"] != resp2.json()["execution_id"]
         after = db_session.query(StrategyExecution).count()
         assert after == before + 2  # two independent executions
+
+
+class TestLoadExecutionMetadataContract:
+    """``_load_execution_metadata`` must never return a non-dict.
+
+    The declared contract is ``dict | None``. Stored JSON that decodes to a
+    list, a scalar, or ``null`` is not an audit trail, so it must be reported
+    as absent instead of being handed to the replay response.
+    """
+
+    def _seed(self, db_session, raw, user_id="user-1"):
+        """Store ``raw`` verbatim as the execution's metadata (bypassing JSON
+        encoding so malformed / non-object payloads can be exercised)."""
+        import secrets
+
+        from app.models import StrategyExecution
+
+        exec_id = secrets.token_hex(16)
+        db_session.add(
+            StrategyExecution(
+                user_id=user_id,
+                execution_id=exec_id,
+                client_order_id="load-contract-coid",
+                symbol="NIFTY",
+                status="FILLED",
+            )
+        )
+        db_session.commit()
+        execution = (
+            db_session.query(StrategyExecution)
+            .filter_by(execution_id=exec_id)
+            .first()
+        )
+        execution.execution_metadata = raw
+        db_session.commit()
+        return exec_id
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            ('{"formula_version": 2, "formula": {"strike_mode": "atm"}}',
+             {"formula_version": 2, "formula": {"strike_mode": "atm"}}),
+            ('{"formula_version": 2}', {"formula_version": 2}),
+        ],
+    )
+    def test_json_object_returns_dict(self, db_session, raw, expected):
+        """A valid JSON object is returned as the metadata dict."""
+        exec_id = self._seed(db_session, raw)
+        assert _load_execution_metadata(db_session, "user-1", exec_id) == expected
+
+    @pytest.mark.parametrize("raw", ["[]", '[{"strike_mode": "atm"}]'])
+    def test_json_array_returns_none(self, db_session, raw):
+        """A JSON array is NOT a valid audit trail."""
+        exec_id = self._seed(db_session, raw)
+        assert _load_execution_metadata(db_session, "user-1", exec_id) is None
+
+    @pytest.mark.parametrize("raw", ['"atm"', "42", "3.14", "true", "false"])
+    def test_json_scalar_returns_none(self, db_session, raw):
+        """A JSON string / number / bool is NOT a valid audit trail."""
+        exec_id = self._seed(db_session, raw)
+        assert _load_execution_metadata(db_session, "user-1", exec_id) is None
+
+    def test_json_null_returns_none(self, db_session):
+        """JSON ``null`` decodes to None and stays None."""
+        exec_id = self._seed(db_session, "null")
+        assert _load_execution_metadata(db_session, "user-1", exec_id) is None
+
+    @pytest.mark.parametrize(
+        "raw", ['{"formula_version": 2', "not json at all", "{,}"]
+    )
+    def test_malformed_json_returns_none(self, db_session, raw):
+        """Malformed JSON is reported as absent, never raised or guessed."""
+        exec_id = self._seed(db_session, raw)
+        assert _load_execution_metadata(db_session, "user-1", exec_id) is None
+
+    def test_missing_row_and_null_column_return_none(self, db_session):
+        """No row, or a NULL column, both mean 'no metadata'."""
+        assert _load_execution_metadata(db_session, "user-1", "no-such-id") is None
+        exec_id = self._seed(db_session, None)
+        assert _load_execution_metadata(db_session, "user-1", exec_id) is None
+
+
+class TestIdempotentReplayMetadata:
+    """An idempotent replay must never rewrite the stored audit trail.
+
+    ``execute_strategy()`` treats a retried ``client_order_id`` as a replay:
+    it returns the ORIGINAL execution untouched (``duplicated=True``) and
+    writes no new rows. The audit trail persisted alongside that execution is
+    therefore immutable history — a replay must not overwrite it with the
+    replay attempt's own (later) resolution, which would leave the stored
+    strikes/prices contradicting the actual ``PaperOrder`` fills.
+    """
+
+    def _execute(self, client, session_id, tid, coid, strike, price, confirmed_strike):
+        with patch(
+            "app.services.template_resolution.resolve_legs", new_callable=AsyncMock
+        ) as mock_resolve, patch(
+            "app.routers.paper.resolve_market_prices", new_callable=AsyncMock
+        ) as mock_prices, patch(
+            "app.routers.paper.require_market_open", new_callable=AsyncMock
+        ):
+            mock_resolve.return_value = _MockResult(
+                legs=[_MockLeg(resolved_strike=strike)]
+            )
+            mock_prices.return_value = {(EXPIRY, strike, "call"): price}
+            return client.post(
+                f"/paper/templates/{tid}/execute",
+                headers=headers(session_id),
+                json={
+                    "client_order_id": coid,
+                    "starting_capital": 500000,
+                    "confirmed_strikes": {0: confirmed_strike},
+                    "confirmed_expiries": {0: EXPIRY},
+                },
+            )
+
+    def test_replay_does_not_overwrite_persisted_metadata(
+        self, client, logged_in, db_session
+    ):
+        tid = _create_template(client, logged_in, name="Replay Metadata")
+
+        first = self._execute(
+            client, logged_in, tid, "exec-replay-md-001", 25000.0, 100.0, 25000.0
+        )
+        assert first.status_code == 200
+        exec_id = first.json()["execution_id"]
+
+        stored_first = db_session.query(StrategyExecution).filter_by(
+            execution_id=exec_id
+        ).first().execution_metadata
+        assert json.loads(stored_first)["execution_resolution"]["legs"][0][
+            "resolved_strike"
+        ] == 25000.0
+
+        # Same idempotency key, chain has since moved one step (25000 -> 25050).
+        replay = self._execute(
+            client, logged_in, tid, "exec-replay-md-001", 25050.0, 115.0, 25050.0
+        )
+        assert replay.status_code == 200
+        assert replay.json()["execution_id"] == exec_id
+        assert replay.json()["duplicated"] is True
+
+        db_session.expire_all()
+        stored_after = (
+            db_session.query(StrategyExecution)
+            .filter_by(execution_id=exec_id)
+            .first()
+            .execution_metadata
+        )
+        assert stored_after == stored_first
+
+        # The stored trail must still describe what was ACTUALLY filled.
+        leg = json.loads(stored_after)["execution_resolution"]["legs"][0]
+        order = db_session.query(PaperOrder).filter_by(
+            execution_id=exec_id
+        ).first()
+        assert leg["resolved_strike"] == order.strike == 25000.0
+        assert leg["fill_price"] == order.fill_price == 100.0
+
+    def test_replay_returns_original_persisted_metadata(
+        self, client, logged_in, db_session
+    ):
+        """The replay response echoes the ORIGINAL audit trail, not the
+        replay attempt's fresh resolution."""
+        tid = _create_template(client, logged_in, name="Replay Response")
+
+        first = self._execute(
+            client, logged_in, tid, "exec-replay-md-002", 25000.0, 100.0, 25000.0
+        )
+        assert first.status_code == 200
+        original_meta = first.json()["execution_metadata"]
+
+        replay = self._execute(
+            client, logged_in, tid, "exec-replay-md-002", 25050.0, 115.0, 25050.0
+        )
+        assert replay.status_code == 200
+        assert replay.json()["duplicated"] is True
+        assert replay.json()["execution_metadata"] == original_meta
+        leg = replay.json()["execution_metadata"]["execution_resolution"]["legs"][0]
+        assert leg["resolved_strike"] == 25000.0
+        assert leg["fill_price"] == 100.0
+
+    def test_replay_writes_no_extra_rows(self, client, logged_in, db_session):
+        """The replay still writes nothing (no second execution/orders/meta)."""
+        tid = _create_template(client, logged_in, name="Replay No Writes")
+
+        first = self._execute(
+            client, logged_in, tid, "exec-replay-md-003", 25000.0, 100.0, 25000.0
+        )
+        assert first.status_code == 200
+        exec_id = first.json()["execution_id"]
+        counts_first = (
+            db_session.query(StrategyExecution).count(),
+            db_session.query(PaperOrder).count(),
+        )
+
+        replay = self._execute(
+            client, logged_in, tid, "exec-replay-md-003", 25050.0, 115.0, 25050.0
+        )
+        assert replay.status_code == 200
+
+        db_session.expire_all()
+        assert (
+            db_session.query(StrategyExecution).count(),
+            db_session.query(PaperOrder).count(),
+        ) == counts_first
+        record = (
+            db_session.query(StrategyExecution)
+            .filter_by(execution_id=exec_id)
+            .first()
+        )
+        assert record.execution_metadata is not None
+
+
+    def test_replay_response_never_carries_non_dict_metadata(
+        self, client, logged_in, db_session
+    ):
+        """End-to-end: a stored non-object never reaches the replay response.
+
+        ``execution_metadata`` is declared ``dict | None``, so a stored JSON
+        array (or any other non-object) must surface as ``null`` on the replay,
+        not as the decoded value.
+        """
+        tid = _create_template(client, logged_in, name="Replay Non Dict")
+
+        first = self._execute(
+            client, logged_in, tid, "exec-replay-md-004", 25000.0, 100.0, 25000.0
+        )
+        assert first.status_code == 200
+        exec_id = first.json()["execution_id"]
+
+        # Corrupt the stored trail into a JSON array (outside the API — the
+        # write path only ever stores dicts).
+        record = (
+            db_session.query(StrategyExecution)
+            .filter_by(execution_id=exec_id)
+            .first()
+        )
+        record.execution_metadata = '[{"resolved_strike": 99999.0}]'
+        db_session.commit()
+
+        replay = self._execute(
+            client, logged_in, tid, "exec-replay-md-004", 25000.0, 100.0, 25000.0
+        )
+        assert replay.status_code == 200
+        assert replay.json()["duplicated"] is True
+        assert replay.json()["execution_metadata"] is None
+
+        # The replay still never rewrites the stored record.
+        db_session.expire_all()
+        assert (
+            db_session.query(StrategyExecution)
+            .filter_by(execution_id=exec_id)
+            .first()
+            .execution_metadata
+            == '[{"resolved_strike": 99999.0}]'
+        )
 
 
 class TestMetadataPersistenceFailure:
