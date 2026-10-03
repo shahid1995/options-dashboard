@@ -538,6 +538,138 @@ class TestConcurrentExecution:
         assert after == before + 2  # two independent executions
 
 
+class TestIdempotentReplayMetadata:
+    """An idempotent replay must never rewrite the stored audit trail.
+
+    ``execute_strategy()`` treats a retried ``client_order_id`` as a replay:
+    it returns the ORIGINAL execution untouched (``duplicated=True``) and
+    writes no new rows. The audit trail persisted alongside that execution is
+    therefore immutable history — a replay must not overwrite it with the
+    replay attempt's own (later) resolution, which would leave the stored
+    strikes/prices contradicting the actual ``PaperOrder`` fills.
+    """
+
+    def _execute(self, client, session_id, tid, coid, strike, price, confirmed_strike):
+        with patch(
+            "app.services.template_resolution.resolve_legs", new_callable=AsyncMock
+        ) as mock_resolve, patch(
+            "app.routers.paper.resolve_market_prices", new_callable=AsyncMock
+        ) as mock_prices, patch(
+            "app.routers.paper.require_market_open", new_callable=AsyncMock
+        ):
+            mock_resolve.return_value = _MockResult(
+                legs=[_MockLeg(resolved_strike=strike)]
+            )
+            mock_prices.return_value = {(EXPIRY, strike, "call"): price}
+            return client.post(
+                f"/paper/templates/{tid}/execute",
+                headers=headers(session_id),
+                json={
+                    "client_order_id": coid,
+                    "starting_capital": 500000,
+                    "confirmed_strikes": {0: confirmed_strike},
+                    "confirmed_expiries": {0: EXPIRY},
+                },
+            )
+
+    def test_replay_does_not_overwrite_persisted_metadata(
+        self, client, logged_in, db_session
+    ):
+        tid = _create_template(client, logged_in, name="Replay Metadata")
+
+        first = self._execute(
+            client, logged_in, tid, "exec-replay-md-001", 25000.0, 100.0, 25000.0
+        )
+        assert first.status_code == 200
+        exec_id = first.json()["execution_id"]
+
+        stored_first = db_session.query(StrategyExecution).filter_by(
+            execution_id=exec_id
+        ).first().execution_metadata
+        assert json.loads(stored_first)["execution_resolution"]["legs"][0][
+            "resolved_strike"
+        ] == 25000.0
+
+        # Same idempotency key, chain has since moved one step (25000 -> 25050).
+        replay = self._execute(
+            client, logged_in, tid, "exec-replay-md-001", 25050.0, 115.0, 25050.0
+        )
+        assert replay.status_code == 200
+        assert replay.json()["execution_id"] == exec_id
+        assert replay.json()["duplicated"] is True
+
+        db_session.expire_all()
+        stored_after = (
+            db_session.query(StrategyExecution)
+            .filter_by(execution_id=exec_id)
+            .first()
+            .execution_metadata
+        )
+        assert stored_after == stored_first
+
+        # The stored trail must still describe what was ACTUALLY filled.
+        leg = json.loads(stored_after)["execution_resolution"]["legs"][0]
+        order = db_session.query(PaperOrder).filter_by(
+            execution_id=exec_id
+        ).first()
+        assert leg["resolved_strike"] == order.strike == 25000.0
+        assert leg["fill_price"] == order.fill_price == 100.0
+
+    def test_replay_returns_original_persisted_metadata(
+        self, client, logged_in, db_session
+    ):
+        """The replay response echoes the ORIGINAL audit trail, not the
+        replay attempt's fresh resolution."""
+        tid = _create_template(client, logged_in, name="Replay Response")
+
+        first = self._execute(
+            client, logged_in, tid, "exec-replay-md-002", 25000.0, 100.0, 25000.0
+        )
+        assert first.status_code == 200
+        original_meta = first.json()["execution_metadata"]
+
+        replay = self._execute(
+            client, logged_in, tid, "exec-replay-md-002", 25050.0, 115.0, 25050.0
+        )
+        assert replay.status_code == 200
+        assert replay.json()["duplicated"] is True
+        assert replay.json()["execution_metadata"] == original_meta
+        leg = replay.json()["execution_metadata"]["execution_resolution"]["legs"][0]
+        assert leg["resolved_strike"] == 25000.0
+        assert leg["fill_price"] == 100.0
+
+    def test_replay_writes_no_extra_rows(self, client, logged_in, db_session):
+        """The replay still writes nothing (no second execution/orders/meta)."""
+        tid = _create_template(client, logged_in, name="Replay No Writes")
+
+        first = self._execute(
+            client, logged_in, tid, "exec-replay-md-003", 25000.0, 100.0, 25000.0
+        )
+        assert first.status_code == 200
+        exec_id = first.json()["execution_id"]
+        counts_first = (
+            db_session.query(StrategyExecution).count(),
+            db_session.query(PaperOrder).count(),
+        )
+
+        replay = self._execute(
+            client, logged_in, tid, "exec-replay-md-003", 25050.0, 115.0, 25050.0
+        )
+        assert replay.status_code == 200
+
+        db_session.expire_all()
+        assert (
+            db_session.query(StrategyExecution).count(),
+            db_session.query(PaperOrder).count(),
+        ) == counts_first
+        record = (
+            db_session.query(StrategyExecution)
+            .filter_by(execution_id=exec_id)
+            .first()
+        )
+        assert record.execution_metadata is not None
+
+
 class TestMetadataPersistenceFailure:
     """Metadata persistence failure does not convert a successful execution into a failure."""
 

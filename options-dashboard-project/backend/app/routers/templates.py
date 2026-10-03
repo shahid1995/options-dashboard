@@ -558,6 +558,30 @@ def _build_execution_metadata(
     }
 
 
+def _load_execution_metadata(
+    db: Session, user_id: str, execution_id: str
+) -> dict | None:
+    """Return the audit trail already persisted for one of the user's executions.
+
+    Used on an idempotent replay, where the stored record — not the current
+    attempt's resolution — is the authoritative history of what was executed.
+    """
+    from app.models import StrategyExecution
+
+    raw = db.scalar(
+        select(StrategyExecution.execution_metadata).where(
+            StrategyExecution.execution_id == execution_id,
+            StrategyExecution.user_id == user_id,
+        )
+    )
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _persist_execution_metadata(db: Session, execution_id: str, metadata: dict) -> None:
     """Write execution metadata in a separate transaction (post-commit).
 
@@ -733,19 +757,32 @@ async def execute_template(
         # transaction. If metadata persistence fails, the execution remains
         # valid — metadata is optional.
         try:
-            metadata = _build_execution_metadata(
-                template=template,
-                preview_result=fresh_result,
-                comparison_changes=changes,
-                confirmed_strikes=request.confirmed_strikes,
-                confirmed_expiries=request.confirmed_expiries,
-                exec_result=result,
-                exec_legs=exec_legs,
-                prices=prices,
-            )
-            _persist_execution_metadata(db, result.execution_id, metadata)
-            # Only include metadata in response if DB write succeeded
-            result = result.model_copy(update={"execution_metadata": metadata})
+            if result.duplicated:
+                # Idempotent replay: execute_strategy() returned the ORIGINAL
+                # execution untouched (no new execution, orders or fills). Its
+                # audit trail was already persisted by the first call. Rebuilding
+                # metadata from THIS attempt's fresh resolution would overwrite a
+                # historical record with strikes/prices the execution never used,
+                # so the stored trail stays authoritative and is echoed back.
+                stored = _load_execution_metadata(db, user_id, result.execution_id)
+                if stored is not None:
+                    result = result.model_copy(
+                        update={"execution_metadata": stored}
+                    )
+            else:
+                metadata = _build_execution_metadata(
+                    template=template,
+                    preview_result=fresh_result,
+                    comparison_changes=changes,
+                    confirmed_strikes=request.confirmed_strikes,
+                    confirmed_expiries=request.confirmed_expiries,
+                    exec_result=result,
+                    exec_legs=exec_legs,
+                    prices=prices,
+                )
+                _persist_execution_metadata(db, result.execution_id, metadata)
+                # Only include metadata in response if DB write succeeded
+                result = result.model_copy(update={"execution_metadata": metadata})
         except Exception:
             logger.warning(
                 "Failed to persist execution metadata for %s",
