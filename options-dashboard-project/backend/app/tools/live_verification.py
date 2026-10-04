@@ -746,6 +746,12 @@ _OPTION_KEY_EXPIRY_PATTERNS = (
 _INSTRUMENT_KEY_RE = re.compile(
     r"[A-Z][A-Z0-9_]*\|[A-Za-z0-9_ ]+(?:\|(?:\d{2}-\d{2}-\d{4}|\d{4}-\d{2}-\d{2}))?"
 )
+#: ASCII control characters (C0 plus DEL).  Checked against the RAW input
+#: BEFORE normalization, because ``str.strip()`` would otherwise silently
+#: delete a trailing "\r\n" or "\t" and make injected control characters
+#: indistinguishable from ordinary padding.  Space (U+0020) is deliberately
+#: NOT in this set: ordinary surrounding spaces stay normalizable.
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 _MAX_INSTRUMENT_KEY_LEN = 120
 
 
@@ -753,11 +759,19 @@ def _instrument_key_error(instrument_key: Any) -> str | None:
     """Validate an option instrument key before it can reach an upstream URL.
 
     Returns ``None`` when the key is acceptable, otherwise a fixed, key-free
-    reason string. Surrounding whitespace is normalized (stripped); anything
-    else outside the grammar above is rejected.
+    reason string.
+
+    Ordinary surrounding spaces are normalized (stripped).  ASCII control
+    characters -- C0 (``\x00``-``\x1f``, including CR, LF and TAB) and DEL
+    (``\x7f``) -- are rejected outright, and they are checked against the RAW
+    input *before* normalization so a trailing ``\r\n`` can never be silently
+    stripped and mistaken for ordinary padding.  Anything else outside the
+    grammar above is rejected, including path, query and fragment delimiters.
     """
     if not isinstance(instrument_key, str):
         return "instrument key must be a string"
+    if _CONTROL_CHAR_RE.search(instrument_key):
+        return "instrument key contains an ASCII control character"
     key = instrument_key.strip()
     if not key:
         return "instrument key is empty"

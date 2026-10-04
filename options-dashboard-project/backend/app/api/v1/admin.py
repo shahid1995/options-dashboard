@@ -481,17 +481,22 @@ class OptionCandleProbeIn(BaseModel):
 
         The probe builds an authenticated Upstox URL path from this value, so
         the request boundary reuses the probe's own validator instead of a
-        second, drifting copy: a traversal, query, fragment or control
-        character is rejected here, and the normalized (stripped) key is what
-        every downstream call receives.
+        second, drifting copy.  Ordinary surrounding spaces are normalized;
+        ASCII control characters (C0 plus DEL) and the path, query and
+        fragment delimiters are rejected here.  Either way the key that every
+        downstream call receives is the normalized one.
+
+        The RAW value is what gets validated.  Stripping first would delete a
+        trailing CR/LF/TAB and make an injected control character look like
+        ordinary padding, so normalization happens only after the check.
+        Ordinary surrounding SPACES are still normalized, not rejected.
         """
         from app.tools.live_verification import _instrument_key_error
 
-        normalized = v.strip() if isinstance(v, str) else v
-        error = _instrument_key_error(normalized)
+        error = _instrument_key_error(v)
         if error is not None:
             raise ValueError(error)
-        return normalized
+        return v.strip() if isinstance(v, str) else v
 
     @field_validator("candle_date")
     @classmethod

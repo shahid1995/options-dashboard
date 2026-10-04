@@ -1006,7 +1006,10 @@ class TestOptionProbeFailClosedHardening:
 
     def test_whitespace_is_normalized_but_never_injected(self):
         assert _instrument_key_error("  NSE_FO|53806  ") is None
-        assert _instrument_key_error("NSE_FO|53806\r\n") is None  # stripped, not embedded
+        # Control characters are rejected on the RAW input, before strip().
+        assert _instrument_key_error("NSE_FO|53806\r\n") is not None
+        assert _instrument_key_error("NSE_FO|53806\t") is not None
+        assert _instrument_key_error("  NSE_FO|53806  ") is None  # spaces still normalize
         assert _instrument_key_error("NSE_FO|53806\nX-Evil: 1") is not None
 
     def test_non_string_keys_are_rejected(self):
@@ -1206,15 +1209,18 @@ class TestOptionProbeKeyNormalization:
     @pytest.mark.parametrize(
         "raw_key",
         [
-            "NSE_FO|53806" + chr(13) + " ",
             "NSE_FO|53806 ",
-            "  NSE_FO|53806" + chr(9),
-            chr(10) + "NSE_FO|53806",
+            "  NSE_FO|53806",
+            "  NSE_FO|53806  ",
         ],
     )
     @pytest.mark.asyncio
     async def test_http_calls_receive_the_normalized_key(self, raw_key):
-        """Both mocks must see the stripped key, never the raw caller string."""
+        """Both mocks must see the stripped key, never the raw caller string.
+
+        Only ordinary SPACES are normalized.  Control characters are rejected
+        before normalization (see the rejection test below).
+        """
         normalized = "NSE_FO|53806"
         probe_date = _ist_date_offset(-2)
         with patch("app.tools.live_verification.get_intraday_candles",
@@ -1229,6 +1235,31 @@ class TestOptionProbeKeyNormalization:
         assert result["instrument_key_source"] == "user-supplied CLI argument (--option-key)"
         assert "instrument_key_error" not in result
 
+    @pytest.mark.parametrize(
+        "raw_key",
+        [
+            "NSE_FO|53806" + chr(13) + chr(10),
+            "NSE_FO|53806" + chr(9),
+            chr(10) + "NSE_FO|53806",
+            "NSE_FO|53" + chr(13) + "806",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_control_character_keys_are_rejected_without_any_request(
+        self, raw_key
+    ):
+        """A control character must never reach an authenticated Upstox URL."""
+        probe_date = _ist_date_offset(-2)
+        with patch("app.tools.live_verification.get_intraday_candles",
+                   new_callable=AsyncMock) as mock_intraday,              patch("app.tools.live_verification.get_historical_candles",
+                   new_callable=AsyncMock) as mock_historical:
+            result = await verify_option_candle_api("test-token", raw_key, probe_date)
+
+        mock_intraday.assert_not_called()
+        mock_historical.assert_not_called()
+        assert result["instrument_key_error"]
+        assert result["live_option_oi_established"] is False
+
     @pytest.mark.asyncio
     async def test_normalized_key_is_used_for_request_descriptions(self):
         """The audit trail records the normalized key too."""
@@ -1238,7 +1269,7 @@ class TestOptionProbeKeyNormalization:
                    new_callable=AsyncMock, return_value=self._oi_candles(probe_date)),              patch("app.tools.live_verification.get_historical_candles",
                    new_callable=AsyncMock, return_value=self._oi_candles(probe_date)):
             result = await verify_option_candle_api(
-                "test-token", f"  {normalized}{chr(13)}", probe_date)
+                "test-token", f"  {normalized}  ", probe_date)
 
         assert result["instrument_key"] == normalized
         assert normalized in result["intraday"]["request"]
