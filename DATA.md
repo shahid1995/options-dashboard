@@ -123,6 +123,11 @@ and `IngestionLog` rows that acquisition produced, without replacing those
 records. `DataCompleteness` is cumulative and carries no run identity, so it
 is not a source of per-run manifest metrics; a run with no run-scoped evidence
 of its own reports `UNKNOWN` completeness rather than being reported complete.
+A manifest's `expected_records` and `actual_records` cover the same population:
+the work declared by that run's checkpoints and the rows fetched by the
+operations that publish exactly those pipelines. Rows fetched by an operation
+with no declared expectation (contract metadata, NIFTY candles) are not counted
+as actual, though their operations still decide completeness.
 
 Raw market observations remain the recomputation source. Current upstream
 entitlement and redistribution status is intentionally `REVIEW_REQUIRED` unless
