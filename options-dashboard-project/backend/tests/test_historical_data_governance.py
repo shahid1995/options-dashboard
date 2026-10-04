@@ -39,6 +39,7 @@ def _catalog(
     db,
     *,
     key: str,
+    table_name: str | None = None,
     tier: str = "RAW",
     pipeline: str | None = "backfill_options",
     completeness_data_type: str | None = "option_candles",
@@ -58,8 +59,15 @@ def _catalog(
         dataset_key=key,
         domain="MARKET_DATA" if tier == "RAW" else "QUANT",
         dataset_tier=tier,
-        table_name="option_candles" if key.endswith("OPTION_CANDLES_3MIN") else (
-            "option_greeks" if key.endswith("OPTION_GREEKS") else "historical_gex"
+        table_name=table_name
+        or (
+            "option_candles"
+            if key.endswith("OPTION_CANDLES_3MIN")
+            else (
+                "option_greeks"
+                if key.endswith("OPTION_GREEKS")
+                else "historical_gex"
+            )
         ),
         pipeline=pipeline,
         completeness_data_type=completeness_data_type,
@@ -455,12 +463,25 @@ def test_governance_datetimes_are_naive_utc(db):
     assert catalog_row.created_at.tzinfo is None
 
 
-def test_realistic_run_derives_completeness_from_pipeline_evidence(db):
-    """A real backfill leaves run-scoped IngestionLog and IngestionCheckpoint
-    rows behind. The manifest must report that evidence instead of ending
-    UNKNOWN with expected_records=None, and must still report a real gap."""
+def test_expected_and_actual_records_describe_the_same_population(db):
+    """``expected_records`` and ``actual_records`` must be comparable.
+
+    Only the options stage declares a checkpoint-backed expectation, so only
+    its log rows belong in the expected/actual population. Contract-metadata
+    and NIFTY rows are produced by operations that declare no expectation at
+    all; counting them would report a surplus (an actual of 80 + 40 + 75
+    against an expected 90) and hide the real 10-row shortfall.
+    """
+    contracts = "UPSTOX_CONTRACT_SPECS"
     nifty = "UPSTOX_NIFTY_CANDLES_3MIN"
     options = "UPSTOX_OPTION_CANDLES_3MIN"
+    _catalog(
+        db,
+        key=contracts,
+        table_name="contract_specs",
+        pipeline="backfill_contracts",
+        completeness_data_type="contract_metadata",
+    )
     _catalog(
         db,
         key=nifty,
@@ -470,26 +491,41 @@ def test_realistic_run_derives_completeness_from_pipeline_evidence(db):
     _catalog(db, key=options)
 
     run = hdg.start_ingestion_run(
-        db, dataset_keys=[nifty, options], run_id="run-realistic"
+        db,
+        dataset_keys=[contracts, nifty, options],
+        run_id="run-realistic",
     )
     db.add_all(
         [
+            # Neither of these stages writes a checkpoint, so neither declares
+            # an expectation.
+            IngestionLog(
+                run_id=run.run_id,
+                operation="contract_metadata",
+                started_at="2026-09-01T00:00:00+00:00",
+                completed_at="2026-09-01T00:00:30+00:00",
+                status="SUCCESS",
+                rows_fetched=40,
+                rows_inserted=40,
+            ),
             IngestionLog(
                 run_id=run.run_id,
                 operation="nifty_candles",
-                started_at="2026-09-01T00:00:00+00:00",
+                started_at="2026-09-01T00:00:30+00:00",
                 completed_at="2026-09-01T00:01:00+00:00",
                 status="SUCCESS",
                 rows_fetched=75,
                 rows_inserted=75,
             ),
+            # The option stage is the checkpoint-backed one: it fetched 80 of
+            # the 90 rows it declared.
             IngestionLog(
                 run_id=run.run_id,
                 operation="option_candles",
                 started_at="2026-09-01T00:01:00+00:00",
                 completed_at="2026-09-01T00:05:00+00:00",
                 status="PARTIAL",
-                rows_fetched=90,
+                rows_fetched=80,
                 rows_inserted=80,
                 error_message="429 rate limit",
             ),
@@ -497,60 +533,78 @@ def test_realistic_run_derives_completeness_from_pipeline_evidence(db):
                 pipeline="backfill_options",
                 instrument_key="NSE_FO|X|01-10-2026",
                 run_id=run.run_id,
-                status="COMPLETED",
+                status="FAILED",
                 items_processed=80,
                 items_total=90,
+                error_message="429 rate limit",
             ),
         ]
     )
     db.commit()
 
     refreshed = hdg.refresh_ingestion_run_metrics(db, run.run_id)
+    # Expected is declared by the checkpointed options pipeline.
     assert refreshed.expected_records == 90
-    assert refreshed.actual_records == 165
-    assert refreshed.missing_records == 0
+    # Actual is what that same pipeline's operation fetched. The contract (40)
+    # and NIFTY (75) rows are outside the population, so this is 80 and not
+    # 195.
+    assert refreshed.actual_records == 80
+    assert refreshed.missing_records == 10
     assert refreshed.checkpoints_total == 1
-    assert refreshed.checkpoints_completed == 1
-    # The option-candle operation came back PARTIAL, so the run is not whole.
+    assert refreshed.checkpoints_completed == 0
+    # The PARTIAL option operation and the FAILED checkpoint are both real
+    # run-scoped evidence, so the run is not whole.
     assert refreshed.completeness_status == "PARTIAL"
 
     finished = hdg.finish_ingestion_run(db, run.run_id, status=hdg.RUN_SUCCEEDED)
     assert finished.status == hdg.RUN_PARTIAL
     assert finished.completed_at is not None
 
-    # A clean run over the same datasets reports COMPLETE and stays SUCCEEDED.
-    clean = hdg.start_ingestion_run(
-        db, dataset_keys=[options], run_id="run-realistic-clean"
+
+def test_run_without_checkpoint_backed_evidence_declares_no_expectation(db):
+    """A run whose operations declare no expectation has no population.
+
+    Contract acquisition writes log rows but no checkpoint, so there is nothing
+    to measure them against: expected stays None, actual stays 0, and no
+    shortfall is invented. Its operations still decide completeness.
+    """
+    key = "UPSTOX_CONTRACT_SPECS"
+    _catalog(
+        db,
+        key=key,
+        table_name="contract_specs",
+        pipeline="backfill_contracts",
+        completeness_data_type="contract_metadata",
     )
+
+    run = hdg.start_ingestion_run(db, dataset_keys=[key], run_id="run-contracts-only")
     db.add_all(
         [
             IngestionLog(
-                run_id=clean.run_id,
-                operation="option_candles",
-                started_at="2026-09-02T00:00:00+00:00",
-                completed_at="2026-09-02T00:05:00+00:00",
+                run_id=run.run_id,
+                operation="contract_metadata",
+                started_at="2026-09-01T00:00:00+00:00",
+                completed_at="2026-09-01T00:00:30+00:00",
                 status="SUCCESS",
-                rows_fetched=90,
-                rows_inserted=90,
-            ),
-            IngestionCheckpoint(
-                pipeline="backfill_options",
-                instrument_key="NSE_FO|Y|01-10-2026",
-                run_id=clean.run_id,
-                status="COMPLETED",
-                items_processed=90,
-                items_total=90,
+                rows_fetched=40,
+                rows_inserted=40,
             ),
         ]
     )
     db.commit()
 
-    ok = hdg.finish_ingestion_run(db, clean.run_id, status=hdg.RUN_SUCCEEDED)
-    assert ok.status == hdg.RUN_SUCCEEDED
-    assert ok.completeness_status == "COMPLETE"
-    assert ok.expected_records == 90
-    assert ok.actual_records == 90
-    assert ok.missing_records == 0
+    refreshed = hdg.refresh_ingestion_run_metrics(db, run.run_id)
+    assert refreshed.expected_records is None
+    # The 40 rows it fetched belong to no declared expectation, so they are
+    # not an actual of 40.
+    assert refreshed.actual_records == 0
+    assert refreshed.missing_records == 0
+    assert refreshed.checkpoints_total == 0
+    # The operation is itself run-scoped evidence, and it succeeded.
+    assert refreshed.completeness_status == "COMPLETE"
+
+    finished = hdg.finish_ingestion_run(db, run.run_id, status=hdg.RUN_SUCCEEDED)
+    assert finished.status == hdg.RUN_SUCCEEDED
 
 
 def test_missing_records_are_the_unprocessed_remainder(db):

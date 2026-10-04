@@ -451,6 +451,16 @@ def refresh_ingestion_run_metrics(
 
     A run that produced neither stays ``UNKNOWN`` rather than being reported
     complete.
+
+    ``expected_records`` and ``actual_records`` describe the SAME population:
+    the work covered by this run's checkpoints. ``expected_records`` is the
+    declared ``items_total`` of the run's checkpoint-backed pipelines, and
+    ``actual_records`` is the ``rows_fetched`` reported by the IngestionLog
+    operations that publish exactly those pipelines. Rows fetched by an
+    operation with no checkpoint-backed expectation (contract metadata, NIFTY
+    candles) are excluded, because measuring them against an expectation they
+    were never part of would report a surplus rather than a shortfall. Those
+    operations still count towards ``completeness_status``.
     """
     run = db.scalar(
         select(HistoricalIngestionRun).where(HistoricalIngestionRun.run_id == run_id)
@@ -461,6 +471,10 @@ def refresh_ingestion_run_metrics(
     dataset_keys = _run_dataset_keys(run)
     pipelines: list[str] = []
     operations: list[str] = []
+    # Catalog pipeline -> the IngestionLog operation that publishes it. This
+    # is what resolves a checkpoint-backed pipeline back to the log rows that
+    # retrieved its rows.
+    operation_by_pipeline: dict[str, str] = {}
     for key in dataset_keys:
         row = get_dataset(db, key)
         if row.pipeline:
@@ -470,15 +484,35 @@ def refresh_ingestion_run_metrics(
             # operation that produces this dataset (contract_metadata,
             # nifty_candles, option_candles).
             operations.append(row.completeness_data_type)
+            if row.pipeline:
+                operation_by_pipeline.setdefault(
+                    row.pipeline, row.completeness_data_type
+                )
+
+    # The pipelines that actually produced run-scoped checkpoint rows. Only
+    # these declared an expectation, so only these have an actual that can be
+    # measured against it. This is `pipelines` narrowed to the ones that wrote
+    # a checkpoint under this run id, so the checkpoint counts below are
+    # unchanged by the narrowing.
+    checkpoint_pipelines: list[str] = []
+    if pipelines:
+        checkpoint_pipelines = list(
+            db.execute(
+                select(IngestionCheckpoint.pipeline).where(
+                    IngestionCheckpoint.run_id == run_id,
+                    IngestionCheckpoint.pipeline.in_(pipelines),
+                ).distinct()
+            ).scalars()
+        )
 
     checkpoint_total = 0
     checkpoint_completed = 0
-    if pipelines:
+    if checkpoint_pipelines:
         checkpoint_total = int(
             db.scalar(
                 select(func.count(IngestionCheckpoint.id)).where(
                     IngestionCheckpoint.run_id == run_id,
-                    IngestionCheckpoint.pipeline.in_(pipelines),
+                    IngestionCheckpoint.pipeline.in_(checkpoint_pipelines),
                 )
             )
             or 0
@@ -487,7 +521,7 @@ def refresh_ingestion_run_metrics(
             db.scalar(
                 select(func.count(IngestionCheckpoint.id)).where(
                     IngestionCheckpoint.run_id == run_id,
-                    IngestionCheckpoint.pipeline.in_(pipelines),
+                    IngestionCheckpoint.pipeline.in_(checkpoint_pipelines),
                     IngestionCheckpoint.status == "COMPLETED",
                 )
             )
@@ -531,12 +565,12 @@ def refresh_ingestion_run_metrics(
     # keeps this portable across SQLite, PostgreSQL and CockroachDB.
     declared_total = 0
     unprocessed_total = 0
-    if pipelines:
+    if checkpoint_pipelines:
         declared_total = int(
             db.scalar(
                 select(func.coalesce(func.sum(IngestionCheckpoint.items_total), 0)).where(
                     IngestionCheckpoint.run_id == run_id,
-                    IngestionCheckpoint.pipeline.in_(pipelines),
+                    IngestionCheckpoint.pipeline.in_(checkpoint_pipelines),
                 )
             )
             or 0
@@ -553,23 +587,38 @@ def refresh_ingestion_run_metrics(
                     )
                 ).where(
                     IngestionCheckpoint.run_id == run_id,
-                    IngestionCheckpoint.pipeline.in_(pipelines),
+                    IngestionCheckpoint.pipeline.in_(checkpoint_pipelines),
                     IngestionCheckpoint.status != "COMPLETED",
                 )
             )
             or 0
         )
 
-    fetched = db.scalar(
-        select(func.coalesce(func.sum(IngestionLog.rows_fetched), 0)).where(
-            IngestionLog.run_id == run_id
-        )
-    )
-    actual = int(fetched or 0)
+    # The log operations that publish the checkpoint-backed pipelines. Rows
+    # fetched by any other operation in this run have no declared expectation
+    # to be measured against, so they are outside the expected/actual
+    # population and must not inflate it. Their operations still count
+    # towards completeness_status above.
+    checkpointed_operations = [
+        operation_by_pipeline[pipeline]
+        for pipeline in checkpoint_pipelines
+        if pipeline in operation_by_pipeline
+    ]
 
-    # Rows this run expected to retrieve. Declared by the producer on its own
-    # checkpoints; absent means the run declared no expectation, which is not
-    # the same as an expectation of zero.
+    actual = 0
+    if checkpointed_operations:
+        fetched = db.scalar(
+            select(func.coalesce(func.sum(IngestionLog.rows_fetched), 0)).where(
+                IngestionLog.run_id == run_id,
+                IngestionLog.operation.in_(checkpointed_operations),
+            )
+        )
+        actual = int(fetched or 0)
+
+    # Rows this run expected to retrieve. Declared by the producer on the
+    # checkpoints of the checkpoint-backed pipelines, and measured against the
+    # rows those same pipelines' operations fetched. Absent means the run
+    # declared no expectation, which is not the same as an expectation of zero.
     expected = declared_total if declared_total > 0 else None
     # Rows this run declared but did not obtain: the unprocessed remainder of
     # the checkpoints that did not complete. A completed checkpoint
