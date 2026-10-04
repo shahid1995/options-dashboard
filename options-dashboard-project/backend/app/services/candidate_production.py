@@ -30,11 +30,18 @@ Production prerequisite (Issue #118 — OPEN, not satisfied today):
     persistence path stores prior OI for a still-unexpired contract, so in
     production this producer cannot compute ΔOI and fails closed
     (``EVIDENCE_INSUFFICIENT`` / ``CHAIN_DATA_MISSING``) with zero writes.
-    UPSTREAM UPSTOX CAPABILITY IS UNVERIFIED: no safe authenticated
-    live-option probe could be performed from the development environment, so
-    nothing here asserts that the broker cannot serve such data — only that
-    this repository does not currently obtain or persist it.  That stays true
-    until live option-OI persistence lands as separate architecture work —
+    UPSTREAM UPSTOX CAPABILITY IS NOW VERIFIED: an authenticated live probe
+    (the PR #125 probe, exposed read-only through the Day-50 admin
+    verification seam) returned 129 historical 3-minute candles for the active
+    NIFTY 22400 CE, instrument ``NSE_FO|40687``, authoritative expiry
+    ``2026-10-06``, with all 129 open-interest values non-null.  The broker can
+    therefore serve the observation D1 requires.  PRODUCTION LIVE-OI
+    PERSISTENCE IS NOT IMPLEMENTED: a probe result is read-only and persists
+    nothing, so D1 still has no stored prior-OI observation and production
+    paper-entry capability remains blocked at that gate.  Repository absence
+    and upstream incapability are different claims: only the first holds now.
+    That stays true until live option-OI persistence lands as separate
+    architecture work —
     never widen the window, never reuse expired-contract history as if it
     were live, never match by strike text, never substitute current OI for
     prior OI, and never coerce missing history to zero.

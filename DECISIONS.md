@@ -393,6 +393,44 @@ critical operational state. Operators must not revoke them while the
 migrator-creator model is in force, and any role-model change must update
 them in the same change.
 
+## ADR-019 · Day-50 Slice A server-side StrategyCandidate producer (Issue #118) · Accepted
+
+New paper entries are produced server-side by `candidate_production`, which
+turns real server-side market evidence into the existing Day-28 → Day-34 chain
+and delegates to the existing sanctioned bridge (`execute_gated_paper_entry` →
+the `execute_strategy` choke point). It is orchestration only: it duplicates no
+payoff/risk/candidate math, creates no DB model and no second execution engine.
+Slice A records three approved decisions:
+
+* **D1** — ΔOI evidence is server-side OI history: current OI from the live
+  chain snapshot, previous OI from the latest eligible `OptionCandle` for the
+  exact broker instrument key within the approved lag/age window. Missing,
+  stale, or null-OI history stays missing — never coerced to zero — and an
+  entry whose requested leg has no eligible prior OI fails closed with zero
+  writes (Invariant 17a).
+* **D2** — the existing broker adapter path (`app.brokers.gateway`); the
+  canonical `MarketDataGateway` is NOT a dependency of this slice.
+* **D5** — no numeric freshness threshold is introduced; the real server-side
+  reference timestamp is recorded once from the evidence and preserved through
+  every contract.
+
+Upstream broker capability is VERIFIED: an authenticated live probe returned 129
+historical 3-minute candles for the active NIFTY 22400 CE, instrument
+`NSE_FO|40687`, authoritative expiry `2026-10-06`, with all 129 open-interest
+values non-null. Production live-OI persistence is NOT implemented and remains
+a separate, unsatisfied architecture prerequisite: `OptionCandle` is populated
+exclusively from the Upstox expired-instruments API, so no stored prior-OI
+observation exists for a still-unexpired contract, and the producer therefore
+cannot compute ΔOI in production and fails closed with zero writes. A
+read-only probe result may never stand in for that stored observation. Live
+paper entries are therefore not operational today, and this record does not
+assert otherwise.
+
+Evidence: PR #123, PR #125, PR #126,
+`options-dashboard-project/backend/app/services/candidate_production.py`,
+`options-dashboard-project/backend/tests/test_candidate_production.py`,
+[`CONTEXT.md`](CONTEXT.md) §6, [`INVARIANTS.md`](INVARIANTS.md) 17a/17b.
+
 ## ADR-020 · Historical acquisition rights gate for unresolved entitlement · Accepted
 
 The Day 48 dataset catalog seeds every Upstox market-data dataset with
