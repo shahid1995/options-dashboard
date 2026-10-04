@@ -117,13 +117,17 @@ Day 48 adds a governance catalog alongside the existing raw/model/analytics
 tables. `HistoricalDatasetGovernance` records source and source-reference
 metadata, entitlement/license/usage/redistribution status, tier, immutability,
 recomputation dependencies and retention policy. `HistoricalIngestionRun`
-snapshots those policy decisions for each acquisition and records checkpoint
-and completeness metrics without replacing the existing `IngestionCheckpoint`,
-`DataCompleteness` or `IngestionLog` records.
+snapshots those policy decisions for each acquisition and derives its
+checkpoint and completeness metrics from the run-scoped `IngestionCheckpoint`
+and `IngestionLog` rows that acquisition produced, without replacing those
+records. `DataCompleteness` is cumulative and carries no run identity, so it
+is not a source of per-run manifest metrics; a run with no run-scoped evidence
+of its own reports `UNKNOWN` completeness rather than being reported complete.
 
 Raw market observations remain the recomputation source. Current upstream
-redistribution status is intentionally `REVIEW_REQUIRED` unless an explicit
-governance decision changes it; API availability is not treated as proof of
-redistribution rights. Retention execution is dry-run-first, allow-listed and
+entitlement and redistribution status is intentionally `REVIEW_REQUIRED` unless
+an explicit governance decision changes it; API availability is not treated as
+proof of either. Acquisition is gated on those recorded rights before anything
+is fetched, under `DECISIONS.md` ADR-020. Retention execution is dry-run-first, allow-listed and
 disabled in the catalog by default; raw-tier deletion is not executable through
 the Day 48 service.

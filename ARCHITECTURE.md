@@ -121,11 +121,23 @@ Historical data acquisition is governed independently from queue mechanics:
   decisions for each acquisition so later policy changes do not rewrite
   historical audit context. It can link a durable `BackgroundJob` ID.
 - **Existing pipeline evidence remains authoritative:** the governance service
-  reads `IngestionCheckpoint`, `DataCompleteness` and `IngestionLog` rather
-  than duplicating their operational state.
-- **Fail-closed rights boundary:** unresolved entitlement or redistribution
-  state is not treated as permission. Public redistribution is allowed only
-  when the catalog explicitly says `ALLOWED`.
+  reads `IngestionCheckpoint` and `IngestionLog` rather than duplicating their
+  operational state. Manifest metrics are derived only from records carrying
+  the run's own identity, so evidence from another acquisition can never be
+  attributed to this run. `DataCompleteness` is cumulative and carries no run
+  identity, so it is not a manifest evidence source. A run that produced no
+  evidence of its own stays `UNKNOWN` rather than being reported complete.
+- **Enforced rights boundary:** acquisition is gated before any data is
+  fetched. Unresolved entitlement is not treated as permission, and
+  redistribution rights are never implied: public redistribution is allowed
+  only when the catalog explicitly says `ALLOWED`. A run refused by the gate
+  fails permanently and leaves no manifest behind. `DECISIONS.md` ADR-020
+  records the one approved exception — unresolved entitlement may be acquired
+  for internal research or backtest only, and the exception is written to the
+  manifest.
+- **Terminal manifests:** once a manifest is committed as `RUNNING`, every
+  exit path finalizes it, including orchestrator construction failure and a
+  failure of the finalization itself.
 - **Retention:** deletion is dry-run-first and uses a static allow-list of
   governed ORM targets. The current catalog keeps raw datasets and disables
   enforcement for derived datasets until a controlled policy enables it.
