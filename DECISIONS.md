@@ -430,3 +430,42 @@ Evidence: PR #123, PR #125, PR #126,
 `options-dashboard-project/backend/app/services/candidate_production.py`,
 `options-dashboard-project/backend/tests/test_candidate_production.py`,
 [`CONTEXT.md`](CONTEXT.md) §6, [`INVARIANTS.md`](INVARIANTS.md) 17a/17b.
+
+## ADR-020 · Historical acquisition rights gate for unresolved entitlement · Accepted
+
+The Day 48 dataset catalog seeds every Upstox market-data dataset with
+`entitlement_status = REVIEW_REQUIRED` pending a documented licensing review.
+This record fixes what a durable `HISTORICAL_INGESTION` job is permitted to do
+while that state is unresolved. It is a rights decision, not a readiness one,
+and it does not assert that redistribution is permitted.
+
+* **Enforcement point.** `execute_historical_ingestion` calls
+  `assert_acquisition_allowed` before any acquisition and before the ingestion
+  manifest is created. A job refused here fails permanently and leaves no
+  manifest behind, so a refused acquisition is never half-recorded.
+* **Unresolved entitlement.** `REVIEW_REQUIRED` may be acquired only for the
+  `INTERNAL_RESEARCH` and `BACKTEST` purposes, and only through the existing
+  explicit `allow_review_required` mechanism on `assert_entitlement_ready`. It
+  is an exception, not an entitlement: the catalog value stays
+  `REVIEW_REQUIRED` and the run records which datasets it proceeded under.
+* **No widening.** `PRIVATE_USER` and `PUBLIC` never receive the exception and
+  are refused outright while entitlement is unresolved.
+* **Auditable, not silent.** Every exception applied is written to the
+  manifest's metadata alongside the catalog snapshot, so a run that relied on
+  one is distinguishable from a run whose entitlements were verified.
+* **Usage stays fail-closed.** `assert_usage_allowed` is enforced for every
+  acquisition regardless of the entitlement exception.
+* **Redistribution stays fail-closed.** Acquiring data for internal analysis
+  is not redistribution, so the redistribution gate blocks any acquisition
+  whose purpose can publish. Unresolved redistribution rights are recorded on
+  the manifest and remain refused at the point of redistribution.
+
+This record does not authorize deployment, a scheduler, or any production
+purge. It closes the Day 48 gap in which the entitlement assertions existed but
+had no production caller.
+
+Evidence: PR #115,
+`options-dashboard-project/backend/app/services/historical_data_governance.py`,
+`options-dashboard-project/backend/app/services/background_jobs.py`,
+`options-dashboard-project/backend/tests/test_historical_data_governance.py`,
+[`ARCHITECTURE.md`](ARCHITECTURE.md) §2.2, [`DATA.md`](DATA.md).

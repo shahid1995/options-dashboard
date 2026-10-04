@@ -1489,57 +1489,92 @@ class TestGovernanceAuditWindow:
         assert chunks[0]["from"] == expected_start.isoformat()
         assert chunks[-1]["to"] == expected_end.isoformat()
 
-    def test_stale_completeness_rows_outside_window_do_not_flip_status(
+    def test_completeness_evidence_from_another_run_cannot_contaminate_this_run(
         self, session_factory
     ):
-        """Case C: with the effective window recorded, an older
-        DataCompleteness row outside it must not make a successful run
-        PARTIAL (finish_ingestion_run downgrade must not fire)."""
+        """Case C: completeness must come from evidence THIS run produced.
+
+        Run A failed partway and run B completed. Run B must not inherit run
+        A's gap, and the SUCCEEDED->PARTIAL downgrade must not fire for it.
+        DataCompleteness rows from an unrelated acquisition are equally
+        irrelevant: the table carries no run identity.
+        """
+        from app.models import IngestionCheckpoint, IngestionLog
         from app.services import historical_data_governance as hdg
 
-        today = datetime.now(timezone.utc).date()
-        window_start = (today - timedelta(days=365)).isoformat()
-
-        run = hdg.start_ingestion_run(
-            session_factory(),
-            dataset_keys=["UPSTOX_NIFTY_CANDLES_3MIN"],
-            coverage_start=window_start,
-            coverage_end=today.isoformat(),
-            run_id="run-audit-window",
-        )
         db = session_factory()
+        run_a = hdg.start_ingestion_run(
+            db,
+            dataset_keys=["UPSTOX_NIFTY_CANDLES_3MIN"],
+            coverage_start="2026-01-01",
+            coverage_end="2026-01-02",
+            run_id="run-a",
+        )
+        run_b = hdg.start_ingestion_run(
+            db,
+            dataset_keys=["UPSTOX_NIFTY_CANDLES_3MIN"],
+            coverage_start="2026-01-01",
+            coverage_end="2026-01-02",
+            run_id="run-b",
+        )
         db.add_all(
             [
-                # Stale row: far outside the effective window.
-                DataCompleteness(
-                    instrument_key="NSE_INDEX|NIFTY 50",
-                    session_date="2020-01-15",
-                    data_type="nifty_candles",
-                    expected_count=500,
-                    actual_count=0,
-                    missing_count=500,
+                # Run A: a PARTIAL operation and an instrument that failed.
+                IngestionLog(
+                    run_id=run_a.run_id,
+                    operation="nifty_candles",
+                    started_at="2026-01-01T00:00:00+00:00",
                     status="PARTIAL",
+                    rows_fetched=10,
+                    rows_inserted=4,
+                    error_message="429 rate limit",
                 ),
-                # Current row: inside the effective window, complete.
-                DataCompleteness(
+                IngestionCheckpoint(
+                    pipeline="backfill_nifty",
                     instrument_key="NSE_INDEX|NIFTY 50",
-                    session_date=today.isoformat(),
-                    data_type="nifty_candles",
-                    expected_count=75,
-                    actual_count=75,
-                    missing_count=0,
-                    status="COMPLETE",
+                    run_id=run_a.run_id,
+                    status="FAILED",
+                    items_processed=4,
+                    items_total=75,
+                    error_message="synthetic failure",
+                ),
+                # Run B touched a different instrument and completed. Run A's
+                # checkpoint still carries run_id "run-a" and must not be
+                # counted, exactly as a checkpoint left behind by an earlier
+                # run is not evidence for this one.
+                IngestionLog(
+                    run_id=run_b.run_id,
+                    operation="nifty_candles",
+                    started_at="2026-01-01T00:00:00+00:00",
+                    status="SUCCESS",
+                    rows_fetched=75,
+                    rows_inserted=75,
+                ),
+                IngestionCheckpoint(
+                    pipeline="backfill_nifty",
+                    instrument_key="NSE_INDEX|NIFTY BANK",
+                    run_id=run_b.run_id,
+                    status="COMPLETED",
+                    items_processed=75,
+                    items_total=75,
                 ),
             ]
         )
         db.commit()
 
-        refreshed = hdg.refresh_ingestion_run_metrics(db, run.run_id)
-        assert refreshed.completeness_status == "COMPLETE"
-        assert refreshed.missing_records == 0
-        assert refreshed.expected_records == 75
+        run_a_metrics = hdg.refresh_ingestion_run_metrics(db, run_a.run_id)
+        assert run_a_metrics.completeness_status == "PARTIAL"
+        assert hdg.finish_ingestion_run(
+            db, run_a.run_id, status=hdg.RUN_SUCCEEDED
+        ).status == hdg.RUN_PARTIAL
 
-        finished = hdg.finish_ingestion_run(db, run.run_id, status=hdg.RUN_SUCCEEDED)
+        run_b_metrics = hdg.refresh_ingestion_run_metrics(db, run_b.run_id)
+        assert run_b_metrics.completeness_status == "COMPLETE"
+        assert run_b_metrics.expected_records == 75
+        assert run_b_metrics.actual_records == 75
+        assert run_b_metrics.missing_records == 0
+
+        finished = hdg.finish_ingestion_run(db, run_b.run_id, status=hdg.RUN_SUCCEEDED)
         assert finished.status == hdg.RUN_SUCCEEDED
 
     def _run_real_chain(self, session_factory, stages, nifty_start_date=None, seed_expiry=None):
@@ -2919,3 +2954,235 @@ class TestCrashRecoveryWithHeartbeat:
             assert recovered.lease_owner == "worker-new"
         finally:
             engine2.dispose()
+
+
+class TestGovernanceAcquisitionRightsBoundary:
+    """Finding 2: the durable HISTORICAL_INGESTION path must actually reach the
+    catalog's rights decision before it acquires anything, and must record the
+    exception it applied on the manifest."""
+
+    @staticmethod
+    def _stub_external_boundaries(monkeypatch, orchestrator_cls):
+        import app.services.backfill_orchestrator as orch_mod
+        import app.services.upstox_client as upstox_mod
+
+        monkeypatch.setattr(orch_mod, "BackfillOrchestrator", orchestrator_cls)
+        monkeypatch.setattr(orch_mod, "TokenBridge", type("B", (), {}))
+        monkeypatch.setattr(
+            upstox_mod,
+            "UpstoxClient",
+            type("C", (), {"__init__": lambda self, token_provider=None: None}),
+        )
+
+    @staticmethod
+    def _successful_orchestrator(calls):
+        class _Result:
+            operation = "backfill_all"
+            status = "SUCCESS"
+            api_calls = 1
+            rows_fetched = 0
+            rows_inserted = 0
+            rows_skipped = 0
+            errors = []
+            metadata = {}
+
+        class _Orch:
+            def __init__(self, db, client, *, force=False, rate_limiter=None):
+                calls.append("constructed")
+                self.run_id = None
+
+            async def run_all(self, *, stages=None, nifty_start_date=None,
+                              options_concurrency=None):
+                calls.append("run_all")
+                return _Result()
+
+        return _Orch
+
+    def test_acquisition_path_reaches_the_entitlement_decision_and_records_it(
+        self, session_factory, monkeypatch
+    ):
+        """The seeded catalog is REVIEW_REQUIRED. Internal research proceeds
+        under the approved ADR-020 exception, and that exception must be
+        written onto the manifest, so the run is auditable rather than silent.
+        """
+        calls = []
+        self._stub_external_boundaries(
+            monkeypatch, self._successful_orchestrator(calls)
+        )
+
+        db = session_factory()
+        job, _ = bj.enqueue(
+            db,
+            job_type="HISTORICAL_INGESTION",
+            idempotency_key="gov-rights:1",
+            payload={"stages": ["options"]},
+        )
+        summary = bj.execute_historical_ingestion(db, job)
+        assert calls == ["constructed", "run_all"]
+
+        manifest = db.scalar(
+            select(HistoricalIngestionRun).where(
+                HistoricalIngestionRun.run_id == summary["governance_run_id"]
+            )
+        )
+        metadata = json.loads(manifest.metadata_json)
+        assert metadata["entitlement_review_required"] == [
+            "UPSTOX_OPTION_CANDLES_3MIN"
+        ]
+        assert metadata["redistribution_review_required"] == [
+            "UPSTOX_OPTION_CANDLES_3MIN"
+        ]
+        snapshot = json.loads(manifest.entitlement_snapshot_json)
+        assert (
+            snapshot["UPSTOX_OPTION_CANDLES_3MIN"]["status"] == "REVIEW_REQUIRED"
+        )
+
+    def test_refused_entitlement_fails_the_job_before_any_acquisition(
+        self, session_factory, monkeypatch
+    ):
+        """An entitlement state that is neither VERIFIED nor reviewable must
+        stop the job permanently, before a manifest or an API call exists."""
+        calls = []
+        self._stub_external_boundaries(
+            monkeypatch, self._successful_orchestrator(calls)
+        )
+
+        db = session_factory()
+        row = db.scalar(
+            select(HistoricalDatasetGovernance).where(
+                HistoricalDatasetGovernance.dataset_key
+                == "UPSTOX_OPTION_CANDLES_3MIN"
+            )
+        )
+        row.entitlement_status = "DENIED"
+        db.commit()
+
+        job, _ = bj.enqueue(
+            db,
+            job_type="HISTORICAL_INGESTION",
+            idempotency_key="gov-rights:2",
+            payload={"stages": ["options"]},
+        )
+        with pytest.raises(bj.JobExecutionError) as excinfo:
+            bj.execute_historical_ingestion(db, job)
+
+        assert excinfo.value.retryable is False
+        assert "governance catalog" in str(excinfo.value)
+        assert calls == []
+        assert (
+            db.scalar(select(func.count()).select_from(HistoricalIngestionRun)) == 0
+        )
+
+
+class TestGovernanceManifestTerminalization:
+    """Finding 6: once the manifest is committed RUNNING, every exit path must
+    leave it terminal with error detail."""
+
+    @staticmethod
+    def _stub(monkeypatch, orchestrator_cls):
+        import app.services.backfill_orchestrator as orch_mod
+        import app.services.upstox_client as upstox_mod
+
+        monkeypatch.setattr(orch_mod, "BackfillOrchestrator", orchestrator_cls)
+        monkeypatch.setattr(orch_mod, "TokenBridge", type("B", (), {}))
+        monkeypatch.setattr(
+            upstox_mod,
+            "UpstoxClient",
+            type("C", (), {"__init__": lambda self, token_provider=None: None}),
+        )
+
+    class _Result:
+        operation = "backfill_all"
+        status = "SUCCESS"
+        api_calls = 1
+        rows_fetched = 5
+        rows_inserted = 5
+        rows_skipped = 0
+        errors = []
+        metadata = {}
+
+    def _run(self, session_factory, idempotency_key):
+        db = session_factory()
+        job, _ = bj.enqueue(
+            db,
+            job_type="HISTORICAL_INGESTION",
+            idempotency_key=idempotency_key,
+            payload={"stages": ["options"]},
+        )
+        return db, job
+
+    def _manifest_for(self, db, job, run_id=None):
+        if run_id:
+            clause = HistoricalIngestionRun.run_id == run_id
+        else:
+            clause = HistoricalIngestionRun.background_job_id == job.id
+        return db.scalar(select(HistoricalIngestionRun).where(clause))
+
+    def test_orchestrator_constructor_failure_leaves_manifest_terminal(
+        self, session_factory, monkeypatch
+    ):
+        class _BrokenCtor:
+            def __init__(self, db, client, *, force=False, rate_limiter=None):
+                raise RuntimeError("synthetic constructor failure")
+
+        self._stub(monkeypatch, _BrokenCtor)
+        db, job = self._run(session_factory, "gov-terminal:ctor")
+
+        with pytest.raises(RuntimeError, match="synthetic constructor failure"):
+            bj.execute_historical_ingestion(db, job)
+
+        manifest = self._manifest_for(db, job)
+        assert manifest is not None
+        assert manifest.status == "FAILED"
+        assert manifest.completed_at is not None
+        assert "synthetic constructor failure" in (manifest.error_message or "")
+
+    def test_successful_execution_leaves_manifest_succeeded(
+        self, session_factory, monkeypatch
+    ):
+        result = self._Result()
+
+        class _Orch:
+            def __init__(self, db, client, *, force=False, rate_limiter=None):
+                self.run_id = None
+
+            async def run_all(self, *, stages=None, nifty_start_date=None,
+                              options_concurrency=None):
+                return result
+
+        self._stub(monkeypatch, _Orch)
+        db, job = self._run(session_factory, "gov-terminal:ok")
+
+        summary = bj.execute_historical_ingestion(db, job)
+
+        manifest = self._manifest_for(db, job, summary["governance_run_id"])
+        assert manifest.status == "SUCCEEDED"
+        assert manifest.completed_at is not None
+        assert manifest.error_message is None
+
+    def test_finalization_failure_still_leaves_manifest_terminal(
+        self, session_factory, monkeypatch
+    ):
+        result = self._Result()
+
+        class _Orch:
+            def __init__(self, db, client, *, force=False, rate_limiter=None):
+                self.run_id = None
+
+            async def run_all(self, *, stages=None, nifty_start_date=None,
+                              options_concurrency=None):
+                return result
+
+        self._stub(monkeypatch, _Orch)
+
+        def _explode(*args, **kwargs):
+            raise RuntimeError("synthetic metrics refresh failure")
+
+        monkeypatch.setattr(bj, "finish_ingestion_run", _explode)
+
+        db, job = self._run(session_factory, "gov-terminal:finalize")
+        summary = bj.execute_historical_ingestion(db, job)
+
+        manifest = self._manifest_for(db, job, summary["governance_run_id"])
+        assert manifest.status == "SUCCEEDED"
+        assert manifest.completed_at is not None

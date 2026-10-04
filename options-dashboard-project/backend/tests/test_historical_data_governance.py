@@ -11,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db import Base
 from app.models import (
+    ContractSpec,
     DataCompleteness,
     HistoricalDatasetGovernance,
     IngestionCheckpoint,
@@ -345,13 +346,13 @@ def test_raw_retention_is_not_executable_even_when_policy_is_destructive(db):
     assert db.scalar(select(func.count()).select_from(OptionCandle)) == 1
 
 
-def test_metrics_refresh_without_completeness_rows_stays_closed(db):
-    """Regression: metrics refresh must not raise when no completeness rows exist.
+def test_run_without_run_scoped_evidence_stays_unknown(db):
+    """Regression: a run that produced no evidence must stay UNKNOWN.
 
-    The SQL-level aggregation rewrite left a stale reference that raised
-    NameError whenever a run had no DataCompleteness rows, which would have
-    turned successful ingestions into falsely-reported failures at
-    finalization time.
+    The manifest may never report a run complete on the strength of rows it
+    did not produce. This also guards the metric refresh against the
+    aggregation path raising when there is nothing to aggregate, which would
+    turn a successful ingestion into a falsely-reported failure.
     """
     key = "UPSTOX_OPTION_CANDLES_3MIN"
     _catalog(db, key=key)
@@ -363,29 +364,19 @@ def test_metrics_refresh_without_completeness_rows_stays_closed(db):
         coverage_end="2026-09-02",
         run_id="run-day48-empty",
     )
-    db.add(
-        IngestionCheckpoint(
-            pipeline="backfill_options",
-            instrument_key="NSE_FO|TEST|01-10-2026",
-            run_id=run.run_id,
-            status="PENDING",
-            items_processed=0,
-            items_total=5,
-        )
-    )
-    db.commit()
 
     refreshed = hdg.refresh_ingestion_run_metrics(db, run.run_id)
     assert refreshed.expected_records is None
     assert refreshed.actual_records == 0
     assert refreshed.missing_records == 0
-    assert refreshed.checkpoints_total == 1
+    assert refreshed.checkpoints_total == 0
     assert refreshed.checkpoints_completed == 0
     assert refreshed.completeness_status == "UNKNOWN"
 
     finished = hdg.finish_ingestion_run(db, run.run_id, status=hdg.RUN_SUCCEEDED)
     assert finished.status == hdg.RUN_SUCCEEDED
     assert finished.expected_records is None
+    assert finished.completeness_status == "UNKNOWN"
     assert finished.completed_at is not None
 
 
@@ -417,16 +408,23 @@ def test_governance_datetimes_are_naive_utc(db):
     def _greek(instrument_key, open_time):
         return _option_greek(instrument_key=instrument_key, open_time=open_time)
 
+    # OptionGreeks.open_time is naive IST (Phase 7.24.4), so the cutoff must
+    # be expressed in IST too. `now` is 2025-02-01 12:00 UTC = 17:30 IST, so
+    # the 30-day cutoff is 2025-01-02 17:30 IST. A naive-UTC cutoff would be
+    # 2025-01-02 12:00 and would silently retain the 12:00-17:30 rows.
     db.add_all(
         [
             # Far outside the window: candidate.
             _greek("NSE_FO|A|01-10-2026", datetime(2025, 1, 1, 3, 45)),
-            # One second before the cutoff: candidate (strict <).
-            _greek("NSE_FO|B|01-10-2026", datetime(2025, 1, 2, 11, 59, 59)),
-            # Exactly at the cutoff: NOT a candidate.
-            _greek("NSE_FO|C|01-10-2026", datetime(2025, 1, 2, 12, 0, 0)),
-            # One second after the cutoff: NOT a candidate.
-            _greek("NSE_FO|D|01-10-2026", datetime(2025, 1, 2, 12, 0, 1)),
+            # Between the naive-UTC and IST cutoffs: the row a naive-UTC
+            # cutoff would have wrongly retained.
+            _greek("NSE_FO|E|01-10-2026", datetime(2025, 1, 2, 12, 0, 0)),
+            # One second before the IST cutoff: candidate (strict <).
+            _greek("NSE_FO|B|01-10-2026", datetime(2025, 1, 2, 17, 29, 59)),
+            # Exactly at the IST cutoff: NOT a candidate.
+            _greek("NSE_FO|C|01-10-2026", datetime(2025, 1, 2, 17, 30, 0)),
+            # One second after the IST cutoff: NOT a candidate.
+            _greek("NSE_FO|D|01-10-2026", datetime(2025, 1, 2, 17, 30, 1)),
         ]
     )
     db.commit()
@@ -439,7 +437,9 @@ def test_governance_datetimes_are_naive_utc(db):
 
     assert plan_aware.cutoff == plan_naive.cutoff
     assert plan_aware.cutoff.tzinfo is None
-    assert plan_aware.candidate_rows == 2
+    # Expressed in the column's own clock (IST), never naive UTC.
+    assert plan_aware.cutoff == datetime(2025, 1, 2, 17, 30)
+    assert plan_aware.candidate_rows == 3
 
     # finalize timestamps are stored naive UTC as well, and the Day 48
     # governance model defaults (started_at/created_at/updated_at) are naive.
@@ -453,3 +453,292 @@ def test_governance_datetimes_are_naive_utc(db):
         )
     )
     assert catalog_row.created_at.tzinfo is None
+
+
+def test_realistic_run_derives_completeness_from_pipeline_evidence(db):
+    """A real backfill leaves run-scoped IngestionLog and IngestionCheckpoint
+    rows behind. The manifest must report that evidence instead of ending
+    UNKNOWN with expected_records=None, and must still report a real gap."""
+    nifty = "UPSTOX_NIFTY_CANDLES_3MIN"
+    options = "UPSTOX_OPTION_CANDLES_3MIN"
+    _catalog(
+        db,
+        key=nifty,
+        pipeline="backfill_nifty",
+        completeness_data_type="nifty_candles",
+    )
+    _catalog(db, key=options)
+
+    run = hdg.start_ingestion_run(
+        db, dataset_keys=[nifty, options], run_id="run-realistic"
+    )
+    db.add_all(
+        [
+            IngestionLog(
+                run_id=run.run_id,
+                operation="nifty_candles",
+                started_at="2026-09-01T00:00:00+00:00",
+                completed_at="2026-09-01T00:01:00+00:00",
+                status="SUCCESS",
+                rows_fetched=75,
+                rows_inserted=75,
+            ),
+            IngestionLog(
+                run_id=run.run_id,
+                operation="option_candles",
+                started_at="2026-09-01T00:01:00+00:00",
+                completed_at="2026-09-01T00:05:00+00:00",
+                status="PARTIAL",
+                rows_fetched=90,
+                rows_inserted=80,
+                error_message="429 rate limit",
+            ),
+            IngestionCheckpoint(
+                pipeline="backfill_options",
+                instrument_key="NSE_FO|X|01-10-2026",
+                run_id=run.run_id,
+                status="COMPLETED",
+                items_processed=80,
+                items_total=90,
+            ),
+        ]
+    )
+    db.commit()
+
+    refreshed = hdg.refresh_ingestion_run_metrics(db, run.run_id)
+    assert refreshed.expected_records == 90
+    assert refreshed.actual_records == 165
+    assert refreshed.missing_records == 0
+    assert refreshed.checkpoints_total == 1
+    assert refreshed.checkpoints_completed == 1
+    # The option-candle operation came back PARTIAL, so the run is not whole.
+    assert refreshed.completeness_status == "PARTIAL"
+
+    finished = hdg.finish_ingestion_run(db, run.run_id, status=hdg.RUN_SUCCEEDED)
+    assert finished.status == hdg.RUN_PARTIAL
+    assert finished.completed_at is not None
+
+    # A clean run over the same datasets reports COMPLETE and stays SUCCEEDED.
+    clean = hdg.start_ingestion_run(
+        db, dataset_keys=[options], run_id="run-realistic-clean"
+    )
+    db.add_all(
+        [
+            IngestionLog(
+                run_id=clean.run_id,
+                operation="option_candles",
+                started_at="2026-09-02T00:00:00+00:00",
+                completed_at="2026-09-02T00:05:00+00:00",
+                status="SUCCESS",
+                rows_fetched=90,
+                rows_inserted=90,
+            ),
+            IngestionCheckpoint(
+                pipeline="backfill_options",
+                instrument_key="NSE_FO|Y|01-10-2026",
+                run_id=clean.run_id,
+                status="COMPLETED",
+                items_processed=90,
+                items_total=90,
+            ),
+        ]
+    )
+    db.commit()
+
+    ok = hdg.finish_ingestion_run(db, clean.run_id, status=hdg.RUN_SUCCEEDED)
+    assert ok.status == hdg.RUN_SUCCEEDED
+    assert ok.completeness_status == "COMPLETE"
+    assert ok.expected_records == 90
+    assert ok.actual_records == 90
+    assert ok.missing_records == 0
+
+
+def test_completeness_ignores_rows_the_run_did_not_produce(db):
+    """DataCompleteness is cumulative and carries no run identity, so its rows
+    can never be attributed to a specific acquisition. A run with no evidence
+    of its own stays UNKNOWN even when matching rows exist for its dataset and
+    window — including a PARTIAL row that would otherwise downgrade it."""
+    key = "UPSTOX_NIFTY_CANDLES_3MIN"
+    _catalog(
+        db,
+        key=key,
+        pipeline="backfill_nifty",
+        completeness_data_type="nifty_candles",
+    )
+
+    run = hdg.start_ingestion_run(
+        db,
+        dataset_keys=[key],
+        coverage_start="2026-09-01",
+        coverage_end="2026-09-02",
+        run_id="run-no-evidence",
+    )
+    db.add_all(
+        [
+            # Both rows sit inside this run's dataset and date window, but
+            # neither was produced by this run.
+            DataCompleteness(
+                instrument_key="NSE_INDEX|NIFTY 50",
+                session_date="2026-09-01",
+                data_type="nifty_candles",
+                expected_count=500,
+                actual_count=0,
+                missing_count=500,
+                status="PARTIAL",
+            ),
+            DataCompleteness(
+                instrument_key="NSE_INDEX|NIFTY 50",
+                session_date="2026-09-02",
+                data_type="nifty_candles",
+                expected_count=75,
+                actual_count=75,
+                missing_count=0,
+                status="COMPLETE",
+            ),
+        ]
+    )
+    db.commit()
+
+    refreshed = hdg.refresh_ingestion_run_metrics(db, run.run_id)
+    assert refreshed.completeness_status == "UNKNOWN"
+    assert refreshed.expected_records is None
+    assert refreshed.missing_records == 0
+
+    finished = hdg.finish_ingestion_run(db, run.run_id, status=hdg.RUN_SUCCEEDED)
+    assert finished.status == hdg.RUN_SUCCEEDED
+
+
+def test_retention_cutoff_matches_each_targets_stored_clock(db):
+    """Every retention target's cutoff must be expressed in the clock that
+    target actually stores — in the same plan_retention call.
+
+    OptionGreeks.open_time is naive IST; ContractSpec.fetched_at is naive UTC.
+    Comparing both against naive UTC is a 5h30 boundary error that silently
+    retains rows it should delete.
+    """
+    greeks_key = "STRIKENOVA_OPTION_GREEKS"
+    contracts_key = "UPSTOX_CONTRACT_SPECS"
+    _catalog(
+        db,
+        key=greeks_key,
+        tier="MODEL",
+        pipeline=None,
+        completeness_data_type=None,
+        source="STRIKENOVA",
+        entitlement_status=hdg.ENTITLEMENT_NOT_APPLICABLE,
+        license_status=hdg.LICENSE_INTERNAL,
+        retention_policy=hdg.RETENTION_DELETE_AFTER_DAYS,
+        retention_days=30,
+        retention_enforced=True,
+        raw_immutable=False,
+        recomputable=True,
+        dependencies=[contracts_key],
+    )
+    _catalog(
+        db,
+        key=contracts_key,
+        pipeline="backfill_contracts",
+        completeness_data_type="contract_metadata",
+        retention_policy=hdg.RETENTION_DELETE_AFTER_DAYS,
+        retention_days=30,
+        retention_enforced=True,
+    )
+
+    def _contract(instrument_key, fetched_at):
+        return ContractSpec(
+            instrument_key=instrument_key,
+            underlying="NIFTY",
+            underlying_key="NSE_FO|58124",
+            expiry="2026-10-01",
+            strike_price=25000.0,
+            instrument_type="CE",
+            trading_symbol="NIFTY25OCT25000CE",
+            segment="NSE_FO",
+            exchange="NSE",
+            source="TEST",
+            source_reference="test",
+            fetched_at=fetched_at,
+        )
+
+    db.add_all(
+        [
+            # Naive IST, five and a half hours after the naive-UTC cutoff.
+            _option_greek(
+                instrument_key="NSE_FO|IST|01-10-2026",
+                open_time=datetime(2026, 9, 4, 10, 0, 0),
+            ),
+            _contract("NSE_FO|UTC-BEFORE|01-10-2026", datetime(2026, 9, 4, 8, 59, 59)),
+            _contract("NSE_FO|UTC-AT|01-10-2026", datetime(2026, 9, 4, 9, 0, 0)),
+        ]
+    )
+    db.commit()
+
+    now = datetime(2026, 10, 4, 9, 0, 0, tzinfo=timezone.utc)
+
+    # IST-stored target: cutoff is the UTC instant expressed in IST.
+    greeks_plan = hdg.plan_retention(db, greeks_key, now=now)
+    assert greeks_plan.cutoff == datetime(2026, 9, 4, 14, 30)
+    # The 10:00 IST row is older than 14:30 IST and must be a candidate. A
+    # naive-UTC cutoff of 09:00 would have retained it.
+    assert greeks_plan.candidate_rows == 1
+
+    # UTC-stored target keeps naive UTC.
+    contracts_plan = hdg.plan_retention(db, contracts_key, now=now)
+    assert contracts_plan.cutoff == datetime(2026, 9, 4, 9, 0)
+    assert contracts_plan.candidate_rows == 1
+
+    # Executing the IST plan deletes exactly the row it selected.
+    applied = hdg.enforce_retention(db, greeks_key, now=now, execute=True)
+    assert applied.deleted_rows == 1
+    remaining = db.scalars(select(OptionGreeks)).all()
+    assert [r.instrument_key for r in remaining] == []
+
+
+def test_acquisition_gate_follows_the_approved_rights_policy(db):
+    """DECISIONS.md ADR-020: unresolved entitlement may be acquired only for
+    internal research or backtest, and only through the explicit
+    allow_review_required escape hatch. Usage stays fail-closed, redistribution
+    blocks any acquisition that can publish, and neither PRIVATE_USER nor
+    PUBLIC receives the exception."""
+    key = "UPSTOX_OPTION_CANDLES_3MIN"
+    _catalog(db, key=key)
+
+    # Seeded REVIEW_REQUIRED / INTERNAL_ONLY: internal research proceeds and
+    # the exception is reported back so the manifest can record it.
+    policy = hdg.assert_acquisition_allowed(
+        db, [key], purpose=hdg.PURPOSE_INTERNAL_RESEARCH
+    )
+    assert policy.entitlement_review_required == (key,)
+    assert policy.redistribution_review_required == (key,)
+    assert hdg.assert_acquisition_allowed(
+        db, [key], purpose=hdg.PURPOSE_BACKTEST
+    ).entitlement_review_required == (key,)
+
+    # PUBLIC never receives the entitlement exception.
+    with pytest.raises(hdg.HistoricalDataGovernanceError):
+        hdg.assert_acquisition_allowed(db, [key], purpose=hdg.PURPOSE_PUBLIC)
+
+    # With entitlement resolved, the remaining gates still bite.
+    row = db.scalar(
+        select(HistoricalDatasetGovernance).where(
+            HistoricalDatasetGovernance.dataset_key == key
+        )
+    )
+    row.entitlement_status = hdg.ENTITLEMENT_VERIFIED
+    db.commit()
+
+    # INTERNAL_ONLY does not permit a private-user purpose.
+    with pytest.raises(hdg.HistoricalDataGovernanceError):
+        hdg.assert_acquisition_allowed(db, [key], purpose=hdg.PURPOSE_PRIVATE_USER)
+    # Nor a publishing purpose, whose unresolved redistribution blocks it.
+    with pytest.raises(hdg.HistoricalDataGovernanceError):
+        hdg.assert_acquisition_allowed(db, [key], purpose=hdg.PURPOSE_PUBLIC)
+
+    # An entitlement state that is neither verified nor review-required is
+    # refused outright, exception or not.
+    row.entitlement_status = "DENIED"
+    db.commit()
+    with pytest.raises(hdg.HistoricalDataGovernanceError):
+        hdg.assert_acquisition_allowed(
+            db, [key], purpose=hdg.PURPOSE_INTERNAL_RESEARCH
+        )
