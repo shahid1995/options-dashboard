@@ -66,15 +66,26 @@ LIVE_KEY_EXPIRY = "2026-10-09"
 TWO_SEGMENT_KEY = "NSE_FO|53806"
 TWO_SEGMENT_EXPIRY = "2026-10-06"
 
+#: Every fact the broker's own contract rows are required to carry before the
+#: seam will treat them as NIFTY expiry authority.  Observed on the live
+#: ``/option/contract`` response: all 1918 rows declared exactly these values.
+NIFTY_ROW_FACTS = {
+    "segment": "NSE_FO",
+    "underlying_key": "NSE_INDEX|Nifty 50",
+    "underlying_symbol": "NIFTY",
+    "exchange": "NSE",
+}
+
 #: Contract-metadata payload the seam resolves the authoritative expiry from,
 #: mirroring the REAL provider shape observed against the staging broker:
-#: two-segment ``instrument_key`` values, expiries in ISO form.  One row is
-#: deliberately kept in the provider's ``dd-mm-yyyy`` form so both broker
-#: calendar formats stay covered.
+#: two-segment ``instrument_key`` values, expiries in ISO form, and the
+#: NIFTY-placing facts above.  One row is deliberately kept in the provider's
+#: ``dd-mm-yyyy`` form so both broker calendar formats stay covered.
 DEFAULT_CONTRACT_METADATA = {
     "status": "success",
     "data": [
         {
+            **NIFTY_ROW_FACTS,
             "instrument_key": LIVE_KEY_IDENTITY,
             "expiry": LIVE_KEY_EXPIRY,
             "instrument_type": "CE",
@@ -82,6 +93,7 @@ DEFAULT_CONTRACT_METADATA = {
             "lot_size": 65,
         },
         {
+            **NIFTY_ROW_FACTS,
             "instrument_key": TWO_SEGMENT_KEY,
             "expiry": "06-10-2026",
             "instrument_type": "CE",
@@ -1214,16 +1226,6 @@ class TestNiftyOptionOnlyScope:
 # 4. Broker identity matching across key renderings
 # ---------------------------------------------------------------------------
 
-#: A NIFTY option row as the broker actually ships it: two-segment
-#: ``instrument_key`` plus the underlying facts that place it in the universe.
-NIFTY_ROW_FACTS = {
-    "segment": "NSE_FO",
-    "underlying_key": "NSE_INDEX|Nifty 50",
-    "underlying_symbol": "NIFTY",
-    "exchange": "NSE",
-}
-
-
 def _row(instrument_key, expiry, **overrides):
     row = dict(NIFTY_ROW_FACTS)
     row["instrument_key"] = instrument_key
@@ -1323,6 +1325,85 @@ class TestBrokerIdentityMatching:
             None,
             authoritative_expiry_date=TWO_SEGMENT_EXPIRY,
         )
+
+    def test_row_with_all_nifty_facts_is_accepted(
+        self, client, admin_session, monkeypatch
+    ):
+        """The baseline the missing-field cases below are measured against."""
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        _contract_metadata_mock(
+            monkeypatch,
+            payload=_payload(_row(TWO_SEGMENT_KEY, TWO_SEGMENT_EXPIRY)),
+        )
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY})
+
+        assert resp.status_code == 200
+        probe.assert_awaited_once_with(
+            PROBE_TOKEN,
+            TWO_SEGMENT_KEY,
+            None,
+            authoritative_expiry_date=TWO_SEGMENT_EXPIRY,
+        )
+
+    @pytest.mark.parametrize("missing", ["segment", "underlying_key", "underlying_symbol"])
+    def test_row_missing_a_nifty_fact_fails_closed(
+        self, client, admin_session, monkeypatch, missing
+    ):
+        """Absence is not consent: an unproven universe is never authority.
+
+        The broker ships all three facts on every ``/option/contract`` row, so a
+        row missing one is not evidence of a NIFTY contract.  Skipping the check
+        would let a row from an unknown universe pass as NIFTY authority.
+        """
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        row = _row(TWO_SEGMENT_KEY, TWO_SEGMENT_EXPIRY)
+        del row[missing]
+        _contract_metadata_mock(monkeypatch, payload=_payload(row))
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY})
+
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "EXPIRY_UNRESOLVED"
+        probe.assert_not_called()
+
+    @pytest.mark.parametrize("missing", ["segment", "underlying_key", "underlying_symbol"])
+    def test_row_with_a_blank_nifty_fact_fails_closed(
+        self, client, admin_session, monkeypatch, missing
+    ):
+        """An empty string proves nothing either."""
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        _contract_metadata_mock(
+            monkeypatch,
+            payload=_payload(_row(TWO_SEGMENT_KEY, TWO_SEGMENT_EXPIRY, **{missing: "   "})),
+        )
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY})
+
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "EXPIRY_UNRESOLVED"
+        probe.assert_not_called()
+
+    @pytest.mark.parametrize("missing", ["segment", "underlying_key", "underlying_symbol"])
+    def test_row_with_a_non_string_nifty_fact_fails_closed(
+        self, client, admin_session, monkeypatch, missing
+    ):
+        """A non-string declaration is unusable, not skippable."""
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        _contract_metadata_mock(
+            monkeypatch,
+            payload=_payload(_row(TWO_SEGMENT_KEY, TWO_SEGMENT_EXPIRY, **{missing: None})),
+        )
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY})
+
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "EXPIRY_UNRESOLVED"
+        probe.assert_not_called()
 
     # -- fail-closed rows ------------------------------------------------
 
