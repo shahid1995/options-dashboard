@@ -92,6 +92,17 @@ Founder acceptance.
     accepting same-window observations, and coercing missing history to zero
     are all forbidden; when no eligible observation exists the entry fails
     closed with zero writes.
+17b. **Active option instrument identity and expiry authority are
+    broker-owned.** A live Upstox option's canonical active identity is the
+    broker's two-segment `NSE_FO|<id>` key form; the three-segment
+    `NSE_FO|<id>|<dd-mm-yyyy>` form names the same instrument with an expiry
+    rendering appended, not a different contract. Any freshness or expiry
+    judgement MUST resolve the expiry from server-side broker contract
+    metadata for that exact broker identity. An operator-supplied embedded
+    expiry suffix is untrusted text: it is cross-checked against broker
+    metadata, and disagreement fails closed. The verification seam accepts no
+    client-supplied authoritative expiry, and an instrument that cannot be
+    matched to contract metadata is never verified unexpired.
 
 ## Process
 

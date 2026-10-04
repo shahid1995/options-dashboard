@@ -76,6 +76,11 @@ Control documents live at the repository root (see [`AI.md`](AI.md)).
   (Phases 7.x); see the phase documents under `docs/`.
 - **Superpowers tracker** — `docs/superpowers/STRIKENOVA_IMPLEMENTATION_STATUS.md`,
   the canonical status snapshot.
+- **Active option instrument identity** — the broker's two-segment
+  `NSE_FO|<id>` key for a live option contract. The three-segment
+  `NSE_FO|<id>|<dd-mm-yyyy>` form names the same instrument with an expiry
+  rendering appended; expiry itself is broker-authoritative (see
+  [`INVARIANTS.md`](INVARIANTS.md) 17b).
 
 ## 5. Related documents
 
@@ -92,12 +97,45 @@ Invariants: [`INVARIANTS.md`](INVARIANTS.md)
   Upstox *expired*-instruments API (see
   `options-dashboard-project/docs/PHASE_7_13_OPTION_CANDLE_PERSISTENCE.md`
   and `docs/PHASE_7_15_LIVE_BACKFILL_PILOT.md`). **Upstream Upstox capability
-  remains UNVERIFIED** — no safe authenticated live-option probe could be
-  performed from the development environment (no live backend session, no
-  current local broker authorization, and the existing live-verification
-  tool targets the NIFTY index only). Repository absence and upstream API
-  incapability are different claims; only the former is established here.
-  The Day-50 paper-entry candidate producer (Issue #118) needs that
-  observation to compute ΔOI, so the production paper-entry path fails
-  closed at that gate until live option-OI persistence lands as separate
-  architecture work. Invariant 17a forbids substituting anything else.
+  is now VERIFIED** — an authenticated live probe against the broker (the
+  PR #125 probe, exposed read-only through the Day-50 admin verification
+  seam) returned 129 historical 3-minute candles for the active NIFTY 22400
+  CE, instrument `NSE_FO|40687` with authoritative expiry `2026-10-06`, all
+  129 open-interest values non-null, and all four capability claims true.
+  Repository absence and upstream API incapability are different claims:
+  the first still holds, the second no longer does. **What remains missing
+  is production persistence**, which is separate architecture work and is
+  unaffected by that verification. The Day-50 paper-entry candidate producer
+  (Issue #118) needs a *stored* prior-OI observation on the stored candle
+  clock to compute ΔOI, so the production paper-entry path still fails
+  closed at that gate. Invariant 17a forbids substituting anything else,
+  and a probe result — read-only, persisting nothing — may never stand in for
+  that stored observation.
+
+
+## 7. Day-50 live option verification seam
+
+`POST /api/v1/admin/live-verification/option-candle`
+(`options-dashboard-project/backend/app/api/v1/admin.py`) is an admin-scoped,
+read-only in-process invocation seam around the merged Day-50 probe
+(`app/tools/live_verification.py`).
+
+- **Credential:** the authenticated caller's own user-scoped market-data
+  credential, resolved through the canonical `resolve_market_data_token`
+  path — never a session token, browser cookie, `TokenBridge`, or the
+  platform cache. It is never returned, persisted, or logged.
+- **Instrument key:** validated through the probe's own allowlist grammar
+  before any authenticated Upstox URL is constructed, and the normalized
+  (stripped) key is the value passed downstream.
+- **Authoritative expiry:** resolved server-side from Upstox contract
+  metadata for that exact broker instrument identity (Invariant 17b). The
+  request body carries no expiry field; an unmatched instrument, an
+  unparseable broker date, or a key whose embedded expiry disagrees with the
+  broker fails closed before any candle request is made.
+- **Output:** a sanitized projection of probe facts and freshness evidence,
+  including `authoritative_expiry_source`, which truthfully reports
+  caller-supplied provenance. Probe semantics — the four capability claims
+  and `live_option_oi_established` — are passed through without
+  reinterpretation.
+- **Side effects:** the sanitized admin audit record only. The probe is
+  read-only against the broker and stores no probe data.
