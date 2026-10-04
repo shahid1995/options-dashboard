@@ -19,7 +19,7 @@ from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import case, delete, func, select
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -519,11 +519,18 @@ def refresh_ingestion_run_metrics(
         )
 
     # --- run-scoped instrument evidence ------------------------------------
-    # `items_total` is the row total the producer declared for an instrument.
-    # Only rows whose run id matches are counted, so a checkpoint left behind
-    # by an earlier run can never speak for this one.
+    # `items_total` is the row total the producer declared for an instrument
+    # and `items_processed` is how much of it it actually got through. Only
+    # rows whose run id matches are counted, so a checkpoint left behind by an
+    # earlier run can never speak for this one.
+    #
+    # Missing rows are the unprocessed remainder, not the declared total: a
+    # checkpoint that retrieved 80 of 90 rows contributed 80 rows and is 10
+    # short, so counting its full `items_total` would report work that
+    # actually happened as missing. `case` (rather than a two-argument max)
+    # keeps this portable across SQLite, PostgreSQL and CockroachDB.
     declared_total = 0
-    declared_incomplete = 0
+    unprocessed_total = 0
     if pipelines:
         declared_total = int(
             db.scalar(
@@ -534,9 +541,17 @@ def refresh_ingestion_run_metrics(
             )
             or 0
         )
-        declared_incomplete = int(
+        unprocessed = (
+            func.coalesce(IngestionCheckpoint.items_total, 0)
+            - func.coalesce(IngestionCheckpoint.items_processed, 0)
+        )
+        unprocessed_total = int(
             db.scalar(
-                select(func.coalesce(func.sum(IngestionCheckpoint.items_total), 0)).where(
+                select(
+                    func.coalesce(
+                        func.sum(case((unprocessed > 0, unprocessed), else_=0)), 0
+                    )
+                ).where(
                     IngestionCheckpoint.run_id == run_id,
                     IngestionCheckpoint.pipeline.in_(pipelines),
                     IngestionCheckpoint.status != "COMPLETED",
@@ -556,10 +571,12 @@ def refresh_ingestion_run_metrics(
     # checkpoints; absent means the run declared no expectation, which is not
     # the same as an expectation of zero.
     expected = declared_total if declared_total > 0 else None
-    # Rows this run declared but did not obtain. Under-counting is the safe
-    # direction: an instrument that failed before declaring a total simply
-    # contributes nothing rather than an invented number.
-    missing = int(declared_incomplete or 0)
+    # Rows this run declared but did not obtain: the unprocessed remainder of
+    # the checkpoints that did not complete. A completed checkpoint
+    # contributes nothing. Under-counting stays the safe direction: an
+    # instrument that failed before declaring a total has no remainder to
+    # report and contributes nothing rather than an invented number.
+    missing = int(unprocessed_total or 0)
 
     incomplete_units = operations_incomplete + (checkpoint_total - checkpoint_completed)
     evidence_units = operations_total + checkpoint_total

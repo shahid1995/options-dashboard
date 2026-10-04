@@ -450,6 +450,21 @@ and it does not assert that redistribution is permitted.
   `REVIEW_REQUIRED` and the run records which datasets it proceeded under.
 * **No widening.** `PRIVATE_USER` and `PUBLIC` never receive the exception and
   are refused outright while entitlement is unresolved.
+* **License state is NOT covered by this exception, and is not adjudicated
+  here.** The catalog carries `license_status` as a field distinct from
+  `entitlement_status`, and the Upstox market-data datasets are seeded
+  `REVIEW_REQUIRED` on both. The approved exception was granted for the
+  entitlement state and is deliberately not read as resolving the license
+  state. This record also does not make license an acquisition gate, because
+  the approved policy enumerated exactly three gates (entitlement, usage,
+  redistribution) and a license gate would halt every historical acquisition
+  against the current catalog. `license_status` is therefore recorded in the
+  manifest's entitlement snapshot on every run and enforced nowhere.
+  **Open founder decision:** whether an unresolved `license_status` must
+  independently block acquisition is unresolved and is deliberately left to a
+  separate governance decision rather than settled by inference here. Until
+  that decision exists, no code treats license as either blocking or
+  cleared.
 * **Auditable, not silent.** Every exception applied is written to the
   manifest's metadata alongside the catalog snapshot, so a run that relied on
   one is distinguishable from a run whose entitlements were verified.

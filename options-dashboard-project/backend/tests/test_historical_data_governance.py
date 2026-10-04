@@ -553,6 +553,95 @@ def test_realistic_run_derives_completeness_from_pipeline_evidence(db):
     assert ok.missing_records == 0
 
 
+def test_missing_records_are_the_unprocessed_remainder(db):
+    """A partially processed checkpoint is short by what it never processed.
+
+    items_total=90 with items_processed=80 means 80 rows were obtained and 10
+    were not, so missing_records is 10. Summing the declared total for an
+    incomplete checkpoint would report 90 missing and claim the 80 rows that
+    were actually retrieved never happened.
+    """
+    key = "UPSTOX_OPTION_CANDLES_3MIN"
+    _catalog(db, key=key)
+
+    partial = hdg.start_ingestion_run(
+        db, dataset_keys=[key], run_id="run-partial-progress"
+    )
+    db.add_all(
+        [
+            IngestionCheckpoint(
+                pipeline="backfill_options",
+                instrument_key="NSE_FO|PARTIAL|01-10-2026",
+                run_id=partial.run_id,
+                status="FAILED",
+                items_processed=80,
+                items_total=90,
+                error_message="429 rate limit",
+            ),
+            IngestionLog(
+                run_id=partial.run_id,
+                operation="option_candles",
+                started_at="2026-09-01T00:00:00+00:00",
+                status="PARTIAL",
+                rows_fetched=80,
+                rows_inserted=80,
+                error_message="429 rate limit",
+            ),
+        ]
+    )
+    db.commit()
+
+    refreshed = hdg.refresh_ingestion_run_metrics(db, partial.run_id)
+    # The producer declared 90 and got through 80.
+    assert refreshed.expected_records == 90
+    # Actual stays consistent with what the ingestion log retrieved.
+    assert refreshed.actual_records == 80
+    # Missing is the unprocessed remainder (90 - 80), not the declared total.
+    assert refreshed.missing_records == 10
+    assert refreshed.completeness_status == "PARTIAL"
+
+    finished = hdg.finish_ingestion_run(
+        db, partial.run_id, status=hdg.RUN_SUCCEEDED
+    )
+    assert finished.status == hdg.RUN_PARTIAL
+    assert finished.missing_records == 10
+    assert finished.completed_at is not None
+
+    # A completed checkpoint contributes its declared total but zero missing,
+    # and the failed run above cannot contaminate it.
+    complete = hdg.start_ingestion_run(
+        db, dataset_keys=[key], run_id="run-complete-progress"
+    )
+    db.add_all(
+        [
+            IngestionCheckpoint(
+                pipeline="backfill_options",
+                instrument_key="NSE_FO|DONE|01-10-2026",
+                run_id=complete.run_id,
+                status="COMPLETED",
+                items_processed=90,
+                items_total=90,
+            ),
+            IngestionLog(
+                run_id=complete.run_id,
+                operation="option_candles",
+                started_at="2026-09-02T00:00:00+00:00",
+                status="SUCCESS",
+                rows_fetched=90,
+                rows_inserted=90,
+            ),
+        ]
+    )
+    db.commit()
+
+    ok = hdg.finish_ingestion_run(db, complete.run_id, status=hdg.RUN_SUCCEEDED)
+    assert ok.expected_records == 90
+    assert ok.actual_records == 90
+    assert ok.missing_records == 0
+    assert ok.completeness_status == "COMPLETE"
+    assert ok.status == hdg.RUN_SUCCEEDED
+
+
 def test_completeness_ignores_rows_the_run_did_not_produce(db):
     """DataCompleteness is cumulative and carries no run identity, so its rows
     can never be attributed to a specific acquisition. A run with no evidence
