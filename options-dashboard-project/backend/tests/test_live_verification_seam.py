@@ -1604,6 +1604,32 @@ class TestControlCharacterRouteBoundary:
         assert probe.call_args.args[1] == TWO_SEGMENT_KEY
 
 
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "NSE_FO|53806" + chr(0x85),
+            chr(0x2028) + "NSE_FO|53806",
+            "NSE_FO|53806" + chr(0x2029),
+            "NSE_FO|53806" + chr(0xA0),
+            "NSE_FO|53806" + chr(0x3000),
+        ],
+    )
+    def test_unicode_whitespace_keys_are_refused_with_zero_side_effects(
+        self, client, admin_session, monkeypatch, raw
+    ):
+        """422 with no credential resolution and no broker or probe call."""
+        sid, _admin = admin_session
+        resolver, probe = _install(monkeypatch, _credential())
+        metadata = _contract_metadata_mock(monkeypatch)
+
+        resp = _post(client, sid, {"instrument_key": raw})
+
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "VALIDATION_ERROR"
+        resolver.assert_not_called()
+        metadata.assert_not_called()
+        probe.assert_not_called()
 class TestInstrumentKeyControlCharacters:
     """Control characters must never survive the request boundary."""
 
@@ -1673,6 +1699,41 @@ class TestInstrumentKeyControlCharacters:
         with pytest.raises(ValidationError):
             OptionCandleProbeIn(instrument_key=key)
 
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "NSE_FO|53806" + chr(0x85),
+            chr(0x85) + "NSE_FO|53806",
+            "NSE_FO|53806" + chr(0x9F),
+            chr(0x2028) + "NSE_FO|53806",
+            "NSE_FO|53806" + chr(0x2028),
+            chr(0x2029) + "NSE_FO|53806",
+            "NSE_FO|53806" + chr(0x2029),
+            "NSE_FO|53806" + chr(0xA0),
+            chr(0xA0) + "NSE_FO|53806",
+            "NSE_FO|53806" + chr(0x3000),
+            "NSE_FO|53" + chr(0xA0) + "806",
+            "NSE_FO|53" + chr(0x2028) + "806",
+        ],
+    )
+    def test_non_ascii_whitespace_and_c1_are_rejected_not_normalized(self, raw):
+        """Only ASCII SPACE is normalizable; C1 and Unicode separators fail.
+
+        ``str.strip()`` would have deleted U+0085, U+00A0, U+2028, U+2029 and
+        U+3000 and turned a malformed key into a valid one.  Normalization is
+        pinned to the single ASCII SPACE, and the control check now spans C1
+        (U+0080-U+009F) as well as C0.
+        """
+        with pytest.raises(ValidationError):
+            OptionCandleProbeIn(instrument_key=raw)
+
+    @pytest.mark.parametrize("raw", ["  NSE_FO|53806  ", " NSE_FO|53806 "])
+    def test_ordinary_ascii_space_padding_is_still_accepted(self, raw):
+        """The one normalizable character remains normalizable."""
+        assert OptionCandleProbeIn(instrument_key=raw).instrument_key == (
+            TWO_SEGMENT_KEY
+        )
     @pytest.mark.parametrize("raw", ["  NSE_FO|53806  ", " NSE_FO|53806 ", "NSE_FO|53806 "])
     def test_padded_key_is_normalized_and_reaches_the_probe(
         self, raw, client, admin_session, monkeypatch

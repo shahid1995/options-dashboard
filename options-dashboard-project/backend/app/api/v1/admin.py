@@ -496,7 +496,7 @@ class OptionCandleProbeIn(BaseModel):
         error = _instrument_key_error(v)
         if error is not None:
             raise ValueError(error)
-        return v.strip() if isinstance(v, str) else v
+        return v.strip(" ") if isinstance(v, str) else v
 
     @field_validator("candle_date")
     @classmethod

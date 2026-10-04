@@ -1006,12 +1006,60 @@ class TestOptionProbeFailClosedHardening:
 
     def test_whitespace_is_normalized_but_never_injected(self):
         assert _instrument_key_error("  NSE_FO|53806  ") is None
-        # Control characters are rejected on the RAW input, before strip().
+        # Control characters are rejected on the RAW input, before any
+        # normalization; only the ASCII SPACE is normalizable.
         assert _instrument_key_error("NSE_FO|53806\r\n") is not None
         assert _instrument_key_error("NSE_FO|53806\t") is not None
         assert _instrument_key_error("  NSE_FO|53806  ") is None  # spaces still normalize
         assert _instrument_key_error("NSE_FO|53806\nX-Evil: 1") is not None
 
+
+    @pytest.mark.parametrize(
+        "pad",
+        [
+            chr(9),      # TAB
+            chr(10),     # LF
+            chr(13),     # CR
+            chr(11),     # VT
+            chr(127),    # DEL
+            chr(0x7F),   # DEL, spelled in hex for symmetry
+            chr(0x80),   # first C1 control
+            chr(0x85),   # NEL -- str.strip() deletes this one
+            chr(0x9F),   # last C1 control
+            chr(0xA0),   # NO-BREAK SPACE
+            chr(0x2028),  # LINE SEPARATOR
+            chr(0x2029),  # PARAGRAPH SEPARATOR
+            chr(0x3000),  # IDEOGRAPHIC SPACE
+        ],
+    )
+    def test_only_ascii_space_is_normalized(self, pad):
+        """Ordinary SPACE padding normalizes; nothing else may.
+
+        ``str.strip()`` removes every Unicode whitespace and separator
+        character, not just SPACE, so a bare strip could silently turn a
+        malformed key into a valid one.  Normalization is therefore pinned to
+        the single ASCII SPACE and the control set covers C1 as well as C0.
+        """
+        assert _instrument_key_error("  NSE_FO|53806  ") is None
+        assert _instrument_key_error(pad + "NSE_FO|53806") is not None
+        assert _instrument_key_error("NSE_FO|53806" + pad) is not None
+        assert _instrument_key_error(pad + "NSE_FO|53806" + pad) is not None
+
+    @pytest.mark.parametrize(
+        "raw_key",
+        [
+            "NSE_FO|53806" + chr(0x85),
+            "NSE_FO|53806" + chr(0xA0),
+            "NSE_FO|53806" + chr(0x2028),
+            "NSE_FO|53806" + chr(0x2029),
+            "NSE_FO|53806" + chr(0x3000),
+            chr(0x2028) + "NSE_FO|53806",
+            "NSE_FO|53" + chr(0xA0) + "806",
+        ],
+    )
+    def test_c1_and_unicode_separators_are_rejected_not_normalized(self, raw_key):
+        """These characters reach the URL grammar, not the normalizer."""
+        assert _instrument_key_error(raw_key) is not None
     def test_non_string_keys_are_rejected(self):
         assert _instrument_key_error(None) is not None
         assert _instrument_key_error(47983) is not None
@@ -1253,6 +1301,41 @@ class TestOptionProbeKeyNormalization:
         with patch("app.tools.live_verification.get_intraday_candles",
                    new_callable=AsyncMock) as mock_intraday,              patch("app.tools.live_verification.get_historical_candles",
                    new_callable=AsyncMock) as mock_historical:
+            result = await verify_option_candle_api("test-token", raw_key, probe_date)
+
+        mock_intraday.assert_not_called()
+        mock_historical.assert_not_called()
+        assert result["instrument_key_error"]
+        assert result["live_option_oi_established"] is False
+
+    @pytest.mark.parametrize(
+        "raw_key",
+        [
+            "NSE_FO|53806" + chr(0x85),
+            "NSE_FO|53806" + chr(0xA0),
+            "NSE_FO|53806" + chr(0x2028),
+            "NSE_FO|53806" + chr(0x2029),
+            "NSE_FO|53806" + chr(0x3000),
+            chr(0x2028) + "NSE_FO|53806",
+            "NSE_FO|53" + chr(0xA0) + "806",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_unicode_whitespace_keys_reach_neither_candle_endpoint(
+        self, raw_key
+    ):
+        """A C1 or Unicode-separator variant must not reach either endpoint.
+
+        Only the ASCII SPACE is normalized, so every one of these survives
+        ``strip(" ")`` intact and must be stopped by the control check or the
+        key grammar -- never by an authenticated request.
+        """
+        probe_date = _ist_date_offset(-2)
+        with patch("app.tools.live_verification.get_intraday_candles",
+                   new_callable=AsyncMock) as mock_intraday, patch(
+            "app.tools.live_verification.get_historical_candles",
+            new_callable=AsyncMock,
+        ) as mock_historical:
             result = await verify_option_candle_api("test-token", raw_key, probe_date)
 
         mock_intraday.assert_not_called()
