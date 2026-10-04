@@ -1190,4 +1190,3 @@ class TestInstrumentKeyControlCharacters:
         assert probe.call_args.args[1] == TWO_SEGMENT_KEY
         assert "instrument_key" not in probe.call_args.kwargs
         assert probe.call_args.kwargs["authoritative_expiry_date"] == TWO_SEGMENT_EXPIRY
-
