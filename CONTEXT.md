@@ -125,8 +125,14 @@ read-only in-process invocation seam around the merged Day-50 probe
   path — never a session token, browser cookie, `TokenBridge`, or the
   platform cache. It is never returned, persisted, or logged.
 - **Instrument key:** validated through the probe's own allowlist grammar
-  before any authenticated Upstox URL is constructed, and the normalized
-  (stripped) key is the value passed downstream.
+  before any authenticated Upstox URL is constructed, and the normalized key
+  is the value passed downstream. Ordinary surrounding spaces are normalized,
+  not rejected. ASCII control characters (C0 plus DEL, including CR, LF and
+  TAB) are rejected against the **raw** input before normalization, so an
+  injected trailing `\r\n` or `\t` can never be stripped away and
+  mistaken for padding; path, query, fragment and percent delimiters stay
+  unrepresentable under the allowlist. A rejected key fails at the request
+  boundary, before credential resolution and before any broker call.
 - **Authoritative expiry:** resolved server-side from Upstox contract
   metadata for that exact broker instrument identity (Invariant 17b). The
   request body carries no expiry field; an unmatched instrument, an

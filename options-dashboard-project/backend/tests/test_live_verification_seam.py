@@ -927,10 +927,14 @@ class TestInstrumentKeyGrammar:
         assert model.instrument_key == "NSE_FO|53806"
 
     @pytest.mark.parametrize(
-        "raw", ["NSE_FO|53806\n", "  NSE_FO|53806  ", "NSE_FO|53806\t", "\nNSE_FO|53806\r\n"]
+        "raw", ["  NSE_FO|53806  ", " NSE_FO|53806 ", "NSE_FO|53806 "]
     )
-    def test_whitespace_is_stripped_before_the_path_is_built(self, raw):
-        """Only the NORMALIZED value can ever reach the Upstox path builder."""
+    def test_ordinary_spaces_are_stripped_before_the_path_is_built(self, raw):
+        """Only the NORMALIZED value can ever reach the path builder.
+
+        Ordinary SPACES are normalized.  Control characters are rejected by
+        the raw-input check instead, so they can never be normalized away.
+        """
         model = OptionCandleProbeIn(instrument_key=raw)
         assert model.instrument_key == "NSE_FO|53806"
         assert not any(c.isspace() and c != " " for c in model.instrument_key)
@@ -1554,6 +1558,52 @@ class TestBrokerIdentityMatching:
         )
 
 
+class TestControlCharacterRouteBoundary:
+    """A rejected key must die at the boundary: no credential, no broker call."""
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "NSE_FO|53806" + chr(13) + chr(10),
+            "NSE_FO|53806" + chr(9),
+            chr(13) + chr(10) + "NSE_FO|53806",
+            "NSE_FO|53" + chr(13) + "806",
+            "NSE_FO|53" + chr(10) + "806",
+            "NSE_FO|53" + chr(9) + "806",
+        ],
+    )
+    def test_control_character_keys_are_refused_with_zero_side_effects(
+        self, client, admin_session, monkeypatch, raw
+    ):
+        sid, _admin = admin_session
+        resolver, probe = _install(monkeypatch, _credential())
+        metadata = _contract_metadata_mock(monkeypatch)
+
+        resp = _post(client, sid, {"instrument_key": raw})
+
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "VALIDATION_ERROR"
+        resolver.assert_not_called()
+        metadata.assert_not_called()
+        probe.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "raw", ["  NSE_FO|53806  ", " NSE_FO|53806 ", "NSE_FO|53806 "]
+    )
+    def test_ordinary_spaces_still_normalize_and_reach_the_probe(
+        self, client, admin_session, monkeypatch, raw
+    ):
+        """Ordinary SPACE padding reaches the probe as the stripped key."""
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        _contract_metadata_mock(monkeypatch)
+
+        resp = _post(client, sid, {"instrument_key": raw})
+
+        assert resp.status_code == 200
+        assert probe.call_args.args[1] == TWO_SEGMENT_KEY
+
+
 class TestInstrumentKeyControlCharacters:
     """Control characters must never survive the request boundary."""
 
@@ -1573,12 +1623,41 @@ class TestInstrumentKeyControlCharacters:
             OptionCandleProbeIn(instrument_key=key)
 
     @pytest.mark.parametrize(
-        "raw", ["NSE_FO|53806" + chr(13), chr(10) + "NSE_FO|53806", "NSE_FO|53806" + chr(9)]
+        "raw",
+        [
+            "NSE_FO|53806" + chr(13) + chr(10),
+            "NSE_FO|53806" + chr(9),
+            chr(10) + "NSE_FO|53806",
+            chr(9) + "NSE_FO|53806",
+            chr(13) + "NSE_FO|53806" + chr(9),
+            "NSE_FO|53806" + chr(0),
+            "NSE_FO|53806" + chr(127),
+            "NSE_FO|53806" + chr(11) + " ",
+        ],
     )
-    def test_edge_whitespace_control_chars_are_stripped_not_rejected(self, raw):
-        """Leading/trailing whitespace is normalization, not acceptance of junk."""
-        model = OptionCandleProbeIn(instrument_key=raw)
-        assert model.instrument_key == "NSE_FO|53806"
+    def test_edge_control_characters_are_rejected_not_stripped(self, raw):
+        """A trailing CRLF is NOT ordinary padding and must never normalize away.
+
+        ``str.strip()`` would delete a leading/trailing CR, LF or TAB, which
+        made injected control characters indistinguishable from padding.  The
+        check now runs against the raw input, before normalization.
+        """
+        with pytest.raises(ValidationError):
+            OptionCandleProbeIn(instrument_key=raw)
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "NSE_FO|53" + chr(13) + "806",
+            "NSE_FO|53" + chr(10) + "806",
+            "NSE_FO|53" + chr(9) + "806",
+            "NSE_FO|53" + chr(11) + "806",
+            "NSE_FO|53" + chr(127) + "806",
+        ],
+    )
+    def test_embedded_control_characters_are_rejected(self, raw):
+        with pytest.raises(ValidationError):
+            OptionCandleProbeIn(instrument_key=raw)
 
     @pytest.mark.parametrize(
         "key",
@@ -1594,9 +1673,7 @@ class TestInstrumentKeyControlCharacters:
         with pytest.raises(ValidationError):
             OptionCandleProbeIn(instrument_key=key)
 
-    @pytest.mark.parametrize(
-        "raw", ["  NSE_FO|53806  ", "NSE_FO|53806" + chr(13) + " ", chr(9) + "NSE_FO|53806"]
-    )
+    @pytest.mark.parametrize("raw", ["  NSE_FO|53806  ", " NSE_FO|53806 ", "NSE_FO|53806 "])
     def test_padded_key_is_normalized_and_reaches_the_probe(
         self, raw, client, admin_session, monkeypatch
     ):
