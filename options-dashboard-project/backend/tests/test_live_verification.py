@@ -1375,3 +1375,142 @@ class TestOptionProbeKeyNormalization:
         assert freshness["key_implies_unexpired"] is True
         assert result["claims"]["claim_4_instrument_verified_unexpired"] is True
 
+class TestCliOptionCandleDateStrictValidation:
+    """The standalone CLI must reject a bad --option-candle-date locally."""
+
+    INVALID = [
+        "20261001",
+        "2026-W40-4",
+        "2026-10-01T00:00:00",
+        "2026/10/01",
+        "2026-10-01/../admin",
+        "2026-10-01?x=1",
+        "2026-10-01#frag",
+        "2026-02-30",
+        "2026-10-01" + chr(13),
+        "2026-10-01" + chr(0x85),
+        "2026-10-01" + chr(0xA0),
+        "2026-10-01" + chr(0x2028),
+        "..",
+        "2026-10-01..",
+    ]
+
+    @staticmethod
+    def _shared_validator_rejects():
+        """The single grammar must reject every listed form."""
+        from app.tools.live_verification import _iso_date_error
+
+        return [v for v in TestCliOptionCandleDateStrictValidation.INVALID
+                if _iso_date_error(v.strip(" ")) is None]
+
+    def test_shared_iso_grammar_rejects_every_invalid_form(self):
+        """Unit-level proof that the strict grammar is what rejects them."""
+        assert self._shared_validator_rejects() == []
+
+    @pytest.mark.parametrize("raw", INVALID)
+    def test_cli_exits_before_any_token_is_resolved(
+        self, monkeypatch, capsys, raw,
+    ):
+        """No token lookup and no authenticated request may happen."""
+        import sys
+
+        from app.tools import live_verification as lv
+
+        token_calls = []
+
+        def _boom_token():
+            token_calls.append(1)
+            raise AssertionError("_get_access_token must not be reached")
+
+        async def _boom_historical(*_a, **_k):
+            raise AssertionError("historical broker request must not happen")
+
+        monkeypatch.setattr(lv, "_get_access_token", _boom_token)
+        monkeypatch.setattr(lv, "get_historical_candles", _boom_historical)
+        monkeypatch.setattr(
+            sys, "argv",
+            ["live_verification", "--option-key", "NSE_FO|53806",
+             "--option-candle-date", raw],
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            asyncio.run(lv.main())
+
+        assert exc.value.code == 1
+        assert token_calls == []
+        out = capsys.readouterr().out
+        assert "--option-candle-date" in out
+        assert "YYYY-MM-DD" in out
+
+    def test_valid_option_candle_date_passes_the_grammar(self):
+        from app.tools.live_verification import _iso_date_error
+
+        assert _iso_date_error("2026-10-01") is None
+        assert _iso_date_error("  2026-10-01  ".strip(" ")) is None
+
+
+class TestConclusionNamesTheExpiryEvidenceSource:
+    """A two-segment key embeds no expiry, so the conclusion must not claim it."""
+
+    @staticmethod
+    def _freshness(**overrides):
+        base = {
+            "expiry_from_instrument_key": None,
+            "key_implies_unexpired": None,
+            "authoritative_expiry_date": "2026-10-06",
+            "authoritative_expiry_supplied": True,
+            "authoritative_expiry_valid": True,
+            "authoritative_expiry_implies_unexpired": False,
+            "verified_unexpired": False,
+        }
+        base.update(overrides)
+        return base
+
+    @staticmethod
+    def _claims(claim4):
+        return {
+            "claim_1_endpoint_accepted_live_option_key": True,
+            "claim_2_endpoint_returned_candles": True,
+            "claim_3_candles_contained_open_interest": True,
+            "claim_4_instrument_verified_unexpired": claim4,
+        }
+
+    def test_two_segment_key_with_expired_authoritative_expiry(self):
+        from app.tools.live_verification import _option_probe_conclusion
+
+        conclusion = _option_probe_conclusion(
+            self._claims(False), self._freshness(),
+        )
+        assert "authoritative broker expiry" in conclusion
+        # The false claim: a two-segment key contains no expiry at all.
+        assert "the key embeds an expiry" not in conclusion
+
+    def test_three_segment_key_with_expired_embedded_expiry(self):
+        from app.tools.live_verification import _option_probe_conclusion
+
+        conclusion = _option_probe_conclusion(
+            self._claims(False),
+            self._freshness(
+                expiry_from_instrument_key="2026-09-01",
+                key_implies_unexpired=False,
+                authoritative_expiry_date=None,
+                authoritative_expiry_supplied=False,
+                authoritative_expiry_valid=False,
+                authoritative_expiry_implies_unexpired=None,
+            ),
+        )
+        assert "the key embeds an expiry" in conclusion
+        assert "authoritative broker expiry" not in conclusion
+
+    def test_unexpired_authoritative_expiry_keeps_the_success_wording(self):
+        from app.tools.live_verification import _option_probe_conclusion
+
+        conclusion = _option_probe_conclusion(
+            self._claims(True),
+            self._freshness(
+                authoritative_expiry_implies_unexpired=True,
+                verified_unexpired=True,
+            ),
+        )
+        assert "verified unexpired/current" in conclusion
+        assert "the key embeds an expiry" not in conclusion
