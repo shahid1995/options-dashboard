@@ -1133,6 +1133,346 @@ class TestAuthoritativeExpiryResolution:
         )
 
 
+# ---------------------------------------------------------------------------
+# 3. Supported universe: NIFTY options only
+# ---------------------------------------------------------------------------
+
+#: Keys this seam does NOT support.  ``get_option_contracts`` is queried for
+#: the Nifty 50 underlying only, so none of these can ever resolve a
+#: trustworthy expiry here and each must fail closed.
+NON_NIFTY_OPTION_KEYS = [
+    "BSE_FO|51892",        # another exchange's option universe
+    "NSE_EQ|RELIANCE",     # an equity, not an option contract
+    "NSE_INDEX|Nifty 50",  # the index itself, not an option contract
+    "BSE_INDEX|SENSEX",    # another exchange's index
+]
+
+
+class TestNiftyOptionOnlyScope:
+    """The seam declares one universe and refuses everything outside it."""
+
+    def test_nifty_option_identity_is_inside_the_supported_scope(self):
+        from app.api.v1.admin import _supports_nifty_option_identity
+
+        assert _supports_nifty_option_identity(TWO_SEGMENT_KEY) is True
+        assert _supports_nifty_option_identity(LIVE_KEY) is True
+        # Normalization happens before the scope question is asked.
+        assert _supports_nifty_option_identity("   " + TWO_SEGMENT_KEY + "   ") is True
+
+    @pytest.mark.parametrize("key", NON_NIFTY_OPTION_KEYS)
+    def test_keys_outside_the_nifty_option_universe_are_unsupported(self, key):
+        from app.api.v1.admin import _supports_nifty_option_identity
+
+        assert _supports_nifty_option_identity(key) is False
+
+    def test_a_malformed_key_is_never_inside_the_supported_scope(self):
+        from app.api.v1.admin import _supports_nifty_option_identity
+
+        for bad in ("", "NSE_FO", "NSE_FO|", "|53806", None, 53806):
+            assert _supports_nifty_option_identity(bad) is False
+
+    @pytest.mark.parametrize("key", NON_NIFTY_OPTION_KEYS)
+    def test_unsupported_key_fails_closed_before_any_broker_work(
+        self, client, admin_session, db_session, monkeypatch, key
+    ):
+        """Out of scope: no credential use, no metadata call, no probe."""
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        metadata = _contract_metadata_mock(monkeypatch)
+
+        resp = _post(client, sid, {"instrument_key": key})
+
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "EXPIRY_UNRESOLVED"
+        metadata.assert_not_called()
+        probe.assert_not_called()
+        events = [
+            e for e in list_admin_audit(db_session)
+            if e["action"] == "live_verification.option_candle"
+        ]
+        assert events[-1]["result"] == "failed"
+        assert events[-1]["detail"]["reason"] == "EXPIRY_UNRESOLVED"
+
+    def test_unresolved_explanation_states_the_supported_scope(
+        self, client, admin_session, monkeypatch
+    ):
+        """The failure message declares NIFTY-only, never arbitrary coverage."""
+        sid, _admin = admin_session
+        _install(monkeypatch, _credential())
+        _contract_metadata_mock(monkeypatch, payload={"status": "success", "data": []})
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY})
+
+        assert resp.status_code == 422
+        message = resp.json()["error"]["message"]
+        assert "NSE_FO" in message
+        assert "NIFTY option contracts only" in message
+        assert "arbitrary" not in message.lower()
+
+
+# ---------------------------------------------------------------------------
+# 4. Broker identity matching across key renderings
+# ---------------------------------------------------------------------------
+
+#: A NIFTY option row as the broker actually ships it: two-segment
+#: ``instrument_key`` plus the underlying facts that place it in the universe.
+NIFTY_ROW_FACTS = {
+    "segment": "NSE_FO",
+    "underlying_key": "NSE_INDEX|Nifty 50",
+    "underlying_symbol": "NIFTY",
+    "exchange": "NSE",
+}
+
+
+def _row(instrument_key, expiry, **overrides):
+    row = dict(NIFTY_ROW_FACTS)
+    row["instrument_key"] = instrument_key
+    row["expiry"] = expiry
+    row.update(overrides)
+    return row
+
+
+def _payload(*rows):
+    return {"status": "success", "data": list(rows)}
+
+
+class TestBrokerIdentityMatching:
+    """Matching compares broker-owned identity in every key rendering."""
+
+    def test_two_segment_metadata_row_matches_a_two_segment_request(
+        self, client, admin_session, monkeypatch
+    ):
+        """What ``/option/contract`` really returns must keep working."""
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        _contract_metadata_mock(
+            monkeypatch,
+            payload=_payload(_row(TWO_SEGMENT_KEY, TWO_SEGMENT_EXPIRY)),
+        )
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY})
+
+        assert resp.status_code == 200
+        probe.assert_awaited_once_with(
+            PROBE_TOKEN,
+            TWO_SEGMENT_KEY,
+            None,
+            authoritative_expiry_date=TWO_SEGMENT_EXPIRY,
+        )
+
+    def test_three_segment_metadata_row_matches_the_same_identity(
+        self, client, admin_session, monkeypatch
+    ):
+        """A three-segment broker key names the same contract, not another one."""
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        _contract_metadata_mock(
+            monkeypatch,
+            payload=_payload(
+                _row(TWO_SEGMENT_KEY + "|06-10-2026", TWO_SEGMENT_EXPIRY)
+            ),
+        )
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY})
+
+        assert resp.status_code == 200
+        probe.assert_awaited_once_with(
+            PROBE_TOKEN,
+            TWO_SEGMENT_KEY,
+            None,
+            authoritative_expiry_date=TWO_SEGMENT_EXPIRY,
+        )
+
+    def test_three_segment_metadata_row_matches_a_three_segment_request(
+        self, client, admin_session, monkeypatch
+    ):
+        """Both sides three-segment still reduce to the same broker identity."""
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        _contract_metadata_mock(
+            monkeypatch,
+            payload=_payload(_row(LIVE_KEY, LIVE_KEY_EXPIRY)),
+        )
+
+        resp = _post(client, sid, {"instrument_key": LIVE_KEY})
+
+        assert resp.status_code == 200
+        probe.assert_awaited_once_with(
+            PROBE_TOKEN,
+            LIVE_KEY,
+            None,
+            authoritative_expiry_date=LIVE_KEY_EXPIRY,
+        )
+
+    def test_whitespace_padded_metadata_key_still_matches(
+        self, client, admin_session, monkeypatch
+    ):
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        _contract_metadata_mock(
+            monkeypatch,
+            payload=_payload(_row("  " + TWO_SEGMENT_KEY + "  ", TWO_SEGMENT_EXPIRY)),
+        )
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY})
+
+        assert resp.status_code == 200
+        probe.assert_awaited_once_with(
+            PROBE_TOKEN,
+            TWO_SEGMENT_KEY,
+            None,
+            authoritative_expiry_date=TWO_SEGMENT_EXPIRY,
+        )
+
+    # -- fail-closed rows ------------------------------------------------
+
+    def test_metadata_row_contradicting_its_own_expiry_field_fails_closed(
+        self, client, admin_session, monkeypatch
+    ):
+        """A row whose key text contradicts its expiry is not authority."""
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        _contract_metadata_mock(
+            monkeypatch,
+            payload=_payload(_row(TWO_SEGMENT_KEY + "|20-10-2026", TWO_SEGMENT_EXPIRY)),
+        )
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY})
+
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "EXPIRY_UNRESOLVED"
+        probe.assert_not_called()
+
+    def test_metadata_row_with_an_unreadable_expiry_fails_closed(
+        self, client, admin_session, monkeypatch
+    ):
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        _contract_metadata_mock(
+            monkeypatch,
+            payload=_payload(_row(TWO_SEGMENT_KEY, "not-a-date")),
+        )
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY})
+
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "EXPIRY_UNRESOLVED"
+        probe.assert_not_called()
+
+    def test_row_declaring_a_non_nifty_underlying_is_not_authority(
+        self, client, admin_session, monkeypatch
+    ):
+        """A non-NIFTY row is never used as NIFTY expiry authority."""
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        _contract_metadata_mock(
+            monkeypatch,
+            payload=_payload(
+                _row(
+                    TWO_SEGMENT_KEY,
+                    TWO_SEGMENT_EXPIRY,
+                    underlying_key="NSE_INDEX|NIFTY MID SELECT",
+                    underlying_symbol="NIFTY MID SELECT",
+                )
+            ),
+        )
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY})
+
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "EXPIRY_UNRESOLVED"
+        probe.assert_not_called()
+
+    def test_two_rows_disagreeing_about_one_contract_fail_closed(
+        self, client, admin_session, monkeypatch
+    ):
+        """Ambiguous broker metadata is a failure, not a coin flip."""
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        _contract_metadata_mock(
+            monkeypatch,
+            payload=_payload(
+                _row(TWO_SEGMENT_KEY, TWO_SEGMENT_EXPIRY),
+                _row(TWO_SEGMENT_KEY + "|13-10-2026", "2026-10-13"),
+            ),
+        )
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY})
+
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "EXPIRY_UNRESOLVED"
+        probe.assert_not_called()
+
+    def test_duplicate_rows_that_agree_are_accepted(
+        self, client, admin_session, monkeypatch
+    ):
+        """Repeated identical rows are one fact, not an ambiguity."""
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        _contract_metadata_mock(
+            monkeypatch,
+            payload=_payload(
+                _row(TWO_SEGMENT_KEY, TWO_SEGMENT_EXPIRY),
+                _row(TWO_SEGMENT_KEY, TWO_SEGMENT_EXPIRY),
+            ),
+        )
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY})
+
+        assert resp.status_code == 200
+        probe.assert_awaited_once_with(
+            PROBE_TOKEN,
+            TWO_SEGMENT_KEY,
+            None,
+            authoritative_expiry_date=TWO_SEGMENT_EXPIRY,
+        )
+
+    def test_embedded_expiry_disagreeing_with_the_broker_fails_closed(
+        self, client, admin_session, monkeypatch
+    ):
+        """Caller key text never overrides the broker's own expiry."""
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        _contract_metadata_mock(
+            monkeypatch,
+            payload=_payload(_row(TWO_SEGMENT_KEY, TWO_SEGMENT_EXPIRY)),
+        )
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY + "|20-10-2026"})
+
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "EXPIRY_UNRESOLVED"
+        probe.assert_not_called()
+
+    def test_body_supplied_expiry_stays_ignored_under_the_new_scope_check(
+        self, client, admin_session, monkeypatch
+    ):
+        """The scope change must not have opened a body-supplied expiry."""
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        _contract_metadata_mock(
+            monkeypatch,
+            payload=_payload(_row(TWO_SEGMENT_KEY, TWO_SEGMENT_EXPIRY)),
+        )
+
+        resp = _post(
+            client,
+            sid,
+            {
+                "instrument_key": TWO_SEGMENT_KEY,
+                "authoritative_expiry_date": "2099-01-01",
+            },
+        )
+
+        assert resp.status_code == 200
+        probe.assert_awaited_once_with(
+            PROBE_TOKEN,
+            TWO_SEGMENT_KEY,
+            None,
+            authoritative_expiry_date=TWO_SEGMENT_EXPIRY,
+        )
+
+
 class TestInstrumentKeyControlCharacters:
     """Control characters must never survive the request boundary."""
 

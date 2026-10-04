@@ -132,6 +132,23 @@ read-only in-process invocation seam around the merged Day-50 probe
   request body carries no expiry field; an unmatched instrument, an
   unparseable broker date, or a key whose embedded expiry disagrees with the
   broker fails closed before any candle request is made.
+- **Supported universe — NIFTY options only, declared, not inferred:**
+  contract metadata is fetched for the NSE `Nifty 50` index underlying
+  (`get_option_contracts` takes an *underlying* key, not an option key), so
+  authoritative expiry exists here only for `NSE_FO` NIFTY option contracts.
+  A key in any other segment — another exchange, an index, an equity — is out
+  of scope and fails closed before any credential use or broker request. No
+  general underlying-resolution architecture is implied, and the
+  `EXPIRY_UNRESOLVED` response states the scope rather than implying coverage
+  of arbitrary option instruments.
+- **Identity matching:** both sides of every match are reduced to the
+  canonical first-two-segment broker identity (`_broker_identity`), because
+  Upstox may name one contract either `NSE_FO|<id>` (what `/option/contract`
+  actually returns) or `NSE_FO|<id>|<dd-mm-yyyy>` (what the candle endpoint
+  accepts). A metadata row that itself carries an expiry rendering must agree
+  with that row's own `expiry` field, a row declaring a non-NIFTY underlying is
+  not authority, and two rows disagreeing about one contract is an ambiguity —
+  all fail closed rather than picking a winner.
 - **Output:** a sanitized projection of probe facts and freshness evidence,
   including `authoritative_expiry_source`, which truthfully reports
   caller-supplied provenance. Probe semantics — the four capability claims
