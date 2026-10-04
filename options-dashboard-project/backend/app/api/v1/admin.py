@@ -625,11 +625,16 @@ def _row_expiry_agrees_with_itself(row: dict, authoritative_iso: str) -> bool:
 
 
 def _is_nifty_option_contract(row: dict, underlying_key: str) -> bool:
-    """True when a contract row's OWN facts place it in the NIFTY universe.
+    """True only when a contract row's OWN facts PROVE it is a NIFTY contract.
 
-    Cross-checks the facts the broker ships with each row, so a row that is not
-    a NIFTY contract can never serve as NIFTY expiry authority.  An absent fact
-    is never invented into a match; a declared fact that contradicts NIFTY is.
+    Cross-checks the facts the broker ships with every ``/option/contract`` row
+    so that a row which is not a NIFTY contract can never serve as NIFTY expiry
+    authority.
+
+    Fail-closed on absence as well as on contradiction: a fact that is missing,
+    empty, non-string, or not the expected NIFTY value all make the row
+    unusable.  Skipping an absent fact would let a row from an unknown universe
+    pass as NIFTY purely because it said nothing — silence is not consent.
     """
     for field, expected in (
         ("segment", NIFTY_OPTION_SEGMENT),
@@ -638,7 +643,7 @@ def _is_nifty_option_contract(row: dict, underlying_key: str) -> bool:
     ):
         declared = row.get(field)
         if not isinstance(declared, str) or not declared.strip():
-            continue
+            return False
         if declared.strip() != expected:
             return False
     return True
