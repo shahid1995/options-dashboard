@@ -126,13 +126,18 @@ read-only in-process invocation seam around the merged Day-50 probe
   platform cache. It is never returned, persisted, or logged.
 - **Instrument key:** validated through the probe's own allowlist grammar
   before any authenticated Upstox URL is constructed, and the normalized key
-  is the value passed downstream. Ordinary surrounding spaces are normalized,
-  not rejected. ASCII control characters (C0 plus DEL, including CR, LF and
-  TAB) are rejected against the **raw** input before normalization, so an
-  injected trailing `\r\n` or `\t` can never be stripped away and
-  mistaken for padding; path, query, fragment and percent delimiters stay
-  unrepresentable under the allowlist. A rejected key fails at the request
-  boundary, before credential resolution and before any broker call.
+  is the value passed downstream. Normalization is pinned to the single
+  ASCII SPACE (U+0020): ordinary leading and trailing spaces are normalized,
+  not rejected. ASCII control characters — C0 (U+0000-U+001F, including
+  CR, LF and TAB), DEL (U+007F) and C1 (U+0080-U+009F, including NEL U+0085) —
+  are rejected against the **raw** input *before* normalization, so an
+  injected trailing CR, LF or TAB can never be stripped away and mistaken for
+  padding. Other non-ASCII whitespace and separators (U+00A0, U+2028, U+2029,
+  U+3000 and friends) are deliberately **not** stripped: they fail the key
+  grammar instead, so a malformed key can never be silently promoted to a
+  valid one by `str.strip()`. Path, query, fragment and percent delimiters
+  stay unrepresentable under the allowlist. A rejected key fails at the
+  request boundary, before credential resolution and before any broker call.
 - **Authoritative expiry:** resolved server-side from Upstox contract
   metadata for that exact broker instrument identity (Invariant 17b). The
   request body carries no expiry field; an unmatched instrument, an

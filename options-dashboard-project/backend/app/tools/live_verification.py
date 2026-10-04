@@ -746,12 +746,14 @@ _OPTION_KEY_EXPIRY_PATTERNS = (
 _INSTRUMENT_KEY_RE = re.compile(
     r"[A-Z][A-Z0-9_]*\|[A-Za-z0-9_ ]+(?:\|(?:\d{2}-\d{2}-\d{4}|\d{4}-\d{2}-\d{2}))?"
 )
-#: ASCII control characters (C0 plus DEL).  Checked against the RAW input
-#: BEFORE normalization, because ``str.strip()`` would otherwise silently
-#: delete a trailing "\r\n" or "\t" and make injected control characters
-#: indistinguishable from ordinary padding.  Space (U+0020) is deliberately
-#: NOT in this set: ordinary surrounding spaces stay normalizable.
-_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+#: ASCII control characters: C0 (U+0000-U+001F), DEL (U+007F) and C1
+#: (U+0080-U+009F, which includes the NEL U+0085 some brokers emit).
+#: Checked against the RAW input BEFORE normalization, because a bare
+#: str.strip() would otherwise silently delete a trailing CR, LF or TAB
+#: and make injected control characters indistinguishable from ordinary
+#: padding.  Space (U+0020) is deliberately NOT in this set: ordinary
+#: surrounding spaces stay normalizable.
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _MAX_INSTRUMENT_KEY_LEN = 120
 
 
@@ -761,18 +763,20 @@ def _instrument_key_error(instrument_key: Any) -> str | None:
     Returns ``None`` when the key is acceptable, otherwise a fixed, key-free
     reason string.
 
-    Ordinary surrounding spaces are normalized (stripped).  ASCII control
-    characters -- C0 (``\x00``-``\x1f``, including CR, LF and TAB) and DEL
-    (``\x7f``) -- are rejected outright, and they are checked against the RAW
-    input *before* normalization so a trailing ``\r\n`` can never be silently
-    stripped and mistaken for ordinary padding.  Anything else outside the
-    grammar above is rejected, including path, query and fragment delimiters.
+    Only the ASCII SPACE (U+0020) is normalized.  Control characters -- C0
+    (U+0000-U+001F, including CR, LF and TAB), DEL (U+007F) and C1
+    (U+0080-U+009F) -- are rejected against the RAW input, before any
+    normalization.  Non-ASCII whitespace that is not a control character
+    (U+00A0, U+2028, U+2029, U+3000 and friends) is NOT stripped: it must
+    fail the grammar instead, so a malformed key can never become a valid
+    one through silent normalization.  Path, query and fragment delimiters
+    likewise fail.
     """
     if not isinstance(instrument_key, str):
         return "instrument key must be a string"
     if _CONTROL_CHAR_RE.search(instrument_key):
         return "instrument key contains an ASCII control character"
-    key = instrument_key.strip()
+    key = instrument_key.strip(" ")
     if not key:
         return "instrument key is empty"
     if len(key) > _MAX_INSTRUMENT_KEY_LEN:
@@ -810,7 +814,7 @@ def _parse_expiry_from_option_key(instrument_key: str) -> str | None:
     """
     if not instrument_key:
         return None
-    key = instrument_key.strip()
+    key = instrument_key.strip(" ")
     for pattern in _OPTION_KEY_EXPIRY_PATTERNS:
         match = pattern.search(key)
         if match is None:
@@ -1208,7 +1212,7 @@ async def verify_option_candle_api(
     # string must never reach an authenticated Upstox URL path.
     key_error = _instrument_key_error(instrument_key)
     if key_error is None:
-        instrument_key = instrument_key.strip()
+        instrument_key = instrument_key.strip(" ")
 
     result: dict[str, Any] = {
         "section": "Live Option Instrument Candle Verification",
