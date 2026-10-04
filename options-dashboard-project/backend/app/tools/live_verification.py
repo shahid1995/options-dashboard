@@ -757,6 +757,33 @@ _CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _MAX_INSTRUMENT_KEY_LEN = 120
 
 
+#: Exact extended ISO calendar-date shape.  date.fromisoformat() alone is
+#: NOT a sufficient check: on Python 3.11+ it also accepts the compact basic
+#: form (20261001), ISO week dates (2026-W40-4) and any other ISO 8601 shape.
+#: Each of those would otherwise be interpolated into an authenticated Upstox
+#: URL path, so the exact shape is required first and the real-calendar-date
+#: check second.
+_ISO_DATE_SHAPE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
+def _iso_date_error(value: Any) -> str | None:
+    """Strict YYYY-MM-DD validation.  Returns None when acceptable.
+
+    Shared by the standalone CLI option probe and the admin request model so
+    one grammar governs every date that can reach a broker URL.  A fixed,
+    value-free reason string is returned on rejection.
+    """
+    if not isinstance(value, str):
+        return "date must be a string"
+    if not _ISO_DATE_SHAPE_RE.fullmatch(value):
+        return "date must be exactly YYYY-MM-DD"
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return "date is not a real calendar date"
+    return None
+
+
 def _instrument_key_error(instrument_key: Any) -> str | None:
     """Validate an option instrument key before it can reach an upstream URL.
 
@@ -1161,9 +1188,20 @@ def _option_probe_conclusion(claims: dict, freshness: dict) -> str:
         )
     if claims["claim_4_instrument_verified_unexpired"] is not True:
         if freshness.get("verified_unexpired") is False:
+            # Name the source of the expiry evidence that actually failed.  A
+            # two-segment key embeds NO expiry, so claiming that it does would
+            # be false; only key_implies_unexpired False means the KEY itself
+            # carried an expired expiry.
+            if freshness.get("key_implies_unexpired") is False:
+                return (
+                    "Open interest was observed, but the key embeds an expiry "
+                    "before the current IST date; this probe does NOT establish "
+                    "live option open interest support."
+                )
             return (
-                "Open interest was observed, but the key embeds an expiry before the "
-                "current IST date; this probe does NOT establish live option open interest support."
+                "Open interest was observed, but the authoritative broker expiry "
+                "resolved for this instrument is before the current IST date; this "
+                "probe does NOT establish live option open interest support."
             )
         return (
             "Open interest was observed, but the instrument could not be verified as "
@@ -1505,6 +1543,24 @@ Examples:
         parser.print_help()
         print("\nERROR: Specify at least one of --all, --candles, --contracts, --round-trip, --option-key, or --dry-run")
         sys.exit(1)
+
+    # Reject a malformed --option-candle-date BEFORE a token is resolved.  The
+    # value is interpolated into the authenticated historical-candle URL path,
+    # so it must never carry an alternate ISO form or a path/query/fragment
+    # delimiter past the local grammar.  The unrelated --candle-date and
+    # --expiry-date options keep their existing semantics.
+    if args.option_candle_date is not None:
+        normalized_option_date = args.option_candle_date.strip(" ")
+        option_date_error = _iso_date_error(normalized_option_date)
+        if option_date_error is not None:
+            print("=" * 70)
+            print("ERROR: invalid --option-candle-date.")
+            print()
+            print(option_date_error)
+            print("Expected exactly YYYY-MM-DD, e.g. 2026-10-01.")
+            print()
+            sys.exit(1)
+        args.option_candle_date = normalized_option_date
 
     logging.basicConfig(level=logging.WARNING)
 

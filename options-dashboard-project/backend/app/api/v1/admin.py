@@ -501,15 +501,26 @@ class OptionCandleProbeIn(BaseModel):
     @field_validator("candle_date")
     @classmethod
     def _candle_date_shape(cls, v: str | None) -> str | None:
+        """Strictly YYYY-MM-DD; alternate ISO forms are rejected, not converted.
+
+        date.fromisoformat() alone is not a validator: on Python 3.11+ it also
+        accepts 20261001, 2026-W40-4 and any other ISO 8601 shape, and that
+        original string is what reaches the historical URL path.  Only the
+        exact extended form is accepted.  Ordinary surrounding spaces are
+        normalized first, using the same single-character contract the
+        instrument key uses, so a control or non-ASCII separator is rejected
+        rather than silently deleted.
+        """
+        from app.tools.live_verification import _iso_date_error
+
         if v is None:
             return None
-        v = v.strip()
+        v = v.strip(" ")
         if not v:
             return None
-        try:
-            date.fromisoformat(v)
-        except ValueError:
-            raise ValueError("candle_date must be YYYY-MM-DD")
+        error = _iso_date_error(v)
+        if error is not None:
+            raise ValueError(f"candle_date must be YYYY-MM-DD ({error})")
         return v
 
 
@@ -949,7 +960,11 @@ async def verify_option_candle(
             "instrument_key": body.instrument_key,
             "candle_date": body.candle_date,
         },
-        result="success",
+        # The probe reports partial/error WITHOUT raising, so an unconditional
+        # "success" would let a failed or half-completed probe be recorded as a
+        # success in the durable audit trail.  Map the probe's own status onto
+        # the EXISTING audit vocabulary; no new enum is introduced.
+        result="success" if payload["status"] == "success" else "failed",
         detail={
             "status": payload["status"],
             "live_option_oi_established": payload["live_option_oi_established"],

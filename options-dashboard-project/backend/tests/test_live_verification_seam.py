@@ -1749,3 +1749,154 @@ class TestInstrumentKeyControlCharacters:
         assert probe.call_args.args[1] == TWO_SEGMENT_KEY
         assert "instrument_key" not in probe.call_args.kwargs
         assert probe.call_args.kwargs["authoritative_expiry_date"] == TWO_SEGMENT_EXPIRY
+
+class TestAuditResultReflectsProbeStatus:
+    """A partial or errored probe must NOT be audited as success."""
+
+    @pytest.mark.parametrize(
+        ("probe_status", "expected_audit"),
+        [
+            ("success", "success"),
+            ("partial", "failed"),
+            ("error", "failed"),
+        ],
+    )
+    def test_audit_result_follows_the_probe_status(
+        self, client, admin_session, monkeypatch, db_session,
+        probe_status, expected_audit,
+    ):
+        sid, _admin = admin_session
+        _resolver, _probe = _install(
+            monkeypatch,
+            _credential(),
+            probe_result=_probe_result(status=probe_status),
+        )
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY})
+
+        # HTTP semantics are UNCHANGED: the probe did not raise, so the seam
+        # still returns 200 and surfaces the probe's own status verbatim.
+        assert resp.status_code == 200
+        assert resp.json()["status"] == probe_status
+
+        events = [
+            e for e in list_admin_audit(db_session)
+            if e["action"] == "live_verification.option_candle"
+        ]
+        assert events[-1]["result"] == expected_audit
+
+    @pytest.mark.parametrize("probe_status", ["partial", "error"])
+    def test_failed_audit_keeps_the_sanitized_detail_only(
+        self, client, admin_session, monkeypatch, db_session, probe_status,
+    ):
+        sid, _admin = admin_session
+        _resolver, _probe = _install(
+            monkeypatch,
+            _credential(),
+            probe_result=_probe_result(status=probe_status),
+        )
+
+        _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY})
+
+        events = [
+            e for e in list_admin_audit(db_session)
+            if e["action"] == "live_verification.option_candle"
+        ]
+        detail = events[-1]["detail"]
+        # Only the two documented sanitized fields; no raw upstream error text
+        # and no credential material may reach the durable record.
+        assert set(detail) == {"status", "live_option_oi_established"}
+        assert detail["status"] == probe_status
+        assert PROBE_TOKEN not in repr(events[-1])
+
+
+class TestCandleDateStrictIsoForm:
+    """``candle_date`` is exactly YYYY-MM-DD and nothing else."""
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "20261001",
+            "2026-W40-4",
+            "2026-10-01T00:00:00",
+            "2026/10/01",
+            "2026-02-30",
+            "2026-13-01",
+            "20261001T000000",
+            "2026-10-01/../admin",
+            "2026-10-01?x=1",
+            "2026-10-01#f",
+            "2026-10-01..2026-10-02",
+            "01-10-2026",
+        ],
+    )
+    def test_non_extended_iso_forms_are_rejected(
+        self, client, admin_session, monkeypatch, raw,
+    ):
+        sid, _admin = admin_session
+        resolver, probe = _install(monkeypatch, _credential())
+        metadata = _contract_metadata_mock(monkeypatch)
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY,
+                                   "candle_date": raw})
+
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "VALIDATION_ERROR"
+        # An unvalidated date must never reach credential resolution, contract
+        # metadata, or the authenticated probe.
+        resolver.assert_not_called()
+        metadata.assert_not_called()
+        probe.assert_not_called()
+
+    def test_exact_iso_date_is_accepted_and_forwarded(
+        self, client, admin_session, monkeypatch,
+    ):
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        _contract_metadata_mock(monkeypatch)
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY,
+                                   "candle_date": "2026-10-01"})
+
+        assert resp.status_code == 200
+        assert probe.call_args.args[2] == "2026-10-01"
+
+    def test_ordinary_spaces_are_normalized_then_validated(
+        self, client, admin_session, monkeypatch,
+    ):
+        sid, _admin = admin_session
+        _resolver, probe = _install(monkeypatch, _credential())
+        _contract_metadata_mock(monkeypatch)
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY,
+                                   "candle_date": "  2026-10-01  "})
+
+        assert resp.status_code == 200
+        assert probe.call_args.args[2] == "2026-10-01"
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "2026-10-01" + chr(13),
+            "2026-10-01" + chr(9),
+            "2026-10-01" + chr(0x85),
+            "2026-10-01" + chr(0xA0),
+            "2026-10-01" + chr(0x2028),
+        ],
+    )
+    def test_control_and_non_ascii_separators_are_rejected(
+        self, client, admin_session, monkeypatch, raw,
+    ):
+        """Only ASCII SPACE is normalizable in the date, same as the key."""
+        sid, _admin = admin_session
+        resolver, probe = _install(monkeypatch, _credential())
+        metadata = _contract_metadata_mock(monkeypatch)
+
+        resp = _post(client, sid, {"instrument_key": TWO_SEGMENT_KEY,
+                                   "candle_date": raw})
+
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "VALIDATION_ERROR"
+        resolver.assert_not_called()
+        metadata.assert_not_called()
+        probe.assert_not_called()
