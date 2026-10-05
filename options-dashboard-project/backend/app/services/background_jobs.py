@@ -793,12 +793,21 @@ def execute_historical_ingestion(
     # Day 48 audit window: the authoritative effective NIFTY window is
     # resolved INSIDE run_all after contract discovery (Finding A) and is
     # returned via result.metadata["nifty_coverage_*"] (Finding B). Here we
-    # only compute provisional bounds for the manifest so a run that fails
-    # before execution still has a best-known window recorded; the manifest
-    # is updated below with the actual executed window once run_all returns.
-    provisional_nifty_start, provisional_nifty_end = resolve_nifty_window(
-        db, start_date=nifty_start_date
-    )
+    # only compute provisional bounds for the manifest so a NIFTY run that
+    # fails before execution still has a best-known window recorded; the
+    # manifest is updated below with the actual executed window once run_all
+    # returns. A run that never requests the NIFTY stage acquires no NIFTY
+    # candles, so it must claim NO coverage window (Finding 6): committing
+    # the provisional resolver bounds for a contracts-only or options-only
+    # job would describe dates this run never worked.
+    coverage_start: str | None = None
+    coverage_end: str | None = None
+    if "nifty" in stages:
+        provisional_nifty_start, provisional_nifty_end = resolve_nifty_window(
+            db, start_date=nifty_start_date
+        )
+        coverage_start = provisional_nifty_start.isoformat()
+        coverage_end = provisional_nifty_end.isoformat()
     force = bool(params.get("force", False))
 
     token_bridge = TokenBridge()
@@ -829,8 +838,8 @@ def execute_historical_ingestion(
         dataset_keys=dataset_keys,
         background_job_id=job.id,
         purpose=PURPOSE_INTERNAL_RESEARCH,
-        coverage_start=provisional_nifty_start.isoformat(),
-        coverage_end=provisional_nifty_end.isoformat(),
+        coverage_start=coverage_start,
+        coverage_end=coverage_end,
         metadata={
             "job_type": job.job_type,
             "stages": stages,
@@ -910,18 +919,27 @@ def execute_historical_ingestion(
                 + error_detail,
                 retryable=not auth_failure,
             )
-    except Exception as exc:
+    except BaseException as exc:
+        # Finding 8: KeyboardInterrupt, SystemExit and asyncio.CancelledError
+        # bypass `except Exception`, but the manifest was already committed
+        # RUNNING above — it must still be terminalized. The original
+        # exception propagates unchanged; asyncio may hand back its own
+        # CancelledError instance for a coroutine-raised one, in which case
+        # its message is empty and the type name carries the cause.
         terminal_status = RUN_FAILED
-        terminal_error = str(exc)[:2000]
+        terminal_error = (str(exc).strip() or type(exc).__name__)[:2000]
         raise
     finally:
-        if terminal_status is not None:
-            _finalize_governance_run(
-                db,
-                governance_run_id,
-                status=terminal_status,
-                error_message=terminal_error,
-            )
+        # Invariant: once committed as RUNNING, a governance manifest is
+        # finalized on EVERY exit path — success, failure, cancellation or
+        # shutdown — and the `or RUN_FAILED` fallback keeps that guarantee
+        # even if a future exit path forgets to decide a status.
+        _finalize_governance_run(
+            db,
+            governance_run_id,
+            status=terminal_status or RUN_FAILED,
+            error_message=terminal_error,
+        )
 
     if pending_failure is not None:
         raise pending_failure

@@ -199,6 +199,30 @@ def _upsert_checkpoint(
         return cp
 
 
+def _declared_progress(
+    fetched: int | None,
+    persisted: int | None,
+) -> dict[str, int]:
+    """Counts an incomplete option checkpoint may authoritatively declare.
+
+    Day 48 Finding 7: ``missing_records`` is the unprocessed remainder of a
+    DECLARED total, so FAILED/PENDING checkpoints must record what the
+    attempt actually knows instead of zeroing the declaration:
+
+    * ``fetched`` — the broker row count, known once the fetch returned;
+    * ``persisted`` — rows this attempt stored, authoritative once
+      persistence completed or provably never started (still 0).
+
+    When either side is unknown (the fetch raised, or persistence failed
+    mid-write), nothing is declared: an instrument that never declared a
+    total has no remainder to report and must contribute nothing rather
+    than an invented number.
+    """
+    if fetched is None or persisted is None:
+        return {}
+    return {"items_processed": persisted, "items_total": fetched}
+
+
 def _log_ingestion(
     db: Session,
     run_id: str,
@@ -938,6 +962,15 @@ class BackfillOrchestrator:
 
         async def process_one(spec: ContractSpec) -> None:
             ik = spec.instrument_key
+            # Day 48 evidence contract (Finding 7): counts are declared on
+            # this attempt's checkpoint only when the attempt genuinely
+            # knows them. `fetched` becomes known once the broker returns
+            # rows; `persisted` starts at 0 (nothing stored yet) and tracks
+            # the stored count once persistence ran. A failure that never
+            # reached the fetch, or whose stored count is unknown, declares
+            # nothing rather than inventing a total or a zero remainder.
+            fetched: int | None = None
+            persisted: int | None = 0
             # Phase 7.24.8C: Wait for rate limiter permission
             await limiter.acquire()
             try:
@@ -947,7 +980,8 @@ class BackfillOrchestrator:
                     limiter.log_status()
                     logger.info(
                         "[%d/%d] Progress (%.0f%%)",
-                        progress[0], total,
+                        progress[0],
+                        total,
                         progress[0] / total * 100,
                     )
 
@@ -970,6 +1004,7 @@ class BackfillOrchestrator:
                     result.api_calls += 1
                     self._api_calls += 1
                     result.rows_fetched += len(candles)
+                fetched = len(candles)
 
                 # Normalize and persist
                 if candles:
@@ -983,7 +1018,15 @@ class BackfillOrchestrator:
                         candles, instrument_key=ik,
                     )
                     valid = [c for c in normalized if validate_candle(c, 0).is_valid]
-                    inserted = record_option_candles(self.db, valid)
+                    try:
+                        inserted = record_option_candles(self.db, valid)
+                    except Exception:
+                        # Rows may have been stored before the failure, so
+                        # the processed count is no longer knowable: declare
+                        # nothing rather than a fabricated zero.
+                        persisted = None
+                        raise
+                    persisted = inserted
 
                     async with lock:
                         result.rows_inserted += inserted
@@ -1006,11 +1049,14 @@ class BackfillOrchestrator:
                 await limiter.mark_instrument_done()
 
             except UpstoxAuthenticationError:
-                # 401 is never retried; instrument stays FAILED
+                # 401 is never retried; instrument stays FAILED. The fetch
+                # never returned, so no total is declared unless this
+                # attempt genuinely learned one.
                 _upsert_checkpoint(
                     self.db, PIPELINE_OPTIONS, ik,
                     status="FAILED", run_id=self.run_id,
                     error_message="Authentication expired",
+                    **_declared_progress(fetched, persisted),
                 )
                 self.db.commit()
                 raise
@@ -1029,6 +1075,7 @@ class BackfillOrchestrator:
                     self.db, PIPELINE_OPTIONS, ik,
                     status="PENDING", run_id=self.run_id,
                     error_message=f"Rate limited (will retry): {e.message}",
+                    **_declared_progress(fetched, persisted),
                 )
                 self.db.commit()
                 logger.warning("Instrument %s rate-limited (will retry)", ik)
@@ -1043,6 +1090,7 @@ class BackfillOrchestrator:
                     self.db, PIPELINE_OPTIONS, ik,
                     status="FAILED", run_id=self.run_id,
                     error_message=str(e)[:500],
+                    **_declared_progress(fetched, persisted),
                 )
                 self.db.commit()
                 logger.warning("Instrument %s failed: %s", ik, e)
