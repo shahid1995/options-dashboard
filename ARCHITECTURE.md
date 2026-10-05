@@ -136,14 +136,26 @@ Historical data acquisition is governed independently from queue mechanics:
   checkpoints, so `missing_records` measures a real declared-but-unprocessed
   remainder instead of collapsing to zero — and an instrument that never
   learned a total declares none rather than an invented one.
-- **Enforced rights boundary:** acquisition is gated before any data is
-  fetched. Unresolved entitlement is not treated as permission, and
-  redistribution rights are never implied: public redistribution is allowed
-  only when the catalog explicitly says `ALLOWED`. A run refused by the gate
-  fails permanently and leaves no manifest behind. `DECISIONS.md` ADR-020
-  records the one approved exception — unresolved entitlement may be acquired
-  for internal research or backtest only, and the exception is written to the
+- **Enforced rights boundary (durable job path only):** the durable
+  `HISTORICAL_INGESTION` job enforces the acquisition gate through
+  `execute_historical_ingestion`, which calls `assert_acquisition_allowed`
+  before any data is fetched and before the ingestion manifest is created.
+  Unresolved entitlement is not treated as permission, and redistribution
+  rights are never implied: public redistribution is allowed only when the
+  catalog explicitly says `ALLOWED`. A job refused by the gate fails
+  permanently and leaves no manifest behind. `DECISIONS.md` ADR-020 records
+  the one approved exception — unresolved entitlement may be acquired for
+  internal research or backtest only, and the exception is written to the
   manifest.
+- **Other acquisition paths are outside this gate (known limitations):**
+  historical acquisition is not rights-gated on every existing code path.
+  `app/api/v1/admin.py` exposes an admin-only route (`POST /api/v1/admin/
+  acquisition/run`) that drives `BackfillOrchestrator` directly on the
+  platform token bridge and does not call `assert_acquisition_allowed`;
+  `run_backfill.py` is the existing CLI entry point that also acquires
+  directly through `BackfillOrchestrator`. These paths are recorded as open
+  follow-ups rather than presented as compliant. `execute_historical_ingestion`
+  remains the only durable enforcement point today.
 - **Terminal manifests:** once a manifest is committed as `RUNNING`, every
   exit path finalizes it, including orchestrator construction failure, a
   failure of the finalization itself, and `BaseException` exits such as

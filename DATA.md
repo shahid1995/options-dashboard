@@ -132,7 +132,12 @@ as actual, though their operations still decide completeness.
 Raw market observations remain the recomputation source. Current upstream
 entitlement and redistribution status is intentionally `REVIEW_REQUIRED` unless
 an explicit governance decision changes it; API availability is not treated as
-proof of either. Acquisition is gated on those recorded rights before anything
-is fetched, under `DECISIONS.md` ADR-020. Retention execution is dry-run-first, allow-listed and
-disabled in the catalog by default; raw-tier deletion is not executable through
-the Day 48 service.
+proof of either. The durable `HISTORICAL_INGESTION` job path gates acquisition
+on those recorded rights before anything is fetched, under `DECISIONS.md`
+ADR-020. Other existing acquisition paths (the admin `POST
+/api/v1/admin/acquisition/run` route and the `run_backfill.py` CLI) acquire
+directly through `BackfillOrchestrator` and are outside that rights gate;
+they are recorded as known limitations / open follow-ups, not as compliant
+paths. Retention execution is dry-run-first, allow-listed and disabled in the
+catalog by default; raw-tier deletion is not executable through the Day 48
+service.
