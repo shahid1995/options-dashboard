@@ -885,3 +885,263 @@ def test_acquisition_gate_follows_the_approved_rights_policy(db):
         hdg.assert_acquisition_allowed(
             db, [key], purpose=hdg.PURPOSE_INTERNAL_RESEARCH
         )
+
+
+# --------------------------------------------------------------------------
+# Day 48 Finding 7 — production-backed missing_records evidence
+# --------------------------------------------------------------------------
+
+
+def _seed_option_spec(db, instrument_key: str, *, expiry: str = "2026-07-28"):
+    db.add(
+        ContractSpec(
+            instrument_key=instrument_key,
+            underlying="NIFTY",
+            underlying_key="NSE_FO|58124",
+            expiry=expiry,
+            strike_price=25000.0,
+            instrument_type="CE",
+            trading_symbol="NIFTY",
+            segment="NSE_FO",
+            exchange="NSE",
+            source="TEST",
+            source_reference="test",
+            fetched_at=datetime(2026, 9, 1),
+        )
+    )
+    db.commit()
+
+
+def _raw_candle(timestamp: str) -> list:
+    """A structurally valid raw Upstox option candle row."""
+    return [timestamp, 150.0, 155.0, 148.0, 152.0, 5000, 325000]
+
+
+def test_production_partial_checkpoint_declares_genuine_expectation(
+    db, monkeypatch
+):
+    """Finding 7 — the REAL option-ingestion path must be able to produce
+    the evidence ``missing_records`` measures.
+
+    Through ``BackfillOrchestrator.run_options`` (the production writer of
+    ``IngestionCheckpoint``):
+
+    * instrument A fetches 5 raw rows, persists 4 (one is structurally
+      invalid), then fails AFTER persistence (an injected limiter
+      completion failure) — its FAILED checkpoint declares
+      ``items_total=5`` / ``items_processed=4``;
+    * instrument B fails AT the fetch and declares nothing (0/0): no
+      expectation is invented for it.
+
+    The run-scoped metrics must then read expected=5 (A's declaration and
+    nothing else), actual=5 (this run's ``option_candles`` rows only), and
+    missing=1 (5 - 4) — non-zero even though the declaring checkpoint is
+    incomplete. Contract/NIFTY log rows from the same run and a foreign
+    run's checkpoint must not move any of those numbers. On a retry run,
+    neither the prior run's declaration nor a fabricated expectation may
+    leak in.
+    """
+    import asyncio
+
+    from app.services.backfill_orchestrator import (
+        PIPELINE_OPTIONS,
+        BackfillOrchestrator,
+    )
+
+    contracts = "UPSTOX_CONTRACT_SPECS"
+    nifty = "UPSTOX_NIFTY_CANDLES_3MIN"
+    options = "UPSTOX_OPTION_CANDLES_3MIN"
+    _catalog(
+        db,
+        key=contracts,
+        table_name="contract_specs",
+        pipeline="backfill_contracts",
+        completeness_data_type="contract_metadata",
+    )
+    _catalog(
+        db,
+        key=nifty,
+        pipeline="backfill_nifty",
+        completeness_data_type="nifty_candles",
+    )
+    _catalog(db, key=options)
+
+    key_a = "NSE_FO|63935|28-07-2026"
+    key_b = "NSE_FO|63936|28-07-2026"
+    _seed_option_spec(db, key_a)
+    _seed_option_spec(db, key_b, expiry="2026-07-28")
+
+    class _Client:
+        async def get_expired_historical_candles(
+            self, instrument_key, interval, start, end
+        ):
+            if instrument_key == key_b:
+                raise RuntimeError("synthetic fetch failure")
+            # 5 raw rows; the last is structurally invalid and is dropped by
+            # normalize_option_candles, so only 4 can ever be persisted.
+            return [
+                _raw_candle("2026-07-28T09:15:00+05:30"),
+                _raw_candle("2026-07-28T09:18:00+05:30"),
+                _raw_candle("2026-07-28T09:21:00+05:30"),
+                _raw_candle("2026-07-28T09:24:00+05:30"),
+                ["2026-07-28T09:27:00+05:30"],
+            ]
+
+    orchestrator = BackfillOrchestrator(db, _Client())
+
+    # Smallest realistic post-persistence failure seam: the instrument has
+    # fetched AND persisted its rows when the rate-limiter completion hook
+    # raises. The production failure handler must record what this attempt
+    # genuinely knows instead of zeroing the declaration.
+    async def _boom():
+        raise RuntimeError("synthetic completion write failure")
+
+    monkeypatch.setattr(
+        orchestrator._rate_limiter, "mark_instrument_done", _boom
+    )
+
+    dataset_keys = [contracts, nifty, options]
+    run = hdg.start_ingestion_run(db, dataset_keys=dataset_keys, run_id="run-prod-partial")
+    # Same wiring background_jobs applies: the orchestrator adopts the
+    # governance run identity so its checkpoints are run-scoped evidence.
+    orchestrator.run_id = run.run_id
+    result = asyncio.run(orchestrator.run_options())
+    assert result.status == "PARTIAL"
+
+    # Same-run rows from the stages this test did not execute through their
+    # own paths; they are legitimate run-scoped log rows a mixed run would
+    # have, and must stay outside the checkpoint-backed population.
+    db.add_all(
+        [
+            IngestionLog(
+                run_id=run.run_id,
+                operation="contract_metadata",
+                started_at="2026-09-01T00:00:00+00:00",
+                status="SUCCESS",
+                rows_fetched=40,
+                rows_inserted=40,
+            ),
+            IngestionLog(
+                run_id=run.run_id,
+                operation="nifty_candles",
+                started_at="2026-09-01T00:00:30+00:00",
+                status="SUCCESS",
+                rows_fetched=75,
+                rows_inserted=75,
+            ),
+            # A foreign run's checkpoint: run-scoped evidence must exclude it.
+            IngestionCheckpoint(
+                pipeline=PIPELINE_OPTIONS,
+                instrument_key="NSE_FO|OTHER|28-07-2026",
+                run_id="run-other",
+                status="FAILED",
+                items_processed=0,
+                items_total=999,
+                error_message="another acquisition",
+            ),
+        ]
+    )
+    db.commit()
+
+    cp_a = db.scalar(
+        select(IngestionCheckpoint).where(
+            IngestionCheckpoint.run_id == run.run_id,
+            IngestionCheckpoint.instrument_key == key_a,
+        )
+    )
+    cp_b = db.scalar(
+        select(IngestionCheckpoint).where(
+            IngestionCheckpoint.run_id == run.run_id,
+            IngestionCheckpoint.instrument_key == key_b,
+        )
+    )
+    # Production wrote a genuine declared total on the incomplete checkpoint:
+    # fetched 5, persisted 4. (Pre-fix production always wrote 0/0 here.)
+    assert cp_a.status == "FAILED"
+    assert cp_a.items_total == 5
+    assert cp_a.items_processed == 4
+    # The fetch-failed instrument knows no total and must declare none.
+    assert cp_b.status == "FAILED"
+    assert cp_b.items_total == 0
+    assert cp_b.items_processed == 0
+
+    refreshed = hdg.refresh_ingestion_run_metrics(db, run.run_id)
+    # Only A declared an expectation; B and the foreign checkpoint contribute
+    # nothing, and contract/NIFTY rows never enter the population.
+    assert refreshed.expected_records == 5
+    assert refreshed.actual_records == 5
+    # The incomplete declaring checkpoint is short by its unprocessed row:
+    # the metric does NOT collapse to zero merely because it is incomplete.
+    assert refreshed.missing_records == 1
+    assert refreshed.checkpoints_total == 2
+    assert refreshed.checkpoints_completed == 0
+    assert refreshed.completeness_status == "PARTIAL"
+
+    finished = hdg.finish_ingestion_run(db, run.run_id, status=hdg.RUN_SUCCEEDED)
+    assert finished.status == hdg.RUN_PARTIAL
+    assert finished.expected_records == 5
+    assert finished.missing_records == 1
+
+    # --- idempotent retry: no inherited, invented, or leaked expectation ---
+    # A now has candles and is skipped; B fails at the fetch again, so run 2
+    # never learns a total and must declare none of its own.
+    run2 = hdg.start_ingestion_run(db, dataset_keys=dataset_keys, run_id="run-prod-retry")
+    orchestrator.run_id = run2.run_id
+    asyncio.run(orchestrator.run_options())
+    db.refresh(cp_a)
+    db.refresh(cp_b)
+    # Run 1's evidence is untouched by the retry.
+    assert cp_a.run_id == run.run_id
+    assert cp_a.items_total == 5
+    assert cp_a.items_processed == 4
+    # B's checkpoint now speaks for run 2, which declared nothing.
+    assert cp_b.run_id == run2.run_id
+
+    refreshed2 = hdg.refresh_ingestion_run_metrics(db, run2.run_id)
+    assert refreshed2.expected_records is None
+    assert refreshed2.actual_records == 0
+    assert refreshed2.missing_records == 0
+
+    # Re-reading run 1's stored metrics after the retry changes nothing.
+    db.refresh(finished)
+    assert finished.expected_records == 5
+    assert finished.missing_records == 1
+
+
+def test_fetch_failure_without_declaration_never_fabricates_expectation(db):
+    """Finding 7 counterpart: when production never learns a total (every
+    fetch fails before returning rows), the run declares no expectation and
+    reports no invented shortfall — under-declaration stays the safe
+    direction, and no zero is dressed up as a measured remainder."""
+    import asyncio
+
+    from app.services.backfill_orchestrator import BackfillOrchestrator
+
+    options = "UPSTOX_OPTION_CANDLES_3MIN"
+    _catalog(db, key=options)
+    key_a = "NSE_FO|63935|28-07-2026"
+    key_b = "NSE_FO|63936|28-07-2026"
+    _seed_option_spec(db, key_a)
+    _seed_option_spec(db, key_b)
+
+    class _Client:
+        async def get_expired_historical_candles(
+            self, instrument_key, interval, start, end
+        ):
+            raise RuntimeError("synthetic fetch failure")
+
+    orchestrator = BackfillOrchestrator(db, _Client())
+    run = hdg.start_ingestion_run(db, dataset_keys=[options], run_id="run-fetch-fail")
+    orchestrator.run_id = run.run_id
+    asyncio.run(orchestrator.run_options())
+
+    refreshed = hdg.refresh_ingestion_run_metrics(db, run.run_id)
+    assert refreshed.expected_records is None
+    assert refreshed.actual_records == 0
+    assert refreshed.missing_records == 0
+    assert refreshed.checkpoints_total == 2
+    assert refreshed.completeness_status == "PARTIAL"
+
+    finished = hdg.finish_ingestion_run(db, run.run_id, status=hdg.RUN_SUCCEEDED)
+    assert finished.status == hdg.RUN_PARTIAL
+    assert finished.expected_records is None

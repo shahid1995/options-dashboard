@@ -12,6 +12,7 @@ Real PostgreSQL/CockroachDB concurrency and migration rehearsal live in
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -1736,12 +1737,14 @@ class TestGovernanceAuditWindow:
         assert audit.coverage_end == "2021-06-30"
         assert captured["orchestrator_run_id"] == summary["governance_run_id"]
 
-    def test_options_only_keeps_existing_manifest_semantics(
+    def test_options_only_claims_no_nifty_coverage_window(
         self, session_factory, monkeypatch
     ):
-        """Options-only jobs have no NIFTY coverage window; the manifest
-        keeps the resolver-derived bounds and a result without NIFTY window
-        metadata must not overwrite them."""
+        """Options-only jobs acquire no NIFTY candles, so the finalized
+        manifest must claim NO coverage window. Committing the provisional
+        resolver bounds (registry expiry - 3 days .. today) would describe a
+        NIFTY window this run never worked (Day 48 Finding 6); a result
+        without NIFTY window metadata must not resurrect it either."""
         captured = {}
         job, summary, audit = self._enqueue_and_run(
             monkeypatch,
@@ -1752,10 +1755,49 @@ class TestGovernanceAuditWindow:
             key="gov-window:options-only",
         )
 
-        today = datetime.now(timezone.utc).date()
-        expected_start = (today - timedelta(days=365)).isoformat()
-        assert audit.coverage_start == expected_start
-        assert audit.coverage_end == today.isoformat()
+        assert audit.coverage_start is None
+        assert audit.coverage_end is None
+
+    def test_contracts_only_claims_no_nifty_coverage_window(
+        self, session_factory, monkeypatch
+    ):
+        """Contract discovery acquires no NIFTY candles either: a
+        contracts-only run must not commit the provisional NIFTY resolver
+        window as its coverage (Day 48 Finding 6)."""
+        captured = {}
+        job, summary, audit = self._enqueue_and_run(
+            monkeypatch,
+            session_factory,
+            {"stages": ["contracts"]},
+            captured,
+            result_metadata={},
+            key="gov-window:contracts-only",
+        )
+
+        assert audit.coverage_start is None
+        assert audit.coverage_end is None
+
+    def test_mixed_run_records_the_executed_nifty_window(
+        self, session_factory, monkeypatch
+    ):
+        """A mixed contracts+nifty+options run whose NIFTY stage executed
+        must keep the ACTUAL executed window from the result metadata on the
+        manifest — stage gating must not drop genuine NIFTY coverage."""
+        captured = {}
+        job, summary, audit = self._enqueue_and_run(
+            monkeypatch,
+            session_factory,
+            {"stages": ["contracts", "nifty", "options"]},
+            captured,
+            result_metadata={
+                "nifty_coverage_start": "2022-03-01",
+                "nifty_coverage_end": "2022-03-31",
+            },
+            key="gov-window:mixed",
+        )
+
+        assert audit.coverage_start == "2022-03-01"
+        assert audit.coverage_end == "2022-03-31"
 
     def test_contracts_failure_stops_nifty_and_records_failure(
         self, session_factory
@@ -3186,3 +3228,46 @@ class TestGovernanceManifestTerminalization:
         manifest = self._manifest_for(db, job, summary["governance_run_id"])
         assert manifest.status == "SUCCEEDED"
         assert manifest.completed_at is not None
+
+    @pytest.mark.parametrize(
+        "signal_exc",
+        [KeyboardInterrupt, SystemExit, asyncio.CancelledError],
+        ids=["keyboard_interrupt", "system_exit", "cancelled_error"],
+    )
+    def test_cancellation_exit_leaves_manifest_terminal(
+        self, session_factory, monkeypatch, signal_exc
+    ):
+        """Day 48 Finding 8: a BaseException raised from the execution seam
+        (KeyboardInterrupt / SystemExit / asyncio.CancelledError) bypasses
+        the `except Exception` handler, but the manifest was already
+        committed RUNNING — it must still be finalized terminal, with the
+        original exception propagating unchanged."""
+
+        class _Interrupted:
+            def __init__(self, db, client, *, force=False, rate_limiter=None):
+                self.run_id = None
+
+            async def run_all(
+                self, *, stages=None, nifty_start_date=None,
+                options_concurrency=None,
+            ):
+                raise signal_exc("synthetic shutdown")
+
+        self._stub(monkeypatch, _Interrupted)
+        db, job = self._run(session_factory, "gov-terminal:cancel")
+
+        # The original exception propagates unchanged (asyncio may hand back
+        # its own CancelledError instance for a coroutine-raised one, so no
+        # message match is asserted here).
+        with pytest.raises(signal_exc):
+            bj.execute_historical_ingestion(db, job)
+
+        manifest = self._manifest_for(db, job)
+        assert manifest is not None
+        assert manifest.status == "FAILED"
+        assert manifest.completed_at is not None
+        # The terminal write still carries a cause: either the exception's
+        # message or, when asyncio supplies an empty one, its type name.
+        detail = manifest.error_message or ""
+        assert detail
+        assert "synthetic shutdown" in detail or signal_exc.__name__ in detail

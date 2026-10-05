@@ -119,7 +119,11 @@ Historical data acquisition is governed independently from queue mechanics:
   retention policy.
 - **Ingestion manifest:** `HistoricalIngestionRun` snapshots the catalog
   decisions for each acquisition so later policy changes do not rewrite
-  historical audit context. It can link a durable `BackgroundJob` ID.
+  historical audit context. It can link a durable `BackgroundJob` ID. Its
+  coverage window describes what the run actually acquired: only a run that
+  requests the NIFTY stage records one — seeded with the resolver's
+  best-known bounds and replaced by the executed window the orchestrator
+  reports — so a contracts-only or options-only job claims no NIFTY window.
 - **Existing pipeline evidence remains authoritative:** the governance service
   reads `IngestionCheckpoint` and `IngestionLog` rather than duplicating their
   operational state. Manifest metrics are derived only from records carrying
@@ -127,6 +131,11 @@ Historical data acquisition is governed independently from queue mechanics:
   attributed to this run. `DataCompleteness` is cumulative and carries no run
   identity, so it is not a manifest evidence source. A run that produced no
   evidence of its own stays `UNKNOWN` rather than being reported complete.
+  Checkpoint declarations are production-backed: the option pipeline records
+  the fetched row count and the rows it stored on incomplete (FAILED/PENDING)
+  checkpoints, so `missing_records` measures a real declared-but-unprocessed
+  remainder instead of collapsing to zero — and an instrument that never
+  learned a total declares none rather than an invented one.
 - **Enforced rights boundary:** acquisition is gated before any data is
   fetched. Unresolved entitlement is not treated as permission, and
   redistribution rights are never implied: public redistribution is allowed
@@ -136,8 +145,9 @@ Historical data acquisition is governed independently from queue mechanics:
   for internal research or backtest only, and the exception is written to the
   manifest.
 - **Terminal manifests:** once a manifest is committed as `RUNNING`, every
-  exit path finalizes it, including orchestrator construction failure and a
-  failure of the finalization itself.
+  exit path finalizes it, including orchestrator construction failure, a
+  failure of the finalization itself, and `BaseException` exits such as
+  `KeyboardInterrupt`, `SystemExit`, and `asyncio.CancelledError`.
 - **Retention:** deletion is dry-run-first and uses a static allow-list of
   governed ORM targets. The current catalog keeps raw datasets and disables
   enforcement for derived datasets until a controlled policy enables it.
