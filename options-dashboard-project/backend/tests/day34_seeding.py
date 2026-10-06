@@ -126,4 +126,32 @@ def day34_gated_seeding(monkeypatch):
     monkeypatch.setattr("app.routers.paper.execute_strategy", gated_execute)
     monkeypatch.setattr(
         "app.services.paper_execution.execute_strategy", gated_execute)
+
+    # Day 50 (Issue #118): the production route no longer calls bare
+    # execute_strategy — it produces the genuine candidate server-side via
+    # candidate_production.produce_candidate_and_execute first.  Legacy
+    # suites seed through that SAME production seam: the wrapper acquires
+    # no broker evidence at all and hands the bare intent to the genuine
+    # Day-28→Day-33 chain below (no fabricated evidence; the real engines
+    # decide eligibility exactly as before).
+    from app.services.candidate_production import (
+        produce_candidate_and_execute as _real_producer,
+    )
+
+    async def seeded_producer(user_id, db, request, prices, **kwargs):
+        candidate = _genuine_candidate_for(request)
+        if candidate is None:
+            # Genuine chain cannot produce eligibility — leave the real
+            # producer to fail closed exactly as it does in production.
+            return await _real_producer(user_id, db, request, prices, **kwargs)
+        return _real_execute_strategy(
+            user_id, request, db, prices,
+            risk_candidate=candidate,
+            risk_policy=PAPER_ENTRY_POLICY,
+        )
+
+    monkeypatch.setattr(
+        "app.services.candidate_production.produce_candidate_and_execute",
+        seeded_producer,
+    )
     yield

@@ -42,7 +42,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Protocol
 
 from sqlalchemy import func, select
@@ -199,6 +199,30 @@ def _upsert_checkpoint(
         return cp
 
 
+def _declared_progress(
+    fetched: int | None,
+    persisted: int | None,
+) -> dict[str, int]:
+    """Counts an incomplete option checkpoint may authoritatively declare.
+
+    Day 48 Finding 7: ``missing_records`` is the unprocessed remainder of a
+    DECLARED total, so FAILED/PENDING checkpoints must record what the
+    attempt actually knows instead of zeroing the declaration:
+
+    * ``fetched`` — the broker row count, known once the fetch returned;
+    * ``persisted`` — rows this attempt stored, authoritative once
+      persistence completed or provably never started (still 0).
+
+    When either side is unknown (the fetch raised, or persistence failed
+    mid-write), nothing is declared: an instrument that never declared a
+    total has no remainder to report and must contribute nothing rather
+    than an invented number.
+    """
+    if fetched is None or persisted is None:
+        return {}
+    return {"items_processed": persisted, "items_total": fetched}
+
+
 def _log_ingestion(
     db: Session,
     run_id: str,
@@ -243,6 +267,43 @@ def _log_ingestion(
 # ---------------------------------------------------------------------------
 # Backfill orchestrator
 # ---------------------------------------------------------------------------
+
+def resolve_nifty_window(
+    db: Session,
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> tuple[date, date]:
+    """Resolve the effective NIFTY ingestion window (single authority).
+
+    ``run_nifty`` consumes the returned dates for chunk generation, and the
+    background-job governance manifest records the same dates as its
+    coverage window, so the audit window can never diverge from the
+    execution window.
+
+    Rules (unchanged from the historical ``run_nifty`` defaults):
+      * ``end_date`` defaults to today (UTC).
+      * an explicit ``start_date`` is respected as-is.
+      * a ``None`` start resolves to the earliest NIFTY contract expiry
+        minus a 3-day buffer so ATM calculations have candles for every
+        expiry, or 365 days before today when the registry is empty.
+    """
+    if end_date is None:
+        end_date = datetime.now(timezone.utc).date()
+    if start_date is None:
+        earliest_expiry_str = db.scalar(
+            select(func.min(ContractSpec.expiry)).where(
+                ContractSpec.underlying == NIFTY_SYMBOL
+            )
+        )
+        if earliest_expiry_str:
+            earliest_expiry = datetime.strptime(
+                earliest_expiry_str, "%Y-%m-%d"
+            ).date()
+            start_date = earliest_expiry - timedelta(days=3)
+        else:
+            start_date = end_date - timedelta(days=365)
+    return start_date, end_date
+
 
 class BackfillOrchestrator:
     """Unified historical data backfill orchestrator.
@@ -352,6 +413,7 @@ class BackfillOrchestrator:
         *,
         stages: list[str] | None = None,
         nifty_start_date: date | None = None,
+        nifty_end_date: date | None = None,
         options_concurrency: int | None = None,
     ) -> BackfillResult:
         """Run the full backfill pipeline.
@@ -362,7 +424,12 @@ class BackfillOrchestrator:
             Which stages to run. Default: ["contracts", "nifty", "options"].
         nifty_start_date:
             Override start date for NIFTY backfill.  When *None*,
-            the default covers the full contract-registry range.
+            the default is resolved AFTER the contracts stage so a freshly
+            discovered registry extends the window (historical behavior).
+        nifty_end_date:
+            Override end date for NIFTY backfill.  When *None*, resolved
+            once (today) together with the start, so the effective window
+            is a single coherent pair.
         """
         if stages is None:
             stages = ["contracts", "nifty", "options"]
@@ -382,7 +449,21 @@ class BackfillOrchestrator:
                 result.errors.extend(contract_result.errors)
 
             if "nifty" in stages:
-                nifty_result = await self.run_nifty(start_date=nifty_start_date)
+                # Resolve the effective NIFTY window HERE — after contract
+                # discovery — so an omitted start derives from the registry
+                # as it exists post-discovery (historical behavior), and the
+                # end is fixed once so it cannot drift past UTC midnight.
+                effective_start, effective_end = resolve_nifty_window(
+                    self.db, start_date=nifty_start_date, end_date=nifty_end_date
+                )
+                nifty_result = await self.run_nifty(
+                    start_date=effective_start, end_date=effective_end
+                )
+                # Expose the actual window for audit consumers (Day 48
+                # governance records exactly these bounds on the manifest).
+                result.metadata["nifty_coverage_start"] = effective_start.isoformat()
+                result.metadata["nifty_coverage_end"] = effective_end.isoformat()
+                result.metadata["chunks"] = nifty_result.metadata.get("chunks", [])
                 result.api_calls += nifty_result.api_calls
                 result.rows_fetched += nifty_result.rows_fetched
                 result.rows_inserted += nifty_result.rows_inserted
@@ -544,27 +625,11 @@ class BackfillOrchestrator:
         start_time = time.time()
 
         try:
-            today = datetime.now(timezone.utc).date()
-            if end_date is None:
-                end_date = today
-
-            # Default start_date: earliest contract expiry date minus 3 day buffer,
-            # so we always have NIFTY candles for ATM calculation of all expiries.
-            # Falls back to 365 days ago if registry is empty.
-            if start_date is None:
-                from datetime import timedelta as _td
-                earliest_expiry_str = self.db.scalar(
-                    select(func.min(ContractSpec.expiry)).where(
-                        ContractSpec.underlying == NIFTY_SYMBOL
-                    )
-                )
-                if earliest_expiry_str:
-                    earliest_expiry = datetime.strptime(
-                        earliest_expiry_str, "%Y-%m-%d"
-                    ).date()
-                    start_date = earliest_expiry - _td(days=3)
-                else:
-                    start_date = today - _td(days=365)
+            # Effective window resolution is owned by the shared resolver so
+            # the governance manifest (Day 48) records exactly this window.
+            start_date, end_date = resolve_nifty_window(
+                self.db, start_date=start_date, end_date=end_date
+            )
 
             # Generate chunks
             chunks = _generate_date_chunks(start_date, end_date, CANDLE_CHUNK_DAYS)
@@ -897,6 +962,15 @@ class BackfillOrchestrator:
 
         async def process_one(spec: ContractSpec) -> None:
             ik = spec.instrument_key
+            # Day 48 evidence contract (Finding 7): counts are declared on
+            # this attempt's checkpoint only when the attempt genuinely
+            # knows them. `fetched` becomes known once the broker returns
+            # rows; `persisted` starts at 0 (nothing stored yet) and tracks
+            # the stored count once persistence ran. A failure that never
+            # reached the fetch, or whose stored count is unknown, declares
+            # nothing rather than inventing a total or a zero remainder.
+            fetched: int | None = None
+            persisted: int | None = 0
             # Phase 7.24.8C: Wait for rate limiter permission
             await limiter.acquire()
             try:
@@ -906,7 +980,8 @@ class BackfillOrchestrator:
                     limiter.log_status()
                     logger.info(
                         "[%d/%d] Progress (%.0f%%)",
-                        progress[0], total,
+                        progress[0],
+                        total,
                         progress[0] / total * 100,
                     )
 
@@ -929,6 +1004,7 @@ class BackfillOrchestrator:
                     result.api_calls += 1
                     self._api_calls += 1
                     result.rows_fetched += len(candles)
+                fetched = len(candles)
 
                 # Normalize and persist
                 if candles:
@@ -942,7 +1018,15 @@ class BackfillOrchestrator:
                         candles, instrument_key=ik,
                     )
                     valid = [c for c in normalized if validate_candle(c, 0).is_valid]
-                    inserted = record_option_candles(self.db, valid)
+                    try:
+                        inserted = record_option_candles(self.db, valid)
+                    except Exception:
+                        # Rows may have been stored before the failure, so
+                        # the processed count is no longer knowable: declare
+                        # nothing rather than a fabricated zero.
+                        persisted = None
+                        raise
+                    persisted = inserted
 
                     async with lock:
                         result.rows_inserted += inserted
@@ -965,11 +1049,14 @@ class BackfillOrchestrator:
                 await limiter.mark_instrument_done()
 
             except UpstoxAuthenticationError:
-                # 401 is never retried; instrument stays FAILED
+                # 401 is never retried; instrument stays FAILED. The fetch
+                # never returned, so no total is declared unless this
+                # attempt genuinely learned one.
                 _upsert_checkpoint(
                     self.db, PIPELINE_OPTIONS, ik,
                     status="FAILED", run_id=self.run_id,
                     error_message="Authentication expired",
+                    **_declared_progress(fetched, persisted),
                 )
                 self.db.commit()
                 raise
@@ -988,6 +1075,7 @@ class BackfillOrchestrator:
                     self.db, PIPELINE_OPTIONS, ik,
                     status="PENDING", run_id=self.run_id,
                     error_message=f"Rate limited (will retry): {e.message}",
+                    **_declared_progress(fetched, persisted),
                 )
                 self.db.commit()
                 logger.warning("Instrument %s rate-limited (will retry)", ik)
@@ -1002,6 +1090,7 @@ class BackfillOrchestrator:
                     self.db, PIPELINE_OPTIONS, ik,
                     status="FAILED", run_id=self.run_id,
                     error_message=str(e)[:500],
+                    **_declared_progress(fetched, persisted),
                 )
                 self.db.commit()
                 logger.warning("Instrument %s failed: %s", ik, e)

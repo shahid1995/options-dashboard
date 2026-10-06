@@ -49,14 +49,17 @@ ANTI-LEAKAGE RULES:
 from __future__ import annotations
 
 import logging
+from bisect import insort
 import math
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import Optional
+from datetime import date, datetime, timedelta
+from typing import Iterable, Optional
 
 from sqlalchemy import select, func, and_, distinct
 from sqlalchemy.orm import Session
+
+from app.services.point_in_time import PointInTimeDataset
 
 from app.models import (
     HistoricalGexSnapshot,
@@ -67,6 +70,18 @@ from app.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _expiry_date(raw_expiry: str) -> date | None:
+    """Parse a stored ``YYYY-MM-DD`` expiry string into a date.
+
+    Returns None for missing or malformed values so a data-quality defect
+    cannot silently become an eligibility decision.
+    """
+    try:
+        return date.fromisoformat(str(raw_expiry))
+    except (TypeError, ValueError):
+        return None
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -235,6 +250,12 @@ class GexResearchEngine:
     def __init__(self, db: Session, calc_version: str = DEFAULT_CALC_VERSION):
         self.db = db
         self.calc_version = calc_version
+        self.pit = PointInTimeDataset(db)
+
+    def _decision_timestamp_for_observation(self, timestamp: datetime) -> datetime:
+        """Return the decision time at the end of a three-minute observation bar."""
+        return timestamp + timedelta(minutes=3)
+
 
     # ==================================================================
     # Phase 2: Research Dataset Builder
@@ -247,6 +268,10 @@ class GexResearchEngine:
         max_timestamps: Optional[int] = None,
     ) -> list[TimestampResearch]:
         """Build a complete leakage-safe research dataset.
+
+        Research timestamps identify the opening time of a three-minute
+        observation bar. Feature availability is enforced at that bar's close
+        (timestamp + 3 minutes); forward outcomes remain labels only.
 
         For every timestamp, assembles:
         - Market state (spot, returns as labels)
@@ -431,94 +456,156 @@ class GexResearchEngine:
         ).scalars().all()
 
     def _fetch_oi_data(self, timestamps: list[datetime]) -> dict:
-        """Fetch OI and volume data from option_candles for each timestamp.
+        """Fetch OI and volume feature state through the PIT dataset boundary.
 
-        Uses option_greeks.open_time to align with historical_gex timestamps,
-        then joins with option_candles to get OI/volume.
+        Bulk PIT reads return decision-major selections: element i belongs to
+        timestamps[i]. Each selected row keeps the SOURCE open_time it
+        resolved to, so a fallback bar is attributed to its original
+        observation time — it is never relabeled as a fresh observation at the
+        requesting decision time, never double-counted across decisions, and
+        never dropped merely because it is stale. Forward NIFTY candles remain
+        separate because they are labels, not features.
+
+        Two research-layer feature rules are applied on top of the PIT
+        boundary without altering it:
+        - OI is state and carries forward; traded volume is event-scoped, so
+          only a candle whose source open_time equals the research timestamp
+          contributes volume. Fallback candles contribute zero fresh volume.
+        - An instrument is an eligible research instrument through its expiry
+          DATE and stops contributing from the following calendar date,
+          judged against the research timestamp's own date.
         """
         if not timestamps:
             return {}
 
-        result = {}
-        batch_size = 500
-        for batch_start in range(0, len(timestamps), batch_size):
-            batch = timestamps[batch_start:batch_start + batch_size]
+        decision_timestamps = [
+            self._decision_timestamp_for_observation(ts) for ts in timestamps
+        ]
 
-            # Get Greek keys for these timestamps
-            greek_rows = self.db.execute(
-                select(
-                    OptionGreeks.open_time,
-                    OptionGreeks.instrument_key,
-                    OptionGreeks.option_type,
-                )
-                .where(
-                    OptionGreeks.open_time.in_(batch),
-                    OptionGreeks.calc_version == "greeks_v3",
-                )
-            ).all()
+        greek_selections = self.pit.option_greeks_selections_at_many(
+            decision_timestamps,
+            interval=DEFAULT_INTERVAL,
+            calc_version="greeks_v3",
+        )
+        if not greek_selections:
+            return {}
 
-            if not greek_rows:
+        # Decision-major pairing, keyed back by the research observation
+        # timestamp (the API contract of this method): greeks_by_decision[ts]
+        # holds exactly the instruments PIT selected FOR that observation's
+        # decision time, never rows belonging to another decision.
+        greeks_by_decision: dict[datetime, dict] = {}
+        for ts, (_, selection) in zip(timestamps, greek_selections):
+            greeks_by_decision[ts] = dict(selection)
+
+        instruments = sorted({
+            instrument_key
+            for selection in greeks_by_decision.values()
+            for instrument_key in selection
+        })
+        # Decision-major selection: each decision's own {instrument: candle}
+        # selection is summed exactly once for that decision. A fallback row
+        # keeps its source open_time (never relabeled to the decision time) and
+        # its value carries forward as the latest available observation — so a
+        # stale bar can neither be duplicated into a later timestamp nor
+        # disappear from one.
+        selection_by_decision: dict[datetime, dict] = defaultdict(dict)
+        for ts, (_, selection) in zip(
+            timestamps,
+            self.pit.option_candles_selections_at_many(
+                decision_timestamps,
+                instrument_keys=instruments,
+                interval=DEFAULT_INTERVAL,
+            ),
+        ):
+            selection_by_decision[ts] = dict(selection)
+
+        ik_to_type = {
+            instrument_key: row.option_type
+            for selection in greeks_by_decision.values()
+            for instrument_key, row in selection.items()
+        }
+
+        # Research-specific contract-lifecycle eligibility: an instrument is a
+        # valid research instrument through its expiry DATE and stops
+        # contributing from the following calendar date. Expiry lives on the
+        # instrument's greeks rows; rows without a parseable expiry are kept
+        # eligible ("unknown" never silently drops a contract).
+        eligible_expiry: dict[str, date | None] = {}
+        for selection in greeks_by_decision.values():
+            for instrument_key, row in selection.items():
+                if instrument_key not in eligible_expiry:
+                    eligible_expiry[instrument_key] = _expiry_date(row.expiry)
+
+        result: dict[datetime, dict] = {}
+        for ts in sorted(greeks_by_decision):
+            allowed_keys = set(greeks_by_decision[ts])
+            total_oi = 0.0
+            call_oi = 0.0
+            put_oi = 0.0
+            total_vol = 0.0
+            call_vol = 0.0
+            put_vol = 0.0
+
+            decision_selection = {}
+            for instrument_key, row in selection_by_decision.get(ts, {}).items():
+                if instrument_key not in allowed_keys:
+                    continue
+                expiry = eligible_expiry.get(instrument_key)
+                if expiry is not None and ts.date() > expiry:
+                    # The research date is past this contract's expiry date:
+                    # it is no longer an active research instrument, so its
+                    # carried state (OI or volume) must not contribute.
+                    continue
+                decision_selection[instrument_key] = row
+            if not decision_selection:
+                # No OI observation was visible to this decision: omit the
+                # timestamp rather than invent a zero observation (matches the
+                # pre-PIT contract for timestamps without option candles).
                 continue
+            for row in decision_selection.values():
+                oi_val = float(row.open_interest or 0)
+                # Traded volume is event-scoped: only a candle whose SOURCE
+                # open_time equals this research timestamp carries fresh
+                # volume. Fallback candles keep OI (state) but contribute no
+                # volume — old traded volume is never relabeled as current.
+                vol_val = (
+                    float(row.volume or 0)
+                    if row.open_time == ts
+                    else 0.0
+                )
+                opt_type = ik_to_type.get(row.instrument_key, "")
+                total_oi += oi_val
+                total_vol += vol_val
+                if opt_type == "CE":
+                    call_oi += oi_val
+                    call_vol += vol_val
+                elif opt_type == "PE":
+                    put_oi += oi_val
+                    put_vol += vol_val
 
-            # Group by timestamp
-            ts_instruments: dict[datetime, list] = defaultdict(list)
-            for open_time, ik, opt_type in greek_rows:
-                ts_instruments[open_time].append((ik, opt_type))
+            result[ts] = {
+                "total_oi": total_oi,
+                "call_oi": call_oi,
+                "put_oi": put_oi,
+                "call_put_ratio": call_oi / put_oi if put_oi > 0 else None,
+                "total_volume": total_vol,
+                "call_volume": call_vol,
+                "put_volume": put_vol,
+                # Explicit source-time association: the latest observation time
+                # this decision's OI selection actually resolved to. A fallback
+                # bar keeps its original source time here, proving the value
+                # was carried forward rather than freshly observed.
+                "oi_source_open_time": (
+                    max(row.open_time for row in decision_selection.values())
+                    if decision_selection else None
+                ),
+                "oi_change": None,
+                "call_oi_change": None,
+                "put_oi_change": None,
+            }
 
-            # Fetch OI for each timestamp
-            for ts, instruments in ts_instruments.items():
-                ik_list = [ik for ik, _ in instruments]
-
-                oi_rows = self.db.execute(
-                    select(
-                        OptionCandle.instrument_key,
-                        OptionCandle.open_interest,
-                        OptionCandle.volume,
-                    )
-                    .where(
-                        OptionCandle.open_time == ts,
-                        OptionCandle.instrument_key.in_(ik_list),
-                    )
-                ).all()
-
-                # Build lookup: instrument_key -> option_type from Greek rows
-                ik_to_type = {ik: opt_type for ik, opt_type in instruments}
-
-                total_oi = 0.0
-                call_oi = 0.0
-                put_oi = 0.0
-                total_vol = 0.0
-                call_vol = 0.0
-                put_vol = 0.0
-
-                for ik, oi, vol in oi_rows:
-                    oi_val = float(oi or 0)
-                    vol_val = float(vol or 0)
-                    opt_type = ik_to_type.get(ik, "")
-                    total_oi += oi_val
-                    total_vol += vol_val
-                    if opt_type == "CE":
-                        call_oi += oi_val
-                        call_vol += vol_val
-                    elif opt_type == "PE":
-                        put_oi += oi_val
-                        put_vol += vol_val
-
-                result[ts] = {
-                    "total_oi": total_oi,
-                    "call_oi": call_oi,
-                    "put_oi": put_oi,
-                    "call_put_ratio": call_oi / put_oi if put_oi > 0 else None,
-                    "total_volume": total_vol,
-                    "call_volume": call_vol,
-                    "put_volume": put_vol,
-                    "oi_change": None,  # Computed later
-                    "call_oi_change": None,
-                    "put_oi_change": None,
-                }
-
-        # Compute OI changes
-        sorted_ts = sorted(result.keys())
+        sorted_ts = sorted(result)
         for i in range(1, len(sorted_ts)):
             curr = result[sorted_ts[i]]
             prev = result[sorted_ts[i - 1]]
@@ -533,19 +620,23 @@ class GexResearchEngine:
     # ==================================================================
 
     def _build_gex_series(self, timestamps: list[datetime]) -> dict:
-        """Build per-timestamp GEX aggregation from historical_gex."""
+        """Build per-timestamp GEX aggregation from historical_gex.
+
+        One bounded bulk PIT load serves every timestamp (Codacy Finding
+        B): the per-timestamp ``open_time == ts`` filter and all downstream
+        aggregation are unchanged."""
         result = {}
 
-        for ts in timestamps:
-            rows = self.db.execute(
-                select(HistoricalGexSnapshot)
-                .where(
-                    HistoricalGexSnapshot.open_time == ts,
-                    HistoricalGexSnapshot.calc_version == self.calc_version,
-                    HistoricalGexSnapshot.status == "SUCCESS",
-                )
-            ).scalars().all()
+        decisions = [self._decision_timestamp_for_observation(ts) for ts in timestamps]
+        rows_by_decision = dict(self.pit.historical_gex_selections_at_many(
+            decisions,
+            interval=DEFAULT_INTERVAL,
+            calc_version=self.calc_version,
+        ))
 
+        for ts, decision in zip(timestamps, decisions):
+            selection = rows_by_decision.get(decision, {})
+            rows = [row for row in selection.values() if row.open_time == ts]
             if not rows:
                 continue
 
@@ -609,28 +700,28 @@ class GexResearchEngine:
         if not sorted_ts:
             return {}
 
-        # Compute percentile thresholds from historical distribution
-        net_gex_values = [gex_series[ts]["net_gex"] for ts in sorted_ts]
-        net_gex_values_sorted = sorted(net_gex_values)
-        n = len(net_gex_values_sorted)
-
-        def percentile(pct):
-            idx = int(pct / 100 * (n - 1))
-            return net_gex_values_sorted[max(0, min(idx, n - 1))]
-
-        p25 = percentile(STRONG_NEGATIVE_PCTILE)
-        p75 = percentile(STRONG_POSITIVE_PCTILE)
-
-        # Flip zone threshold: 10% of the median absolute GEX
-        median_abs = percentile(50)
-        flip_zone_threshold = abs(median_abs) * FLIP_ZONE_PCTILE / 100
-
         result = {}
         previous_regime = None
         regime_start_idx = 0
+        historical_values: list[float] = []
 
         for i, ts in enumerate(sorted_ts):
             net_gex = gex_series[ts]["net_gex"]
+
+            # PIT invariant: regime thresholds may use only observations known
+            # at this timestamp. Never compute thresholds from future rows.
+            insort(historical_values, net_gex)
+            ordered_history = historical_values
+            n = len(ordered_history)
+
+            def percentile(pct):
+                idx = int(pct / 100 * (n - 1))
+                return ordered_history[max(0, min(idx, n - 1))]
+
+            p25 = percentile(STRONG_NEGATIVE_PCTILE)
+            p75 = percentile(STRONG_POSITIVE_PCTILE)
+            median_abs = percentile(50)
+            flip_zone_threshold = abs(median_abs) * FLIP_ZONE_PCTILE / 100
 
             # Classify
             if abs(net_gex) <= flip_zone_threshold:
@@ -676,26 +767,42 @@ class GexResearchEngine:
     # ==================================================================
 
     def _compute_flips(self, timestamps: list[datetime]) -> dict:
-        """Compute gamma flip for each timestamp."""
-        result = {}
+        """Compute gamma flip for each timestamp.
 
-        for ts in timestamps:
-            flip = self._detect_gamma_flip_at_timestamp(ts)
+        One bounded bulk PIT load serves every timestamp (Greptile /
+        CodeRabbit mixed-time finding); each per-timestamp detection
+        receives only rows whose source open_time is that observation."""
+        decisions = [self._decision_timestamp_for_observation(ts) for ts in timestamps]
+        rows_by_decision = dict(self.pit.historical_gex_selections_at_many(
+            decisions,
+            interval=DEFAULT_INTERVAL,
+            calc_version=self.calc_version,
+        ))
+
+        result = {}
+        for ts, decision in zip(timestamps, decisions):
+            flip = self._detect_gamma_flip_at_timestamp(
+                ts, rows=rows_by_decision.get(decision, {}).values())
             result[ts] = flip
 
         return result
 
-    def _detect_gamma_flip_at_timestamp(self, ts: datetime) -> dict:
-        """Detect gamma flip at a single timestamp using strike-level GEX."""
-        # Get strike-level GEX
-        rows = self.db.execute(
-            select(HistoricalGexSnapshot)
-            .where(
-                HistoricalGexSnapshot.open_time == ts,
-                HistoricalGexSnapshot.calc_version == self.calc_version,
-                HistoricalGexSnapshot.status == "SUCCESS",
+    def _detect_gamma_flip_at_timestamp(
+        self, ts: datetime, rows: Iterable[HistoricalGexSnapshot] | None = None,
+    ) -> dict:
+        """Detect gamma flip at a single timestamp using strike-level GEX.
+
+        ``rows`` defaults to the per-instrument-latest PIT accessor for the
+        one-off path. Either way, only rows whose source ``open_time`` is
+        the observation timestamp are aggregated — a stale fallback row is
+        valid for the generic PIT accessor but never enters this snapshot."""
+        if rows is None:
+            rows = self.pit.historical_gex_at(
+                self._decision_timestamp_for_observation(ts),
+                interval=DEFAULT_INTERVAL,
+                calc_version=self.calc_version,
             )
-        ).scalars().all()
+        rows = [row for row in rows if row.open_time == ts]
 
         if len(rows) < 2:
             return {"status": "INSUFFICIENT_DATA"}
@@ -753,25 +860,42 @@ class GexResearchEngine:
     # ==================================================================
 
     def _compute_walls(self, timestamps: list[datetime]) -> dict:
-        """Compute gamma walls for each timestamp."""
-        result = {}
+        """Compute gamma walls for each timestamp.
 
-        for ts in timestamps:
-            wall = self._detect_walls_at_timestamp(ts)
+        One bounded bulk PIT load serves every timestamp; each detection
+        receives only rows whose source open_time is that observation, so
+        spot and wall distances come from exact observation-time rows."""
+        decisions = [self._decision_timestamp_for_observation(ts) for ts in timestamps]
+        rows_by_decision = dict(self.pit.historical_gex_selections_at_many(
+            decisions,
+            interval=DEFAULT_INTERVAL,
+            calc_version=self.calc_version,
+        ))
+
+        result = {}
+        for ts, decision in zip(timestamps, decisions):
+            wall = self._detect_walls_at_timestamp(
+                ts, rows=rows_by_decision.get(decision, {}).values())
             result[ts] = wall
 
         return result
 
-    def _detect_walls_at_timestamp(self, ts: datetime) -> dict:
-        """Detect gamma walls at a single timestamp."""
-        rows = self.db.execute(
-            select(HistoricalGexSnapshot)
-            .where(
-                HistoricalGexSnapshot.open_time == ts,
-                HistoricalGexSnapshot.calc_version == self.calc_version,
-                HistoricalGexSnapshot.status == "SUCCESS",
+    def _detect_walls_at_timestamp(
+        self, ts: datetime, rows: Iterable[HistoricalGexSnapshot] | None = None,
+    ) -> dict:
+        """Detect gamma walls at a single timestamp.
+
+        ``rows`` defaults to the per-instrument-latest PIT accessor for the
+        one-off path. Either way, spot and wall distances derive only from
+        rows whose source ``open_time`` is the observation timestamp — a
+        stale fallback row never enters this snapshot."""
+        if rows is None:
+            rows = self.pit.historical_gex_at(
+                self._decision_timestamp_for_observation(ts),
+                interval=DEFAULT_INTERVAL,
+                calc_version=self.calc_version,
             )
-        ).scalars().all()
+        rows = [row for row in rows if row.open_time == ts]
 
         if not rows:
             return {}

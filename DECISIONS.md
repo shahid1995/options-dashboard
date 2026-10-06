@@ -392,3 +392,95 @@ Residual: the two `pg_default_acl` rows in production `strikenova` are now
 critical operational state. Operators must not revoke them while the
 migrator-creator model is in force, and any role-model change must update
 them in the same change.
+
+## ADR-019 · Day-50 Slice A server-side StrategyCandidate producer (Issue #118) · Accepted
+
+New paper entries are produced server-side by `candidate_production`, which
+turns real server-side market evidence into the existing Day-28 → Day-34 chain
+and delegates to the existing sanctioned bridge (`execute_gated_paper_entry` →
+the `execute_strategy` choke point). It is orchestration only: it duplicates no
+payoff/risk/candidate math, creates no DB model and no second execution engine.
+Slice A records three approved decisions:
+
+* **D1** — ΔOI evidence is server-side OI history: current OI from the live
+  chain snapshot, previous OI from the latest eligible `OptionCandle` for the
+  exact broker instrument key within the approved lag/age window. Missing,
+  stale, or null-OI history stays missing — never coerced to zero — and an
+  entry whose requested leg has no eligible prior OI fails closed with zero
+  writes (Invariant 17a).
+* **D2** — the existing broker adapter path (`app.brokers.gateway`); the
+  canonical `MarketDataGateway` is NOT a dependency of this slice.
+* **D5** — no numeric freshness threshold is introduced; the real server-side
+  reference timestamp is recorded once from the evidence and preserved through
+  every contract.
+
+Upstream broker capability is VERIFIED: an authenticated live probe returned 129
+historical 3-minute candles for the active NIFTY 22400 CE, instrument
+`NSE_FO|40687`, authoritative expiry `2026-10-06`, with all 129 open-interest
+values non-null. Production live-OI persistence is NOT implemented and remains
+a separate, unsatisfied architecture prerequisite: `OptionCandle` is populated
+exclusively from the Upstox expired-instruments API, so no stored prior-OI
+observation exists for a still-unexpired contract, and the producer therefore
+cannot compute ΔOI in production and fails closed with zero writes. A
+read-only probe result may never stand in for that stored observation. Live
+paper entries are therefore not operational today, and this record does not
+assert otherwise.
+
+Evidence: PR #123, PR #125, PR #126,
+`options-dashboard-project/backend/app/services/candidate_production.py`,
+`options-dashboard-project/backend/tests/test_candidate_production.py`,
+[`CONTEXT.md`](CONTEXT.md) §6, [`INVARIANTS.md`](INVARIANTS.md) 17a/17b.
+
+## ADR-020 · Historical acquisition rights gate for unresolved entitlement · Accepted
+
+The Day 48 dataset catalog seeds every Upstox market-data dataset with
+`entitlement_status = REVIEW_REQUIRED` pending a documented licensing review.
+This record fixes what a durable `HISTORICAL_INGESTION` job is permitted to do
+while that state is unresolved. It is a rights decision, not a readiness one,
+and it does not assert that redistribution is permitted.
+
+* **Enforcement point.** `execute_historical_ingestion` calls
+  `assert_acquisition_allowed` before any acquisition and before the ingestion
+  manifest is created. A job refused here fails permanently and leaves no
+  manifest behind, so a refused acquisition is never half-recorded.
+* **Unresolved entitlement.** `REVIEW_REQUIRED` may be acquired only for the
+  `INTERNAL_RESEARCH` and `BACKTEST` purposes, and only through the existing
+  explicit `allow_review_required` mechanism on `assert_entitlement_ready`. It
+  is an exception, not an entitlement: the catalog value stays
+  `REVIEW_REQUIRED` and the run records which datasets it proceeded under.
+* **No widening.** `PRIVATE_USER` and `PUBLIC` never receive the exception and
+  are refused outright while entitlement is unresolved.
+* **License state is NOT covered by this exception, and is not adjudicated
+  here.** The catalog carries `license_status` as a field distinct from
+  `entitlement_status`, and the Upstox market-data datasets are seeded
+  `REVIEW_REQUIRED` on both. The approved exception was granted for the
+  entitlement state and is deliberately not read as resolving the license
+  state. This record also does not make license an acquisition gate, because
+  the approved policy enumerated exactly three gates (entitlement, usage,
+  redistribution) and a license gate would halt every historical acquisition
+  against the current catalog. `license_status` is therefore recorded in the
+  manifest's entitlement snapshot on every run and enforced nowhere.
+  **Open founder decision:** whether an unresolved `license_status` must
+  independently block acquisition is unresolved and is deliberately left to a
+  separate governance decision rather than settled by inference here. Until
+  that decision exists, no code treats license as either blocking or
+  cleared.
+* **Auditable, not silent.** Every exception applied is written to the
+  manifest's metadata alongside the catalog snapshot, so a run that relied on
+  one is distinguishable from a run whose entitlements were verified.
+* **Usage stays fail-closed.** `assert_usage_allowed` is enforced for every
+  acquisition regardless of the entitlement exception.
+* **Redistribution stays fail-closed.** Acquiring data for internal analysis
+  is not redistribution, so the redistribution gate blocks any acquisition
+  whose purpose can publish. Unresolved redistribution rights are recorded on
+  the manifest and remain refused at the point of redistribution.
+
+This record does not authorize deployment, a scheduler, or any production
+purge. It closes the Day 48 gap in which the entitlement assertions existed but
+had no production caller.
+
+Evidence: PR #115,
+`options-dashboard-project/backend/app/services/historical_data_governance.py`,
+`options-dashboard-project/backend/app/services/background_jobs.py`,
+`options-dashboard-project/backend/tests/test_historical_data_governance.py`,
+[`ARCHITECTURE.md`](ARCHITECTURE.md) §2.2, [`DATA.md`](DATA.md).

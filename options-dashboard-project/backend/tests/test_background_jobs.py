@@ -12,6 +12,7 @@ Real PostgreSQL/CockroachDB concurrency and migration rehearsal live in
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -20,7 +21,7 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
 from app.db import Base
-from app.models import BackgroundJob, JobStatus
+from app.models import BackgroundJob, ContractSpec, DataCompleteness, HistoricalDatasetGovernance, HistoricalIngestionRun, IngestionCheckpoint, IngestionLog, JobStatus
 from app.services import background_jobs as bj
 
 
@@ -36,6 +37,73 @@ def session_factory():
         "sqlite://", connect_args={"check_same_thread": False}
     )
     Base.metadata.create_all(bind=engine)
+    seed = sessionmaker(bind=engine, autocommit=False, autoflush=False)()
+    seed.add_all(
+        [
+            HistoricalDatasetGovernance(
+                dataset_key="UPSTOX_OPTION_CANDLES_3MIN",
+                domain="MARKET_DATA",
+                dataset_tier="RAW",
+                table_name="option_candles",
+                pipeline="backfill_options",
+                completeness_data_type="option_candles",
+                source="UPSTOX",
+                source_reference="test",
+                source_version="test",
+                entitlement_requirement="TEST",
+                entitlement_status="REVIEW_REQUIRED",
+                license_status="REVIEW_REQUIRED",
+                usage_policy="INTERNAL_ONLY",
+                redistribution_status="REVIEW_REQUIRED",
+                retention_policy="KEEP",
+                raw_immutable=True,
+                recomputable=True,
+                dependencies_json="[]",
+            ),
+            HistoricalDatasetGovernance(
+                dataset_key="UPSTOX_NIFTY_CANDLES_3MIN",
+                domain="MARKET_DATA",
+                dataset_tier="RAW",
+                table_name="nifty_candles",
+                pipeline="backfill_nifty",
+                completeness_data_type="nifty_candles",
+                source="UPSTOX",
+                source_reference="test",
+                source_version="test",
+                entitlement_requirement="TEST",
+                entitlement_status="REVIEW_REQUIRED",
+                license_status="REVIEW_REQUIRED",
+                usage_policy="INTERNAL_ONLY",
+                redistribution_status="REVIEW_REQUIRED",
+                retention_policy="KEEP",
+                raw_immutable=True,
+                recomputable=True,
+                dependencies_json="[]",
+            ),
+            HistoricalDatasetGovernance(
+                dataset_key="UPSTOX_CONTRACT_SPECS",
+                domain="MARKET_DATA",
+                dataset_tier="RAW",
+                table_name="contract_specs",
+                pipeline="backfill_contracts",
+                completeness_data_type="contract_metadata",
+                source="UPSTOX",
+                source_reference="test",
+                source_version="test",
+                entitlement_requirement="TEST",
+                entitlement_status="REVIEW_REQUIRED",
+                license_status="REVIEW_REQUIRED",
+                usage_policy="INTERNAL_ONLY",
+                redistribution_status="REVIEW_REQUIRED",
+                retention_policy="KEEP",
+                raw_immutable=True,
+                recomputable=True,
+                dependencies_json="[]",
+            ),
+        ]
+    )
+    seed.commit()
+    seed.close()
     factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
     yield factory
     engine.dispose()
@@ -501,6 +569,7 @@ class _FakeResult:
         self.rows_inserted = 3
         self.rows_skipped = 0
         self.errors = errors or []
+        self.metadata = {}
 
 
 class _FakeOrchestrator:
@@ -1124,15 +1193,17 @@ class TestConcurrencyPropagation:
             rows_inserted = 0
             rows_skipped = 0
             errors = []
+            metadata = {}
 
         class _FakeOrchestrator:
             def __init__(self, db, client, *, force=False, rate_limiter=None):
-                pass
+                self.run_id = None
 
             async def run_all(
                 self, *, stages=None, nifty_start_date=None, options_concurrency=None
             ):
                 captured["options_concurrency"] = options_concurrency
+                captured["orchestrator_run_id"] = self.run_id
                 return _FakeResult()
 
         import app.services.backfill_orchestrator as orch_mod
@@ -1153,8 +1224,20 @@ class TestConcurrencyPropagation:
             idempotency_key="conc:1",
             payload={"stages": ["options"], "concurrency": 4},
         )
-        bj.execute_historical_ingestion(db, job)
+        summary = bj.execute_historical_ingestion(db, job)
         assert captured["options_concurrency"] == 4
+        assert summary["governance_run_id"]
+        assert captured["orchestrator_run_id"] == summary["governance_run_id"]
+
+        audit = db.scalar(
+            select(HistoricalIngestionRun).where(
+                HistoricalIngestionRun.run_id == summary["governance_run_id"]
+            )
+        )
+        assert audit is not None
+        assert json.loads(audit.dataset_keys_json) == ["UPSTOX_OPTION_CANDLES_3MIN"]
+        assert audit.status == "SUCCEEDED"
+        assert audit.background_job_id == job.id
 
     def test_orchestrator_run_all_forwards_to_run_options(self):
         """Direct regression: run_all(options_concurrency=N) reaches the
@@ -1205,6 +1288,551 @@ class TestConcurrencyPropagation:
         orch = _MiniOrchestrator.__new__(_MiniOrchestrator)
         asyncio.run(orch.run_all(stages=["options"]))
         assert "concurrency" not in recorded  # run_options default preserved
+
+
+class TestHistoricalGovernanceFailureAudit:
+    def test_orchestrator_failure_finalizes_governance_run(
+        self, session_factory, monkeypatch
+    ):
+        class _FailingOrchestrator:
+            def __init__(self, db, client, *, force=False, rate_limiter=None):
+                pass
+
+            async def run_all(
+                self, *, stages=None, nifty_start_date=None, options_concurrency=None
+            ):
+                raise RuntimeError("synthetic ingestion failure")
+
+        import app.services.backfill_orchestrator as orch_mod
+        import app.services.upstox_client as upstox_mod
+
+        monkeypatch.setattr(orch_mod, "BackfillOrchestrator", _FailingOrchestrator)
+        monkeypatch.setattr(orch_mod, "TokenBridge", type("B", (), {}))
+        monkeypatch.setattr(
+            upstox_mod,
+            "UpstoxClient",
+            type("C", (), {"__init__": lambda self, token_provider=None: None}),
+        )
+
+        db = session_factory()
+        job, _ = bj.enqueue(
+            db,
+            job_type="HISTORICAL_INGESTION",
+            idempotency_key="gov-fail:1",
+            payload={"stages": ["options"]},
+        )
+        with pytest.raises(RuntimeError, match="synthetic ingestion failure"):
+            bj.execute_historical_ingestion(db, job)
+
+        audit = db.scalar(
+            select(HistoricalIngestionRun).where(
+                HistoricalIngestionRun.background_job_id == job.id
+            )
+        )
+        assert audit is not None
+        assert audit.status == "FAILED"
+        assert "synthetic ingestion failure" in (audit.error_message or "")
+
+
+class TestGovernanceAuditWindow:
+    """Day 48 audit-window: the governance manifest's coverage window must
+    be the SAME effective window the NIFTY stage actually ingests —
+    resolved once and shared — so completeness aggregation cannot be
+    skewed by DataCompleteness rows from outside this run's window.
+    (CodeRabbit finding on 8b0071b.)"""
+
+    def _seed_nifty_expiry(self, db, expiry: str):
+        db.add(
+            ContractSpec(
+                instrument_key="NSE_FO|58124|TESTCE",
+                underlying="NIFTY",
+                underlying_key="NSE_FO|58124",
+                expiry=expiry,
+                strike_price=25000.0,
+                instrument_type="CE",
+                trading_symbol="NIFTY",
+                segment="NSE_FO",
+                exchange="NSE",
+                source="TEST",
+                source_reference="test",
+                fetched_at=datetime(2026, 9, 1),
+            )
+        )
+        db.commit()
+
+    def _enqueue_and_run(self, monkeypatch, session_factory, payload, captured, result_metadata=None, key=None):
+        class _FakeResult:
+            operation = "backfill_all"
+            status = "SUCCESS"
+            api_calls = 1
+            rows_fetched = 0
+            rows_inserted = 0
+            rows_skipped = 0
+            errors = []
+            metadata = result_metadata or {}
+
+        class _FakeOrch:
+            def __init__(self, db, client, *, force=False, rate_limiter=None):
+                self.run_id = None
+
+            async def run_all(
+                self,
+                *,
+                stages=None,
+                nifty_start_date=None,
+                nifty_end_date=None,
+                options_concurrency=None,
+            ):
+                captured["nifty_start"] = nifty_start_date
+                captured["nifty_end"] = nifty_end_date
+                captured["orchestrator_run_id"] = self.run_id
+                return _FakeResult()
+
+        import app.services.backfill_orchestrator as orch_mod
+        import app.services.upstox_client as upstox_mod
+
+        monkeypatch.setattr(orch_mod, "BackfillOrchestrator", _FakeOrch)
+        monkeypatch.setattr(orch_mod, "TokenBridge", type("B", (), {}))
+        monkeypatch.setattr(
+            upstox_mod,
+            "UpstoxClient",
+            type("C", (), {"__init__": lambda self, token_provider=None: None}),
+        )
+        db = session_factory()
+        job, _ = bj.enqueue(
+            db,
+            job_type="HISTORICAL_INGESTION",
+            idempotency_key=key
+            or f"gov-window:{payload.get('nifty_start_date', 'default')}",
+            payload=payload,
+        )
+        summary = bj.execute_historical_ingestion(db, job)
+        audit = db.scalar(
+            select(HistoricalIngestionRun).where(
+                HistoricalIngestionRun.run_id == summary["governance_run_id"]
+            )
+        )
+        db.close()
+        return job, summary, audit
+
+    def test_explicit_start_shared_between_governance_and_ingestion(
+        self, session_factory, monkeypatch
+    ):
+        """Case A: an explicit nifty_start_date reaches run_nifty unchanged
+        AND the manifest records exactly that start plus the effective end
+        (today), not NULL bounds."""
+        db = session_factory()
+        self._seed_nifty_expiry(db, "2026-12-24")
+        db.close()
+
+        captured = {}
+        job, summary, audit = self._enqueue_and_run(
+            monkeypatch,
+            session_factory,
+            {"stages": ["nifty"], "nifty_start_date": "2024-01-01"},
+            captured,
+        )
+
+        today = datetime.now(timezone.utc).date()
+        assert captured["nifty_start"] == datetime(2024, 1, 1).date()
+        assert audit.coverage_start == "2024-01-01"
+        assert audit.coverage_end == today.isoformat()
+        assert captured["orchestrator_run_id"] == summary["governance_run_id"]
+    def test_omitted_start_records_resolved_default_window(
+        self, session_factory, monkeypatch
+    ):
+        """Case B: with no explicit start, run_nifty's normal default
+        (earliest NIFTY expiry - 3 days, or today - 365 without a registry)
+        must be recorded on the manifest — not NULL — so the audit window
+        equals the execution window."""
+        captured = {}
+        job, summary, audit = self._enqueue_and_run(
+            monkeypatch,
+            session_factory,
+            {"stages": ["nifty"]},
+            captured,
+        )
+
+        today = datetime.now(timezone.utc).date()
+        expected_default_start = today - timedelta(days=365)
+        # background_jobs forwards the RAW payload start (None when omitted);
+        # default resolution happens inside run_all after contract discovery.
+        assert captured["nifty_start"] is None
+        assert audit.coverage_start == expected_default_start.isoformat()
+        assert audit.coverage_end == today.isoformat()
+
+    def test_run_nifty_resolution_matches_shared_window(
+        self, session_factory
+    ):
+        """Case B (execution side): run_nifty via run_all with no explicit
+        start must produce the SAME chunks the shared resolver computes —
+        proving the execution window equals the audit window (run_nifty in
+        dry-run mode returns the resolved chunk plan without API calls)."""
+        import asyncio
+
+        from app.services.backfill_orchestrator import (
+            BackfillOrchestrator,
+            resolve_nifty_window,
+        )
+
+        db = session_factory()
+        orch = BackfillOrchestrator.__new__(BackfillOrchestrator)
+        orch.db = db
+        orch.dry_run = True
+
+        result = asyncio.run(orch.run_nifty())
+
+        today = datetime.now(timezone.utc).date()
+        expected_start, expected_end = today - timedelta(days=365), today
+        resolved_start, resolved_end = resolve_nifty_window(db)
+        assert (resolved_start, resolved_end) == (expected_start, expected_end)
+        chunks = result.metadata["chunks"]
+        assert chunks[0]["from"] == expected_start.isoformat()
+        assert chunks[-1]["to"] == expected_end.isoformat()
+
+    def test_completeness_evidence_from_another_run_cannot_contaminate_this_run(
+        self, session_factory
+    ):
+        """Case C: completeness must come from evidence THIS run produced.
+
+        Run A failed partway and run B completed. Run B must not inherit run
+        A's gap, and the SUCCEEDED->PARTIAL downgrade must not fire for it.
+        DataCompleteness rows from an unrelated acquisition are equally
+        irrelevant: the table carries no run identity.
+        """
+        from app.models import IngestionCheckpoint, IngestionLog
+        from app.services import historical_data_governance as hdg
+
+        db = session_factory()
+        run_a = hdg.start_ingestion_run(
+            db,
+            dataset_keys=["UPSTOX_NIFTY_CANDLES_3MIN"],
+            coverage_start="2026-01-01",
+            coverage_end="2026-01-02",
+            run_id="run-a",
+        )
+        run_b = hdg.start_ingestion_run(
+            db,
+            dataset_keys=["UPSTOX_NIFTY_CANDLES_3MIN"],
+            coverage_start="2026-01-01",
+            coverage_end="2026-01-02",
+            run_id="run-b",
+        )
+        db.add_all(
+            [
+                # Run A: a PARTIAL operation and an instrument that failed.
+                IngestionLog(
+                    run_id=run_a.run_id,
+                    operation="nifty_candles",
+                    started_at="2026-01-01T00:00:00+00:00",
+                    status="PARTIAL",
+                    rows_fetched=10,
+                    rows_inserted=4,
+                    error_message="429 rate limit",
+                ),
+                IngestionCheckpoint(
+                    pipeline="backfill_nifty",
+                    instrument_key="NSE_INDEX|NIFTY 50",
+                    run_id=run_a.run_id,
+                    status="FAILED",
+                    items_processed=4,
+                    items_total=75,
+                    error_message="synthetic failure",
+                ),
+                # Run B touched a different instrument and completed. Run A's
+                # checkpoint still carries run_id "run-a" and must not be
+                # counted, exactly as a checkpoint left behind by an earlier
+                # run is not evidence for this one.
+                IngestionLog(
+                    run_id=run_b.run_id,
+                    operation="nifty_candles",
+                    started_at="2026-01-01T00:00:00+00:00",
+                    status="SUCCESS",
+                    rows_fetched=75,
+                    rows_inserted=75,
+                ),
+                IngestionCheckpoint(
+                    pipeline="backfill_nifty",
+                    instrument_key="NSE_INDEX|NIFTY BANK",
+                    run_id=run_b.run_id,
+                    status="COMPLETED",
+                    items_processed=75,
+                    items_total=75,
+                ),
+            ]
+        )
+        db.commit()
+
+        run_a_metrics = hdg.refresh_ingestion_run_metrics(db, run_a.run_id)
+        assert run_a_metrics.completeness_status == "PARTIAL"
+        assert hdg.finish_ingestion_run(
+            db, run_a.run_id, status=hdg.RUN_SUCCEEDED
+        ).status == hdg.RUN_PARTIAL
+
+        run_b_metrics = hdg.refresh_ingestion_run_metrics(db, run_b.run_id)
+        assert run_b_metrics.completeness_status == "COMPLETE"
+        assert run_b_metrics.expected_records == 75
+        assert run_b_metrics.actual_records == 75
+        assert run_b_metrics.missing_records == 0
+
+        finished = hdg.finish_ingestion_run(db, run_b.run_id, status=hdg.RUN_SUCCEEDED)
+        assert finished.status == hdg.RUN_SUCCEEDED
+
+    def _run_real_chain(self, session_factory, stages, nifty_start_date=None, seed_expiry=None):
+        """Drive the REAL BackfillOrchestrator.run_all with only the
+        external boundaries faked: contract discovery is simulated by the
+        run_contracts override persisting ContractSpec rows (the effect
+        real discovery would have), and the options stage is stubbed.
+        run_nifty itself stays REAL in dry-run mode, so the resolved chunk
+        plan is observable without any API or candle writes.
+
+        When seed_expiry is given the registry is EMPTY before run_all and
+        is only populated inside run_contracts — proving the default NIFTY
+        start is resolved AFTER contract discovery, not before.
+        """
+        import asyncio
+
+        from app.services.backfill_orchestrator import (
+            BackfillOrchestrator,
+            BackfillResult,
+        )
+
+        chain = self
+
+        class _ChainOrchestrator(BackfillOrchestrator):
+            async def run_contracts(self):
+                if seed_expiry:
+                    chain._seed_nifty_expiry(self.db, seed_expiry)
+                result = BackfillResult(operation="contracts", status="SUCCESS")
+                result.metadata["expiries"] = [seed_expiry] if seed_expiry else []
+                return result
+
+            async def run_options(self, concurrency=None, **kwargs):
+                return BackfillResult(operation="options", status="SUCCESS")
+
+        db = session_factory()
+        orch = _ChainOrchestrator.__new__(_ChainOrchestrator)
+        BackfillOrchestrator.__init__(
+            orch, db, client=None, dry_run=True
+        )
+        orch.force = False
+
+        result = asyncio.run(
+            orch.run_all(stages=list(stages), nifty_start_date=nifty_start_date)
+        )
+        db.close()
+        return result
+
+    def test_contracts_plus_nifty_resolves_default_start_after_discovery(
+        self, session_factory
+    ):
+        """Case A (CodeRabbit on 2d4cec2): with an initially EMPTY registry,
+        contract discovery must run BEFORE the default start is resolved.
+        A newly discovered expiry older than the 365-day fallback must
+        extend the effective window back to (expiry - 3 days)."""
+        # Registry starts EMPTY; the older-than-365d expiry only appears
+        # when the contracts stage runs (seeded inside run_contracts).
+        result = self._run_real_chain(
+            session_factory,
+            ["contracts", "nifty"],
+            seed_expiry="2020-01-30",
+        )
+
+        today = datetime.now(timezone.utc).date()
+        assert result.metadata["nifty_coverage_start"] == "2020-01-27"
+        assert result.metadata["nifty_coverage_end"] == today.isoformat()
+        chunks = result.metadata["chunks"]
+        assert chunks[0]["from"] == "2020-01-27"
+        assert chunks[-1]["to"] == today.isoformat()
+
+    def test_run_all_forwards_resolved_start_and_end_to_run_nifty(
+        self, session_factory
+    ):
+        """Cases B+C (CodeRabbit on 2d4cec2): run_nifty must receive BOTH
+        the resolved start AND the resolved end explicitly — it must never
+        re-derive an omitted end (UTC-midnight divergence) — and the
+        forwarded start must be the post-discovery default."""
+        import asyncio
+
+        from app.services.backfill_orchestrator import (
+            BackfillOrchestrator,
+            BackfillResult,
+        )
+
+        db = session_factory()
+        self._seed_nifty_expiry(db, "2020-01-30")
+        db.close()
+
+        captured = {}
+
+        class _CaptureNifty(BackfillOrchestrator):
+            async def run_contracts(self):
+                result = BackfillResult(operation="contracts", status="SUCCESS")
+                result.metadata["expiries"] = ["2020-01-30"]
+                return result
+
+            async def run_nifty(self, start_date=None, end_date=None):
+                captured["start"] = start_date
+                captured["end"] = end_date
+                result = BackfillResult(operation="nifty_candles", status="SUCCESS")
+                result.metadata["chunks"] = [
+                    {"from": start_date.isoformat(), "to": end_date.isoformat()}
+                ]
+                return result
+
+            async def run_options(self, concurrency=None, **kwargs):
+                return BackfillResult(operation="options", status="SUCCESS")
+
+        orch = _CaptureNifty.__new__(_CaptureNifty)
+        BackfillOrchestrator.__init__(orch, session_factory(), client=None)
+
+        run_result = asyncio.run(orch.run_all(stages=["contracts", "nifty"]))
+        assert run_result.errors == [], run_result.errors
+
+        today = datetime.now(timezone.utc).date()
+        assert captured["start"] == datetime(2020, 1, 27).date()
+        assert captured["end"] == today
+
+    def test_explicit_start_survives_contracts_and_nifty(self, session_factory):
+        """Case E: an explicit nifty_start_date is respected as-is through
+        the contracts + nifty coordination (a registry with an older expiry
+        must NOT override it)."""
+        db = session_factory()
+        self._seed_nifty_expiry(db, "2020-01-30")
+        db.close()
+
+        result = self._run_real_chain(
+            session_factory,
+            ["contracts", "nifty"],
+            nifty_start_date=datetime(2024, 1, 1).date(),
+        )
+
+        assert result.metadata["nifty_coverage_start"] == "2024-01-01"
+        chunks = result.metadata["chunks"]
+        assert chunks[0]["from"] == "2024-01-01"
+
+    def test_manifest_records_actual_window_from_execution_result(
+        self, session_factory, monkeypatch
+    ):
+        """Case D: the manifest must carry the window the execution ACTUALLY
+        used (from the orchestrator result), not a value background_jobs
+        guessed before run_all."""
+        captured = {}
+        job, summary, audit = self._enqueue_and_run(
+            monkeypatch,
+            session_factory,
+            {"stages": ["nifty"]},
+            captured,
+            result_metadata={
+                "nifty_coverage_start": "2021-06-01",
+                "nifty_coverage_end": "2021-06-30",
+            },
+            key="gov-window:actual",
+        )
+
+        # background_jobs forwards the RAW payload start; the manifest's
+        # authoritative window comes from the executed result metadata.
+        assert captured["nifty_start"] is None
+        assert audit.coverage_start == "2021-06-01"
+        assert audit.coverage_end == "2021-06-30"
+        assert captured["orchestrator_run_id"] == summary["governance_run_id"]
+
+    def test_options_only_claims_no_nifty_coverage_window(
+        self, session_factory, monkeypatch
+    ):
+        """Options-only jobs acquire no NIFTY candles, so the finalized
+        manifest must claim NO coverage window. Committing the provisional
+        resolver bounds (registry expiry - 3 days .. today) would describe a
+        NIFTY window this run never worked (Day 48 Finding 6); a result
+        without NIFTY window metadata must not resurrect it either."""
+        captured = {}
+        job, summary, audit = self._enqueue_and_run(
+            monkeypatch,
+            session_factory,
+            {"stages": ["options"]},
+            captured,
+            result_metadata={},
+            key="gov-window:options-only",
+        )
+
+        assert audit.coverage_start is None
+        assert audit.coverage_end is None
+
+    def test_contracts_only_claims_no_nifty_coverage_window(
+        self, session_factory, monkeypatch
+    ):
+        """Contract discovery acquires no NIFTY candles either: a
+        contracts-only run must not commit the provisional NIFTY resolver
+        window as its coverage (Day 48 Finding 6)."""
+        captured = {}
+        job, summary, audit = self._enqueue_and_run(
+            monkeypatch,
+            session_factory,
+            {"stages": ["contracts"]},
+            captured,
+            result_metadata={},
+            key="gov-window:contracts-only",
+        )
+
+        assert audit.coverage_start is None
+        assert audit.coverage_end is None
+
+    def test_mixed_run_records_the_executed_nifty_window(
+        self, session_factory, monkeypatch
+    ):
+        """A mixed contracts+nifty+options run whose NIFTY stage executed
+        must keep the ACTUAL executed window from the result metadata on the
+        manifest — stage gating must not drop genuine NIFTY coverage."""
+        captured = {}
+        job, summary, audit = self._enqueue_and_run(
+            monkeypatch,
+            session_factory,
+            {"stages": ["contracts", "nifty", "options"]},
+            captured,
+            result_metadata={
+                "nifty_coverage_start": "2022-03-01",
+                "nifty_coverage_end": "2022-03-31",
+            },
+            key="gov-window:mixed",
+        )
+
+        assert audit.coverage_start == "2022-03-01"
+        assert audit.coverage_end == "2022-03-31"
+
+    def test_contracts_failure_stops_nifty_and_records_failure(
+        self, session_factory
+    ):
+        """Failure path: run_all converts a contracts-stage exception into a
+        FAILED result WITHOUT running NIFTY — no effective NIFTY window is
+        resolved or fabricated after the failure (status/errors carry the
+        failure; background_jobs finalizes the manifest FAILED)."""
+        import asyncio
+
+        from app.services.backfill_orchestrator import BackfillOrchestrator
+
+        captured = {}
+
+        class _FailingContracts(BackfillOrchestrator):
+            async def run_contracts(self):
+                raise RuntimeError("synthetic contract discovery failure")
+
+            async def run_nifty(self, start_date=None, end_date=None):
+                captured["called"] = True
+                raise AssertionError("run_nifty must not run after contract failure")
+
+            async def run_options(self, concurrency=None, **kwargs):
+                raise AssertionError("run_options must not run after contract failure")
+
+        orch = _FailingContracts.__new__(_FailingContracts)
+        BackfillOrchestrator.__init__(orch, session_factory(), client=None)
+
+        result = asyncio.run(orch.run_all(stages=["contracts", "nifty"]))
+        assert result.status == "FAILED"
+        assert any(
+            "synthetic contract discovery failure" in e for e in result.errors
+        )
+        assert "called" not in captured
+        assert "nifty_coverage_start" not in result.metadata
 
 
 class TestCliDatabaseUrlNormalization:
@@ -1316,6 +1944,54 @@ def _shared_memory_sqlite_factory():
         poolclass=StaticPool,
     )
     Base.metadata.create_all(bind=engine)
+    # Day 48: the real historical-ingestion execution path fails closed
+    # without a governed catalog, so mirror the migrated schema's seeded
+    # stage datasets here (same rows the session_factory fixture seeds).
+    seed = sessionmaker(bind=engine, autocommit=False, autoflush=False)()
+    seed.add_all(
+        HistoricalDatasetGovernance(
+            dataset_key=key,
+            domain="MARKET_DATA",
+            dataset_tier="RAW",
+            table_name=table_name,
+            pipeline=pipeline,
+            completeness_data_type=data_type,
+            source="UPSTOX",
+            source_reference="test",
+            source_version="test",
+            entitlement_requirement="TEST",
+            entitlement_status="REVIEW_REQUIRED",
+            license_status="REVIEW_REQUIRED",
+            usage_policy="INTERNAL_ONLY",
+            redistribution_status="REVIEW_REQUIRED",
+            retention_policy="KEEP",
+            raw_immutable=True,
+            recomputable=True,
+            dependencies_json="[]",
+        )
+        for key, table_name, pipeline, data_type in (
+            (
+                "UPSTOX_CONTRACT_SPECS",
+                "contract_specs",
+                "backfill_contracts",
+                "contract_metadata",
+            ),
+            (
+                "UPSTOX_NIFTY_CANDLES_3MIN",
+                "nifty_candles",
+                "backfill_nifty",
+                "nifty_candles",
+            ),
+            (
+                "UPSTOX_OPTION_CANDLES_3MIN",
+                "option_candles",
+                "backfill_options",
+                "option_candles",
+            ),
+        )
+    )
+    seed.commit()
+    seed.close()
     return sessionmaker(bind=engine, autocommit=False, autoflush=False), engine
 
 
@@ -1828,6 +2504,7 @@ class TestWorkerRateLimiterLifecycle:
                 rows_inserted = 0
                 rows_skipped = 0
                 errors = []
+                metadata = {}
 
             class _FakeOrch:
                 def __init__(self, db, client, *, force=False, rate_limiter=None):
@@ -2319,3 +2996,568 @@ class TestCrashRecoveryWithHeartbeat:
             assert recovered.lease_owner == "worker-new"
         finally:
             engine2.dispose()
+
+
+class TestGovernanceAcquisitionRightsBoundary:
+    """Finding 2: the durable HISTORICAL_INGESTION path must actually reach the
+    catalog's rights decision before it acquires anything, and must record the
+    exception it applied on the manifest."""
+
+    @staticmethod
+    def _stub_external_boundaries(monkeypatch, orchestrator_cls):
+        import app.services.backfill_orchestrator as orch_mod
+        import app.services.upstox_client as upstox_mod
+
+        monkeypatch.setattr(orch_mod, "BackfillOrchestrator", orchestrator_cls)
+        monkeypatch.setattr(orch_mod, "TokenBridge", type("B", (), {}))
+        monkeypatch.setattr(
+            upstox_mod,
+            "UpstoxClient",
+            type("C", (), {"__init__": lambda self, token_provider=None: None}),
+        )
+
+    @staticmethod
+    def _successful_orchestrator(calls):
+        class _Result:
+            operation = "backfill_all"
+            status = "SUCCESS"
+            api_calls = 1
+            rows_fetched = 0
+            rows_inserted = 0
+            rows_skipped = 0
+            errors = []
+            metadata = {}
+
+        class _Orch:
+            def __init__(self, db, client, *, force=False, rate_limiter=None):
+                calls.append("constructed")
+                self.run_id = None
+
+            async def run_all(self, *, stages=None, nifty_start_date=None,
+                              options_concurrency=None):
+                calls.append("run_all")
+                return _Result()
+
+        return _Orch
+
+    def test_acquisition_path_reaches_the_entitlement_decision_and_records_it(
+        self, session_factory, monkeypatch
+    ):
+        """The seeded catalog is REVIEW_REQUIRED. Internal research proceeds
+        under the approved ADR-020 exception, and that exception must be
+        written onto the manifest, so the run is auditable rather than silent.
+        """
+        calls = []
+        self._stub_external_boundaries(
+            monkeypatch, self._successful_orchestrator(calls)
+        )
+
+        db = session_factory()
+        job, _ = bj.enqueue(
+            db,
+            job_type="HISTORICAL_INGESTION",
+            idempotency_key="gov-rights:1",
+            payload={"stages": ["options"]},
+        )
+        summary = bj.execute_historical_ingestion(db, job)
+        assert calls == ["constructed", "run_all"]
+
+        manifest = db.scalar(
+            select(HistoricalIngestionRun).where(
+                HistoricalIngestionRun.run_id == summary["governance_run_id"]
+            )
+        )
+        metadata = json.loads(manifest.metadata_json)
+        assert metadata["entitlement_review_required"] == [
+            "UPSTOX_OPTION_CANDLES_3MIN"
+        ]
+        assert metadata["redistribution_review_required"] == [
+            "UPSTOX_OPTION_CANDLES_3MIN"
+        ]
+        snapshot = json.loads(manifest.entitlement_snapshot_json)
+        assert (
+            snapshot["UPSTOX_OPTION_CANDLES_3MIN"]["status"] == "REVIEW_REQUIRED"
+        )
+
+    def test_refused_entitlement_fails_the_job_before_any_acquisition(
+        self, session_factory, monkeypatch
+    ):
+        """An entitlement state that is neither VERIFIED nor reviewable must
+        stop the job permanently, before a manifest or an API call exists."""
+        calls = []
+        self._stub_external_boundaries(
+            monkeypatch, self._successful_orchestrator(calls)
+        )
+
+        db = session_factory()
+        row = db.scalar(
+            select(HistoricalDatasetGovernance).where(
+                HistoricalDatasetGovernance.dataset_key
+                == "UPSTOX_OPTION_CANDLES_3MIN"
+            )
+        )
+        row.entitlement_status = "DENIED"
+        db.commit()
+
+        job, _ = bj.enqueue(
+            db,
+            job_type="HISTORICAL_INGESTION",
+            idempotency_key="gov-rights:2",
+            payload={"stages": ["options"]},
+        )
+        with pytest.raises(bj.JobExecutionError) as excinfo:
+            bj.execute_historical_ingestion(db, job)
+
+        assert excinfo.value.retryable is False
+        assert "governance catalog" in str(excinfo.value)
+        assert calls == []
+        assert (
+            db.scalar(select(func.count()).select_from(HistoricalIngestionRun)) == 0
+        )
+
+
+class TestGovernanceManifestTerminalization:
+    """Finding 6: once the manifest is committed RUNNING, every exit path must
+    leave it terminal with error detail."""
+
+    @staticmethod
+    def _stub(monkeypatch, orchestrator_cls):
+        import app.services.backfill_orchestrator as orch_mod
+        import app.services.upstox_client as upstox_mod
+
+        monkeypatch.setattr(orch_mod, "BackfillOrchestrator", orchestrator_cls)
+        monkeypatch.setattr(orch_mod, "TokenBridge", type("B", (), {}))
+        monkeypatch.setattr(
+            upstox_mod,
+            "UpstoxClient",
+            type("C", (), {"__init__": lambda self, token_provider=None: None}),
+        )
+
+    class _Result:
+        operation = "backfill_all"
+        status = "SUCCESS"
+        api_calls = 1
+        rows_fetched = 5
+        rows_inserted = 5
+        rows_skipped = 0
+        errors = []
+        metadata = {}
+
+    def _run(self, session_factory, idempotency_key):
+        db = session_factory()
+        job, _ = bj.enqueue(
+            db,
+            job_type="HISTORICAL_INGESTION",
+            idempotency_key=idempotency_key,
+            payload={"stages": ["options"]},
+        )
+        return db, job
+
+    def _manifest_for(self, db, job, run_id=None):
+        if run_id:
+            clause = HistoricalIngestionRun.run_id == run_id
+        else:
+            clause = HistoricalIngestionRun.background_job_id == job.id
+        return db.scalar(select(HistoricalIngestionRun).where(clause))
+
+    def test_orchestrator_constructor_failure_leaves_manifest_terminal(
+        self, session_factory, monkeypatch
+    ):
+        class _BrokenCtor:
+            def __init__(self, db, client, *, force=False, rate_limiter=None):
+                raise RuntimeError("synthetic constructor failure")
+
+        self._stub(monkeypatch, _BrokenCtor)
+        db, job = self._run(session_factory, "gov-terminal:ctor")
+
+        with pytest.raises(RuntimeError, match="synthetic constructor failure"):
+            bj.execute_historical_ingestion(db, job)
+
+        manifest = self._manifest_for(db, job)
+        assert manifest is not None
+        assert manifest.status == "FAILED"
+        assert manifest.completed_at is not None
+        assert "synthetic constructor failure" in (manifest.error_message or "")
+
+    def test_successful_execution_leaves_manifest_succeeded(
+        self, session_factory, monkeypatch
+    ):
+        result = self._Result()
+
+        class _Orch:
+            def __init__(self, db, client, *, force=False, rate_limiter=None):
+                self.run_id = None
+
+            async def run_all(self, *, stages=None, nifty_start_date=None,
+                              options_concurrency=None):
+                return result
+
+        self._stub(monkeypatch, _Orch)
+        db, job = self._run(session_factory, "gov-terminal:ok")
+
+        summary = bj.execute_historical_ingestion(db, job)
+
+        manifest = self._manifest_for(db, job, summary["governance_run_id"])
+        assert manifest.status == "SUCCEEDED"
+        assert manifest.completed_at is not None
+        assert manifest.error_message is None
+
+    def test_finalization_failure_still_leaves_manifest_terminal(
+        self, session_factory, monkeypatch
+    ):
+        result = self._Result()
+
+        class _Orch:
+            def __init__(self, db, client, *, force=False, rate_limiter=None):
+                self.run_id = None
+
+            async def run_all(self, *, stages=None, nifty_start_date=None,
+                              options_concurrency=None):
+                return result
+
+        self._stub(monkeypatch, _Orch)
+
+        def _explode(*args, **kwargs):
+            raise RuntimeError("synthetic metrics refresh failure")
+
+        monkeypatch.setattr(bj, "finish_ingestion_run", _explode)
+
+        db, job = self._run(session_factory, "gov-terminal:finalize")
+        summary = bj.execute_historical_ingestion(db, job)
+
+        manifest = self._manifest_for(db, job, summary["governance_run_id"])
+        assert manifest.status == "SUCCEEDED"
+        assert manifest.completed_at is not None
+
+    @pytest.mark.parametrize(
+        "signal_exc",
+        [KeyboardInterrupt, SystemExit, asyncio.CancelledError],
+        ids=["keyboard_interrupt", "system_exit", "cancelled_error"],
+    )
+    def test_cancellation_exit_leaves_manifest_terminal(
+        self, session_factory, monkeypatch, signal_exc
+    ):
+        """Day 48 Finding 8: a BaseException raised from the execution seam
+        (KeyboardInterrupt / SystemExit / asyncio.CancelledError) bypasses
+        the `except Exception` handler, but the manifest was already
+        committed RUNNING — it must still be finalized terminal, with the
+        original exception propagating unchanged."""
+
+        class _Interrupted:
+            def __init__(self, db, client, *, force=False, rate_limiter=None):
+                self.run_id = None
+
+            async def run_all(
+                self, *, stages=None, nifty_start_date=None,
+                options_concurrency=None,
+            ):
+                raise signal_exc("synthetic shutdown")
+
+        self._stub(monkeypatch, _Interrupted)
+        db, job = self._run(session_factory, "gov-terminal:cancel")
+
+        # The original exception propagates unchanged (asyncio may hand back
+        # its own CancelledError instance for a coroutine-raised one, so no
+        # message match is asserted here).
+        with pytest.raises(signal_exc):
+            bj.execute_historical_ingestion(db, job)
+
+        manifest = self._manifest_for(db, job)
+        assert manifest is not None
+        assert manifest.status == "FAILED"
+        assert manifest.completed_at is not None
+        # The terminal write still carries a cause: either the exception's
+        # message or, when asyncio supplies an empty one, its type name.
+        detail = manifest.error_message or ""
+        assert detail
+        assert "synthetic shutdown" in detail or signal_exc.__name__ in detail
+
+    @staticmethod
+    def _evidence_orchestrator(rows_for_run, result):
+        """Stub orchestrator that writes real run-scoped evidence for the run.
+
+        ``rows_for_run`` receives the governance run id (assigned before
+        ``run_all``) and returns the IngestionCheckpoint/IngestionLog rows the
+        production option pipeline would have written, so the derived manifest
+        metrics come from the catalog mapping rather than from literals.
+        """
+
+        class _Orch:
+            def __init__(self, db, client, *, force=False, rate_limiter=None):
+                self.run_id = None
+                self._db = db
+
+            async def run_all(self, *, stages=None, nifty_start_date=None,
+                              options_concurrency=None):
+                for row in rows_for_run(self.run_id):
+                    self._db.add(row)
+                self._db.commit()
+                return result
+
+        return _Orch
+
+    @staticmethod
+    def _partial_option_evidence(run_id):
+        """90 rows declared, 80 stored, one fetch operation -> PARTIAL."""
+        return [
+            IngestionCheckpoint(
+                pipeline="backfill_options",
+                instrument_key="NSE_FO|63935|28-07-2026",
+                run_id=run_id,
+                status="PARTIAL",
+                items_total=90,
+                items_processed=80,
+                started_at="2026-07-28T09:15:00+05:30",
+            ),
+            IngestionLog(
+                run_id=run_id,
+                operation="option_candles",
+                instrument_key="NSE_FO|63935|28-07-2026",
+                status="PARTIAL",
+                started_at="2026-07-28T09:15:00+05:30",
+                rows_fetched=90,
+            ),
+        ]
+
+    @staticmethod
+    def _complete_option_evidence(run_id):
+        """90 rows declared and all 90 stored, fetch succeeded -> COMPLETE."""
+        return [
+            IngestionCheckpoint(
+                pipeline="backfill_options",
+                instrument_key="NSE_FO|63935|28-07-2026",
+                run_id=run_id,
+                status="COMPLETED",
+                items_total=90,
+                items_processed=90,
+                started_at="2026-07-28T09:15:00+05:30",
+                completed_at="2026-07-28T15:30:00+05:30",
+            ),
+            IngestionLog(
+                run_id=run_id,
+                operation="option_candles",
+                instrument_key="NSE_FO|63935|28-07-2026",
+                status="SUCCESS",
+                started_at="2026-07-28T09:15:00+05:30",
+                completed_at="2026-07-28T15:30:00+05:30",
+                rows_fetched=90,
+            ),
+        ]
+
+    @staticmethod
+    def _fail_terminal_status_commit(monkeypatch, session_factory, hdg, observed):
+        """Fail ONLY the commit that follows the metric refresh.
+
+        The real ``refresh_ingestion_run_metrics`` still runs and commits, so
+        the window under test -- metrics durable, manifest still RUNNING -- is
+        genuinely reached. The injected row violates a NOT NULL constraint at
+        flush time, so the terminal commit fails with a real integrity error
+        that invalidates the transaction (the state a rejected terminal write
+        leaves behind) rather than merely raising in Python. The real fallback
+        then runs, so the persisted result is what gets asserted.
+        """
+        real_refresh = hdg.refresh_ingestion_run_metrics
+
+        def refresh_then_fail_next_commit(db, run_id):
+            run = real_refresh(db, run_id)  # REAL metrics, committed
+
+            # Snapshot the DURABLE state via an independent session: this
+            # proves the refresh committed, and records that the manifest was
+            # still RUNNING -- i.e. that the window under test was reached.
+            probe = session_factory()
+            committed = probe.scalar(
+                select(HistoricalIngestionRun).where(
+                    HistoricalIngestionRun.run_id == run_id
+                )
+            )
+            observed["metrics"] = (
+                committed.expected_records,
+                committed.actual_records,
+                committed.missing_records,
+                committed.completeness_status,
+            )
+            observed["status_after_refresh"] = committed.status
+            probe.close()
+
+            real_commit = db.commit
+
+            def failing_commit(*args, **kwargs):
+                db.commit = real_commit  # one-shot: only this commit fails
+                db.add(IngestionLog(
+                    run_id=None,
+                    operation="terminal-status-probe",
+                    started_at="2026-07-28T09:15:00+05:30",
+                    status="PARTIAL",
+                ))
+                try:
+                    return real_commit(*args, **kwargs)
+                except Exception as exc:
+                    observed["failure"] = type(exc).__name__
+                    try:
+                        db.scalar(select(HistoricalIngestionRun))
+                        observed["poisoned"] = None
+                    except Exception as probe_exc:
+                        observed["poisoned"] = type(probe_exc).__name__
+                    raise
+
+            db.commit = failing_commit
+            return run
+
+        monkeypatch.setattr(
+            hdg, "refresh_ingestion_run_metrics", refresh_then_fail_next_commit
+        )
+
+        # Record that the recovery path was taken, while still running the
+        # REAL fallback so the persisted result is what gets asserted.
+        real_force = bj.force_terminal_ingestion_run
+        fallback_calls = []
+        observed["fallback_calls"] = fallback_calls
+
+        def recording_force(db, run_id, *, status, error_message=None):
+            fallback_calls.append(status)
+            return real_force(
+                db, run_id, status=status, error_message=error_message
+            )
+
+        monkeypatch.setattr(bj, "force_terminal_ingestion_run", recording_force)
+
+    def test_mid_finalization_failure_recovers_with_metrics_intact(
+        self, session_factory, monkeypatch
+    ):
+        """Day 48 mid-finalization window: ``refresh_ingestion_run_metrics()``
+        commits the calculated metrics, the LATER terminal-status commit
+        fails, and ``_finalize_governance_run()`` recovers through the
+        ``force_terminal_ingestion_run()`` fallback.
+
+        ``test_finalization_failure_still_leaves_manifest_terminal`` patches
+        ``finish_ingestion_run`` wholesale, so it aborts before the refresh
+        phase ever runs and cannot reach this window. Here the real refresh
+        runs and commits, and ONLY the terminal-status write is failed -- with
+        a genuine flush-time integrity error, so the session is invalidated
+        exactly as a rejected terminal write leaves it and the fallback's
+        rollback is load-bearing rather than cosmetic.
+
+        The final state is read back through independent sessions, so every
+        assertion is about persisted rows rather than in-memory ORM state.
+
+        The fallback must also preserve the terminal semantics the refresh's
+        own evidence already implies: a PARTIAL acquisition is recorded as
+        RUN_PARTIAL, never as a clean SUCCEEDED.
+        """
+        from app.services import historical_data_governance as hdg
+
+        observed = {}
+        self._stub(
+            monkeypatch,
+            self._evidence_orchestrator(
+                self._partial_option_evidence, self._Result()
+            ),
+        )
+        self._fail_terminal_status_commit(
+            monkeypatch, session_factory, hdg, observed
+        )
+
+        db, job = self._run(session_factory, "gov-terminal:mid-finalization")
+        summary = bj.execute_historical_ingestion(db, job)
+        db.close()
+
+        # 1. The real refresh persisted the calculated metrics, and the
+        #    manifest was still RUNNING at that point.
+        assert observed["metrics"] == (90, 90, 10, "PARTIAL")
+        assert observed["status_after_refresh"] == "RUNNING"
+
+        # 2. The terminal-status persistence really failed ...
+        assert observed["failure"] == "IntegrityError"
+        # ... and genuinely invalidated the session, so the fallback's
+        # rollback is doing necessary recovery work.
+        assert observed["poisoned"] == "PendingRollbackError"
+
+        # 3. The fallback was the recovery path actually taken. It is handed
+        #    the requested terminal status and derives the stored one from the
+        #    completeness the refresh already committed.
+        assert observed["fallback_calls"] == ["SUCCEEDED"]
+
+        # 4. The persisted manifest is terminal with a completion timestamp,
+        #    and keeps the PARTIAL semantics of its own evidence: a PARTIAL
+        #    acquisition is never recorded as a clean SUCCEEDED.
+        check = session_factory()
+        manifest = check.scalar(
+            select(HistoricalIngestionRun).where(
+                HistoricalIngestionRun.run_id == summary["governance_run_id"]
+            )
+        )
+        assert manifest is not None
+        assert manifest.status == hdg.RUN_PARTIAL
+        assert manifest.completed_at is not None
+
+        # 5. The already-committed metrics survived the fallback unchanged.
+        assert (
+            manifest.expected_records,
+            manifest.actual_records,
+            manifest.missing_records,
+            manifest.completeness_status,
+        ) == observed["metrics"]
+
+        # 6. No manifest is left stranded in RUNNING.
+        assert check.scalar(
+            select(func.count()).select_from(HistoricalIngestionRun).where(
+                HistoricalIngestionRun.status == "RUNNING"
+            )
+        ) == 0
+        check.close()
+
+    def test_fallback_preserves_success_for_a_complete_run(
+        self, session_factory, monkeypatch
+    ):
+        """The complement of the window above, and the guard against
+        over-applying the PARTIAL downgrade: a run whose refreshed evidence is
+        COMPLETE must still finish SUCCEEDED when the fallback terminalizes it.
+        """
+        from app.services import historical_data_governance as hdg
+
+        observed = {}
+        self._stub(
+            monkeypatch,
+            self._evidence_orchestrator(
+                self._complete_option_evidence, self._Result()
+            ),
+        )
+        self._fail_terminal_status_commit(
+            monkeypatch, session_factory, hdg, observed
+        )
+
+        db, job = self._run(
+            session_factory, "gov-terminal:mid-finalization-complete"
+        )
+        summary = bj.execute_historical_ingestion(db, job)
+        db.close()
+
+        # The refresh committed clean COMPLETE evidence, and the terminal
+        # commit still failed, so the fallback is the path under test.
+        assert observed["metrics"] == (90, 90, 0, "COMPLETE")
+        assert observed["status_after_refresh"] == "RUNNING"
+        assert observed["failure"] == "IntegrityError"
+        assert observed["poisoned"] == "PendingRollbackError"
+        assert observed["fallback_calls"] == ["SUCCEEDED"]
+
+        check = session_factory()
+        manifest = check.scalar(
+            select(HistoricalIngestionRun).where(
+                HistoricalIngestionRun.run_id == summary["governance_run_id"]
+            )
+        )
+        assert manifest is not None
+        assert manifest.status == hdg.RUN_SUCCEEDED
+        assert manifest.completed_at is not None
+        assert (
+            manifest.expected_records,
+            manifest.actual_records,
+            manifest.missing_records,
+            manifest.completeness_status,
+        ) == observed["metrics"]
+        assert check.scalar(
+            select(func.count()).select_from(HistoricalIngestionRun).where(
+                HistoricalIngestionRun.status == "RUNNING"
+            )
+        ) == 0
+        check.close()

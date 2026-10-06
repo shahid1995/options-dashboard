@@ -118,7 +118,49 @@ async def test_option_contracts_return_canonical_contract():
     raw = {"data": [{"expiry": "2026-09-24"}, {"expiry": "2026-08-28"}, {"expiry": "2026-08-28"}]}
     adapter = UpstoxAdapter("tok", contracts_fetcher=make_fetcher(raw))
     result = await adapter.get_option_contracts("NIFTY")
-    assert result == {"symbol": "NIFTY", "expiries": ["2026-08-28", "2026-09-24"]}
+    assert result == {
+        "symbol": "NIFTY",
+        "expiries": ["2026-08-28", "2026-09-24"],
+        "contracts": [],
+    }
+
+
+async def test_option_contracts_preserve_authoritative_lot_size():
+    raw = {
+        "data": [
+            {
+                "expiry": "2026-08-28",
+                "strike_price": 25000,
+                "instrument_type": "CE",
+                "lot_size": 65,
+                "instrument_key": "NSE_FO|CALL-25000",
+            },
+            {
+                "expiry": "2026-08-28",
+                "strike_price": 25000,
+                "instrument_type": "PE",
+                "lot_size": 65,
+                "instrument_key": "NSE_FO|PUT-25000",
+            },
+        ]
+    }
+    adapter = UpstoxAdapter("tok", contracts_fetcher=make_fetcher(raw))
+    result = await adapter.get_option_contracts("NIFTY")
+    assert result["expiries"] == ["2026-08-28"]
+    assert result["contracts"] == [
+        {
+            "expiry": "2026-08-28",
+            "strike": 25000.0,
+            "option_type": "call",
+            "lot_size": 65,
+        },
+        {
+            "expiry": "2026-08-28",
+            "strike": 25000.0,
+            "option_type": "put",
+            "lot_size": 65,
+        },
+    ]
 
 
 async def test_option_chain_returns_canonical_transformed_chain():

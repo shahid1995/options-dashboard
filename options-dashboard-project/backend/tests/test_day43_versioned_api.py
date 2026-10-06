@@ -244,6 +244,74 @@ class TestDomainSchemaBoundary:
         assert resp.status_code == 200
         assert set(resp.json().keys()) == {"symbol", "expiries"}
 
+    def test_expiries_response_model_strips_internal_contract_metadata(
+        self, client, monkeypatch
+    ):
+        """The public expiry contract stays exactly ``ExpiriesOut``.
+
+        ``get_option_contracts()`` also returns internal execution-contract
+        metadata (``contracts``) that paper execution needs for authoritative
+        lot-size resolution. That field is not public: ``ExpiriesOut`` is
+        ``extra="forbid"``, so returning the raw adapter dict made the
+        response model raise ``ResponseValidationError`` and the endpoint
+        answer 500. The route must project only the documented fields while
+        the adapter keeps the metadata for internal callers.
+        """
+        import asyncio
+
+        from app.brokers.domain.enums import BROKER_ID_UPSTOX
+        from app.brokers.gateway import gateway
+        from app.services import upstox
+
+        session_id = token_store.set_token("tok-xyz")
+        client.cookies.set(SESSION_COOKIE_NAME, session_id)
+        monkeypatch.setattr(
+            upstox,
+            "get_option_contracts",
+            AsyncMock(
+                return_value={
+                    "data": [
+                        {
+                            "expiry": "2026-08-28",
+                            "strike_price": 24500.0,
+                            "instrument_type": "CE",
+                            "lot_size": 75,
+                        },
+                        {
+                            "expiry": "2026-09-24",
+                            "strike_price": 24500.0,
+                            "instrument_type": "PE",
+                            "lot_size": 75,
+                        },
+                    ],
+                }
+            ),
+        )
+
+        # Non-vacuity guard: the adapter really does hand the route internal
+        # contract metadata for this payload, so the assertions below are
+        # exercising the response-model boundary rather than an empty field.
+        adapter_payload = asyncio.run(
+            gateway.create(
+                BROKER_ID_UPSTOX, access_token="tok-xyz"
+            ).get_option_contracts("NIFTY")
+        )
+        assert adapter_payload["contracts"], "fixture must produce contracts"
+        assert adapter_payload["symbol"] == "NIFTY"
+
+        resp = client.get("/api/v1/chains/NIFTY/expiries")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # Exactly the documented public fields — no internal metadata.
+        assert set(body.keys()) == {"symbol", "expiries"}
+        assert body["symbol"] == "NIFTY"
+        assert body["expiries"] == ["2026-08-28", "2026-09-24"]
+        # Also validate through the declared response model itself, so the
+        # public schema is proven to accept the projected payload.
+        from app.api.v1.schemas import ExpiriesOut
+
+        assert ExpiriesOut.model_validate(body).model_dump() == body
+
 
 # ===========================================================================
 # 3. Error envelope

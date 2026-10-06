@@ -360,7 +360,15 @@ class TestAccountSecurityMigration:
             }
             assert expected <= tables, f"missing tables: {expected - tables}"
 
-            command.downgrade(cfg, "a3b4c5d6e7f8")
+            # CodeRabbit #2 (Day 49): the head revision d49aa0000001 refuses
+            # downgrade (intentionally irreversible UTC→IST normalization).
+            # The refusal is atomic — raised before any revision rewinds — so
+            # the four security tables remain in place and re-upgrading is a
+            # no-op.
+            with pytest.raises(NotImplementedError) as excinfo:
+                command.downgrade(cfg, "a3b4c5d6e7f8")
+            assert "irreversible" in str(excinfo.value).lower()
+
             with engine.connect() as conn:
                 tables_after = {
                     r[0]
@@ -368,9 +376,11 @@ class TestAccountSecurityMigration:
                         text("SELECT name FROM sqlite_master WHERE type='table'")
                     ).fetchall()
                 }
-            assert expected.isdisjoint(tables_after), "downgrade must drop the four tables"
+            assert expected <= tables_after, (
+                "refused downgrade must leave the four security tables intact"
+            )
 
-            command.upgrade(cfg, "head")
+            command.upgrade(cfg, "head")  # idempotent no-op after refusal
             with engine.connect() as conn:
                 tables_restored = {
                     r[0]

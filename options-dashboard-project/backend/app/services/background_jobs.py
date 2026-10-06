@@ -67,6 +67,18 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.models import BackgroundJob, JobStatus, JobType
+from app.services.historical_data_governance import (
+    PURPOSE_INTERNAL_RESEARCH,
+    RUN_FAILED,
+    RUN_PARTIAL,
+    RUN_SUCCEEDED,
+    HistoricalDataGovernanceError,
+    assert_acquisition_allowed,
+    dataset_keys_for_stages,
+    finish_ingestion_run,
+    force_terminal_ingestion_run,
+    start_ingestion_run,
+)
 from app.services.rate_limiter import GlobalRateLimiter  # stdlib-only module, no cycle
 from app.utils.retry import retry_on_serialization  # noqa: E402 (patch point for tests)
 
@@ -722,7 +734,11 @@ def execute_historical_ingestion(
     required); other stage failures are retryable because the orchestrator
     resumes from durable checkpoints.
     """
-    from app.services.backfill_orchestrator import BackfillOrchestrator, TokenBridge
+    from app.services.backfill_orchestrator import (
+        BackfillOrchestrator,
+        TokenBridge,
+        resolve_nifty_window,
+    )
     from app.services.upstox_client import UpstoxClient
 
     try:
@@ -774,6 +790,24 @@ def execute_historical_ingestion(
         from datetime import date as _date
 
         nifty_start_date = _date.fromisoformat(str(start_raw))
+    # Day 48 audit window: the authoritative effective NIFTY window is
+    # resolved INSIDE run_all after contract discovery (Finding A) and is
+    # returned via result.metadata["nifty_coverage_*"] (Finding B). Here we
+    # only compute provisional bounds for the manifest so a NIFTY run that
+    # fails before execution still has a best-known window recorded; the
+    # manifest is updated below with the actual executed window once run_all
+    # returns. A run that never requests the NIFTY stage acquires no NIFTY
+    # candles, so it must claim NO coverage window (Finding 6): committing
+    # the provisional resolver bounds for a contracts-only or options-only
+    # job would describe dates this run never worked.
+    coverage_start: str | None = None
+    coverage_end: str | None = None
+    if "nifty" in stages:
+        provisional_nifty_start, provisional_nifty_end = resolve_nifty_window(
+            db, start_date=nifty_start_date
+        )
+        coverage_start = provisional_nifty_start.isoformat()
+        coverage_end = provisional_nifty_end.isoformat()
     force = bool(params.get("force", False))
 
     token_bridge = TokenBridge()
@@ -782,41 +816,167 @@ def execute_historical_ingestion(
     # applied as THIS job's ceiling (per-job policy), preserving any
     # cooldown/pacing state earned by earlier jobs in the same worker.
     rate_limiter = prepare_run_rate_limiter(rate_limiter, concurrency=concurrency)
-    orchestrator = BackfillOrchestrator(
-        db, client, force=force, rate_limiter=rate_limiter
-    )
-    # F5: forward the requested concurrency so the option stage's limiter
-    # ceiling is the job's request, not the orchestrator default.
-    result = asyncio.run(
-        orchestrator.run_all(
-            stages=list(stages),
-            nifty_start_date=nifty_start_date,
-            options_concurrency=concurrency,
+    dataset_keys = dataset_keys_for_stages(stages)
+    # Day 48 rights boundary: acquisition is gated on what the catalog
+    # records BEFORE anything is acquired. This runs before the manifest is
+    # created, so a job refused by policy leaves no manifest behind at all.
+    try:
+        acquisition_policy = assert_acquisition_allowed(
+            db,
+            dataset_keys,
+            purpose=PURPOSE_INTERNAL_RESEARCH,
         )
+    except HistoricalDataGovernanceError as exc:
+        raise JobExecutionError(
+            "historical acquisition is not permitted by the dataset "
+            f"governance catalog: {exc}",
+            retryable=False,
+        ) from exc
+
+    governance_run = start_ingestion_run(
+        db,
+        dataset_keys=dataset_keys,
+        background_job_id=job.id,
+        purpose=PURPOSE_INTERNAL_RESEARCH,
+        coverage_start=coverage_start,
+        coverage_end=coverage_end,
+        metadata={
+            "job_type": job.job_type,
+            "stages": stages,
+            # The rights this run proceeded under, so an applied exception is
+            # auditable on the manifest rather than silent.
+            "entitlement_review_required": list(
+                acquisition_policy.entitlement_review_required
+            ),
+            "redistribution_review_required": list(
+                acquisition_policy.redistribution_review_required
+            ),
+        },
     )
+    governance_run_id = governance_run.run_id
 
-    summary: dict[str, Any] = {
-        "operation": result.operation,
-        "status": result.status,
-        "api_calls": result.api_calls,
-        "rows_fetched": result.rows_fetched,
-        "rows_inserted": result.rows_inserted,
-        "rows_skipped": result.rows_skipped,
-        "errors": result.errors[:10],
-    }
+    # From here the manifest is committed as RUNNING, so every exit path must
+    # leave it terminal. `terminal_status` is decided inside the guarded
+    # region and applied in `finally`.
+    terminal_status = None
+    terminal_error = None
+    pending_failure = None
+    summary = {}
+    try:
+        orchestrator = BackfillOrchestrator(
+            db, client, force=force, rate_limiter=rate_limiter
+        )
+        # The existing orchestrator already owns the checkpoint/log run_id.
+        # Reuse the governance manifest ID so the audit snapshot joins the
+        # durable ingestion records instead of creating a parallel run
+        # identity.
+        orchestrator.run_id = governance_run_id
+        # F5: forward the requested concurrency so the option stage's limiter
+        # ceiling is the job's request, not the orchestrator default.
+        result = asyncio.run(
+            orchestrator.run_all(
+                stages=list(stages),
+                nifty_start_date=nifty_start_date,
+                options_concurrency=concurrency,
+            )
+        )
 
-    if result.status == "SUCCESS":
-        return summary
+        # The orchestrator result is the single authority for the window the
+        # execution actually used; record it on the manifest before
+        # finalization so the run's evidence is read over exactly the
+        # executed window. Only trust the metadata when the NIFTY stage ran.
+        executed_start = result.metadata.get("nifty_coverage_start")
+        executed_end = result.metadata.get("nifty_coverage_end")
+        if executed_start and executed_end and "nifty" in stages:
+            governance_run.coverage_start = executed_start
+            governance_run.coverage_end = executed_end
+            db.commit()
 
-    auth_failure = any(
-        "AUTH_EXPIRED" in e or "Authentication" in e for e in result.errors
-    )
-    raise JobExecutionError(
-        f"historical ingestion ended with status {result.status}: "
-        + ("; ".join(result.errors[:3]) or "no error detail"),
-        retryable=not auth_failure,
-    )
+        summary = {
+            "operation": result.operation,
+            "status": result.status,
+            "api_calls": result.api_calls,
+            "rows_fetched": result.rows_fetched,
+            "rows_inserted": result.rows_inserted,
+            "rows_skipped": result.rows_skipped,
+            "errors": result.errors[:10],
+            "governance_run_id": governance_run_id,
+        }
 
+        error_detail = "; ".join(result.errors[:3]) or "no error detail"
+        if result.status == "SUCCESS":
+            terminal_status = RUN_SUCCEEDED
+        else:
+            terminal_status = (
+                RUN_PARTIAL if result.status == "PARTIAL" else RUN_FAILED
+            )
+            terminal_error = error_detail
+            auth_failure = any(
+                "AUTH_EXPIRED" in e or "Authentication" in e for e in result.errors
+            )
+            pending_failure = JobExecutionError(
+                f"historical ingestion ended with status {result.status}: "
+                + error_detail,
+                retryable=not auth_failure,
+            )
+    except BaseException as exc:
+        # Finding 8: KeyboardInterrupt, SystemExit and asyncio.CancelledError
+        # bypass `except Exception`, but the manifest was already committed
+        # RUNNING above — it must still be terminalized. The original
+        # exception propagates unchanged; asyncio may hand back its own
+        # CancelledError instance for a coroutine-raised one, in which case
+        # its message is empty and the type name carries the cause.
+        terminal_status = RUN_FAILED
+        terminal_error = (str(exc).strip() or type(exc).__name__)[:2000]
+        raise
+    finally:
+        # Invariant: once committed as RUNNING, a governance manifest is
+        # finalized on EVERY exit path — success, failure, cancellation or
+        # shutdown — and the `or RUN_FAILED` fallback keeps that guarantee
+        # even if a future exit path forgets to decide a status.
+        _finalize_governance_run(
+            db,
+            governance_run_id,
+            status=terminal_status or RUN_FAILED,
+            error_message=terminal_error,
+        )
+
+    if pending_failure is not None:
+        raise pending_failure
+    return summary
+
+
+def _finalize_governance_run(
+    db: Session,
+    run_id: str,
+    *,
+    status: str,
+    error_message: str | None,
+) -> None:
+    """Leave a manifest terminal even when the metric refresh itself fails.
+
+    ``finish_ingestion_run`` aggregates evidence and commits; either step can
+    fail on a poisoned session. Falling back to a bare terminal write keeps
+    the guarantee that a committed manifest never stays RUNNING.
+    """
+    try:
+        finish_ingestion_run(db, run_id, status=status, error_message=error_message)
+        return
+    except Exception:
+        logger.exception(
+            "metrics refresh failed while finalizing historical governance "
+            "run %s; writing a bare terminal state",
+            run_id,
+        )
+    try:
+        force_terminal_ingestion_run(
+            db, run_id, status=status, error_message=error_message
+        )
+    except Exception:
+        logger.exception(
+            "could not write a terminal state for historical governance run %s",
+            run_id,
+        )
 
 def execute_job(
     db: Session,

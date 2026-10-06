@@ -42,6 +42,7 @@ from app.services.journal import (
 )
 from app.services.capital import get_capital_summary
 from app.services.market_status import get_market_status
+from app.services.paper_contracts import resolve_authoritative_lot_sizes
 from app.services.performance import get_analytics
 from app.services.paper_execution import (
     PaperExecutionError,
@@ -184,13 +185,20 @@ async def submit_leg_close(
 # ---- Phase 5.0: server-authoritative paper trading -------------------------
 
 
-async def resolve_market_prices(access_token: str, symbol: str, legs) -> dict:
+async def resolve_market_prices(
+    access_token: str, symbol: str, legs, *, chain_sink: dict | None = None,
+) -> dict:
     """Resolve the authoritative fill price for every leg from market data.
 
     Fetches each required expiry's chain ONCE and maps each leg to the LTP of
     its own strike/side (Phase 2.1 rule: every expiry uses its own chain; a
     missing chain, strike or quote blocks execution — no fallback pricing
     from another expiry, no stale client values).
+
+    ``chain_sink``, when supplied, records the full canonical adapter payload
+    per expiry.  Day 50 / Issue #118 uses it so the candidate producer builds
+    its evidence from the very snapshot that produced these fill prices,
+    instead of fetching a second, independent chain.
 
     Returns ``{(expiry, strike, option_type): ltp}``.
     """
@@ -203,7 +211,10 @@ async def resolve_market_prices(access_token: str, symbol: str, legs) -> dict:
     prices: dict[tuple, float] = {}
     try:
         for expiry, leg_list in by_expiry.items():
-            chain = (await adapter.get_option_chain(symbol, expiry))["chain"]
+            payload = await adapter.get_option_chain(symbol, expiry)
+            if chain_sink is not None:
+                chain_sink[expiry] = payload
+            chain = payload["chain"]
             by_strike = {row["strike"]: row for row in chain}
             for leg in leg_list:
                 row = by_strike.get(leg.strike_price)
@@ -361,8 +372,32 @@ async def submit_execution(
     user_id, access_token = require_session(user)
     await require_market_open(access_token)
     try:
-        prices = await resolve_market_prices(access_token, request.symbol, request.legs)
-        return execute_strategy(user_id, request, db, prices)
+        lot_sizes = await resolve_authoritative_lot_sizes(
+            access_token, request.symbol, request.legs
+        )
+        normalized_legs = [
+            leg.model_copy(update={
+                "lot_size": lot_sizes[(
+                    str(leg.expiration_date),
+                    float(leg.strike_price),
+                    str(leg.option_type).lower(),
+                )]
+            })
+            for leg in request.legs
+        ]
+        request = request.model_copy(update={"legs": normalized_legs})
+        # The snapshot that prices the fill is handed to the producer so the
+        # candidate's evidence is bound to the SAME broker read (Issue #118).
+        chains: dict = {}
+        prices = await resolve_market_prices(
+            access_token, request.symbol, request.legs, chain_sink=chains)
+        # Day 50 / Issue #118: every new entry must carry a genuine
+        # server-generated StrategyCandidate. The producer acquires the
+        # real evidence, runs the existing Day-28→Day-33 chain, and
+        # delegates to execute_gated_paper_entry → execute_strategy.
+        from app.services.candidate_production import produce_candidate_and_execute
+        return await produce_candidate_and_execute(
+            user_id, db, request, prices, chains=chains)
     except PaperExecutionError as exc:
         raise _paper_error(exc, db=db, user_id=user_id) from exc
 

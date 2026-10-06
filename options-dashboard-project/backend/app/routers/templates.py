@@ -681,6 +681,7 @@ async def execute_template(
         resolve_legs,
         validate_execution_resolution,
     )
+    from app.services.paper_contracts import resolve_authoritative_lot_sizes
     from app.services.paper_execution import execute_strategy
 
     user_id, access_token = require_session(user)
@@ -734,6 +735,17 @@ async def execute_template(
     from app.services.paper_execution import PaperExecutionError
 
     try:
+        lot_sizes = await resolve_authoritative_lot_sizes(
+            access_token, template.symbol, price_legs
+        )
+        for leg in exec_legs:
+            key = (
+                str(leg["expiration_date"]),
+                float(leg["strike_price"]),
+                str(leg["option_type"]).lower(),
+            )
+            leg["lot_size"] = lot_sizes[key]
+
         prices = await resolve_market_prices(access_token, template.symbol, price_legs)
 
         # Build the execution request
