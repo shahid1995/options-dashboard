@@ -647,6 +647,20 @@ def refresh_ingestion_run_metrics(
     return run
 
 
+def _effective_terminal_status(requested: str, completeness_status: str) -> str:
+    """Derive the status actually stored for a terminal manifest.
+
+    A run asked to finish ``SUCCEEDED`` whose own refreshed evidence says the
+    acquisition was ``PARTIAL`` must not be recorded as a clean success. Both
+    the normal finalizer and the last-resort fallback derive the stored status
+    here, and the fallback reads the completeness the metric refresh already
+    committed, so the two entry points cannot disagree about the same run.
+    """
+    if requested == RUN_SUCCEEDED and completeness_status == "PARTIAL":
+        return RUN_PARTIAL
+    return requested
+
+
 def finish_ingestion_run(
     db: Session,
     run_id: str,
@@ -657,10 +671,8 @@ def finish_ingestion_run(
     if status not in {RUN_SUCCEEDED, RUN_FAILED, RUN_PARTIAL}:
         raise HistoricalDataGovernanceError(f"invalid ingestion-run status: {status}")
     run = refresh_ingestion_run_metrics(db, run_id)
-    run.status = status
+    run.status = _effective_terminal_status(status, run.completeness_status)
     run.error_message = error_message
-    if status == RUN_SUCCEEDED and run.completeness_status == "PARTIAL":
-        run.status = RUN_PARTIAL
     run.completed_at = _utcnow_naive()
     db.commit()
     db.refresh(run)
@@ -680,6 +692,11 @@ def force_terminal_ingestion_run(
     failed: a manifest must never be left RUNNING with no owner and no
     terminal error. Evidence metrics are left exactly as the failed refresh
     left them rather than being guessed.
+
+    The stored status is derived from the completeness the metric refresh
+    already committed, so a run whose persisted evidence says PARTIAL is not
+    recorded as a clean SUCCEEDED here: the fallback and the normal finalizer
+    agree on the same derived terminal status.
     """
     if status not in {RUN_SUCCEEDED, RUN_FAILED, RUN_PARTIAL}:
         raise HistoricalDataGovernanceError(f"invalid ingestion-run status: {status}")
@@ -689,7 +706,7 @@ def force_terminal_ingestion_run(
     )
     if run is None:
         raise HistoricalDataGovernanceError(f"unknown ingestion run: {run_id}")
-    run.status = status
+    run.status = _effective_terminal_status(status, run.completeness_status)
     run.error_message = error_message
     run.completed_at = _utcnow_naive()
     db.commit()
