@@ -1033,14 +1033,23 @@ def execute_job(
     job: BackgroundJob,
     *,
     rate_limiter: Any | None = None,
+    worker_id: str | None = None,
 ) -> dict[str, Any]:
     """Dispatch a claimed job by type.
 
     ``rate_limiter`` (optional) is the worker's shared limiter; direct
     callers may omit it, exactly as before.
+
+    ``worker_id`` (optional) is the claiming worker's identity, forwarded to
+    the historical-ingestion dispatch so the ownership-protected
+    abandoned-manifest recovery runs during normal worker execution
+    (Day-48 Finding 2). Direct/non-worker callers may omit it, exactly as
+    before.
     """
     if job.job_type == JobType.HISTORICAL_INGESTION.value:
-        return execute_historical_ingestion(db, job, rate_limiter=rate_limiter)
+        return execute_historical_ingestion(
+            db, job, rate_limiter=rate_limiter, worker_id=worker_id
+        )
     raise JobExecutionError(
         f"unknown job type: {job.job_type!r}", retryable=False
     )
@@ -1124,7 +1133,7 @@ def _execute_one(
         )
         heartbeat.start()
         try:
-            execute_job(db, job, rate_limiter=rate_limiter)
+            execute_job(db, job, rate_limiter=rate_limiter, worker_id=worker_id)
         except Exception as exc:
             # F7: persist the failure transition on a FRESH session via the
             # repository's serialization retry — the execution session may

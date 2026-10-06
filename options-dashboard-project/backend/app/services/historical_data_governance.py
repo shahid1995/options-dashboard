@@ -140,6 +140,20 @@ _RETENTION_TARGETS: dict[str, tuple[type[Any], str, str]] = {
     "STRIKENOVA_HISTORICAL_GEX": (HistoricalGexSnapshot, "open_time", CLOCK_IST_NAIVE),
 }
 
+# Raw-data protection is a STATIC property of the target, recorded here next
+# to the allow-list — never a property of the editable catalog row. The
+# catalog's ``dataset_tier`` is governance metadata an operator can change;
+# retiering a raw historical dataset to MODEL must not make its rows
+# deletable. Only targets absent from this set (derived model/analytics
+# output) can ever be executable, regardless of what the catalog says.
+_RAW_RETENTION_TARGETS = frozenset(
+    {
+        "UPSTOX_CONTRACT_SPECS",
+        "UPSTOX_NIFTY_CANDLES_3MIN",
+        "UPSTOX_OPTION_CANDLES_3MIN",
+    }
+)
+
 
 def dataset_keys_for_stages(stages: list[str]) -> list[str]:
     """Return deterministic governance keys for validated ingestion stages."""
@@ -909,7 +923,11 @@ def plan_retention(
         policy=row.retention_policy,
         cutoff=cutoff,
         candidate_rows=candidate_rows,
-        executable=row.retention_enforced and row.dataset_tier != "RAW",
+        executable=(
+            row.retention_enforced
+            and row.dataset_tier != "RAW"
+            and dataset_key not in _RAW_RETENTION_TARGETS
+        ),
         reason=reason,
     )
 
@@ -927,13 +945,22 @@ def enforce_retention(
         return plan
 
     row = get_dataset(db, dataset_key)
-    if row.dataset_tier == "RAW":
+    if dataset_key in _RAW_RETENTION_TARGETS or row.dataset_tier == "RAW":
         raise HistoricalDataGovernanceError(
             f"raw historical data cannot be deleted by the Day 48 retention service: "
             f"{dataset_key}"
         )
     if plan.cutoff is None:
         return plan
+
+    # Finding 5: executable deletion must satisfy the EXISTING recomputation
+    # contract before a single row is removed. This reuses
+    # ``assert_recomputation_safe`` — the single dependency-validation
+    # authority — so a non-recomputable dataset, a missing or inactive
+    # dependency, or a cyclic chain blocks deletion instead of destroying
+    # the last copy. Raw targets never reach this point: the static guard
+    # above refuses them independently of this check.
+    assert_recomputation_safe(db, dataset_key)
 
     model, timestamp_name, _clock_convention = _RETENTION_TARGETS[dataset_key]
     timestamp_column = getattr(model, timestamp_name)

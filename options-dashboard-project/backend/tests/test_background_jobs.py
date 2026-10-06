@@ -943,6 +943,258 @@ class TestStaleWorkerOwnershipProtection:
         assert row.lease_owner == "worker-B"
 
 
+class TestWorkerIdPropagationToHistoricalIngestion:
+    """Finding 2: the claiming worker's identity must actually reach
+    ``execute_historical_ingestion`` on the REAL worker path
+    (``run_worker`` -> ``_execute_one`` -> ``execute_job`` -> dispatch),
+    otherwise the ownership-protected abandoned-manifest recovery is
+    bypassed during normal worker execution and only direct callers get
+    the ownership boundary."""
+
+    @staticmethod
+    def _capture(captured):
+        def _fake(db, job, *, rate_limiter=None, worker_id=None):
+            captured["worker_id"] = worker_id
+            return {"operation": "backfill_all", "status": "SUCCESS"}
+
+        return _fake
+
+    def test_execute_job_forwards_worker_id(self, session_factory, monkeypatch):
+        db = session_factory()
+        job, _ = _enqueue(db, "prop:forward", payload={"stages": ["contracts"]})
+        captured = {}
+        monkeypatch.setattr(
+            bj, "execute_historical_ingestion", self._capture(captured)
+        )
+
+        bj.execute_job(db, job, worker_id="worker-W")
+        assert captured["worker_id"] == "worker-W"
+
+        # Direct/non-worker callers that omit worker_id stay backward
+        # compatible: the dispatch still works and passes no identity.
+        bj.execute_job(db, job)
+        assert captured["worker_id"] is None
+
+    def test_execute_one_forwards_its_worker_id(self, session_factory, monkeypatch):
+        db = session_factory()
+        job, _ = _enqueue(db, "prop:one", payload={"stages": ["contracts"]})
+        claimed = bj.claim_next(db, worker_id="worker-chain", lease_seconds=900)
+        assert claimed is not None
+        job_id = claimed.id
+        captured = {}
+        monkeypatch.setattr(bj, "execute_job", self._capture(captured))
+
+        verdict = bj._execute_one(
+            session_factory=session_factory,
+            job_id=job_id,
+            worker_id="worker-chain",
+        )
+        assert verdict == "succeeded"
+        assert captured["worker_id"] == "worker-chain"
+
+    def test_run_worker_chain_delivers_worker_id(self, session_factory, monkeypatch):
+        db = session_factory()
+        _enqueue(db, "prop:loop", payload={"stages": ["contracts"]})
+        captured = {}
+        monkeypatch.setattr(
+            bj, "execute_historical_ingestion", self._capture(captured)
+        )
+
+        summary = bj.run_worker(
+            session_factory=session_factory, once=True, worker_id="worker-loop"
+        )
+        assert summary["claimed"] == 1
+        assert summary["succeeded"] == 1
+        assert captured["worker_id"] == "worker-loop"
+
+
+class TestLeaseRecoveryManifestTerminalization:
+    """Finding 2 integration: lease expiry -> reclamation -> replacement
+    recovery must terminalize the abandoned manifest, and a stale worker
+    must never record a successful final state for a reclaimed attempt.
+
+    Uses the repository's existing background-job seams: ``claim_next`` for
+    claims, an explicit past ``lease_expires_at`` for deterministic lease
+    expiry, ``run_worker(once=True)`` for the replacement worker's real
+    path, and the stubbed orchestrator so no network is touched.
+    """
+
+    class _SuccessResult:
+        operation = "backfill_all"
+        status = "SUCCESS"
+        api_calls = 1
+        rows_fetched = 0
+        rows_inserted = 0
+        rows_skipped = 0
+        errors = []
+        metadata = {}
+
+    @staticmethod
+    def _stub(monkeypatch, orchestrator_cls):
+        import app.services.backfill_orchestrator as orch_mod
+        import app.services.upstox_client as upstox_mod
+
+        monkeypatch.setattr(orch_mod, "BackfillOrchestrator", orchestrator_cls)
+        monkeypatch.setattr(orch_mod, "TokenBridge", type("B", (), {}))
+        monkeypatch.setattr(
+            upstox_mod,
+            "UpstoxClient",
+            type("C", (), {"__init__": lambda self, token_provider=None: None}),
+        )
+
+    def test_replacement_worker_recovery_terminalizes_abandoned_manifest(
+        self, session_factory, monkeypatch
+    ):
+        """Full worker chain: A claims and leaves a RUNNING manifest, then
+        loses its lease; B reclaims through ``run_worker`` and its REAL
+        ``execute_historical_ingestion`` path must terminalize A's manifest
+        before creating its own, so the two never coexist as RUNNING, while
+        B's attempt finishes normally and A's manifest stays FAILED."""
+        from app.services import historical_data_governance as hdg
+
+        result = self._SuccessResult()
+
+        class _Orch:
+            def __init__(self, db, client, *, force=False, rate_limiter=None):
+                self.run_id = None
+
+            async def run_all(
+                self, *, stages=None, nifty_start_date=None,
+                options_concurrency=None,
+            ):
+                return result
+
+        self._stub(monkeypatch, _Orch)
+
+        db_a = session_factory()
+        job, _ = _enqueue(db_a, "f2:recovery", payload={"stages": ["contracts"]})
+        job_id = job.id
+        job_a = bj.claim_next(db_a, worker_id="worker-A", lease_seconds=900)
+        assert job_a is not None
+
+        # Worker A's in-flight governance manifest, committed RUNNING.
+        old_run = hdg.start_ingestion_run(
+            db_a,
+            dataset_keys=["UPSTOX_CONTRACT_SPECS"],
+            background_job_id=job_a.id,
+        )
+        old_run_id = old_run.run_id
+        # Deterministic recovery ordering: the old manifest predates recovery.
+        old_run.started_at = _utcnow() - timedelta(seconds=30)
+        db_a.commit()
+        db_a.close()
+
+        # A's lease expires while A is still "executing".
+        expired = session_factory()
+        row = expired.scalar(select(BackgroundJob))
+        row.lease_expires_at = _utcnow() - timedelta(seconds=1)
+        expired.commit()
+        expired.close()
+
+        # Replacement worker B reclaims and runs the REAL worker loop, which
+        # must deliver worker_id="worker-B" all the way into
+        # execute_historical_ingestion so recovery actually runs.
+        summary = bj.run_worker(
+            session_factory=session_factory, once=True, worker_id="worker-B"
+        )
+        assert summary["claimed"] == 1
+        assert summary["succeeded"] == 1
+
+        check = session_factory()
+        old_run_row = check.scalar(
+            select(HistoricalIngestionRun).where(
+                HistoricalIngestionRun.run_id == old_run_id
+            )
+        )
+        # The abandoned manifest is terminal FAILED, not stranded RUNNING ...
+        assert old_run_row.status == hdg.RUN_FAILED
+        assert "abandoned by worker recovery" in (old_run_row.error_message or "")
+
+        # ... B's replacement manifest exists and succeeded, and no manifest
+        # for this job is left RUNNING (A's was terminalized before B's
+        # attempt created its own).
+        job_runs = check.scalars(
+            select(HistoricalIngestionRun).where(
+                HistoricalIngestionRun.background_job_id == job_id
+            )
+        ).all()
+        assert len(job_runs) == 2
+        assert not any(r.status == hdg.RUN_RUNNING for r in job_runs)
+        b_run = [r for r in job_runs if r.run_id != old_run_id][0]
+        assert b_run.status == hdg.RUN_SUCCEEDED
+
+        job_row = check.scalar(
+            select(BackgroundJob).where(BackgroundJob.id == job_id)
+        )
+        assert job_row.status == JobStatus.SUCCEEDED.value
+        # The terminal transition releases the lease; attempt_count==2 proves
+        # this is the REPLACEMENT worker's attempt that completed the job.
+        assert job_row.lease_owner is None
+        assert job_row.lease_expires_at is None
+        assert job_row.attempt_count == 2
+        check.close()
+
+    def test_stale_worker_cannot_record_success_for_reclaimed_attempt(
+        self, session_factory, monkeypatch
+    ):
+        """A worker still inside ``execute_historical_ingestion`` when its
+        lease is reclaimed must not finalize its manifest as SUCCEEDED, even
+        though its orchestrator reports SUCCESS: the finalization-time
+        ownership check forces FAILED, and the job row stays with the
+        replacement attempt."""
+        from app.services import historical_data_governance as hdg
+
+        result = self._SuccessResult()
+
+        class _ReclaimingOrch:
+            def __init__(self, db, client, *, force=False, rate_limiter=None):
+                self.run_id = None
+
+            async def run_all(
+                self, *, stages=None, nifty_start_date=None,
+                options_concurrency=None,
+            ):
+                # Mid-execution: A's lease expires and worker B reclaims.
+                s = session_factory()
+                r = s.scalar(select(BackgroundJob))
+                r.lease_expires_at = _utcnow() - timedelta(seconds=1)
+                s.commit()
+                s.close()
+                reclaim = session_factory()
+                assert bj.claim_next(reclaim, worker_id="worker-B") is not None
+                reclaim.close()
+                return result
+
+        self._stub(monkeypatch, _ReclaimingOrch)
+
+        db = session_factory()
+        job, _ = _enqueue(db, "f2:stale-final", payload={"stages": ["contracts"]})
+        job_a = bj.claim_next(db, worker_id="worker-A", lease_seconds=900)
+        assert job_a is not None
+
+        summary = bj.execute_historical_ingestion(db, job_a, worker_id="worker-A")
+
+        # Despite the orchestrator's SUCCESS, the stale worker could not
+        # record a successful final state for the reclaimed attempt.
+        db.expire_all()
+        manifest = db.scalar(
+            select(HistoricalIngestionRun).where(
+                HistoricalIngestionRun.run_id == summary["governance_run_id"]
+            )
+        )
+        assert manifest.status == hdg.RUN_FAILED
+        assert "ownership lost before finalization" in (manifest.error_message or "")
+
+        # The job row belongs to the replacement attempt, untouched by A.
+        job_row = db.scalar(
+            select(BackgroundJob).where(BackgroundJob.id == job.id)
+        )
+        assert job_row.status == JobStatus.RUNNING.value
+        assert job_row.lease_owner == "worker-B"
+        assert job_row.attempt_count == 2
+        db.close()
+
+
 class TestFailureTransitionPersistence:
     """F7: the failure transition survives transient database errors."""
 

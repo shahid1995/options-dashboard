@@ -696,6 +696,193 @@ def test_raw_retention_is_not_executable_even_when_policy_is_destructive(db):
     assert db.scalar(select(func.count()).select_from(OptionCandle)) == 1
 
 
+def _destructive_greeks_target(
+    db,
+    *,
+    recomputable: bool = True,
+    dependencies: list[str] | None = None,
+):
+    """Enable destructive retention for the GREEKS derived target with one
+    already-expired row, so a delete would actually remove data unless a
+    governance guard blocks it."""
+    _catalog(
+        db,
+        key="STRIKENOVA_OPTION_GREEKS",
+        tier="MODEL",
+        pipeline=None,
+        completeness_data_type=None,
+        source="STRIKENOVA",
+        entitlement_status=hdg.ENTITLEMENT_NOT_APPLICABLE,
+        license_status=hdg.LICENSE_INTERNAL,
+        usage_policy=hdg.USAGE_INTERNAL_ONLY,
+        retention_policy=hdg.RETENTION_DELETE_AFTER_DAYS,
+        retention_days=30,
+        retention_enforced=True,
+        raw_immutable=False,
+        recomputable=recomputable,
+        dependencies=dependencies
+        if dependencies is not None
+        else ["UPSTOX_OPTION_CANDLES_3MIN"],
+    )
+    db.add(
+        _option_greek(
+            open_time=datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(days=60)
+        )
+    )
+    db.commit()
+
+
+def test_retention_tier_flip_cannot_unlock_a_raw_target(db):
+    """Finding 4: raw-data protection is a static property of the target,
+    never of the editable catalog tier. Retiering a raw dataset to MODEL
+    with enforcement enabled must not make its rows deletable."""
+    key = "UPSTOX_OPTION_CANDLES_3MIN"
+    _catalog(
+        db,
+        key=key,
+        retention_policy=hdg.RETENTION_DELETE_AFTER_DAYS,
+        retention_days=30,
+        retention_enforced=True,
+        raw_immutable=True,
+    )
+    db.add(
+        OptionCandle(
+            instrument_key="NSE_FO|TEST|01-10-2026",
+            interval="3min",
+            open_time=datetime(2025, 1, 1, 3, 45),
+            open=1.0,
+            high=1.0,
+            low=1.0,
+            close=1.0,
+            volume=1.0,
+            open_interest=1.0,
+            source="TEST",
+            fetched_at=datetime(2025, 1, 1, 4, 0),
+        )
+    )
+    db.commit()
+
+    # The tamper: the catalog row is retiered from RAW to MODEL.
+    row = db.scalar(
+        select(HistoricalDatasetGovernance).where(
+            HistoricalDatasetGovernance.dataset_key == key
+        )
+    )
+    row.dataset_tier = "MODEL"
+    db.commit()
+
+    plan = hdg.enforce_retention(
+        db,
+        key,
+        now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        execute=True,
+    )
+    # The row is a genuine deletion candidate, but the static raw
+    # classification refuses execution regardless of the catalog tier.
+    assert plan.candidate_rows == 1
+    assert plan.executable is False
+    assert plan.deleted_rows == 0
+    assert db.scalar(select(func.count()).select_from(OptionCandle)) == 1
+
+
+def test_retention_deletion_blocked_when_not_recomputable(db):
+    """Finding 5: a derived dataset with ``recomputable=False`` must be
+    refused by ``execute=True`` before any row is removed."""
+    key = "STRIKENOVA_OPTION_GREEKS"
+    _destructive_greeks_target(db, recomputable=False)
+
+    with pytest.raises(
+        hdg.HistoricalDataGovernanceError, match="not marked recomputable"
+    ):
+        hdg.enforce_retention(
+            db, key, now=datetime(2026, 10, 1, tzinfo=timezone.utc), execute=True
+        )
+    assert db.scalar(select(func.count()).select_from(OptionGreeks)) == 1
+
+
+def test_retention_deletion_blocked_when_dependency_missing(db):
+    """Finding 5: a dependency with no catalog row blocks deletion — the
+    recomputation contract cannot be proven, so the last copy survives."""
+    key = "STRIKENOVA_OPTION_GREEKS"
+    # Declared dependency that was never catalogued.
+    _destructive_greeks_target(db, dependencies=["UPSTOX_NIFTY_CANDLES_3MIN"])
+
+    with pytest.raises(
+        hdg.HistoricalDataGovernanceError, match="unknown or inactive"
+    ):
+        hdg.enforce_retention(
+            db, key, now=datetime(2026, 10, 1, tzinfo=timezone.utc), execute=True
+        )
+    assert db.scalar(select(func.count()).select_from(OptionGreeks)) == 1
+
+
+def test_retention_deletion_blocked_when_dependency_inactive(db):
+    """Finding 5: deactivating a dependency after the fact blocks deletion —
+    an inactive dependency is not a proven recomputation source."""
+    key = "STRIKENOVA_OPTION_GREEKS"
+    _catalog(db, key="UPSTOX_OPTION_CANDLES_3MIN")
+    dep = db.scalar(
+        select(HistoricalDatasetGovernance).where(
+            HistoricalDatasetGovernance.dataset_key == "UPSTOX_OPTION_CANDLES_3MIN"
+        )
+    )
+    dep.active = False
+    db.commit()
+    _destructive_greeks_target(db, dependencies=["UPSTOX_OPTION_CANDLES_3MIN"])
+
+    with pytest.raises(
+        hdg.HistoricalDataGovernanceError, match="unknown or inactive"
+    ):
+        hdg.enforce_retention(
+            db, key, now=datetime(2026, 10, 1, tzinfo=timezone.utc), execute=True
+        )
+    assert db.scalar(select(func.count()).select_from(OptionGreeks)) == 1
+
+
+def test_retention_deletion_blocked_on_cyclic_dependency(db):
+    """Finding 5: a cyclic dependency chain blocks deletion — the existing
+    ``assert_recomputation_safe`` cycle detection is the authority."""
+    key = "STRIKENOVA_OPTION_GREEKS"
+    _destructive_greeks_target(db, dependencies=["STRIKENOVA_HISTORICAL_GEX"])
+    _catalog(
+        db,
+        key="STRIKENOVA_HISTORICAL_GEX",
+        tier="ANALYTICS",
+        pipeline=None,
+        completeness_data_type=None,
+        source="STRIKENOVA",
+        entitlement_status=hdg.ENTITLEMENT_NOT_APPLICABLE,
+        license_status=hdg.LICENSE_INTERNAL,
+        usage_policy=hdg.USAGE_INTERNAL_ONLY,
+        retention_policy=hdg.RETENTION_KEEP,
+        raw_immutable=False,
+        recomputable=True,
+        dependencies=["STRIKENOVA_OPTION_GREEKS"],
+    )
+
+    with pytest.raises(hdg.HistoricalDataGovernanceError, match="cyclic"):
+        hdg.enforce_retention(
+            db, key, now=datetime(2026, 10, 1, tzinfo=timezone.utc), execute=True
+        )
+    assert db.scalar(select(func.count()).select_from(OptionGreeks)) == 1
+
+
+def test_retention_deletion_allowed_for_valid_recomputation_chain(db):
+    """Finding 5 complement: a valid recomputable chain still permits the
+    governed delete — the new guard must not make retention a no-op."""
+    key = "STRIKENOVA_OPTION_GREEKS"
+    _catalog(db, key="UPSTOX_OPTION_CANDLES_3MIN")
+    _destructive_greeks_target(db, dependencies=["UPSTOX_OPTION_CANDLES_3MIN"])
+
+    plan = hdg.enforce_retention(
+        db, key, now=datetime(2026, 10, 1, tzinfo=timezone.utc), execute=True
+    )
+    assert plan.executable is True
+    assert plan.deleted_rows == 1
+    assert db.scalar(select(func.count()).select_from(OptionGreeks)) == 0
+
+
 def test_run_without_run_scoped_evidence_stays_unknown(db):
     """Regression: a run that produced no evidence must stay UNKNOWN.
 
