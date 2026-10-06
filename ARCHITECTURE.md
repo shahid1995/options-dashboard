@@ -1,6 +1,6 @@
 # StrikeNova — Architecture
 
-**Status:** Canonical · **Owner:** Founder · **Last reviewed:** 2026-09-18
+**Status:** Canonical · **Owner:** Founder · **Last reviewed:** 2026-09-28
 
 Ground truth is the code; this document maps it. Deep-dive phase documents
 live under `options-dashboard-project/docs/` (historical evidence).
@@ -39,6 +39,7 @@ CockroachDB Cloud — production database (Alembic-managed schema)
 | Broker sync | `backend/app/broker_sync/` | Ingestion models/pipeline for broker data |
 | Data/config | `backend/app/db.py`, `backend/app/config.py` | Engine/session construction from `DATABASE_URL`; pydantic settings |
 | Durable background jobs | `backend/app/services/background_jobs.py`, `backend/run_jobs.py` | Day 47 database-backed job queue on the application database (see below) |
+| Historical data governance | `backend/app/services/historical_data_governance.py`, `HistoricalDatasetGovernance`, `HistoricalIngestionRun` | Day 48 provenance/entitlement/usage/redistribution/retention control plane for historical datasets; keeps policy distinct from raw market observations and derived analytics. |
 | Migrations | `backend/alembic/` | **Sole schema authority** (ADR-002) |
 | Tests | `backend/tests/` | pytest suite (185 test files) |
 
@@ -108,6 +109,67 @@ broker (Redis/Celery/RabbitMQ/Kafka) is introduced.
 - **Not deployed:** no production worker service or scheduler exists yet;
   enabling one requires separate authorization.
 
+### 2.2 Historical data governance (Day 48)
+
+Historical data acquisition is governed independently from queue mechanics:
+
+- **Dataset catalog:** `HistoricalDatasetGovernance` records source, source
+  reference/version, entitlement state, license state, usage scope,
+  redistribution state, raw immutability, recomputability, dependencies and
+  retention policy.
+- **Ingestion manifest:** `HistoricalIngestionRun` snapshots the catalog
+  decisions for each acquisition so later policy changes do not rewrite
+  historical audit context. It can link a durable `BackgroundJob` ID. Its
+  coverage window describes what the run actually acquired: only a run that
+  requests the NIFTY stage records one — seeded with the resolver's
+  best-known bounds and replaced by the executed window the orchestrator
+  reports — so a contracts-only or options-only job claims no NIFTY window.
+- **Existing pipeline evidence remains authoritative:** the governance service
+  reads `IngestionCheckpoint` and `IngestionLog` rather than duplicating their
+  operational state. Manifest metrics are derived only from records carrying
+  the run's own identity, so evidence from another acquisition can never be
+  attributed to this run. `DataCompleteness` is cumulative and carries no run
+  identity, so it is not a manifest evidence source. A run that produced no
+  evidence of its own stays `UNKNOWN` rather than being reported complete.
+  Checkpoint declarations are production-backed: the option pipeline records
+  the fetched row count and the rows it stored on incomplete (FAILED/PENDING)
+  checkpoints, so `missing_records` measures a real declared-but-unprocessed
+  remainder instead of collapsing to zero — and an instrument that never
+  learned a total declares none rather than an invented one.
+- **Enforced rights boundary (durable job path only):** the durable
+  `HISTORICAL_INGESTION` job enforces the acquisition gate through
+  `execute_historical_ingestion`, which calls `assert_acquisition_allowed`
+  before any data is fetched and before the ingestion manifest is created.
+  Unresolved entitlement is not treated as permission, and redistribution
+  rights are never implied: public redistribution is allowed only when the
+  catalog explicitly says `ALLOWED`. A job refused by the gate fails
+  permanently and leaves no manifest behind. `DECISIONS.md` ADR-020 records
+  the one approved exception — unresolved entitlement may be acquired for
+  internal research or backtest only, and the exception is written to the
+  manifest.
+- **Other acquisition paths are outside this gate (known limitations):**
+  historical acquisition is not rights-gated on every existing code path.
+  `app/api/v1/admin.py` exposes an admin-only route (`POST /api/v1/admin/
+  acquisition/run`) that drives `BackfillOrchestrator` directly on the
+  platform token bridge and does not call `assert_acquisition_allowed`;
+  `run_backfill.py` is the existing CLI entry point that also acquires
+  directly through `BackfillOrchestrator`. These paths are recorded as open
+  follow-ups rather than presented as compliant. `execute_historical_ingestion`
+  remains the only durable enforcement point today.
+- **Terminal manifests:** once a manifest is committed as `RUNNING`, every
+  exit path finalizes it, including orchestrator construction failure, a
+  failure of the finalization itself, and `BaseException` exits such as
+  `KeyboardInterrupt`, `SystemExit`, and `asyncio.CancelledError`.
+- **Retention:** deletion is dry-run-first and uses a static allow-list of
+  governed ORM targets. The current catalog keeps raw datasets and disables
+  enforcement for derived datasets until a controlled policy enables it.
+- **Recomputation:** derived model/analytics datasets must declare governed raw
+  dependencies; the service checks the dependency graph before a dataset is
+  considered recomputation-safe.
+
+No Day 48 scheduler, production purge, production database mutation, or
+deployment is enabled by this architecture record.
+ 
 ## 3. Frontend (Next.js)
 
 | Layer | Location | Responsibility |
