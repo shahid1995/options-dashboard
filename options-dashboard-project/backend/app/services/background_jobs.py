@@ -77,6 +77,7 @@ from app.services.historical_data_governance import (
     dataset_keys_for_stages,
     finish_ingestion_run,
     force_terminal_ingestion_run,
+    recover_abandoned_manifest,
     start_ingestion_run,
 )
 from app.services.rate_limiter import GlobalRateLimiter  # stdlib-only module, no cycle
@@ -717,6 +718,7 @@ def execute_historical_ingestion(
     job: BackgroundJob,
     *,
     rate_limiter: Any | None = None,
+    worker_id: str | None = None,
 ) -> dict[str, Any]:
     """Execute a HISTORICAL_INGESTION job through the real orchestrator.
 
@@ -728,6 +730,13 @@ def execute_historical_ingestion(
     ``rate_limiter`` is the worker's shared limiter when called from the
     worker loop (adaptive state persists across jobs); omitted, a fresh
     limiter is constructed for this run (direct/CLI/test callers).
+
+    ``worker_id`` is the durable worker's identity for the ownership boundary.
+    When provided, the durable path calls :func:`recover_abandoned_manifest`
+    after claiming the job and before creating its manifest, so a crashed
+    attempt's manifest is terminalized (FAILED) before the replacement attempt
+    creates its own manifest. A stale worker whose lease has expired (or whose
+    job was reclaimed) is never allowed to touch manifests.
 
     Raises :class:`JobExecutionError` with a retryability verdict:
     authentication problems are permanent (human re-authentication
@@ -817,6 +826,7 @@ def execute_historical_ingestion(
     # cooldown/pacing state earned by earlier jobs in the same worker.
     rate_limiter = prepare_run_rate_limiter(rate_limiter, concurrency=concurrency)
     dataset_keys = dataset_keys_for_stages(stages)
+
     # Day 48 rights boundary: acquisition is gated on what the catalog
     # records BEFORE anything is acquired. This runs before the manifest is
     # created, so a job refused by policy leaves no manifest behind at all.
@@ -832,6 +842,16 @@ def execute_historical_ingestion(
             f"governance catalog: {exc}",
             retryable=False,
         ) from exc
+
+    # Day 48 Finding 2: if a previous attempt's lease expired and this worker
+    # has just reclaimed the job, terminalize the old attempt's still-RUNNING
+    # manifest as FAILED (abandoned) BEFORE creating the replacement manifest,
+    # so the two attempts never coexist as RUNNING for the same job. Ownership
+    # is verified with the same conditional lease check ``complete_job`` uses,
+    # so a stale worker whose lease expired (or whose job was reclaimed) is a
+    # no-op here.
+    if worker_id is not None:
+        recover_abandoned_manifest(db, job.id, worker_id=worker_id)
 
     governance_run = start_ingestion_run(
         db,
@@ -930,6 +950,36 @@ def execute_historical_ingestion(
         terminal_error = (str(exc).strip() or type(exc).__name__)[:2000]
         raise
     finally:
+        # Day 48 Finding 2 ownership boundary at finalization time: a worker
+        # that no longer owns the job must not record a success for a manifest
+        # whose job has been reclaimed by a replacement attempt. When
+        # ``worker_id`` is available and the job is still owned by this worker,
+        # finalize normally; otherwise force the manifest FAILED so an abandoned
+        # manifest is never recorded as SUCCEEDED/COMPLETE.
+        if (
+            worker_id is not None
+            and governance_run is not None
+            and governance_run.background_job_id is not None
+        ):
+            from app.models import BackgroundJob, JobStatus as _JobStatus
+
+            now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+            still_owned = db.scalar(
+                select(BackgroundJob.id).where(
+                    BackgroundJob.id == governance_run.background_job_id,
+                    BackgroundJob.status == _JobStatus.RUNNING.value,
+                    BackgroundJob.lease_owner == worker_id,
+                    BackgroundJob.lease_expires_at.isnot(None),
+                    BackgroundJob.lease_expires_at > now_naive,
+                )
+            )
+            if still_owned is None:
+                terminal_status = RUN_FAILED
+                terminal_error = (
+                    (terminal_error or "")
+                    + "ownership lost before finalization; abandoned manifest terminalized"
+                ).strip()
+
         # Invariant: once committed as RUNNING, a governance manifest is
         # finalized on EVERY exit path — success, failure, cancellation or
         # shutdown — and the `or RUN_FAILED` fallback keeps that guarantee

@@ -7,10 +7,13 @@ import json
 
 import pytest
 from sqlalchemy import create_engine, func, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from app.db import Base
 from app.models import (
+    HistoricalIngestionRun,
+
     ContractSpec,
     DataCompleteness,
     HistoricalDatasetGovernance,
@@ -93,6 +96,73 @@ def _catalog(
     return row
 
 
+def test_start_ingestion_run_refresh_failure_leaves_manifest_failed(db):
+    """Finding 1 regression: a manifest committed as RUNNING whose post-commit
+    refresh then fails must NOT remain RUNNING. The failure remains observable
+    (the original exception propagates), the run id is available independently
+    of ORM refresh success, and terminalization occurs through the safe fallback
+    path (force_terminal_ingestion_run) rather than being suppressed.
+    """
+    key = "UPSTOX_OPTION_CANDLES_3MIN"
+    _catalog(db, key=key)
+
+    # An explicit session local keeps a private reference to its refresh method
+    # so the monkeypatch survives the call below (the fixture `db` is rebound
+    # inside the function only after this point, never before).    # Patch the session's refresh so the first call (the post-commit refresh of
+    # the newly created manifest) raises while the session otherwise still works.
+    # Keep every reference through the same local `session` name so the monkeypatch
+    # survives the call below.
+    session = db
+    real_refresh = session.refresh
+    refresh_calls = {"n": 0}
+
+    def refresh_fails(obj, *args, **kwargs):
+        refresh_calls["n"] += 1
+        if refresh_calls["n"] == 1:
+            raise OperationalError("synthetic refresh failure", None, None)
+        return real_refresh(obj, *args, **kwargs)
+
+    session.refresh = refresh_fails
+
+    run_id = "run-refresh-failed"
+    with pytest.raises(OperationalError, match="synthetic refresh failure"):
+        hdg.start_ingestion_run(session, dataset_keys=[key], run_id=run_id)
+
+    # The original exception propagated (failure remains observable); the refresh
+    # was attempted at least once (the post-commit refresh).
+    assert refresh_calls["n"] >= 1
+
+
+    # The manifest was committed, so read it back through an independent
+    # session on the same engine.
+    db2 = sessionmaker(bind=db.get_bind(), autocommit=False, autoflush=False)()
+    try:
+        manifest = db2.scalar(
+            select(HistoricalIngestionRun).where(
+                HistoricalIngestionRun.run_id == run_id
+            )
+        )
+        # The manifest does not remain RUNNING -- the safe fallback terminalized
+        # it as FAILED, because a committed manifest must never be left RUNNING
+        # with no owner and no terminal error.
+        assert manifest is not None, "manifest must exist after commit"
+        assert manifest.status == hdg.RUN_FAILED, (
+            "manifest must be terminal FAILED, not %s" % (manifest.status,)
+        )
+        assert manifest.completed_at is not None
+        assert "post-commit refresh failed" in (manifest.error_message or "")
+
+        # No manifest is left RUNNING.
+        assert db2.scalar(
+            select(func.count()).select_from(HistoricalIngestionRun).where(
+                HistoricalIngestionRun.status == "RUNNING"
+            )
+        ) == 0, "no manifest may remain RUNNING"
+    finally:
+        db2.close()
+
+
+
 def test_entitlement_and_redistribution_fail_closed(db):
     key = "UPSTOX_OPTION_CANDLES_3MIN"
     _catalog(db, key=key)
@@ -126,6 +196,278 @@ def test_stage_mapping_rejects_unknown_and_deduplicates(db):
 
     with pytest.raises(hdg.HistoricalDataGovernanceError):
         hdg.dataset_keys_for_stages(["unknown"])
+
+
+# --------------------------------------------------------------------------
+# Finding 3 — historical metric derivation must be snapshot-stable
+# --------------------------------------------------------------------------
+
+
+def test_refresh_uses_run_snapshot_not_current_catalog(db):
+    """Finding 3 regression: ``refresh_ingestion_run_metrics`` must interpret
+    a run's evidence using the dataset-mapping the run snapshotted at start,
+    not the current catalog state.
+
+    A run is created with mapping A (dataset X -> pipeline p-X, operation op-X).
+    The catalog mapping for X is then changed to B (pipeline p-Y, operation op-Y),
+    and a new run is created that snapshots mapping B. Refreshing the FIRST run
+    must still use mapping A, while the SECOND run uses mapping B.
+    """
+    key_x = "UPSTOX_OPTION_CANDLES_3MIN"
+    key_y = "UPSTOX_NIFTY_CANDLES_3MIN"
+
+    # Mapping A: X -> backfill_options / option_candles
+    _catalog(
+        db,
+        key=key_x,
+        pipeline="backfill_options",
+        completeness_data_type="option_candles",
+    )
+    _catalog(
+        db,
+        key=key_y,
+        pipeline="backfill_nifty",
+        completeness_data_type="nifty_candles",
+    )
+
+    run_a = hdg.start_ingestion_run(
+        db, dataset_keys=[key_x, key_y], run_id="run-mapping-a"
+    )
+
+    # Add run-A evidence: one option_candles checkpoint+log (for key_x) and one
+    # nifty_candles log (for key_y, no checkpoint).
+    db.add_all(
+        [
+            IngestionCheckpoint(
+                pipeline="backfill_options",
+                instrument_key="NSE_FO|A|01-10-2026",
+                run_id=run_a.run_id,
+                status="COMPLETED",
+                items_processed=10,
+                items_total=10,
+            ),
+            IngestionLog(
+                run_id=run_a.run_id,
+                operation="option_candles",
+                started_at="2026-09-01T00:00:00+00:00",
+                status="SUCCESS",
+                rows_fetched=10,
+                rows_inserted=10,
+            ),
+            IngestionLog(
+                run_id=run_a.run_id,
+                operation="nifty_candles",
+                started_at="2026-09-01T00:00:00+00:00",
+                status="SUCCESS",
+                rows_fetched=5,
+                rows_inserted=5,
+            ),
+        ]
+    )
+    db.commit()
+
+    refreshed_a = hdg.refresh_ingestion_run_metrics(db, run_a.run_id)
+    assert refreshed_a.expected_records == 10
+    assert refreshed_a.actual_records == 10
+    assert refreshed_a.missing_records == 0
+    assert refreshed_a.completeness_status == "COMPLETE"
+
+    # Mutate the catalog AFTER run A started: change X's mapping to B
+    # (pipeline backfill_nifty, operation nifty_candles) and deactivate Y.
+    row_x = db.scalar(
+        select(HistoricalDatasetGovernance).where(
+            HistoricalDatasetGovernance.dataset_key == key_x
+        )
+    )
+    row_x.pipeline = "backfill_nifty"
+    row_x.completeness_data_type = "nifty_candles"
+    row_x.table_name = "nifty_candles"
+    row_y = db.scalar(
+        select(HistoricalDatasetGovernance).where(
+            HistoricalDatasetGovernance.dataset_key == key_y
+        )
+    )
+    row_y.active = False
+    db.commit()
+
+    # Refresh run A again: must STILL use mapping A (option_candles), so the
+    # nifty_candles log rows for run A are NOT measured against X's expectation,
+    # and X's expectation (10) is still matched by the option_candles actual (10).
+    refreshed_a_again = hdg.refresh_ingestion_run_metrics(db, run_a.run_id)
+    assert refreshed_a_again.expected_records == 10
+    assert refreshed_a_again.actual_records == 10
+    assert refreshed_a_again.missing_records == 0
+    assert refreshed_a_again.completeness_status == "COMPLETE"
+
+    # A deactivated catalog row must not break refresh of an existing run.
+    assert hdg.get_dataset(db, key_x).active is True  # X still active
+
+    # A NEW run sees the current catalog mapping: X now maps to nifty_candles.
+    run_b = hdg.start_ingestion_run(
+        db, dataset_keys=[key_x], run_id="run-mapping-b"
+    )
+    db.add_all(
+        [
+            IngestionCheckpoint(
+                pipeline="backfill_nifty",
+                instrument_key="NSE_INDEX|NIFTY 50|B|01-10-2026",
+                run_id=run_b.run_id,
+                status="COMPLETED",
+                items_processed=7,
+                items_total=7,
+            ),
+            IngestionLog(
+                run_id=run_b.run_id,
+                operation="nifty_candles",
+                started_at="2026-09-01T00:00:00+00:00",
+                status="SUCCESS",
+                rows_fetched=7,
+                rows_inserted=7,
+            ),
+        ]
+    )
+    db.commit()
+
+    refreshed_b = hdg.refresh_ingestion_run_metrics(db, run_b.run_id)
+    assert refreshed_b.expected_records == 7
+    assert refreshed_b.actual_records == 7
+    assert refreshed_b.completeness_status == "COMPLETE"
+
+    # Existing source/entitlement/policy snapshots on run A are unchanged.
+    snapshot_a = json.loads(run_a.source_snapshot_json)
+    assert snapshot_a[key_x]["source"] == "UPSTOX"
+
+    policy_a = json.loads(run_a.policy_snapshot_json)
+    assert policy_a[key_x]["dataset_tier"] == "RAW"
+
+
+def test_deactivated_catalog_row_does_not_break_existing_run_refresh(db):
+    """Finding 3 companion: deactivating a catalog row must not make refresh
+    of an existing run fail, because the run snapshots its mapping at start.
+    """
+    key = "UPSTOX_OPTION_CANDLES_3MIN"
+    _catalog(db, key=key, pipeline="backfill_options", completeness_data_type="option_candles")
+
+    run = hdg.start_ingestion_run(
+        db, dataset_keys=[key], run_id="run-deactivated"
+    )
+    db.add_all(
+        [
+            IngestionCheckpoint(
+                pipeline="backfill_options",
+                instrument_key="NSE_FO|DEACT|01-10-2026",
+                run_id=run.run_id,
+                status="COMPLETED",
+                items_processed=4,
+                items_total=4,
+            ),
+            IngestionLog(
+                run_id=run.run_id,
+                operation="option_candles",
+                started_at="2026-09-01T00:00:00+00:00",
+                status="SUCCESS",
+                rows_fetched=4,
+                rows_inserted=4,
+            ),
+        ]
+    )
+    db.commit()
+
+    assert hdg.refresh_ingestion_run_metrics(db, run.run_id).completeness_status == "COMPLETE"
+
+    # Deactivate the catalog row.
+    row = db.scalar(
+        select(HistoricalDatasetGovernance).where(
+            HistoricalDatasetGovernance.dataset_key == key
+        )
+    )
+    row.active = False
+    db.commit()
+
+    # Refresh must still work using the run's snapshot.
+    refreshed = hdg.refresh_ingestion_run_metrics(db, run.run_id)
+    assert refreshed.completeness_status == "COMPLETE"
+    assert refreshed.expected_records == 4
+    assert refreshed.actual_records == 4
+
+    # A new run that tries to use the deactivated key must fail (current catalog).
+    with pytest.raises(hdg.HistoricalDataGovernanceError, match="inactive historical dataset"):
+        hdg.start_ingestion_run(db, dataset_keys=[key], run_id="run-after-deactivate")
+
+
+def test_legacy_run_without_mapping_snapshot_fails_closed(db):
+    """Finding 3 existing-data semantics: a run whose
+    ``dataset_mapping_snapshot_json`` is empty (the migration's
+    ``server_default="{}"`` for rows created before the snapshot field
+    existed) must fail refresh with a clear governance error rather than
+    silently falling back to the mutable current catalog.
+
+    The current catalog here holds a VALID mapping, so a catalog fallback
+    would silently succeed; the run must fail anyway — fabricated or
+    retroactively reinterpreted mappings are the failure mode Finding 3
+    exists to prevent. The run stays readable and terminalizable through the
+    metrics-free fallback path.
+    """
+    key = "UPSTOX_OPTION_CANDLES_3MIN"
+    # Valid, active current catalog mapping: a fallback to the catalog would
+    # succeed — which is exactly what must not happen.
+    _catalog(
+        db,
+        key=key,
+        pipeline="backfill_options",
+        completeness_data_type="option_candles",
+    )
+
+    run = hdg.start_ingestion_run(db, dataset_keys=[key], run_id="run-legacy")
+    db.add_all(
+        [
+            IngestionCheckpoint(
+                pipeline="backfill_options",
+                instrument_key="NSE_FO|LEGACY|01-10-2026",
+                run_id=run.run_id,
+                status="COMPLETED",
+                items_processed=4,
+                items_total=4,
+            ),
+            IngestionLog(
+                run_id=run.run_id,
+                operation="option_candles",
+                started_at="2026-09-01T00:00:00+00:00",
+                status="SUCCESS",
+                rows_fetched=4,
+                rows_inserted=4,
+            ),
+        ]
+    )
+    db.commit()
+
+    # Simulate a pre-snapshot legacy row: the column exists (migration
+    # applied) but holds only the server default.
+    run.dataset_mapping_snapshot_json = "{}"
+    db.commit()
+    with pytest.raises(
+        hdg.HistoricalDataGovernanceError, match="missing dataset mapping"
+    ):
+        hdg.refresh_ingestion_run_metrics(db, run.run_id)
+
+    # A blank value (no JSON written at all) fails the same way.
+    run.dataset_mapping_snapshot_json = ""
+    db.commit()
+    with pytest.raises(
+        hdg.HistoricalDataGovernanceError, match="missing dataset mapping"
+    ):
+        hdg.refresh_ingestion_run_metrics(db, run.run_id)
+
+    # The run remains readable and terminalizable: the metrics-free fallback
+    # (force_terminal_ingestion_run) never needs the snapshot, so a legacy
+    # manifest can always be closed out instead of being stranded RUNNING.
+    forced = hdg.force_terminal_ingestion_run(
+        db,
+        run.run_id,
+        status=hdg.RUN_FAILED,
+        error_message="legacy run closed without metric refresh",
+    )
+    assert forced.status == hdg.RUN_FAILED
 
 
 def test_ingestion_run_snapshots_policy_and_metrics(db):

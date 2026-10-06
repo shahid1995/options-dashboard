@@ -22,6 +22,10 @@ from typing import Any
 from sqlalchemy import case, delete, func, select
 from sqlalchemy.orm import Session
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 from app.models import (
     ContractSpec,
     HistoricalDatasetGovernance,
@@ -344,10 +348,27 @@ def assert_recomputation_safe(
 def _snapshot_policy(
     db: Session,
     dataset_keys: list[str],
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Snapshot the immutable dataset-mapping a run will be interpreted against.
+
+    The run-scoped metric derivation in
+    :func:`refresh_ingestion_run_metrics` must be stable for the lifetime of a
+    run: a catalog edit after the run begins (including deactivating a row) must
+    not change how the run's evidence is interpreted, and deactivating a row
+    must not break refresh of an existing run.
+
+    The snapshot therefore records the minimum immutable mapping needed to
+    reconstruct the per-dataset ``pipeline`` and ``completeness_data_type``
+    assignments at run start (the two fields that tell refresh which ingestion
+    operations and checkpoints belong to which dataset). The source/entitlement
+    and usage/redistribution/retention policy snapshots are extended to include
+    ``dataset_tier`` so the retention path can also be validated against the
+    snapshot rather than a later catalog edit.
+    """
     source: dict[str, Any] = {}
     entitlement: dict[str, Any] = {}
     policy: dict[str, Any] = {}
+    dataset_mapping: dict[str, Any] = {}
 
     for key in dataset_keys:
         row = get_dataset(db, key)
@@ -369,7 +390,73 @@ def _snapshot_policy(
             "retention_enforced": row.retention_enforced,
             "dataset_tier": row.dataset_tier,
         }
-    return source, entitlement, policy
+        dataset_mapping[key] = {
+            "pipeline": row.pipeline,
+            "completeness_data_type": row.completeness_data_type,
+            "dataset_tier": row.dataset_tier,
+        }
+    return source, entitlement, policy, dataset_mapping
+
+
+def recover_abandoned_manifest(
+    db: Session,
+    background_job_id: str,
+    *,
+    worker_id: str | None = None,
+    now: datetime | None = None,
+) -> int:
+    """Terminalize a crashed attempt's manifest when ownership transfers.
+
+    When a durable ``HISTORICAL_INGESTION`` job's lease expires and another
+    worker reclaims it, the new attempt must not coexist with the old attempt's
+    still-RUNNING manifest. This helper is called by the durable execution path
+    AFTER the new worker has claimed ownership and BEFORE it creates its own
+    manifest, so the old attempt's manifest is terminalized as FAILED (abandoned)
+    and the replacement attempt becomes the sole RUNNING manifest for the job.
+
+    A stale worker whose lease has expired (or whose job was reclaimed) is never
+    allowed to touch manifests: ownership is verified with the same conditional
+    lease check ``complete_job`` uses, and unverified callers are no-ops.
+
+    The old manifests are identified by ``started_at < now`` so the manifest the
+    replacement attempt is about to create (whose ``started_at`` will be ``>= now``)
+    is never touched.
+    """
+    if not worker_id:
+        return 0
+    now = now or _utcnow_naive()
+
+    # Ownership check: the same conditional lease contract ``complete_job`` uses.
+    # If this worker no longer owns the job, it must not touch any manifests.
+    from app.models import BackgroundJob, JobStatus
+
+    still_owned = db.scalar(
+        select(BackgroundJob.id).where(
+            BackgroundJob.id == background_job_id,
+            BackgroundJob.status == JobStatus.RUNNING.value,
+            BackgroundJob.lease_owner == worker_id,
+            BackgroundJob.lease_expires_at.isnot(None),
+            BackgroundJob.lease_expires_at > now,
+        )
+    )
+    if still_owned is None:
+        return 0
+
+    from sqlalchemy import update as _sqlalchemy_update
+
+    result = db.execute(
+        _sqlalchemy_update(HistoricalIngestionRun)
+        .where(HistoricalIngestionRun.background_job_id == background_job_id)
+        .where(HistoricalIngestionRun.status == RUN_RUNNING)
+        .where(HistoricalIngestionRun.started_at < now)
+        .values(
+            status=RUN_FAILED,
+            error_message="abandoned by worker recovery: previous attempt did not finalize",
+            completed_at=now,
+        )
+    )
+    db.commit()
+    return result.rowcount or 0
 
 
 def start_ingestion_run(
@@ -383,7 +470,18 @@ def start_ingestion_run(
     run_id: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> HistoricalIngestionRun:
-    """Create an auditable run manifest with immutable policy snapshots."""
+    """Create an auditable run manifest with immutable policy snapshots.
+
+    The returned run id is the immutable identity of the manifest and is
+    available even when the post-commit refresh fails (see the refresh-error
+    handling in this function).
+
+    When called by the durable ``HISTORICAL_INGESTION`` path with a
+    ``background_job_id``, the caller is responsible for calling
+    :func:`recover_abandoned_manifest` BEFORE this function so a crashed
+    attempt's manifest is terminalized before the replacement attempt creates
+    its own manifest.
+    """
     if not dataset_keys:
         raise HistoricalDataGovernanceError("at least one dataset key is required")
     if purpose not in _ALLOWED_PURPOSES:
@@ -393,7 +491,7 @@ def start_ingestion_run(
     for key in unique_keys:
         get_dataset(db, key)
 
-    source, entitlement, policy = _snapshot_policy(db, unique_keys)
+    source, entitlement, policy, dataset_mapping = _snapshot_policy(db, unique_keys)
     manifest = HistoricalIngestionRun(
         run_id=run_id or uuid4().hex,
         background_job_id=background_job_id,
@@ -401,6 +499,7 @@ def start_ingestion_run(
         source_snapshot_json=json.dumps(source, sort_keys=True),
         entitlement_snapshot_json=json.dumps(entitlement, sort_keys=True),
         policy_snapshot_json=json.dumps(policy, sort_keys=True),
+        dataset_mapping_snapshot_json=json.dumps(dataset_mapping, sort_keys=True),
         purpose=purpose,
         coverage_start=coverage_start,
         coverage_end=coverage_end,
@@ -409,7 +508,34 @@ def start_ingestion_run(
     )
     db.add(manifest)
     db.commit()
-    db.refresh(manifest)
+    # The run id is the immutable identity of this manifest. Keep it
+    # available independently of the post-commit refresh below, so a
+    # refresh failure cannot strand a committed RUNNING manifest and so
+    # the caller never depends on ORM state to know which run was created.
+    manifest_run_id = manifest.run_id
+    try:
+        db.refresh(manifest)
+    except Exception:
+        logger.exception(
+            "historical ingestion manifest %s committed RUNNING but the "
+            "post-commit refresh failed; terminalizing as failed instead of "
+            "leaving it RUNNING",
+            manifest_run_id,
+        )
+        try:
+            force_terminal_ingestion_run(
+                db,
+                manifest_run_id,
+                status=RUN_FAILED,
+                error_message="historical ingestion manifest committed RUNNING but post-commit refresh failed",
+            )
+        except Exception:
+            logger.exception(
+                "could not terminalize historical ingestion manifest %s "
+                "after a refresh failure; the manifest may be stranded RUNNING",
+                manifest_run_id,
+            )
+        raise
     return manifest
 
 
@@ -469,25 +595,40 @@ def refresh_ingestion_run_metrics(
         raise HistoricalDataGovernanceError(f"unknown ingestion run: {run_id}")
 
     dataset_keys = _run_dataset_keys(run)
+
+    # Historical metric interpretation must be stable for the lifetime of a run.
+    # The run snapshots the immutable dataset-mapping at run start (pipeline +
+    # completeness_data_type per dataset), so a catalog edit after the run begins
+    # (including deactivating a row) cannot alter how this run's evidence is
+    # interpreted, and deactivating a row cannot break refresh of an existing run.
+    # A NEW run will snapshot the then-current catalog, so it sees any later
+    # mapping; an existing run keeps the mapping it started with.
+    mapping = json.loads(run.dataset_mapping_snapshot_json or "{}")
+    if not isinstance(mapping, dict):
+        raise HistoricalDataGovernanceError(
+            f"invalid dataset_mapping_snapshot_json for run {run_id}"
+        )
+
     pipelines: list[str] = []
     operations: list[str] = []
-    # Catalog pipeline -> the IngestionLog operation that publishes it. This
+    # Run-scoped pipeline -> the IngestionLog operation that publishes it. This
     # is what resolves a checkpoint-backed pipeline back to the log rows that
     # retrieved its rows.
     operation_by_pipeline: dict[str, str] = {}
     for key in dataset_keys:
-        row = get_dataset(db, key)
-        if row.pipeline:
-            pipelines.append(row.pipeline)
-        if row.completeness_data_type:
-            # The catalog's completeness_data_type names the IngestionLog
-            # operation that produces this dataset (contract_metadata,
-            # nifty_candles, option_candles).
-            operations.append(row.completeness_data_type)
-            if row.pipeline:
-                operation_by_pipeline.setdefault(
-                    row.pipeline, row.completeness_data_type
-                )
+        mapping_for_key = mapping.get(key)
+        if not isinstance(mapping_for_key, dict):
+            raise HistoricalDataGovernanceError(
+                f"missing dataset mapping for {key!r} in run {run_id}"
+            )
+        pipeline = mapping_for_key.get("pipeline")
+        data_type = mapping_for_key.get("completeness_data_type")
+        if pipeline:
+            pipelines.append(pipeline)
+        if data_type:
+            operations.append(data_type)
+            if pipeline:
+                operation_by_pipeline.setdefault(pipeline, data_type)
 
     # The pipelines that actually produced run-scoped checkpoint rows. Only
     # these declared an expectation, so only these have an actual that can be

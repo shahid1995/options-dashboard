@@ -153,6 +153,44 @@ def test_every_revision_resolves_and_is_import_safe():
         assert Path(rev.path).exists(), f"revision file missing on disk: {rev.path}"
 
 
+def test_historical_ingestion_runs_has_dataset_mapping_snapshot_column():
+    """Finding 3 (PR #128): the application model and governance service
+    persist ``dataset_mapping_snapshot_json`` on every ingestion manifest, so
+    the migration chain must actually create that column — verified against
+    the real alembic upgrade, not the SQLAlchemy test-fixture schema.
+    """
+    cfg, path = _fresh_db()
+    try:
+        command.upgrade(cfg, "head")
+        engine = create_engine(f"sqlite:///{path}")
+        with engine.connect() as conn:
+            tables = {
+                r[0]
+                for r in conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table'")
+                ).fetchall()
+            }
+            columns = set()
+            if "historical_ingestion_runs" in tables:
+                columns = {
+                    r[1]
+                    for r in conn.execute(
+                        text("PRAGMA table_info(historical_ingestion_runs)")
+                    ).fetchall()
+                }
+        engine.dispose()
+        assert "historical_ingestion_runs" in tables, (
+            "historical_ingestion_runs table missing after upgrade"
+        )
+        assert "dataset_mapping_snapshot_json" in columns, (
+            "d48aa0000002 must add historical_ingestion_runs."
+            "dataset_mapping_snapshot_json so refresh_ingestion_run_metrics "
+            "can read the immutable snapshot written by start_ingestion_run"
+        )
+    finally:
+        os.remove(path)
+
+
 def test_broker_authorizations_table_created_by_upgrade():
     cfg, path = _fresh_db()
     try:

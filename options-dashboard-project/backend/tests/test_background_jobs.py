@@ -3151,7 +3151,9 @@ class TestGovernanceManifestTerminalization:
             idempotency_key=idempotency_key,
             payload={"stages": ["options"]},
         )
-        return db, job
+        bj.claim_next(db, worker_id="worker-factory", lease_seconds=900)
+        db.commit()
+        return db, job, "worker-factory"
 
     def _manifest_for(self, db, job, run_id=None):
         if run_id:
@@ -3168,10 +3170,10 @@ class TestGovernanceManifestTerminalization:
                 raise RuntimeError("synthetic constructor failure")
 
         self._stub(monkeypatch, _BrokenCtor)
-        db, job = self._run(session_factory, "gov-terminal:ctor")
+        db, job, worker = self._run(session_factory, "gov-terminal:ctor")
 
         with pytest.raises(RuntimeError, match="synthetic constructor failure"):
-            bj.execute_historical_ingestion(db, job)
+            bj.execute_historical_ingestion(db, job, worker_id=worker)
 
         manifest = self._manifest_for(db, job)
         assert manifest is not None
@@ -3193,9 +3195,13 @@ class TestGovernanceManifestTerminalization:
                 return result
 
         self._stub(monkeypatch, _Orch)
-        db, job = self._run(session_factory, "gov-terminal:ok")
+        db, job, worker = self._run(session_factory, "gov-terminal:ok")
 
-        summary = bj.execute_historical_ingestion(db, job)
+        summary = bj.execute_historical_ingestion(db, job, worker_id=worker)
+
+        # The durable path runs recover_abandoned_manifest before creating the
+        # manifest; with no prior RUNNING manifest for this job that is a no-op,
+        # so the success path is unchanged.
 
         manifest = self._manifest_for(db, job, summary["governance_run_id"])
         assert manifest.status == "SUCCEEDED"
@@ -3222,8 +3228,8 @@ class TestGovernanceManifestTerminalization:
 
         monkeypatch.setattr(bj, "finish_ingestion_run", _explode)
 
-        db, job = self._run(session_factory, "gov-terminal:finalize")
-        summary = bj.execute_historical_ingestion(db, job)
+        db, job, worker = self._run(session_factory, "gov-terminal:finalize")
+        summary = bj.execute_historical_ingestion(db, job, worker_id=worker)
 
         manifest = self._manifest_for(db, job, summary["governance_run_id"])
         assert manifest.status == "SUCCEEDED"
@@ -3254,13 +3260,16 @@ class TestGovernanceManifestTerminalization:
                 raise signal_exc("synthetic shutdown")
 
         self._stub(monkeypatch, _Interrupted)
-        db, job = self._run(session_factory, "gov-terminal:cancel")
+        db, job, worker = self._run(session_factory, "gov-terminal:cancel")
 
         # The original exception propagates unchanged (asyncio may hand back
         # its own CancelledError instance for a coroutine-raised one, so no
-        # message match is asserted here).
+        # message match is asserted here). The durable path runs
+        # recover_abandoned_manifest before creating the manifest; with no prior
+        # RUNNING manifest for this job that is a no-op, so the cancellation
+        # path is unchanged.
         with pytest.raises(signal_exc):
-            bj.execute_historical_ingestion(db, job)
+            bj.execute_historical_ingestion(db, job, worker_id=worker)
 
         manifest = self._manifest_for(db, job)
         assert manifest is not None
@@ -3457,9 +3466,14 @@ class TestGovernanceManifestTerminalization:
             monkeypatch, session_factory, hdg, observed
         )
 
-        db, job = self._run(session_factory, "gov-terminal:mid-finalization")
-        summary = bj.execute_historical_ingestion(db, job)
+        db, job, worker = self._run(session_factory,            "gov-terminal:mid-finalization")
+        summary = bj.execute_historical_ingestion(db, job, worker_id=worker)
         db.close()
+
+        # The durable path runs recover_abandoned_manifest before creating the
+        # manifest; with no prior RUNNING manifest for this job that is a no-op,
+        # so the mid-finalization window is unchanged.
+
 
         # 1. The real refresh persisted the calculated metrics, and the
         #    manifest was still RUNNING at that point.
@@ -3526,11 +3540,15 @@ class TestGovernanceManifestTerminalization:
             monkeypatch, session_factory, hdg, observed
         )
 
-        db, job = self._run(
+        db, job, worker = self._run(
             session_factory, "gov-terminal:mid-finalization-complete"
         )
-        summary = bj.execute_historical_ingestion(db, job)
+        summary = bj.execute_historical_ingestion(db, job, worker_id=worker)
         db.close()
+
+        # The durable path runs recover_abandoned_manifest before creating the
+        # manifest; with no prior RUNNING manifest for this job that is a no-op,
+        # so the mid-finalization window is unchanged.
 
         # The refresh committed clean COMPLETE evidence, and the terminal
         # commit still failed, so the fallback is the path under test.

@@ -1332,6 +1332,7 @@ class HistoricalIngestionRun(Base):
     source_snapshot_json: Mapped[str] = mapped_column(Text, default="{}")
     entitlement_snapshot_json: Mapped[str] = mapped_column(Text, default="{}")
     policy_snapshot_json: Mapped[str] = mapped_column(Text, default="{}")
+    dataset_mapping_snapshot_json: Mapped[str] = mapped_column(Text, default="{}")
 
     purpose: Mapped[str] = mapped_column(String(32), default="INTERNAL_RESEARCH")
     coverage_start: Mapped[str | None] = mapped_column(String(10), nullable=True)
