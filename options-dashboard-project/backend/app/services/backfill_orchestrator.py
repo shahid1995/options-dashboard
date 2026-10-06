@@ -988,15 +988,20 @@ class BackfillOrchestrator:
             # nothing rather than inventing a total or a zero remainder.
             fetched: int | None = None
             persisted: int | None = 0
-            # Session isolation: this task owns its OWN Session end to end.
-            # Created before the rate-limiter slot is taken; closed on every
-            # exit path. A database failure below poisons (and is rolled
-            # back on) ONLY this Session, so it can never invalidate another
-            # instrument's transaction or the orchestrator's session.
-            task_db = task_session_factory()
+            # Phase 7.24.8C: Wait for rate-limiter permission FIRST, so no
+            # Session (and no pooled connection) is opened while the task
+            # waits for its turn. The slot is always released afterwards,
+            # even if the factory below fails.
+            await limiter.acquire()
             try:
-                # Phase 7.24.8C: Wait for rate limiter permission
-                await limiter.acquire()
+                # Session isolation: this task owns its OWN Session end to
+                # end; a database failure below poisons (and is rolled back
+                # on) ONLY this Session, so it can never invalidate another
+                # instrument's transaction or the orchestrator's session. A
+                # Session that is created is always closed by the inner
+                # finally; a factory failure creates none and still releases
+                # the limiter slot via the outer finally.
+                task_db = task_session_factory()
                 try:
                     # Log progress
                     progress[0] += 1
@@ -1130,12 +1135,12 @@ class BackfillOrchestrator:
                     logger.warning("Instrument %s failed: %s", ik, e)
 
                 finally:
-                    # Always release the semaphore slot
-                    limiter.release()
+                    # Always close this instrument's Session (rolling back
+                    # anything left open).
+                    task_db.close()
             finally:
-                # Release this instrument's Session on every exit path
-                # (rolling back anything left open).
-                task_db.close()
+                # Always release the semaphore slot acquired above.
+                limiter.release()
 
         # Launch all tasks — rate limiter gates concurrency and pacing
         tasks = [process_one(spec) for spec in remaining]
