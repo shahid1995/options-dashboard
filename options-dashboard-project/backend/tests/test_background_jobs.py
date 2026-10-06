@@ -3271,3 +3271,179 @@ class TestGovernanceManifestTerminalization:
         detail = manifest.error_message or ""
         assert detail
         assert "synthetic shutdown" in detail or signal_exc.__name__ in detail
+
+    def test_mid_finalization_failure_recovers_with_metrics_intact(
+        self, session_factory, monkeypatch
+    ):
+        """Day 48 mid-finalization window: ``refresh_ingestion_run_metrics()``
+        commits the calculated metrics, the LATER terminal-status commit
+        fails, and ``_finalize_governance_run()`` recovers through the
+        ``force_terminal_ingestion_run()`` fallback.
+
+        ``test_finalization_failure_still_leaves_manifest_terminal`` patches
+        ``finish_ingestion_run`` wholesale, so it aborts before the refresh
+        phase ever runs and cannot reach this window. Here the real refresh
+        runs and commits, and ONLY the terminal-status write is failed -- with
+        a genuine flush-time integrity error, so the session is invalidated
+        exactly as a rejected terminal write leaves it and the fallback's
+        rollback is load-bearing rather than cosmetic.
+
+        The final state is read back through independent sessions, so every
+        assertion is about persisted rows rather than in-memory ORM state.
+        """
+        from app.services import historical_data_governance as hdg
+        from app.models import IngestionCheckpoint, IngestionLog
+
+        observed = {}
+        result = self._Result()
+
+        class _Orch:
+            """Writes this run's real run-scoped checkpoint/log evidence."""
+
+            def __init__(self, db, client, *, force=False, rate_limiter=None):
+                self.run_id = None
+                self._db = db
+
+            async def run_all(self, *, stages=None, nifty_start_date=None,
+                              options_concurrency=None):
+                # 90 rows declared, 80 stored, one operation reporting the
+                # fetch. Through the catalog's backfill_options ->
+                # option_candles mapping this is expected=90, actual=90,
+                # missing=10, completeness=PARTIAL.
+                self._db.add(IngestionCheckpoint(
+                    pipeline="backfill_options",
+                    instrument_key="NSE_FO|63935|28-07-2026",
+                    run_id=self.run_id,
+                    status="PARTIAL",
+                    items_total=90,
+                    items_processed=80,
+                    started_at="2026-07-28T09:15:00+05:30",
+                ))
+                self._db.add(IngestionLog(
+                    run_id=self.run_id,
+                    operation="option_candles",
+                    instrument_key="NSE_FO|63935|28-07-2026",
+                    status="PARTIAL",
+                    started_at="2026-07-28T09:15:00+05:30",
+                    rows_fetched=90,
+                ))
+                self._db.commit()
+                return result
+
+        self._stub(monkeypatch, _Orch)
+
+        real_refresh = hdg.refresh_ingestion_run_metrics
+
+        def refresh_then_fail_next_commit(db, run_id):
+            run = real_refresh(db, run_id)  # REAL metrics, committed
+
+            # Snapshot the DURABLE state via an independent session: this
+            # proves the refresh committed, and records that the manifest was
+            # still RUNNING -- i.e. that the window under test was reached.
+            probe = session_factory()
+            committed = probe.scalar(
+                select(HistoricalIngestionRun).where(
+                    HistoricalIngestionRun.run_id == run_id
+                )
+            )
+            observed["metrics"] = (
+                committed.expected_records,
+                committed.actual_records,
+                committed.missing_records,
+                committed.completeness_status,
+            )
+            observed["status_after_refresh"] = committed.status
+            probe.close()
+
+            # Fail ONLY the commit that follows the refresh. The injected row
+            # violates a NOT NULL constraint at flush time, so the transaction
+            # is genuinely invalidated -- the state a rejected terminal-status
+            # write leaves behind -- rather than merely raising in Python.
+            real_commit = db.commit
+
+            def failing_commit(*args, **kwargs):
+                db.commit = real_commit  # one-shot: only this commit fails
+                db.add(IngestionLog(
+                    run_id=None,
+                    operation="terminal-status-probe",
+                    started_at="2026-07-28T09:15:00+05:30",
+                    status="PARTIAL",
+                ))
+                try:
+                    return real_commit(*args, **kwargs)
+                except Exception as exc:
+                    observed["failure"] = type(exc).__name__
+                    try:
+                        db.scalar(select(HistoricalIngestionRun))
+                        observed["poisoned"] = None
+                    except Exception as probe_exc:
+                        observed["poisoned"] = type(probe_exc).__name__
+                    raise
+
+            db.commit = failing_commit
+            return run
+
+        monkeypatch.setattr(
+            hdg, "refresh_ingestion_run_metrics", refresh_then_fail_next_commit
+        )
+
+        # Record that the recovery path was taken, while still running the
+        # REAL fallback so the persisted result is what gets asserted.
+        real_force = bj.force_terminal_ingestion_run
+        fallback_calls = []
+
+        def recording_force(db, run_id, *, status, error_message=None):
+            fallback_calls.append(status)
+            return real_force(
+                db, run_id, status=status, error_message=error_message
+            )
+
+        monkeypatch.setattr(bj, "force_terminal_ingestion_run", recording_force)
+
+        db, job = self._run(session_factory, "gov-terminal:mid-finalization")
+        summary = bj.execute_historical_ingestion(db, job)
+        db.close()
+
+        # 1. The real refresh persisted the calculated metrics, and the
+        #    manifest was still RUNNING at that point.
+        assert observed["metrics"] == (90, 90, 10, "PARTIAL")
+        assert observed["status_after_refresh"] == "RUNNING"
+
+        # 2. The terminal-status persistence really failed ...
+        assert observed["failure"] == "IntegrityError"
+        # ... and genuinely invalidated the session, so the fallback's
+        # rollback is doing necessary recovery work.
+        assert observed["poisoned"] == "PendingRollbackError"
+
+        # 3. The fallback was the recovery path actually taken.
+        assert fallback_calls == ["SUCCEEDED"]
+
+        # 4. The persisted manifest is terminal, with a completion timestamp.
+        #    The fallback writes the REQUESTED terminal status and deliberately
+        #    does not re-derive the completeness downgrade that finish_ingestion_run
+        #    applies, so the status is SUCCEEDED while completeness stays PARTIAL.
+        check = session_factory()
+        manifest = check.scalar(
+            select(HistoricalIngestionRun).where(
+                HistoricalIngestionRun.run_id == summary["governance_run_id"]
+            )
+        )
+        assert manifest is not None
+        assert manifest.status == "SUCCEEDED"
+        assert manifest.completed_at is not None
+
+        # 5. The already-committed metrics survived the fallback unchanged.
+        assert (
+            manifest.expected_records,
+            manifest.actual_records,
+            manifest.missing_records,
+            manifest.completeness_status,
+        ) == observed["metrics"]
+
+        # 6. No manifest is left stranded in RUNNING.
+        assert check.scalar(
+            select(func.count()).select_from(HistoricalIngestionRun).where(
+                HistoricalIngestionRun.status == "RUNNING"
+            )
+        ) == 0
+        check.close()
