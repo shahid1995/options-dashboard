@@ -166,7 +166,7 @@ def test_day49_migrates_legacy_iv_timestamps_to_ist(temp_db):
             )
         )
         conn.execute(
-            text("INSERT INTO alembic_version (version_num) VALUES ('d48aa0000001')")
+            text("INSERT INTO alembic_version (version_num) VALUES ('d48aa0000002')")
         )
         conn.execute(
             text(
@@ -276,7 +276,7 @@ def test_auth_callback_does_not_call_ensure_identity_schema(monkeypatch):
 
 
 def _run_d49_migration(temp_db, rows):
-    """Stamp a create_all database at d48aa0000001, seed IVObservation rows,
+    """Stamp a create_all database at d48aa0000002, seed IVObservation rows,
     run the d49aa0000001 migration, and return the persisted values."""
     from alembic import command
     from alembic.config import Config
@@ -293,7 +293,7 @@ def _run_d49_migration(temp_db, rows):
             )
         )
         conn.execute(
-            text("INSERT INTO alembic_version (version_num) VALUES ('d48aa0000001')")
+            text("INSERT INTO alembic_version (version_num) VALUES ('d48aa0000002')")
         )
         for index, observed_at in enumerate(rows):
             conn.execute(
@@ -393,7 +393,7 @@ def test_day49_migration_downgrade_is_refused(temp_db):
             )
         )
         conn.execute(
-            text("INSERT INTO alembic_version (version_num) VALUES ('d48aa0000001')")
+            text("INSERT INTO alembic_version (version_num) VALUES ('d48aa0000002')")
         )
     engine.dispose()
 
@@ -402,7 +402,7 @@ def test_day49_migration_downgrade_is_refused(temp_db):
     command.upgrade(alembic_cfg, "head")
 
     with pytest.raises(Exception) as excinfo:
-        command.downgrade(alembic_cfg, "d48aa0000001")
+        command.downgrade(alembic_cfg, "d48aa0000002")
     message = str(excinfo.value).lower()
     assert "irreversible" in message
     assert "ist" in message or "timestamp" in message
@@ -438,7 +438,7 @@ def test_day49_migration_never_reexecutes_over_post_day49_rows(temp_db):
     UTC→IST conversion via any supported deployment path: replaying the
     startup command leaves it unchanged, and the only lower-revision
     command (downgrade) refuses. Reaching the double-shift requires an
-    unsupported out-of-band ``alembic stamp d48aa0000001`` before an
+    unsupported out-of-band ``alembic stamp d48aa0000002`` before an
     upgrade — an operator action no workflow, script, or document in this
     repository performs.
     """
@@ -459,7 +459,7 @@ def test_day49_migration_never_reexecutes_over_post_day49_rows(temp_db):
             )
         )
         conn.execute(
-            text("INSERT INTO alembic_version (version_num) VALUES ('d48aa0000001')")
+            text("INSERT INTO alembic_version (version_num) VALUES ('d48aa0000002')")
         )
     engine.dispose()
 

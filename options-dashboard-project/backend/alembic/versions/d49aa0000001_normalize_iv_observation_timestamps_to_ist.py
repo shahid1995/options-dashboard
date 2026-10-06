@@ -28,7 +28,11 @@ from alembic import op
 import sqlalchemy as sa
 
 revision = "d49aa0000001"
-down_revision = "d48aa0000001"
+# Isolated Day-49-only reconstruction: the merged Day-48 base added
+# d48aa0000002 after this migration was originally written, so d49 chains
+# onto the merged Day-48 head to keep a single linear history (Alembic
+# single-head invariant).
+down_revision = "d48aa0000002"
 branch_labels = None
 depends_on = None
 
