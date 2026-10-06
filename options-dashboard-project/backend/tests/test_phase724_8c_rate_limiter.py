@@ -987,3 +987,135 @@ class TestRateLimiterOrchestratorIntegration:
         with patch("app.services.upstox_client.UpstoxClient") as MockCls:
             hermetic_init_db()
             MockCls.assert_not_called()
+
+
+# ===========================================================================
+# Session isolation for concurrent instrument tasks
+# ===========================================================================
+
+
+class TestConcurrentInstrumentSessionIsolation:
+    """Each concurrent ``process_one`` task must own its OWN Session.
+
+    One instrument's database failure may poison only (and roll back only)
+    that instrument's transaction — never another instrument's transaction
+    nor the orchestrator's own session used for discovery and the final
+    ingestion log.
+    """
+
+    @pytest.mark.asyncio
+    async def test_concurrent_tasks_never_use_the_shared_session(
+        self, db, monkeypatch
+    ):
+        import app.services.backfill_orchestrator as bo
+
+        _add_nifty_candles(db, date(2024, 9, 30))
+        _add_specs_for_expiry(db, "2024-10-03", [25000, 25050])  # 4 instruments
+
+        real_upsert = bo._upsert_checkpoint
+        used: list = []  # strong refs keep object identity stable
+
+        def recording_upsert(the_db, pipeline, instrument_key, status, **kwargs):
+            used.append((instrument_key, the_db))
+            return real_upsert(the_db, pipeline, instrument_key, status, **kwargs)
+
+        monkeypatch.setattr(bo, "_upsert_checkpoint", recording_upsert)
+
+        client = _mock_client()
+        orch = BackfillOrchestrator(
+            db, client, rate_limiter=GlobalRateLimiter(config=_fast_config())
+        )
+        result = await orch.run_options(concurrency=4)
+
+        assert result.status == "SUCCESS"
+        n = result.metadata["instruments_to_process"]
+        assert n == 4
+        # RUNNING + COMPLETED checkpoint per instrument at minimum.
+        assert len(used) >= 2 * n
+        # Exactly one distinct Session object per concurrent instrument ...
+        assert len({id(the_db) for _ik, the_db in used}) == n
+        # ... and NEVER the orchestrator's own session.
+        assert all(the_db is not orch.db for _ik, the_db in used)
+        # Each instrument's transaction committed independently: all rows
+        # are visible from the orchestrator's session afterwards. The mock
+        # client returns 100 candles per instrument but only 2 unique
+        # timestamps, and the idempotent upsert dedups them.
+        assert (
+            db.execute(select(func.count(OptionCandle.id))).scalar() == 2 * n
+        )
+
+    @pytest.mark.asyncio
+    async def test_instrument_db_failure_is_rolled_back_in_isolation(
+        self, db, monkeypatch
+    ):
+        import app.services.option_candles as option_candles_mod
+
+        _add_nifty_candles(db, date(2024, 9, 30))
+        _add_specs_for_expiry(db, "2024-10-03", [25000])  # 2 instruments
+
+        real_record = option_candles_mod.record_option_candles
+        state = {"poisoned": False}
+
+        def poisoning_record(the_db, candles):
+            if not state["poisoned"]:
+                state["poisoned"] = True
+                # A failed ORM FLUSH (NOT NULL violation here) is the class
+                # of database failure that marks a Session's transaction
+                # rollback-only: every later operation on THAT Session
+                # raises PendingRollbackError until it is rolled back.
+                the_db.add(ContractSpec(instrument_key=None, underlying="NIFTY"))
+                the_db.flush()
+            return real_record(the_db, candles)
+
+        monkeypatch.setattr(
+            option_candles_mod, "record_option_candles", poisoning_record
+        )
+
+        client = _mock_client()
+        orch = BackfillOrchestrator(
+            db, client, rate_limiter=GlobalRateLimiter(config=_fast_config())
+        )
+        # run_options must RETURN, not raise: the poison stays inside the
+        # failing instrument's own session and is rolled back there — it
+        # must never cascade into another instrument's transaction or the
+        # orchestrator's final ingestion log.
+        result = await orch.run_options(concurrency=2)
+
+        assert result.status == "PARTIAL"
+        assert len(result.errors) == 1
+
+        checkpoints = db.execute(
+            select(IngestionCheckpoint).where(
+                IngestionCheckpoint.pipeline == PIPELINE_OPTIONS
+            )
+        ).scalars().all()
+        statuses = sorted(cp.status for cp in checkpoints)
+        assert statuses.count("FAILED") == 1
+        assert statuses.count("COMPLETED") == 1
+        # The healthy instrument persisted via its own session: 100 candles
+        # processed (2 unique timestamps after idempotent upsert).
+        assert result.rows_inserted == 100
+        assert db.execute(select(func.count(OptionCandle.id))).scalar() == 2
+
+    @pytest.mark.asyncio
+    async def test_direct_construction_without_session_factory_still_works(self, db):
+        """Backward compatibility: existing callers construct the
+        orchestrator exactly as before — no session_factory argument — and
+        still get a correct run (isolation is derived internally)."""
+        _add_nifty_candles(db, date(2024, 9, 30))
+        _add_specs_for_expiry(db, "2024-10-03", [25000])
+
+        client = _mock_client()
+        orch = BackfillOrchestrator(
+            db, client, rate_limiter=GlobalRateLimiter(config=_fast_config())
+        )
+        result = await orch.run_options(concurrency=2)
+
+        assert result.status == "SUCCESS"
+        checkpoints = db.execute(
+            select(IngestionCheckpoint).where(
+                IngestionCheckpoint.pipeline == PIPELINE_OPTIONS
+            )
+        ).scalars().all()
+        assert checkpoints
+        assert all(cp.status == "COMPLETED" for cp in checkpoints)

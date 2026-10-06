@@ -43,10 +43,10 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.models import (
     ContractSpec,
@@ -332,11 +332,17 @@ class BackfillOrchestrator:
         dry_run: bool = False,
         force: bool = False,
         rate_limiter: GlobalRateLimiter | None = None,
+        session_factory: Callable[[], Session] | None = None,
     ):
         self.db = db
         self.client = client
         self.dry_run = dry_run
         self.force = force
+        # Optional per-task Session factory for the concurrent options path.
+        # When omitted, one is derived from ``db``'s engine inside
+        # ``_run_options_rate_limited``, so every existing direct/CLI caller
+        # gets session isolation without any construction change.
+        self._session_factory = session_factory
         self.run_id = f"backfill_{uuid.uuid4().hex[:12]}"
         self._api_calls = 0
         # Phase 7.24.8C: Global rate limiter (shared across workers)
@@ -953,12 +959,23 @@ class BackfillOrchestrator:
             ``release()`` after.
           - On 429 the limiter enters global cooldown; on success it
             gradually widens the window.
-          - Each instrument still has an independent DB transaction.
+          - Each instrument task owns its OWN Session (independent
+            transaction boundary): a database failure in one instrument
+            poisons and rolls back only that instrument's work, never
+            another instrument's transaction or the orchestrator's own
+            session used for discovery and the final ingestion log.
         """
         lock = asyncio.Lock()  # Protects shared result counters
         progress = [0]
         total = len(remaining)
         limiter = self._rate_limiter
+        # Session isolation contract: every concurrent instrument task opens
+        # its own Session. An explicit session_factory from the caller wins;
+        # otherwise one is derived from this session's bind so existing
+        # direct/CLI callers get isolation without any code change.
+        task_session_factory = self._session_factory or sessionmaker(
+            bind=self.db.get_bind()
+        )
 
         async def process_one(spec: ContractSpec) -> None:
             ik = spec.instrument_key
@@ -971,133 +988,154 @@ class BackfillOrchestrator:
             # nothing rather than inventing a total or a zero remainder.
             fetched: int | None = None
             persisted: int | None = 0
-            # Phase 7.24.8C: Wait for rate limiter permission
-            await limiter.acquire()
+            # Session isolation: this task owns its OWN Session end to end.
+            # Created before the rate-limiter slot is taken; closed on every
+            # exit path. A database failure below poisons (and is rolled
+            # back on) ONLY this Session, so it can never invalidate another
+            # instrument's transaction or the orchestrator's session.
+            task_db = task_session_factory()
             try:
-                # Log progress
-                progress[0] += 1
-                if progress[0] % 10 == 0 or progress[0] == total:
-                    limiter.log_status()
-                    logger.info(
-                        "[%d/%d] Progress (%.0f%%)",
-                        progress[0],
-                        total,
-                        progress[0] / total * 100,
+                # Phase 7.24.8C: Wait for rate limiter permission
+                await limiter.acquire()
+                try:
+                    # Log progress
+                    progress[0] += 1
+                    if progress[0] % 10 == 0 or progress[0] == total:
+                        limiter.log_status()
+                        logger.info(
+                            "[%d/%d] Progress (%.0f%%)",
+                            progress[0],
+                            total,
+                            progress[0] / total * 100,
+                        )
+
+                    # Set checkpoint
+                    _upsert_checkpoint(
+                        task_db, PIPELINE_OPTIONS, ik,
+                        status="RUNNING", run_id=self.run_id,
+                    )
+                    task_db.commit()
+
+                    # Fetch candles
+                    candles = await self.client.get_expired_historical_candles(
+                        ik, DEFAULT_INTERVAL_API, spec.expiry, spec.expiry,
                     )
 
-                # Set checkpoint
-                _upsert_checkpoint(
-                    self.db, PIPELINE_OPTIONS, ik,
-                    status="RUNNING", run_id=self.run_id,
-                )
-                self.db.commit()
-
-                # Fetch candles
-                candles = await self.client.get_expired_historical_candles(
-                    ik, DEFAULT_INTERVAL_API, spec.expiry, spec.expiry,
-                )
-
-                # Signal success to the rate limiter
-                await limiter.on_success()
-
-                async with lock:
-                    result.api_calls += 1
-                    self._api_calls += 1
-                    result.rows_fetched += len(candles)
-                fetched = len(candles)
-
-                # Normalize and persist
-                if candles:
-                    from app.services.option_candles import (
-                        normalize_option_candles,
-                        record_option_candles,
-                    )
-                    from app.services.candle_validation import validate_candle
-
-                    normalized = normalize_option_candles(
-                        candles, instrument_key=ik,
-                    )
-                    valid = [c for c in normalized if validate_candle(c, 0).is_valid]
-                    try:
-                        inserted = record_option_candles(self.db, valid)
-                    except Exception:
-                        # Rows may have been stored before the failure, so
-                        # the processed count is no longer knowable: declare
-                        # nothing rather than a fabricated zero.
-                        persisted = None
-                        raise
-                    persisted = inserted
+                    # Signal success to the rate limiter
+                    await limiter.on_success()
 
                     async with lock:
-                        result.rows_inserted += inserted
+                        result.api_calls += 1
+                        self._api_calls += 1
+                        result.rows_fetched += len(candles)
+                    fetched = len(candles)
 
+                    # Normalize and persist
+                    if candles:
+                        from app.services.option_candles import (
+                            normalize_option_candles,
+                            record_option_candles,
+                        )
+                        from app.services.candle_validation import validate_candle
+
+                        normalized = normalize_option_candles(
+                            candles, instrument_key=ik,
+                        )
+                        valid = [c for c in normalized if validate_candle(c, 0).is_valid]
+                        try:
+                            inserted = record_option_candles(task_db, valid)
+                        except Exception:
+                            # Rows may have been stored before the failure, so
+                            # the processed count is no longer knowable: declare
+                            # nothing rather than a fabricated zero.
+                            persisted = None
+                            raise
+                        persisted = inserted
+
+                        async with lock:
+                            result.rows_inserted += inserted
+
+                        _upsert_checkpoint(
+                            task_db, PIPELINE_OPTIONS, ik,
+                            status="COMPLETED", run_id=self.run_id,
+                            items_processed=inserted,
+                            items_total=len(candles),
+                        )
+                    else:
+                        _upsert_checkpoint(
+                            task_db, PIPELINE_OPTIONS, ik,
+                            status="COMPLETED", run_id=self.run_id,
+                            items_processed=0,
+                            items_total=0,
+                        )
+
+                    task_db.commit()
+                    await limiter.mark_instrument_done()
+
+                except UpstoxAuthenticationError:
+                    # 401 is never retried; instrument stays FAILED. The fetch
+                    # never returned, so no total is declared unless this
+                    # attempt genuinely learned one. Roll back THIS task's
+                    # session first so its failure checkpoint is writable even
+                    # after a partial write; no other session is touched.
+                    task_db.rollback()
                     _upsert_checkpoint(
-                        self.db, PIPELINE_OPTIONS, ik,
-                        status="COMPLETED", run_id=self.run_id,
-                        items_processed=inserted,
-                        items_total=len(candles),
+                        task_db, PIPELINE_OPTIONS, ik,
+                        status="FAILED", run_id=self.run_id,
+                        error_message="Authentication expired",
+                        **_declared_progress(fetched, persisted),
                     )
-                else:
+                    task_db.commit()
+                    raise
+
+                except UpstoxRateLimitError as e:
+                    # Phase 7.24.8C: 429 goes through the global rate limiter,
+                    # NOT the instrument failure path.  The instrument remains
+                    # PENDING for retry on the next run.
+                    await limiter.on_429(retry_after=e.retry_after)
+
+                    async with lock:
+                        result.errors.append(f"{ik}: 429 rate limit")
+
+                    # Mark as PENDING (not FAILED) so checkpoint/resume retries it
+                    task_db.rollback()
                     _upsert_checkpoint(
-                        self.db, PIPELINE_OPTIONS, ik,
-                        status="COMPLETED", run_id=self.run_id,
-                        items_processed=0,
-                        items_total=0,
+                        task_db, PIPELINE_OPTIONS, ik,
+                        status="PENDING", run_id=self.run_id,
+                        error_message=f"Rate limited (will retry): {e.message}",
+                        **_declared_progress(fetched, persisted),
                     )
+                    task_db.commit()
+                    logger.warning("Instrument %s rate-limited (will retry)", ik)
 
-                self.db.commit()
-                await limiter.mark_instrument_done()
+                except Exception as e:
+                    await limiter.on_error()
 
-            except UpstoxAuthenticationError:
-                # 401 is never retried; instrument stays FAILED. The fetch
-                # never returned, so no total is declared unless this
-                # attempt genuinely learned one.
-                _upsert_checkpoint(
-                    self.db, PIPELINE_OPTIONS, ik,
-                    status="FAILED", run_id=self.run_id,
-                    error_message="Authentication expired",
-                    **_declared_progress(fetched, persisted),
-                )
-                self.db.commit()
-                raise
+                    async with lock:
+                        result.errors.append(f"{ik}: {e}")
 
-            except UpstoxRateLimitError as e:
-                # Phase 7.24.8C: 429 goes through the global rate limiter,
-                # NOT the instrument failure path.  The instrument remains
-                # PENDING for retry on the next run.
-                await limiter.on_429(retry_after=e.retry_after)
+                    # Clear THIS instrument's poisoned transaction first (the
+                    # failure may have been a database error), so its failure
+                    # checkpoint can still be written. Only this task's own
+                    # session is rolled back — other instruments' transactions
+                    # and the orchestrator's session are unaffected.
+                    task_db.rollback()
+                    _upsert_checkpoint(
+                        task_db, PIPELINE_OPTIONS, ik,
+                        status="FAILED", run_id=self.run_id,
+                        error_message=str(e)[:500],
+                        **_declared_progress(fetched, persisted),
+                    )
+                    task_db.commit()
+                    logger.warning("Instrument %s failed: %s", ik, e)
 
-                async with lock:
-                    result.errors.append(f"{ik}: 429 rate limit")
-
-                # Mark as PENDING (not FAILED) so checkpoint/resume retries it
-                _upsert_checkpoint(
-                    self.db, PIPELINE_OPTIONS, ik,
-                    status="PENDING", run_id=self.run_id,
-                    error_message=f"Rate limited (will retry): {e.message}",
-                    **_declared_progress(fetched, persisted),
-                )
-                self.db.commit()
-                logger.warning("Instrument %s rate-limited (will retry)", ik)
-
-            except Exception as e:
-                await limiter.on_error()
-
-                async with lock:
-                    result.errors.append(f"{ik}: {e}")
-
-                _upsert_checkpoint(
-                    self.db, PIPELINE_OPTIONS, ik,
-                    status="FAILED", run_id=self.run_id,
-                    error_message=str(e)[:500],
-                    **_declared_progress(fetched, persisted),
-                )
-                self.db.commit()
-                logger.warning("Instrument %s failed: %s", ik, e)
-
+                finally:
+                    # Always release the semaphore slot
+                    limiter.release()
             finally:
-                # Always release the semaphore slot
-                limiter.release()
+                # Release this instrument's Session on every exit path
+                # (rolling back anything left open).
+                task_db.close()
 
         # Launch all tasks — rate limiter gates concurrency and pacing
         tasks = [process_one(spec) for spec in remaining]
