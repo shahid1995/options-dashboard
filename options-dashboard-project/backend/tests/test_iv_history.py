@@ -105,7 +105,33 @@ def test_prune_removes_old_observations_only(db_session):
     assert all((datetime.fromisoformat(r["timestamp"]) - naive_now).days > -90 for r in rows)
 
 
+def test_prune_uses_canonical_ist_clock(db_session, monkeypatch):
+    fixed_now = datetime(2026, 9, 29, 0, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(iv_history, "_utcnow", lambda: fixed_now)
+
+    iv_history.record_iv_observations(
+        db_session,
+        [
+            obs(timestamp="2026-06-30T02:00:00+05:30"),
+            obs(timestamp="2026-06-30T06:00:00+05:30"),
+        ],
+    )
+
+    assert iv_history.prune_iv_observations(db_session, retention_days=91) == 1
+    rows = iv_history.get_iv_observations(db_session, "NIFTY")
+    assert len(rows) == 1
+
+
 def test_empty_input_records_nothing(db_session):
     assert iv_history.record_iv_observations(db_session, []) == 0
     assert iv_history.record_iv_observations(db_session, None) == 0
     assert len(iv_history.get_iv_observations(db_session, "NIFTY")) == 0
+
+def test_record_normalizes_observation_timestamp_to_ist(db_session):
+    """Persisted IV timestamps use the canonical naive-IST market-data clock."""
+    n = iv_history.record_iv_observations(db_session, [
+        obs(timestamp="2026-08-27T04:33:00Z"),
+    ])
+    assert n == 1
+    row = db_session.query(iv_history.IVObservation).one()
+    assert row.observed_at == datetime(2026, 8, 27, 10, 3)

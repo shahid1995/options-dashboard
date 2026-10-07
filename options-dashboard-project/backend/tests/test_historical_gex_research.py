@@ -287,7 +287,9 @@ class TestRegimeClassification:
         assert "POSITIVE_GAMMA" in regimes[ts2]["transition"]
 
     def test_enhanced_regime_granularity(self, db_session):
-        """Enhanced regime should have detailed classification."""
+        """Detailed regime classification is intact under the Day 49 causal
+        (past-only) percentile rule: a timestamp's thresholds come from its own
+        history, never from future observations."""
         engine = GexResearchEngine(db_session)
         regimes = engine._compute_regimes({
             datetime(2025, 1, 1): {"net_gex": -10000},
@@ -295,8 +297,20 @@ class TestRegimeClassification:
             datetime(2025, 1, 3): {"net_gex": 0.0},
             datetime(2025, 1, 4): {"net_gex": 100},
             datetime(2025, 1, 5): {"net_gex": 10000},
+            datetime(2025, 1, 6): {"net_gex": -20000},
         })
 
+        # At 2025-01-01 only -10000 is known, so it IS the entire historical
+        # distribution and cannot be extreme relative to itself (WEAK, not
+        # STRONG) — the old future-inclusive test relied on the leak.
+        assert regimes[datetime(2025, 1, 1)]["detailed_regime"] == "WEAK_NEGATIVE"
+        # By 2025-01-05 the past-only distribution is
+        # [-10000, -100, 0, 100, 10000]; 10000 exceeds its 75th percentile.
+        assert regimes[datetime(2025, 1, 5)]["detailed_regime"] == "STRONG_POSITIVE"
+        # By 2025-01-06 the past includes [-10000, -100, 0, 100, 10000], so
+        # -20000 is below its 25th percentile and classifies STRONG_NEGATIVE
+        # from its own history alone.
+        assert regimes[datetime(2025, 1, 6)]["detailed_regime"] == "STRONG_NEGATIVE"
         detailed = [regimes[ts]["detailed_regime"] for ts in sorted(regimes.keys())]
         assert "STRONG_NEGATIVE" in detailed
         assert "STRONG_POSITIVE" in detailed
@@ -716,3 +730,585 @@ class TestProductionDBProtection:
         """Engine URL should not reference production DB."""
         url = str(db_session.get_bind().url)
         assert "paper_journal" not in url
+
+def test_regime_percentiles_do_not_use_future_gex_values():
+    """A future GEX observation must not change an earlier regime classification."""
+    from datetime import datetime
+
+    from app.services.historical_gex_research import GexResearchEngine
+
+    t1 = datetime(2026, 8, 27, 10, 0)
+    t2 = datetime(2026, 8, 27, 10, 3)
+    t3 = datetime(2026, 8, 27, 10, 6)
+
+    gex_series = {
+        t1: {"net_gex": 100.0},
+        t2: {"net_gex": 0.0},
+        t3: {"net_gex": -1000.0},
+    }
+
+    engine = GexResearchEngine.__new__(GexResearchEngine)
+    regimes = engine._compute_regimes(gex_series)
+
+    # With only t1 known, +100 is the full historical distribution and is not
+    # made "strong positive" by the unseen -1000 future observation.
+    assert regimes[t1]["detailed_regime"] == "WEAK_POSITIVE"
+
+
+def test_fallback_oi_is_attributed_to_its_source_timestamp(db_session):
+    """Greptile P1 regression: when the only option candle is the 10:00 bar and
+    research decisions fall at 10:00/10:03/10:06, the same stale observation is
+    neither relabeled as a fresh 10:03/10:06 observation, duplicated into later
+    timestamps, nor dropped — and no OI change is fabricated between research
+    timestamps whose source observation never changed. OI is state and
+    carries forward, but traded volume is event-scoped: a stale candle
+    contributes no fresh volume to later research timestamps."""
+    ts_1000 = datetime(2026, 8, 27, 10, 0)
+    ts_1003 = datetime(2026, 8, 27, 10, 3)
+    ts_1006 = datetime(2026, 8, 27, 10, 6)
+
+    db_session.add(OptionCandle(
+        instrument_key="TEST|CE", interval="3min", open_time=ts_1000,
+        open=100, high=105, low=95, close=102, volume=10,
+        open_interest=700, fetched_at=ts_1000,
+    ))
+    for ts in (ts_1000, ts_1003, ts_1006):
+        db_session.add(OptionGreeks(
+            instrument_key="TEST|CE", interval="3min", open_time=ts,
+            spot=24500, strike=24500, expiry="2026-09-03", option_type="CE",
+            option_price=100, lot_size=65, time_to_expiry=0.1,
+            risk_free_rate=0.065, intrinsic_value=0, implied_volatility=0.2,
+            delta=0.5, gamma=0.001, vega=10, theta=-5,
+            calc_model="BLACK_SCHOLES_EUROPEAN", calc_version="greeks_v3",
+            calculated_at=ts, status="SUCCESS",
+        ))
+    db_session.commit()
+
+    engine = GexResearchEngine(db_session)
+    oi_data = engine._fetch_oi_data([ts_1000, ts_1003, ts_1006])
+
+    # Every research timestamp receives its own decision-major selection: the
+    # 10:00 source observation is the latest completed bar for all three.
+    assert set(oi_data) == {ts_1000, ts_1003, ts_1006}
+    for ts in (ts_1000, ts_1003, ts_1006):
+        # OI is state: the latest completed eligible observation carries
+        # forward without duplication or relabeling.
+        assert oi_data[ts]["total_oi"] == 700
+        assert oi_data[ts]["oi_source_open_time"] == ts_1000
+    # Traded volume is event-scoped: only the fresh 10:00 observation
+    # contributes it. No new candle means no fresh volume at 10:03/10:06.
+    assert oi_data[ts_1000]["total_volume"] == 10
+    assert oi_data[ts_1000]["call_volume"] == 10
+    assert oi_data[ts_1003]["total_volume"] == 0
+    assert oi_data[ts_1006]["total_volume"] == 0
+
+    # No fresh observation arrived, so no OI change may be fabricated between
+    # research timestamps — the fallback attribution keeps OI flat.
+    assert oi_data[ts_1003]["oi_change"] == 0
+    assert oi_data[ts_1006]["oi_change"] == 0
+    assert oi_data[ts_1003]["call_oi_change"] == 0
+    assert oi_data[ts_1006]["call_oi_change"] == 0
+
+
+def _add_greek(
+    db_session, instrument_key, ts, option_type="CE", expiry="2026-09-30",
+    status="SUCCESS",
+):
+    """Insert one greeks_v3 row. ``status`` defaults to SUCCESS so the row
+    participates in the default PIT selection; pass a non-SUCCESS status to
+    model a failed implied-volatility solve."""
+    db_session.add(OptionGreeks(
+        instrument_key=instrument_key, interval="3min", open_time=ts,
+        spot=24500, strike=24500, expiry=expiry, option_type=option_type,
+        option_price=100, lot_size=65, time_to_expiry=0.1,
+        risk_free_rate=0.065, intrinsic_value=0, implied_volatility=0.2,
+        delta=0.5, gamma=0.001, vega=10, theta=-5,
+        calc_model="BLACK_SCHOLES_EUROPEAN", calc_version="greeks_v3",
+        calculated_at=ts, status=status,
+    ))
+
+
+def _add_contract_spec(db_session, instrument_key, *, option_type, expiry):
+    """Insert the authoritative per-instrument metadata row used as the
+    option-type/expiry fallback when a contract has no Greeks row at all."""
+    db_session.add(ContractSpec(
+        instrument_key=instrument_key, underlying="NIFTY",
+        underlying_key="NSE_INDEX|Nifty 50", expiry=expiry,
+        strike_price=24500.0, instrument_type=option_type,
+        lot_size=65, minimum_lot=65, freeze_quantity=1800, tick_size=0.05,
+        trading_symbol=instrument_key, segment="NSE_FO", exchange="NSE",
+        weekly=True, source="TEST", source_reference="test",
+        fetched_at=datetime(2026, 8, 27, 10, 0),
+    ))
+
+
+def _add_candle(db_session, instrument_key, ts, oi, volume, option_type="CE"):
+    db_session.add(OptionCandle(
+        instrument_key=instrument_key, interval="3min", open_time=ts,
+        open=100, high=105, low=95, close=102, volume=volume,
+        open_interest=oi, fetched_at=ts,
+    ))
+
+
+def test_stale_volume_is_not_carried_forward(db_session):
+    """Greptile P1 regression: OI is state and carries forward, but traded
+    volume is event-scoped — a fallback candle contributes zero fresh volume
+    to research timestamps after its source bar."""
+    ts_1000 = datetime(2026, 8, 27, 10, 0)
+    ts_1003 = datetime(2026, 8, 27, 10, 3)
+    ts_1006 = datetime(2026, 8, 27, 10, 6)
+    _add_candle(db_session, "TEST|CE", ts_1000, oi=700, volume=10)
+    for ts in (ts_1000, ts_1003, ts_1006):
+        _add_greek(db_session, "TEST|CE", ts)
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data(
+        [ts_1000, ts_1003, ts_1006]
+    )
+
+    assert set(oi_data) == {ts_1000, ts_1003, ts_1006}
+    # OI carries forward from the 10:00 source observation.
+    for ts in (ts_1000, ts_1003, ts_1006):
+        assert oi_data[ts]["total_oi"] == 700
+        assert oi_data[ts]["oi_source_open_time"] == ts_1000
+    # Volume is only observed once — at its source bar. No fresh traded
+    # volume may be fabricated at 10:03 or 10:06.
+    assert oi_data[ts_1000]["total_volume"] == 10
+    assert oi_data[ts_1003]["total_volume"] == 0
+    assert oi_data[ts_1006]["total_volume"] == 0
+    assert oi_data[ts_1003]["call_volume"] == 0
+    assert oi_data[ts_1006]["put_volume"] == 0
+    # OI unchanged while volume was never re-observed.
+    assert oi_data[ts_1003]["oi_change"] == 0
+    assert oi_data[ts_1006]["oi_change"] == 0
+
+
+def test_fresh_volume_resumes_at_a_new_source_candle(db_session):
+    """A genuinely new candle (OI 750, volume 20) becomes the fresh source:
+    its volume counts, OI updates, and the source time advances."""
+    ts_1000 = datetime(2026, 8, 27, 10, 0)
+    ts_1003 = datetime(2026, 8, 27, 10, 3)
+    ts_1006 = datetime(2026, 8, 27, 10, 6)
+    ts_1009 = datetime(2026, 8, 27, 10, 9)
+    _add_candle(db_session, "TEST|CE", ts_1000, oi=700, volume=10)
+    _add_candle(db_session, "TEST|CE", ts_1009, oi=750, volume=20)
+    for ts in (ts_1000, ts_1003, ts_1006, ts_1009):
+        _add_greek(db_session, "TEST|CE", ts)
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data(
+        [ts_1000, ts_1003, ts_1006, ts_1009]
+    )
+
+    assert oi_data[ts_1006]["total_volume"] == 0
+    assert oi_data[ts_1006]["oi_source_open_time"] == ts_1000
+    # Fresh 10:09 candle: new OI, fresh volume, advanced source time.
+    assert oi_data[ts_1009]["total_oi"] == 750
+    assert oi_data[ts_1009]["total_volume"] == 20
+    assert oi_data[ts_1009]["call_volume"] == 20
+    assert oi_data[ts_1009]["oi_source_open_time"] == ts_1009
+    assert oi_data[ts_1009]["oi_change"] == 50
+
+
+def test_expired_option_stops_contributing_after_expiry_date(db_session):
+    """Greptile P1 regression: a contract stays eligible through its expiry
+    DATE (2026-08-27) but must not contribute OI or volume from the next
+    calendar date onward, even though PIT fallback can still see its rows."""
+    expiry = "2026-08-27"
+    ts_expiry = datetime(2026, 8, 27, 10, 0)
+    ts_next_day = datetime(2026, 8, 28, 10, 0)
+    _add_candle(db_session, "EXP|CE", ts_expiry, oi=700, volume=10)
+    _add_greek(db_session, "EXP|CE", ts_expiry, expiry=expiry)
+    # Next-day greeks would let PIT keep selecting the contract on 08-28.
+    _add_greek(db_session, "EXP|CE", ts_next_day, expiry=expiry)
+    # An active contract keeps the 08-28 research timestamp alive.
+    _add_candle(db_session, "ACT|CE", ts_next_day, oi=300, volume=5)
+    _add_greek(db_session, "ACT|CE", ts_next_day)
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data(
+        [ts_expiry, ts_next_day]
+    )
+
+    # Expiry-day research may still use the contract.
+    assert oi_data[ts_expiry]["total_oi"] == 700
+    assert oi_data[ts_expiry]["total_volume"] == 10
+    assert oi_data[ts_expiry]["oi_source_open_time"] == ts_expiry
+    # From the following calendar date the expired instrument is no longer an
+    # active research instrument: only the active contract contributes.
+    assert oi_data[ts_next_day]["total_oi"] == 300
+    assert oi_data[ts_next_day]["call_oi"] == 300
+    assert oi_data[ts_next_day]["total_volume"] == 5
+    # The expired contract's OI leaves the change calculation cleanly.
+    assert oi_data[ts_next_day]["oi_change"] == 300 - 700
+    assert oi_data[ts_next_day]["oi_source_open_time"] == ts_next_day
+
+
+def test_active_contract_oi_still_carries_forward_after_last_candle(db_session):
+    """An unexpired contract keeps contributing carried-forward OI after its
+    last candle, protecting the intended Day 49 PIT behavior."""
+    ts_1000 = datetime(2026, 8, 27, 10, 0)
+    ts_1003 = datetime(2026, 8, 27, 10, 3)
+    _add_candle(db_session, "ACT|CE", ts_1000, oi=700, volume=10)
+    _add_greek(db_session, "ACT|CE", ts_1000)
+    _add_greek(db_session, "ACT|CE", ts_1003)
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data([ts_1000, ts_1003])
+
+    assert oi_data[ts_1000]["total_oi"] == 700
+    assert oi_data[ts_1003]["total_oi"] == 700
+    assert oi_data[ts_1003]["oi_source_open_time"] == ts_1000
+    assert oi_data[ts_1003]["total_volume"] == 0
+
+
+def test_mixed_fresh_and_fallback_instruments_split_volume_by_source(db_session):
+    """Freshness is per instrument: at one research timestamp the instrument
+    with a source candle at T contributes its volume, while the instrument
+    whose source candle predates T carries OI with zero fresh volume."""
+    ts_0957 = datetime(2026, 8, 27, 9, 57)
+    ts_1000 = datetime(2026, 8, 27, 10, 0)
+    _add_candle(db_session, "A|CE", ts_1000, oi=800, volume=30)
+    _add_candle(db_session, "B|PE", ts_0957, oi=500, volume=40)
+    _add_greek(db_session, "A|CE", ts_1000, option_type="CE")
+    _add_greek(db_session, "B|PE", ts_1000, option_type="PE")
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data([ts_1000])
+
+    assert set(oi_data) == {ts_1000}
+    row = oi_data[ts_1000]
+    # Both instruments contribute OI (A fresh, B carried forward).
+    assert row["total_oi"] == 1300
+    assert row["call_oi"] == 800
+    assert row["put_oi"] == 500
+    # Only A observed volume at this timestamp; B's 09:57 volume stays there.
+    assert row["total_volume"] == 30
+    assert row["call_volume"] == 30
+    assert row["put_volume"] == 0
+    # Source-time association is visible through the audit mechanism.
+    assert row["oi_source_open_time"] == ts_1000
+
+
+def test_build_gex_series_reads_the_bounded_gex_load_once(db_session, monkeypatch):
+    """Codacy Finding B: the GEX series must be built through the bulk PIT
+    seam — one bounded load for the whole timestamp list, never one query
+    per timestamp."""
+    from app.services.point_in_time import PointInTimeDataset
+
+    spot = 24500.0
+    rows = []
+    for ts in (datetime(2026, 8, 27, 10, 0), datetime(2026, 8, 27, 10, 3)):
+        for key, option_type, signed in (
+            ("A|CE", "CE", 1500.0),
+            ("A|PE", "PE", -900.0),
+        ):
+            rows.append(HistoricalGexSnapshot(
+                instrument_key=key,
+                interval="3min",
+                open_time=ts,
+                spot=spot,
+                strike=24500.0,
+                expiry="2026-09-03",
+                option_type=option_type,
+                gamma=0.001,
+                open_interest=100,
+                option_price=100.0,
+                lot_size=65,
+                raw_gex=abs(signed),
+                signed_gex=signed,
+                calc_version="h_gex_v1",
+                calculated_at=ts,
+                status="SUCCESS",
+            ))
+    db_session.add_all(rows)
+    db_session.commit()
+
+    timestamps = [datetime(2026, 8, 27, 10, 0), datetime(2026, 8, 27, 10, 3)]
+    expected_decisions = [ts + timedelta(minutes=3) for ts in timestamps]
+    real_selections = PointInTimeDataset.historical_gex_selections_at_many
+    bulk_calls = []
+
+    def _spy(self, decision_timestamps, **kwargs):
+        bulk_calls.append(list(decision_timestamps))
+        return real_selections(self, decision_timestamps, **kwargs)
+
+    monkeypatch.setattr(
+        PointInTimeDataset, "historical_gex_selections_at_many", _spy)
+
+    engine = GexResearchEngine(db_session)
+    series = engine._build_gex_series(timestamps)
+
+    assert bulk_calls == [expected_decisions], (
+        "the GEX series must be built with one bulk selection call for all "
+        "decision timestamps, not one PIT query per timestamp"
+    )
+    assert set(series) == set(timestamps)
+    assert series[timestamps[0]]["net_gex"] == pytest.approx(600.0)
+    assert series[timestamps[0]]["instrument_count"] == 2
+    assert series[timestamps[1]]["net_gex"] == pytest.approx(600.0)
+    assert series[timestamps[1]]["instrument_count"] == 2
+
+
+def _add_gex_snapshot(db_session, key, option_type, strike, ts, signed, spot):
+    db_session.add(HistoricalGexSnapshot(
+        instrument_key=key,
+        interval="3min",
+        open_time=ts,
+        spot=spot,
+        strike=strike,
+        expiry="2026-09-03",
+        option_type=option_type,
+        gamma=0.001,
+        open_interest=100,
+        option_price=100.0,
+        lot_size=65,
+        raw_gex=abs(signed),
+        signed_gex=signed,
+        calc_version="h_gex_v1",
+        calculated_at=ts,
+        status="SUCCESS",
+    ))
+
+
+def test_flip_excludes_stale_fallback_rows_from_timestamp_signal(db_session):
+    """Greptile/CodeRabbit mixed-time finding: a timestamp-level flip
+    snapshot must aggregate only rows whose source open_time is the
+    observation timestamp. TEST|PE has no 10:03 snapshot; its older 10:00
+    fallback is valid for the generic PIT accessor but must never enter
+    the 10:03 flip calculation."""
+    ts_1003 = datetime(2026, 8, 27, 10, 3)
+    _add_gex_snapshot(db_session, "TEST|CE", "CE", 24500.0, ts_1003, 1500.0, 24500.0)
+    _add_gex_snapshot(db_session, "TEST|PE", "PE", 24400.0, datetime(2026, 8, 27, 10, 0), -900.0, 24100.0)
+    db_session.commit()
+
+    flip = GexResearchEngine(db_session)._detect_gamma_flip_at_timestamp(ts_1003)
+
+    # Only the exact 10:03 CE row remains -> a single strike cannot produce
+    # a sign change, so the result must be INSUFFICIENT_DATA, not a flip
+    # computed against the stale 10:00 PE row.
+    assert flip["status"] == "INSUFFICIENT_DATA"
+
+
+def test_walls_use_exact_observation_rows_and_spot(db_session):
+    """Wall detection must rank strikes and derive spot from the exact
+    observation rows only: the stale 10:00 PE fallback (different spot)
+    must not contribute a negative wall or contaminate wall distances."""
+    ts_1003 = datetime(2026, 8, 27, 10, 3)
+    _add_gex_snapshot(db_session, "TEST|CE", "CE", 24500.0, ts_1003, 1500.0, 24500.0)
+    _add_gex_snapshot(db_session, "TEST|PE", "PE", 24400.0, datetime(2026, 8, 27, 10, 0), -900.0, 24100.0)
+    db_session.commit()
+
+    wall = GexResearchEngine(db_session)._detect_walls_at_timestamp(ts_1003)
+
+    # Only the exact 10:03 CE row: positive wall at its own strike with
+    # distance measured from that row's exact-time spot (== 24500 -> 0.0),
+    # and no negative wall from the stale fallback row.
+    assert set(wall) == {"pos_wall_strike", "pos_wall_distance", "pos_wall_gex"}
+    assert wall["pos_wall_strike"] == 24500.0
+    assert wall["pos_wall_distance"] == pytest.approx(0.0)
+    assert wall["pos_wall_gex"] == pytest.approx(1500.0)
+
+
+def test_compute_flips_and_walls_use_the_bounded_bulk_load_once(db_session, monkeypatch):
+    """The research flip/wall paths must reuse the bulk GEX selection seam
+    for the whole timestamp list — never one PIT query per timestamp."""
+    from app.services.point_in_time import PointInTimeDataset
+
+    spot = 24500.0
+    for ts in (datetime(2026, 8, 27, 10, 0), datetime(2026, 8, 27, 10, 3)):
+        _add_gex_snapshot(db_session, "A|CE", "CE", 24500.0, ts, 1500.0, spot)
+        _add_gex_snapshot(db_session, "A|PE", "PE", 24400.0, ts, -900.0, spot)
+    db_session.commit()
+
+    timestamps = [datetime(2026, 8, 27, 10, 0), datetime(2026, 8, 27, 10, 3)]
+    expected_decisions = [ts + timedelta(minutes=3) for ts in timestamps]
+    real_selections = PointInTimeDataset.historical_gex_selections_at_many
+    real_at = PointInTimeDataset.historical_gex_at
+    bulk_calls = []
+    at_calls = []
+
+    def _spy_bulk(self, decision_timestamps, **kwargs):
+        bulk_calls.append(list(decision_timestamps))
+        return real_selections(self, decision_timestamps, **kwargs)
+
+    def _spy_at(self, *args, **kwargs):
+        at_calls.append(args)
+        return real_at(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        PointInTimeDataset, "historical_gex_selections_at_many", _spy_bulk)
+    monkeypatch.setattr(PointInTimeDataset, "historical_gex_at", _spy_at)
+
+    engine = GexResearchEngine(db_session)
+    flips = engine._compute_flips(timestamps)
+    assert bulk_calls == [expected_decisions], (
+        "_compute_flips must issue exactly one bulk selection call"
+    )
+    walls = engine._compute_walls(timestamps)
+    assert bulk_calls == [expected_decisions, expected_decisions], (
+        "_compute_walls must issue exactly one bulk selection call"
+    )
+    assert at_calls == [], (
+        "research flip/wall paths must not call historical_gex_at per timestamp"
+    )
+
+    for ts in timestamps:
+        assert flips[ts]["status"] == "ESTIMATED"
+        assert walls[ts]["pos_wall_strike"] == 24500.0
+        assert walls[ts]["pos_wall_distance"] == pytest.approx(0.0)
+        assert walls[ts]["neg_wall_strike"] == 24400.0
+
+
+# ---------------------------------------------------------------------------
+# Day 49 remediation: OI/volume are market observations and must survive a
+# missing or failed derived-Greeks row.
+# ---------------------------------------------------------------------------
+
+
+def test_oi_includes_contract_with_success_greeks(db_session):
+    """Baseline: candle + SUCCESS Greeks is counted and classified."""
+    ts = datetime(2026, 8, 27, 10, 0)
+    _add_candle(db_session, "OK|CE", ts, oi=640, volume=15)
+    _add_greek(db_session, "OK|CE", ts, option_type="CE")
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data([ts])
+
+    assert oi_data[ts]["total_oi"] == 640
+    assert oi_data[ts]["call_oi"] == 640
+    assert oi_data[ts]["total_volume"] == 15
+    assert oi_data[ts]["oi_source_open_time"] == ts
+
+
+def test_oi_includes_contract_with_failed_greeks(db_session):
+    """REQUIRED (Day 49 remediation): a contract whose implied-volatility solve
+    FAILED still has a real candle observation. Its OI and volume must not be
+    discarded just because the DERIVED Greeks row is unsuccessful, and the
+    failed row still supplies option type + expiry for classification."""
+    ts = datetime(2026, 8, 27, 10, 0)
+    _add_candle(db_session, "FAIL|PE", ts, oi=640, volume=15)
+    _add_greek(db_session, "FAIL|PE", ts, option_type="PE", status="FAILED")
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data([ts])
+
+    assert oi_data[ts]["total_oi"] == 640
+    assert oi_data[ts]["put_oi"] == 640
+    assert oi_data[ts]["call_oi"] == 0
+    assert oi_data[ts]["total_volume"] == 15
+    assert oi_data[ts]["put_volume"] == 15
+    assert oi_data[ts]["oi_source_open_time"] == ts
+
+
+def test_oi_includes_contract_with_no_greeks_row(db_session):
+    """REQUIRED (Day 49 remediation): a contract with candles but NO Greeks row
+    at all still contributes OI, classified through the authoritative
+    contract_specs metadata."""
+    ts = datetime(2026, 8, 27, 10, 0)
+    _add_candle(db_session, "SPEC|PE", ts, oi=900, volume=25)
+    _add_contract_spec(
+        db_session, "SPEC|PE", option_type="PE", expiry="2026-09-03")
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data([ts])
+
+    assert oi_data[ts]["total_oi"] == 900
+    assert oi_data[ts]["put_oi"] == 900
+    assert oi_data[ts]["call_oi"] == 0
+    assert oi_data[ts]["total_volume"] == 25
+
+
+def test_oi_preserves_candle_contract_without_any_metadata(db_session):
+    """Even with no Greeks row and no contract_specs row, a real candle is
+    never dropped: it contributes to total OI/volume (it is simply not
+    assigned to a call/put bucket)."""
+    ts = datetime(2026, 8, 27, 10, 0)
+    _add_candle(db_session, "BARE|XX", ts, oi=250, volume=5)
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data([ts])
+
+    assert oi_data[ts]["total_oi"] == 250
+    assert oi_data[ts]["call_oi"] == 0
+    assert oi_data[ts]["put_oi"] == 0
+    assert oi_data[ts]["total_volume"] == 5
+
+
+def test_oi_mixed_greek_availability_keeps_every_candle(db_session):
+    """REQUIRED (Day 49 remediation): at one research timestamp, contracts with
+    SUCCESS Greeks, FAILED Greeks and no Greeks row all contribute."""
+    ts = datetime(2026, 8, 27, 10, 0)
+    _add_candle(db_session, "OK|CE", ts, oi=100, volume=1)
+    _add_greek(db_session, "OK|CE", ts, option_type="CE")
+    _add_candle(db_session, "FAIL|PE", ts, oi=200, volume=2)
+    _add_greek(db_session, "FAIL|PE", ts, option_type="PE", status="FAILED")
+    _add_candle(db_session, "SPEC|CE", ts, oi=300, volume=3)
+    _add_contract_spec(
+        db_session, "SPEC|CE", option_type="CE", expiry="2026-09-03")
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data([ts])
+
+    assert oi_data[ts]["total_oi"] == 600
+    assert oi_data[ts]["call_oi"] == 400
+    assert oi_data[ts]["put_oi"] == 200
+    assert oi_data[ts]["total_volume"] == 6
+    assert oi_data[ts]["call_volume"] == 4
+    assert oi_data[ts]["put_volume"] == 2
+
+
+def test_failed_and_missing_greeks_carry_oi_forward_exactly_once(db_session):
+    """REQUIRED (Day 49 remediation): the 2100 -> 700 no-duplication guarantee
+    must still hold for contracts whose Greeks failed or are absent. A stale
+    candle carries OI forward exactly once and contributes no fresh volume."""
+    ts_1000 = datetime(2026, 8, 27, 10, 0)
+    ts_1003 = datetime(2026, 8, 27, 10, 3)
+    ts_1006 = datetime(2026, 8, 27, 10, 6)
+    _add_candle(db_session, "FAIL|CE", ts_1000, oi=400, volume=7)
+    _add_greek(db_session, "FAIL|CE", ts_1000, option_type="CE", status="FAILED")
+    _add_candle(db_session, "BARE|CE", ts_1000, oi=300, volume=3)
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data(
+        [ts_1000, ts_1003, ts_1006]
+    )
+
+    assert set(oi_data) == {ts_1000, ts_1003, ts_1006}
+    for ts in (ts_1000, ts_1003, ts_1006):
+        # 400 + 300, counted once per decision and never doubled.
+        assert oi_data[ts]["total_oi"] == 700
+        assert oi_data[ts]["oi_source_open_time"] == ts_1000
+    # Volume is event-scoped: only the fresh 10:00 bar contributes.
+    assert oi_data[ts_1000]["total_volume"] == 10
+    assert oi_data[ts_1003]["total_volume"] == 0
+    assert oi_data[ts_1006]["total_volume"] == 0
+    assert oi_data[ts_1003]["oi_change"] == 0
+    assert oi_data[ts_1006]["oi_change"] == 0
+
+
+def test_expired_candle_only_contract_stops_after_expiry_via_spec(db_session):
+    """REQUIRED (Day 49 remediation): lifecycle is enforced through the
+    contract_specs expiry when a contract has no Greeks row. It stays eligible
+    through its expiry DATE and stops from the following calendar date."""
+    expiry = "2026-08-27"
+    ts_expiry = datetime(2026, 8, 27, 10, 0)
+    ts_next = datetime(2026, 8, 28, 10, 0)
+    _add_candle(db_session, "SPEC|CE", ts_expiry, oi=700, volume=10)
+    _add_contract_spec(
+        db_session, "SPEC|CE", option_type="CE", expiry=expiry)
+    # An active contract keeps the 08-28 research timestamp alive.
+    _add_candle(db_session, "ACT|CE", ts_next, oi=300, volume=5)
+    _add_greek(db_session, "ACT|CE", ts_next)
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data(
+        [ts_expiry, ts_next]
+    )
+
+    assert oi_data[ts_expiry]["total_oi"] == 700
+    assert oi_data[ts_expiry]["total_volume"] == 10
+    # From the following calendar date the expired candle-only contract no
+    # longer contributes; only the active contract does.
+    assert oi_data[ts_next]["total_oi"] == 300
+    assert oi_data[ts_next]["call_oi"] == 300

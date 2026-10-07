@@ -42,13 +42,13 @@ def db(engine):
     session.close()
 
 
-def _insert_gex(db, timestamp, strike, option_type, signed_gex, spot, expiry="2024-10-03", calc_version="h_gex_v1"):
+def _insert_gex(db, timestamp, strike, option_type, signed_gex, spot, expiry="2024-10-03", calc_version="h_gex_v1", interval="3min"):
     """Insert a historical GEX row."""
     # Use unique instrument_key per strike+type to avoid unique constraint conflicts
     suffix = "CE" if option_type == "CE" else "PE"
     db.add(HistoricalGexSnapshot(
         instrument_key=f"NSE_FO|{int(strike)}{suffix}|{expiry}",
-        interval="3min",
+        interval=interval,
         open_time=timestamp,
         spot=spot,
         strike=strike,
@@ -221,6 +221,44 @@ class TestTimeSeries:
         timestamps = engine.get_timestamps(start=t2)
         assert timestamps == [t2, t3]
 
+    def test_get_timestamps_only_returns_analytics_interval(self, db):
+        """Interval contract (Greptile P1, Day 49): the engine is a
+        3-minute analytics engine -- DEFAULT_INTERVAL drives every read
+        and FORWARD_RETURN_INTERVALS is expressed in 3-minute candles --
+        so timestamp discovery must never surface snapshots from another
+        interval. A 5-minute snapshot would otherwise be discovered and
+        then silently dropped by the exact-observation PIT accessor.
+        """
+        t_3min = datetime(2024, 10, 3, 9, 15)
+        t_5min = datetime(2024, 10, 3, 9, 25)
+        _insert_gex(db, t_3min, 25000, "CE", 1000000.0, 25000)
+        _insert_gex(db, t_5min, 25000, "CE", 1000000.0, 25000, interval="5min")
+        engine = GexAnalyticsEngine(db)
+
+        assert engine.get_timestamps() == [t_3min]
+        assert engine.aggregate_timestamp(t_5min) is None
+
+    def test_get_timestamps_interval_contract_is_insert_order_independent(self, db):
+        """Inverse insertion order: a 5-minute snapshot inserted before
+        any 3-minute row must not change interval-correct discovery."""
+        t_5min = datetime(2024, 10, 3, 9, 25)
+        t_3min = datetime(2024, 10, 3, 9, 15)
+        _insert_gex(db, t_5min, 25000, "CE", 1000000.0, 25000, interval="5min")
+        _insert_gex(db, t_3min, 25000, "CE", 1000000.0, 25000)
+        engine = GexAnalyticsEngine(db)
+
+        assert engine.get_timestamps() == [t_3min]
+
+    def test_get_timestamps_range_honors_interval_contract(self, db):
+        """Ranged discovery applies the same interval predicate."""
+        t_3min = datetime(2024, 10, 3, 9, 15)
+        t_5min = datetime(2024, 10, 3, 9, 25)
+        _insert_gex(db, t_3min, 25000, "CE", 1000000.0, 25000)
+        _insert_gex(db, t_5min, 25000, "CE", 1000000.0, 25000, interval="5min")
+        engine = GexAnalyticsEngine(db)
+
+        assert engine.get_timestamps(start=t_3min) == [t_3min]
+
 
 # ---------------------------------------------------------------------------
 # C. Regime tests
@@ -359,6 +397,44 @@ class TestGammaWalls:
         engine = GexAnalyticsEngine(db)
         walls = engine.detect_walls(ts, top_n=5)
         assert len(walls.positive_walls) == 5
+
+    def test_wall_spot_uses_exact_observation_timestamp(self, db):
+        """Mixed-time wall-spot regression (CodeRabbit): strike_data is
+        restricted to the observation timestamp, but the spot lookup took
+        the first row of the per-instrument-fallback PIT accessor, so a
+        stale fallback row's spot could drive wall distances. The wall
+        spot must come from an exact ``open_time == ts`` row."""
+        ts = datetime(2024, 10, 3, 9, 15)
+        stale = datetime(2024, 10, 3, 9, 12)
+        # Stale PE row (inserted first): no 9:15 PE row exists, so the
+        # per-instrument fallback returns this 9:12 row with spot 24100.
+        _insert_gex(db, stale, 24900, "PE", -3000000.0, 24100)
+        # Exact 9:15 CE row supplies the true current spot 25000.
+        _insert_gex(db, ts, 25500, "CE", 5000000.0, 25000)
+
+        engine = GexAnalyticsEngine(db)
+        walls = engine.detect_walls(ts)
+
+        # Strike from the exact 9:15 observation; distance measured from
+        # the exact 9:15 spot (25500 - 25000), never the stale 24100 spot.
+        assert walls.strongest_positive.strike == 25500
+        assert walls.spot == pytest.approx(25000.0)
+        assert walls.strongest_positive.distance_from_spot == pytest.approx(500.0)
+        assert walls.strongest_positive.distance_pct == pytest.approx(2.0)
+
+    def test_wall_spot_without_exact_rows_stays_empty(self, db):
+        """No exact-timestamp rows: the stale fallback row must not become
+        the wall spot for timestamp T."""
+        stale = datetime(2024, 10, 3, 9, 12)
+        _insert_gex(db, stale, 24900, "PE", -3000000.0, 24100)
+
+        engine = GexAnalyticsEngine(db)
+        walls = engine.detect_walls(datetime(2024, 10, 3, 9, 15))
+
+        # No 9:15 strike data at all: existing empty-result behavior.
+        assert walls.strongest_positive is None
+        assert walls.strongest_negative is None
+        assert walls.spot == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------
