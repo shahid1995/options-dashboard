@@ -55,12 +55,20 @@ def _with_completed_candle_cutoff(
 
 def _completed_bar_open_time(decision_timestamp: datetime, interval: str) -> datetime:
     """Return the latest fully completed candle's open time at a decision cutoff."""
+    # The persisted candle intervals are the repository's ``VALID_INTERVALS``
+    # set (``app/services/nifty_candles.py``, ``option_candles.py``,
+    # ``app/routers/candles.py``): 1min, 3min, 5min, 15min, 30min, 1hour, 1day.
+    # The map previously recognized a bare "day" and omitted "1hour", so a PIT
+    # read against valid persisted 1hour/1day rows raised ValueError
+    # (Day 49 correction). "day" is retained only as a legacy alias.
     durations = {
         "1min": 60,
         "3min": 180,
         "5min": 300,
         "15min": 900,
         "30min": 1800,
+        "1hour": 3600,
+        "1day": 86400,
         "day": 86400,
     }
     seconds = durations.get(interval)
@@ -431,16 +439,21 @@ class PointInTimeDataset:
         instrument_keys: list[str] | None = None,
         interval: str = "3min",
         calc_version: str = DEFAULT_GREEKS_CALC_VERSION,
+        successful_only: bool = True,
     ) -> list[tuple[datetime, dict[str, OptionGreeks]]]:
         """Pair each decision timestamp with its selected Greeks per instrument.
 
         Element i is ``(decision_timestamps[i], {instrument_key: row})`` where
-        row is the latest completed SUCCESS row (of the requested calc version)
-        available by that decision. A missing entry means no completed row
-        existed for that pair yet. When no fresh bar exists, the latest earlier
-        completed bar is selected with its original source ``open_time``
-        intact, so consumers can distinguish the requested decision timestamp
-        from the source observation timestamp.
+        row is the latest completed row (of the requested calc version)
+        available by that decision. By default only ``SUCCESS`` rows are
+        eligible; ``successful_only=False`` widens the selection to rows whose
+        implied-volatility solve did not succeed, which consumers use purely
+        for contract identity/metadata (option type, expiry) without letting a
+        non-SUCCESS row stand in for a Greek value. A missing entry means no
+        completed row existed for that pair yet. When no fresh bar exists, the
+        latest earlier completed bar is selected with its original source
+        ``open_time`` intact, so consumers can distinguish the requested
+        decision timestamp from the source observation timestamp.
         """
         cutoffs = [_require_cutoff(ts) for ts in decision_timestamps]
         if not cutoffs:
@@ -451,12 +464,13 @@ class PointInTimeDataset:
         targets = [_completed_bar_open_time(cutoff, interval) for cutoff in cutoffs]
 
         def _greeks_eligibility(entity):
-            predicates = [
-                entity.interval == interval,
-                entity.status == "SUCCESS",
+            predicates = [entity.interval == interval]
+            if successful_only:
+                predicates.append(entity.status == "SUCCESS")
+            predicates.append(
                 entity.calc_version
-                == (calc_version or DEFAULT_GREEKS_CALC_VERSION),
-            ]
+                == (calc_version or DEFAULT_GREEKS_CALC_VERSION)
+            )
             if instrument_keys is not None:
                 predicates.append(
                     entity.instrument_key.in_(instrument_keys))
@@ -515,13 +529,15 @@ class PointInTimeDataset:
         instrument_keys: list[str] | None = None,
         interval: str = "3min",
         calc_version: str = DEFAULT_GREEKS_CALC_VERSION,
+        successful_only: bool = True,
     ) -> list[OptionGreeks]:
         """Return completed Greeks paired with the supplied decision timestamps.
 
-        Element i is the latest completed SUCCESS row (of the requested calc
-        version) for decision_timestamps[i], one entry per instrument. When no
-        fresh bar exists by a decision time, the latest earlier completed bar is
-        returned with its original source ``open_time`` intact.
+        Element i is the latest completed row (of the requested calc version)
+        for decision_timestamps[i], one entry per instrument; by default only
+        ``SUCCESS`` rows are eligible. When no fresh bar exists by a decision
+        time, the latest earlier completed bar is returned with its original
+        source ``open_time`` intact.
         """
         cutoffs = [_require_cutoff(ts) for ts in decision_timestamps]
         if not cutoffs:
@@ -532,6 +548,7 @@ class PointInTimeDataset:
             instrument_keys=instrument_keys,
             interval=interval,
             calc_version=calc_version,
+            successful_only=successful_only,
         )
         return [
             row

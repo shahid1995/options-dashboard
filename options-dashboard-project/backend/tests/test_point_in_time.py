@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy import create_engine, event, func, select
@@ -14,7 +14,10 @@ from app.models import (
     OptionGreeks,
 )
 from app.services import iv_history
-from app.services.point_in_time import PointInTimeDataset
+from app.services.point_in_time import (
+    PointInTimeDataset,
+    _completed_bar_open_time,
+)
 
 
 @pytest.fixture
@@ -1435,4 +1438,72 @@ def test_bounded_seed_edge_cases_preserved(db_session, monkeypatch, use_grouped)
         SEED_MATRIX_DECISIONS, instrument_keys=["NOPE|CE"])
     assert [ts for ts, _ in selections] == SEED_MATRIX_DECISIONS
     assert all(selection == {} for _, selection in selections)
+
+
+# ---------------------------------------------------------------------------
+# Day 49 remediation: PIT interval support for every persisted interval
+# ---------------------------------------------------------------------------
+
+# Exactly the repository's persisted-candle contract
+# (VALID_INTERVALS in app/services/nifty_candles.py, option_candles.py and
+# app/routers/candles.py).
+PERSISTED_INTERVAL_SECONDS = {
+    "1min": 60,
+    "3min": 180,
+    "5min": 300,
+    "15min": 900,
+    "30min": 1800,
+    "1hour": 3600,
+    "1day": 86400,
+}
+
+
+@pytest.mark.parametrize(
+    "interval,seconds", sorted(PERSISTED_INTERVAL_SECONDS.items())
+)
+def test_completed_bar_open_time_supports_every_persisted_interval(
+    interval, seconds
+):
+    """REQUIRED AUDIT (Day 49): every interval the candle writers persist must
+    map to its completion duration. The original map recognized a bare "day"
+    and omitted "1hour"/"1day", so a PIT read against valid persisted
+    hourly/daily rows raised ValueError before querying anything."""
+    decision = datetime(2026, 8, 27, 10, 0)
+    assert _completed_bar_open_time(decision, interval) == (
+        decision - timedelta(seconds=seconds)
+    )
+
+
+def test_completed_bar_open_time_rejects_unknown_interval():
+    """An interval outside the persisted contract is still rejected at the PIT
+    boundary rather than silently assumed to be three minutes."""
+    with pytest.raises(ValueError, match="Unsupported PIT candle interval"):
+        _completed_bar_open_time(datetime(2026, 8, 27, 10, 0), "7min")
+
+
+def test_pit_reads_serve_persisted_hour_and_day_rows(db_session):
+    """REQUIRED AUDIT (Day 49): the persisted 1hour/1day intervals are served
+    by the PIT interface instead of raising ValueError."""
+    hour_ts = datetime(2026, 8, 27, 9, 0)
+    day_ts = datetime(2026, 8, 26, 0, 0)
+    db_session.add_all([
+        NiftyCandle(
+            symbol="NIFTY", interval="1hour", open_time=hour_ts,
+            open=24500, high=24510, low=24490, close=24505, volume=1000,
+        ),
+        NiftyCandle(
+            symbol="NIFTY", interval="1day", open_time=day_ts,
+            open=24400, high=24600, low=24300, close=24500, volume=9000,
+        ),
+    ])
+    db_session.commit()
+
+    pit = PointInTimeDataset(db_session)
+    decision = datetime(2026, 8, 27, 10, 0)
+
+    hourly = pit.nifty_candles("NIFTY", decision, interval="1hour")
+    assert [row.open_time for row in hourly] == [hour_ts]
+
+    daily = pit.nifty_candles("NIFTY", decision, interval="1day")
+    assert [row.open_time for row in daily] == [day_ts]
 

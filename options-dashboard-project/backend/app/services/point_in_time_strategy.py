@@ -53,10 +53,21 @@ def build_point_in_time_strategy_inputs(
         calc_version=greeks_calc_version,
     )
     greek_selection = greek_selections[0][1] if greek_selections else {}
-    gex = pit.historical_gex_at(
-        normalized_decision,
+    # GEX must honor the SAME instrument universe as the candle and Greeks
+    # reads. ``historical_gex_at`` has no instrument filter, so calling it here
+    # returned the latest eligible snapshot of every instrument that has ever
+    # existed — unrelated and expired contracts leaked into the strategy-input
+    # bundle. The per-instrument bulk selection seam already supports the
+    # ``instrument_keys`` bound, so it is reused rather than a second filter
+    # being invented: empty ``instrument_keys`` now yields no GEX (the same
+    # empty-universe contract as the candle and Greeks selections) instead of
+    # the entire snapshot set.
+    gex_selections = pit.historical_gex_selections_at_many(
+        [normalized_decision],
+        instrument_keys=instrument_keys,
         calc_version=gex_calc_version,
     )
+    gex_selection = gex_selections[0][1] if gex_selections else {}
 
     return PointInTimeStrategyInputs(
         decision_timestamp=normalized_decision,
@@ -67,5 +78,7 @@ def build_point_in_time_strategy_inputs(
         option_greeks=tuple(
             row for _, row in sorted(greek_selection.items())
         ),
-        historical_gex=tuple(gex),
+        historical_gex=tuple(
+            row for _, row in sorted(gex_selection.items())
+        ),
     )

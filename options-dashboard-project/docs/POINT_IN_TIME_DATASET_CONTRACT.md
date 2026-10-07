@@ -12,6 +12,37 @@ The governing invariant is:
 
 StrikeNova historical market-data candles are persisted as **naive IST (Asia/Kolkata)** timestamps. The public PIT interface therefore accepts either a naive datetime (interpreted as IST) or a timezone-aware timestamp, which is normalized through `app.utils.market_time.to_ist_naive()`. IV observations are normalized to the same canonical naive-IST representation when persisted. A Day 49 Alembic migration converts pre-Day-49 naive-UTC IV rows to that canonical IST representation before the new contract is used.
 
+### Migration sequencing (Day 49 IV timestamp normalization)
+
+`d49aa0000001_normalize_iv_observation_timestamps_to_ist` rewrites *legacy*
+naive-UTC `iv_observations.observed_at` values into the canonical naive-IST
+representation. Because the application writes canonical naive IST, the
+migration must run **before** any Day-49 application code writes an IV row —
+otherwise a freshly written IST row would be shifted a second time (+05:30).
+
+The supported deployment path already guarantees that ordering:
+
+- `init_db()` runs from the FastAPI lifespan and calls
+  `_run_alembic_migrations()` (`alembic upgrade head`) as its **first** step,
+  before the app serves requests and before the background GEX-capture loop
+  starts, so a process cannot write application data before the chain is at
+  head.
+- For every non-SQLite target, migrations execute under the ADR-017
+  transactional lease (`app/db.py::_execute_serialized`), so exactly one
+  process runs the chain and no second instance can interleave an
+  `upgrade head` with application writes.
+- `d49aa0000001` is the single Alembic head, and its `downgrade()` raises
+  deliberately, so a downgrade followed by an upgrade cannot double-shift
+  rows.
+
+**Operational prerequisite (must hold):** the revision is applied by the
+application startup path, or by an operator running `alembic upgrade head`
+out-of-band *before* any process running Day-49 code writes IV observations.
+No supported workflow performs `alembic stamp` past this revision or an
+intervening downgrade. If a deployment ever separates "run migrations" from
+"start the app" such that the app can write IV rows first, this prerequisite is
+violated and the migration must be re-evaluated.
+
 ### Feature time vs processing time
 
 For raw market data, the source observation timestamp is the feature-availability boundary:
@@ -46,6 +77,35 @@ Therefore:
 Forward outcomes are labels, not features. A research/backtest pipeline may deliberately query future market observations to calculate a label after selecting the PIT feature set, but those rows must never enter the PIT feature interface.
 
 The PIT dataset interface contains feature reads only; it deliberately does not expose a "future outcome" method.
+
+## Interval support
+
+Interval-derived market bars (NIFTY candles, option candles, and the derived
+Greeks/GEX rows computed from them) carry an explicit `interval`. The PIT
+interface maps every **persisted** candle interval to its completion duration:
+
+| Interval | Completion duration |
+|---|---|
+| `1min` | 60 s |
+| `3min` | 180 s |
+| `5min` | 300 s |
+| `15min` | 900 s |
+| `30min` | 1800 s |
+| `1hour` | 3600 s |
+| `1day` | 86400 s |
+
+These are exactly the repository's persisted-interval contract —
+`VALID_INTERVALS` in `app/services/nifty_candles.py`,
+`app/services/option_candles.py` and `app/routers/candles.py`. Any other
+interval is rejected with `ValueError` at the PIT boundary rather than being
+silently assumed to be three minutes. (`day` is retained only as a legacy
+alias for `1day`.)
+
+Day 49's **consumers** are deliberately 3-minute-only — `GexResearchEngine`
+and `GexAnalyticsEngine` both pin `DEFAULT_INTERVAL = "3min"` and expose no
+interval selector — but the PIT interface itself is interval-generic, so
+already-persisted `1hour`/`1day` data cannot raise a spurious `ValueError` if a
+future consumer requests it.
 
 ## Initial supported datasets
 

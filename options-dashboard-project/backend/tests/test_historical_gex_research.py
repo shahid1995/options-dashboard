@@ -810,9 +810,13 @@ def test_fallback_oi_is_attributed_to_its_source_timestamp(db_session):
     assert oi_data[ts_1006]["call_oi_change"] == 0
 
 
-def _add_greek(db_session, instrument_key, ts, option_type="CE", expiry="2026-09-30"):
-    """Insert one SUCCESS greeks_v3 row so the instrument participates in the
-    PIT selection for research timestamps at/after ``ts``."""
+def _add_greek(
+    db_session, instrument_key, ts, option_type="CE", expiry="2026-09-30",
+    status="SUCCESS",
+):
+    """Insert one greeks_v3 row. ``status`` defaults to SUCCESS so the row
+    participates in the default PIT selection; pass a non-SUCCESS status to
+    model a failed implied-volatility solve."""
     db_session.add(OptionGreeks(
         instrument_key=instrument_key, interval="3min", open_time=ts,
         spot=24500, strike=24500, expiry=expiry, option_type=option_type,
@@ -820,7 +824,21 @@ def _add_greek(db_session, instrument_key, ts, option_type="CE", expiry="2026-09
         risk_free_rate=0.065, intrinsic_value=0, implied_volatility=0.2,
         delta=0.5, gamma=0.001, vega=10, theta=-5,
         calc_model="BLACK_SCHOLES_EUROPEAN", calc_version="greeks_v3",
-        calculated_at=ts, status="SUCCESS",
+        calculated_at=ts, status=status,
+    ))
+
+
+def _add_contract_spec(db_session, instrument_key, *, option_type, expiry):
+    """Insert the authoritative per-instrument metadata row used as the
+    option-type/expiry fallback when a contract has no Greeks row at all."""
+    db_session.add(ContractSpec(
+        instrument_key=instrument_key, underlying="NIFTY",
+        underlying_key="NSE_INDEX|Nifty 50", expiry=expiry,
+        strike_price=24500.0, instrument_type=option_type,
+        lot_size=65, minimum_lot=65, freeze_quantity=1800, tick_size=0.05,
+        trading_symbol=instrument_key, segment="NSE_FO", exchange="NSE",
+        weekly=True, source="TEST", source_reference="test",
+        fetched_at=datetime(2026, 8, 27, 10, 0),
     ))
 
 
@@ -1140,3 +1158,157 @@ def test_compute_flips_and_walls_use_the_bounded_bulk_load_once(db_session, monk
         assert walls[ts]["pos_wall_strike"] == 24500.0
         assert walls[ts]["pos_wall_distance"] == pytest.approx(0.0)
         assert walls[ts]["neg_wall_strike"] == 24400.0
+
+
+# ---------------------------------------------------------------------------
+# Day 49 remediation: OI/volume are market observations and must survive a
+# missing or failed derived-Greeks row.
+# ---------------------------------------------------------------------------
+
+
+def test_oi_includes_contract_with_success_greeks(db_session):
+    """Baseline: candle + SUCCESS Greeks is counted and classified."""
+    ts = datetime(2026, 8, 27, 10, 0)
+    _add_candle(db_session, "OK|CE", ts, oi=640, volume=15)
+    _add_greek(db_session, "OK|CE", ts, option_type="CE")
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data([ts])
+
+    assert oi_data[ts]["total_oi"] == 640
+    assert oi_data[ts]["call_oi"] == 640
+    assert oi_data[ts]["total_volume"] == 15
+    assert oi_data[ts]["oi_source_open_time"] == ts
+
+
+def test_oi_includes_contract_with_failed_greeks(db_session):
+    """REQUIRED (Day 49 remediation): a contract whose implied-volatility solve
+    FAILED still has a real candle observation. Its OI and volume must not be
+    discarded just because the DERIVED Greeks row is unsuccessful, and the
+    failed row still supplies option type + expiry for classification."""
+    ts = datetime(2026, 8, 27, 10, 0)
+    _add_candle(db_session, "FAIL|PE", ts, oi=640, volume=15)
+    _add_greek(db_session, "FAIL|PE", ts, option_type="PE", status="FAILED")
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data([ts])
+
+    assert oi_data[ts]["total_oi"] == 640
+    assert oi_data[ts]["put_oi"] == 640
+    assert oi_data[ts]["call_oi"] == 0
+    assert oi_data[ts]["total_volume"] == 15
+    assert oi_data[ts]["put_volume"] == 15
+    assert oi_data[ts]["oi_source_open_time"] == ts
+
+
+def test_oi_includes_contract_with_no_greeks_row(db_session):
+    """REQUIRED (Day 49 remediation): a contract with candles but NO Greeks row
+    at all still contributes OI, classified through the authoritative
+    contract_specs metadata."""
+    ts = datetime(2026, 8, 27, 10, 0)
+    _add_candle(db_session, "SPEC|PE", ts, oi=900, volume=25)
+    _add_contract_spec(
+        db_session, "SPEC|PE", option_type="PE", expiry="2026-09-03")
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data([ts])
+
+    assert oi_data[ts]["total_oi"] == 900
+    assert oi_data[ts]["put_oi"] == 900
+    assert oi_data[ts]["call_oi"] == 0
+    assert oi_data[ts]["total_volume"] == 25
+
+
+def test_oi_preserves_candle_contract_without_any_metadata(db_session):
+    """Even with no Greeks row and no contract_specs row, a real candle is
+    never dropped: it contributes to total OI/volume (it is simply not
+    assigned to a call/put bucket)."""
+    ts = datetime(2026, 8, 27, 10, 0)
+    _add_candle(db_session, "BARE|XX", ts, oi=250, volume=5)
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data([ts])
+
+    assert oi_data[ts]["total_oi"] == 250
+    assert oi_data[ts]["call_oi"] == 0
+    assert oi_data[ts]["put_oi"] == 0
+    assert oi_data[ts]["total_volume"] == 5
+
+
+def test_oi_mixed_greek_availability_keeps_every_candle(db_session):
+    """REQUIRED (Day 49 remediation): at one research timestamp, contracts with
+    SUCCESS Greeks, FAILED Greeks and no Greeks row all contribute."""
+    ts = datetime(2026, 8, 27, 10, 0)
+    _add_candle(db_session, "OK|CE", ts, oi=100, volume=1)
+    _add_greek(db_session, "OK|CE", ts, option_type="CE")
+    _add_candle(db_session, "FAIL|PE", ts, oi=200, volume=2)
+    _add_greek(db_session, "FAIL|PE", ts, option_type="PE", status="FAILED")
+    _add_candle(db_session, "SPEC|CE", ts, oi=300, volume=3)
+    _add_contract_spec(
+        db_session, "SPEC|CE", option_type="CE", expiry="2026-09-03")
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data([ts])
+
+    assert oi_data[ts]["total_oi"] == 600
+    assert oi_data[ts]["call_oi"] == 400
+    assert oi_data[ts]["put_oi"] == 200
+    assert oi_data[ts]["total_volume"] == 6
+    assert oi_data[ts]["call_volume"] == 4
+    assert oi_data[ts]["put_volume"] == 2
+
+
+def test_failed_and_missing_greeks_carry_oi_forward_exactly_once(db_session):
+    """REQUIRED (Day 49 remediation): the 2100 -> 700 no-duplication guarantee
+    must still hold for contracts whose Greeks failed or are absent. A stale
+    candle carries OI forward exactly once and contributes no fresh volume."""
+    ts_1000 = datetime(2026, 8, 27, 10, 0)
+    ts_1003 = datetime(2026, 8, 27, 10, 3)
+    ts_1006 = datetime(2026, 8, 27, 10, 6)
+    _add_candle(db_session, "FAIL|CE", ts_1000, oi=400, volume=7)
+    _add_greek(db_session, "FAIL|CE", ts_1000, option_type="CE", status="FAILED")
+    _add_candle(db_session, "BARE|CE", ts_1000, oi=300, volume=3)
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data(
+        [ts_1000, ts_1003, ts_1006]
+    )
+
+    assert set(oi_data) == {ts_1000, ts_1003, ts_1006}
+    for ts in (ts_1000, ts_1003, ts_1006):
+        # 400 + 300, counted once per decision and never doubled.
+        assert oi_data[ts]["total_oi"] == 700
+        assert oi_data[ts]["oi_source_open_time"] == ts_1000
+    # Volume is event-scoped: only the fresh 10:00 bar contributes.
+    assert oi_data[ts_1000]["total_volume"] == 10
+    assert oi_data[ts_1003]["total_volume"] == 0
+    assert oi_data[ts_1006]["total_volume"] == 0
+    assert oi_data[ts_1003]["oi_change"] == 0
+    assert oi_data[ts_1006]["oi_change"] == 0
+
+
+def test_expired_candle_only_contract_stops_after_expiry_via_spec(db_session):
+    """REQUIRED (Day 49 remediation): lifecycle is enforced through the
+    contract_specs expiry when a contract has no Greeks row. It stays eligible
+    through its expiry DATE and stops from the following calendar date."""
+    expiry = "2026-08-27"
+    ts_expiry = datetime(2026, 8, 27, 10, 0)
+    ts_next = datetime(2026, 8, 28, 10, 0)
+    _add_candle(db_session, "SPEC|CE", ts_expiry, oi=700, volume=10)
+    _add_contract_spec(
+        db_session, "SPEC|CE", option_type="CE", expiry=expiry)
+    # An active contract keeps the 08-28 research timestamp alive.
+    _add_candle(db_session, "ACT|CE", ts_next, oi=300, volume=5)
+    _add_greek(db_session, "ACT|CE", ts_next)
+    db_session.commit()
+
+    oi_data = GexResearchEngine(db_session)._fetch_oi_data(
+        [ts_expiry, ts_next]
+    )
+
+    assert oi_data[ts_expiry]["total_oi"] == 700
+    assert oi_data[ts_expiry]["total_volume"] == 10
+    # From the following calendar date the expired candle-only contract no
+    # longer contributes; only the active contract does.
+    assert oi_data[ts_next]["total_oi"] == 300
+    assert oi_data[ts_next]["call_oi"] == 300

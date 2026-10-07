@@ -466,8 +466,14 @@ class GexResearchEngine:
         never dropped merely because it is stale. Forward NIFTY candles remain
         separate because they are labels, not features.
 
-        Two research-layer feature rules are applied on top of the PIT
+        Three research-layer feature rules are applied on top of the PIT
         boundary without altering it:
+        - The instrument universe is the option candles themselves. OI and
+          traded volume are MARKET OBSERVATIONS, so a contract with visible
+          candles contributes even when its derived Greeks row is missing or
+          its implied-volatility solve failed. The universe is therefore NOT
+          narrowed to ``status == "SUCCESS"`` Greeks rows (Day 49 correction:
+          a failed IV solve must never erase real open interest).
         - OI is state and carries forward; traded volume is event-scoped, so
           only a candle whose source open_time equals the research timestamp
           contributes volume. Fallback candles contribute zero fresh volume.
@@ -482,64 +488,78 @@ class GexResearchEngine:
             self._decision_timestamp_for_observation(ts) for ts in timestamps
         ]
 
-        greek_selections = self.pit.option_greeks_selections_at_many(
+        # Universe: the option candles ARE the market observation. Every
+        # instrument with a candle visible to a decision participates,
+        # regardless of whether a derived Greeks row exists or succeeded.
+        # Decision-major pairing is keyed back by the research observation
+        # timestamp (the API contract of this method): selection_by_decision[ts]
+        # holds exactly the instruments PIT selected FOR that observation's
+        # decision time, never rows belonging to another decision. A fallback
+        # row keeps its source open_time (never relabeled to the decision time)
+        # and its value carries forward as the latest available observation —
+        # so a stale bar can neither be duplicated into a later timestamp nor
+        # disappear from one.
+        candle_selections = self.pit.option_candles_selections_at_many(
             decision_timestamps,
             interval=DEFAULT_INTERVAL,
-            calc_version="greeks_v3",
         )
-        if not greek_selections:
+        if not candle_selections:
             return {}
-
-        # Decision-major pairing, keyed back by the research observation
-        # timestamp (the API contract of this method): greeks_by_decision[ts]
-        # holds exactly the instruments PIT selected FOR that observation's
-        # decision time, never rows belonging to another decision.
-        greeks_by_decision: dict[datetime, dict] = {}
-        for ts, (_, selection) in zip(timestamps, greek_selections):
-            greeks_by_decision[ts] = dict(selection)
-
+        selection_by_decision: dict[datetime, dict] = {
+            ts: dict(selection)
+            for ts, (_, selection) in zip(timestamps, candle_selections)
+        }
         instruments = sorted({
             instrument_key
-            for selection in greeks_by_decision.values()
+            for selection in selection_by_decision.values()
             for instrument_key in selection
         })
-        # Decision-major selection: each decision's own {instrument: candle}
-        # selection is summed exactly once for that decision. A fallback row
-        # keeps its source open_time (never relabeled to the decision time) and
-        # its value carries forward as the latest available observation — so a
-        # stale bar can neither be duplicated into a later timestamp nor
-        # disappear from one.
-        selection_by_decision: dict[datetime, dict] = defaultdict(dict)
-        for ts, (_, selection) in zip(
-            timestamps,
-            self.pit.option_candles_selections_at_many(
-                decision_timestamps,
-                instrument_keys=instruments,
-                interval=DEFAULT_INTERVAL,
-            ),
-        ):
-            selection_by_decision[ts] = dict(selection)
+        if not instruments:
+            return {}
 
-        ik_to_type = {
-            instrument_key: row.option_type
-            for selection in greeks_by_decision.values()
-            for instrument_key, row in selection.items()
-        }
-
-        # Research-specific contract-lifecycle eligibility: an instrument is a
-        # valid research instrument through its expiry DATE and stops
-        # contributing from the following calendar date. Expiry lives on the
-        # instrument's greeks rows; rows without a parseable expiry are kept
-        # eligible ("unknown" never silently drops a contract).
-        eligible_expiry: dict[str, date | None] = {}
-        for selection in greeks_by_decision.values():
+        # Metadata for classification (option type) and lifecycle (expiry):
+        # the Greeks row is consulted first and is allowed to be non-SUCCESS —
+        # a failed IV solve still carries the contract's identity. The
+        # authoritative ``contract_specs`` metadata is the fallback for a
+        # contract with no usable Greeks metadata at all.
+        ik_to_type: dict[str, str] = {}
+        expiry_by_instrument: dict[str, date | None] = {}
+        greek_selections = self.pit.option_greeks_selections_at_many(
+            decision_timestamps,
+            instrument_keys=instruments,
+            interval=DEFAULT_INTERVAL,
+            calc_version="greeks_v3",
+            successful_only=False,
+        )
+        for _, selection in greek_selections:
             for instrument_key, row in selection.items():
-                if instrument_key not in eligible_expiry:
-                    eligible_expiry[instrument_key] = _expiry_date(row.expiry)
+                if row.option_type:
+                    ik_to_type.setdefault(instrument_key, row.option_type)
+                if instrument_key not in expiry_by_instrument:
+                    expiry_by_instrument[instrument_key] = _expiry_date(
+                        row.expiry)
+
+        unresolved = [
+            instrument_key
+            for instrument_key in instruments
+            if not ik_to_type.get(instrument_key)
+            or expiry_by_instrument.get(instrument_key) is None
+        ]
+        if unresolved:
+            specs = self.db.execute(
+                select(ContractSpec).where(
+                    ContractSpec.instrument_key.in_(unresolved)
+                )
+            ).scalars()
+            for spec in specs:
+                if not ik_to_type.get(spec.instrument_key):
+                    ik_to_type[spec.instrument_key] = spec.instrument_type
+                if expiry_by_instrument.get(spec.instrument_key) is None:
+                    expiry_by_instrument[spec.instrument_key] = _expiry_date(
+                        spec.expiry)
 
         result: dict[datetime, dict] = {}
-        for ts in sorted(greeks_by_decision):
-            allowed_keys = set(greeks_by_decision[ts])
+        for ts in sorted(selection_by_decision):
             total_oi = 0.0
             call_oi = 0.0
             put_oi = 0.0
@@ -548,10 +568,8 @@ class GexResearchEngine:
             put_vol = 0.0
 
             decision_selection = {}
-            for instrument_key, row in selection_by_decision.get(ts, {}).items():
-                if instrument_key not in allowed_keys:
-                    continue
-                expiry = eligible_expiry.get(instrument_key)
+            for instrument_key, row in selection_by_decision[ts].items():
+                expiry = expiry_by_instrument.get(instrument_key)
                 if expiry is not None and ts.date() > expiry:
                     # The research date is past this contract's expiry date:
                     # it is no longer an active research instrument, so its

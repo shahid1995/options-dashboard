@@ -41,9 +41,16 @@ superseded — production is CockroachDB.
 
 ## 4. Conventions
 
-- **Timestamps:** UTC storage, IST market context — standardized per
-  `docs/PHASE_7_24_4_TIMEZONE_STANDARDIZATION.md`; no naive `datetime.now()`
-  in production paths. Exception (scoped): the Day 47 job-scheduling fields
+- **Timestamps:** market-data timestamps are **naive IST (Asia/Kolkata)** —
+  IST market context with IST storage — standardized per
+  `docs/PHASE_7_24_4_TIMEZONE_STANDARDIZATION.md` and converted at ingestion
+  boundaries by `app/utils/market_time.py::to_ist_naive()` (the single
+  canonical conversion, so the database never stores UTC market data). This
+  covers candle `open_time` (NIFTY, option, Greeks and GEX) and, since Day 49,
+  `IVObservation.observed_at`; the point-in-time contract
+  (`options-dashboard-project/docs/POINT_IN_TIME_DATASET_CONTRACT.md`)
+  normalizes through the same function. No naive `datetime.now()` in
+  production paths. Scoped exception: the Day 47 job-scheduling fields
   (`available_at`, `lease_expires_at`, `started_at`, `completed_at`,
   `created_at`, `updated_at` on `background_jobs`) deliberately store and
   compare naive UTC so claim/retry semantics are identical across SQLite,
