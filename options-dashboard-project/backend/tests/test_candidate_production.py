@@ -54,9 +54,6 @@ from app.strategy_evaluation.contracts import (
 )
 from app.utils.market_time import is_market_hours, to_ist_naive
 
-#: Broker-authoritative index option lot size used by the route-level stubs.
-BROKER_LOT = 65
-
 
 @pytest.fixture
 def db_session():
@@ -711,31 +708,6 @@ def _route_market_open_gate():
 
 
 class TestRoute:
-    @pytest.fixture(autouse=True)
-    def authoritative_lot_sizes(self):
-        """Day 49: the entry route resolves broker-authoritative lot sizes
-        before producing a candidate.  Route tests stub that broker call so
-        they exercise the producer and the choke point, never the network
-        (mirrors tests/test_template_execution_integration.py)."""
-
-        async def fake_lot_sizes(access_token, symbol, legs):
-            # A broker-authoritative value INDEPENDENT of the client payload,
-            # so the route's normalization is genuinely exercised.
-            return {
-                (
-                    str(leg.expiration_date),
-                    float(leg.strike_price),
-                    str(leg.option_type).lower(),
-                ): BROKER_LOT
-                for leg in legs
-            }
-
-        with patch(
-            "app.routers.paper.resolve_authoritative_lot_sizes",
-            new=AsyncMock(side_effect=fake_lot_sizes),
-        ):
-            yield
-
     def test_route_reaches_choke_point_only_through_producer(
             self, client, db_session, monkeypatch):
         """Happy path: route → real producer → real choke point (fake chain)."""
