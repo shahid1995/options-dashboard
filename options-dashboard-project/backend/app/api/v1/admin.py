@@ -24,7 +24,6 @@ Operational views are read-only and admin-scoped:
 
 from __future__ import annotations
 
-from datetime import date
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -658,9 +657,12 @@ def _is_nifty_option_contract(row: dict, underlying_key: str) -> bool:
         ("underlying_symbol", NIFTY_UNDERLYING_SYMBOL),
     ):
         declared = row.get(field)
-        if not isinstance(declared, str) or not declared.strip():
+        if not isinstance(declared, str):
             return False
-        if declared.strip() != expected:
+        # One normalization per field: the emptiness check and the comparison
+        # must agree on exactly the same value (Codacy: repeated ``.strip()``).
+        normalized = declared.strip()
+        if not normalized or normalized != expected:
             return False
     return True
 

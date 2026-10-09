@@ -45,6 +45,7 @@ from app.services.candidate_production import (
     OI_HISTORY_MIN_LAG,
     ProducerError,
     _apply_identities,
+    _atm_iv,
     _build_side_index,
     _chain_observation,
     _classify_tail,
@@ -64,7 +65,11 @@ from app.services.candidate_production import (
 )
 from app.routers.deps import SESSION_COOKIE_NAME
 from app.services.paper_execution import PaperExecutionError
-from app.strike_ranking.contracts import RankingFactor
+from app.strike_ranking.contracts import (
+    RankingFactor,
+    StrikeRankingResult,
+    StrikeRankingStatus,
+)
 from app.strategy_evaluation.contracts import (
     DimensionState,
     PayoffExpirySemantics,
@@ -1806,3 +1811,304 @@ class TestQuantityAwareTailClassification:
         legs = [self._leg("buy", "call", 25000.0, 1),
                 self._leg("sell", "call", 25000.0, 1)]
         assert _classify_tail(legs) is TailClass.NONE
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed entry gates — the critical paths the coverage finding named.
+#
+# Every branch below is a gate that must RAISE (or skip) rather than let a
+# request through with fabricated/absent evidence.  They were the genuinely
+# untested lines in ``candidate_production.py``; each uses the module's own
+# fixtures, so the assertions exercise the real producer, not a stand-in.
+# ---------------------------------------------------------------------------
+
+class TestFailClosedCoreGates:
+    @staticmethod
+    def _seed(db):
+        db.add_all(prior_candles(all_keys(), 950_000.0))
+        db.add_all(spot_closes())
+        db.commit()
+
+    def test_empty_chain_rows_fails_closed(self, db_session):
+        self._seed(db_session)
+        with pytest.raises(ProducerError) as exc:
+            run_core(db_session,
+                     chain={"underlying_spot_price": 25000.0, "chain": []})
+        assert exc.value.code == "CHAIN_DATA_MISSING"
+
+    def test_missing_spot_price_fails_closed(self, db_session):
+        self._seed(db_session)
+        chain = make_chain()
+        chain["underlying_spot_price"] = None
+        with pytest.raises(ProducerError) as exc:
+            run_core(db_session, chain=chain)
+        assert exc.value.code == "CHAIN_DATA_MISSING"
+
+    def test_chain_with_no_priceable_side_fails_closed_after_binding(
+            self, db_session):
+        """Rows exist but no side carries a price, so the identity-bound index
+        is empty — the producer must refuse rather than rank nothing."""
+        self._seed(db_session)
+        chain = make_chain()
+        for row in chain["chain"]:
+            for name in ("call", "put"):
+                row[name]["ltp"] = None
+        with pytest.raises(ProducerError) as exc:
+            run_core(db_session, chain=chain)
+        assert exc.value.code == "CHAIN_DATA_MISSING"
+
+    def test_unusable_row_is_skipped_by_the_delta_scan(self, db_session):
+        """A malformed extra row must be SKIPPED (no ΔOI, no index entry),
+        never coerced — and it must not break the rest of the snapshot."""
+        self._seed(db_session)
+        chain = make_chain()
+        chain["chain"].append(
+            {"strike": 25200.0, "call": {"ltp": None}, "put": {"ltp": None}})
+        chain["chain"].append(
+            {"strike": 0.0, "call": {"ltp": None}, "put": {"ltp": None}})
+        produced = run_core(db_session, chain=chain)
+        assert produced.candidate.lifecycle_state.value == "ELIGIBLE"
+        assert (25200.0, "call") not in _build_side_index(chain)
+        assert (0.0, "call") not in _build_side_index(chain)
+
+    def test_side_index_never_admits_an_unusable_row(self):
+        chain = make_chain()
+        chain["chain"].append(
+            {"strike": -1.0, "call": {"ltp": 100.0}, "put": {"ltp": 90.0}})
+        chain["chain"].append(
+            {"strike": 25200.0, "call": {"ltp": None}, "put": {"ltp": 0.0}})
+        index = _build_side_index(chain)
+        for key in ((-1.0, "call"), (-1.0, "put"),
+                    (25200.0, "call"), (25200.0, "put")):
+            assert key not in index, key
+        assert (25000.0, "call") in index
+
+    def test_opportunity_failure_is_evidence_insufficient(self, db_session,
+                                                          monkeypatch):
+        """When the genuine intelligence chain cannot yield an Opportunity the
+        producer converts it to a fail-closed ProducerError, never a default."""
+        self._seed(db_session)
+
+        def _boom(*args, **kwargs):
+            raise ValueError("no usable signal in this snapshot")
+
+        monkeypatch.setattr(
+            "app.services.candidate_production.discover_opportunity", _boom)
+        with pytest.raises(ProducerError) as exc:
+            run_core(db_session)
+        assert exc.value.code == "EVIDENCE_INSUFFICIENT"
+        assert "Opportunity" in str(exc.value)
+
+    def test_nothing_eligible_after_ranking_is_evidence_insufficient(
+            self, db_session, monkeypatch):
+        """Candidates existed but every one was suppressed by the existing
+        Day-30 rules: the producer must refuse, never pick a fallback."""
+        self._seed(db_session)
+
+        def _nothing(inp):
+            return StrikeRankingResult(
+                status=StrikeRankingStatus.NOTHING_ELIGIBLE,
+                ranked=(), suppressed=(),
+                weights=inp.weights, objective_id=inp.objective_id)
+
+        monkeypatch.setattr(
+            "app.services.candidate_production.rank_strikes", _nothing)
+        with pytest.raises(ProducerError) as exc:
+            run_core(db_session)
+        assert exc.value.code == "EVIDENCE_INSUFFICIENT"
+        assert "no eligible strike" in str(exc.value)
+
+    def test_gate_rejection_is_candidate_not_eligible_with_zero_mutation(
+            self, db_session, monkeypatch):
+        """A rejecting Day-32 gate must surface its reasons and write nothing."""
+        self._seed(db_session)
+        before = (
+            db_session.query(StrategyExecution).count(),
+            db_session.query(PaperOrder).count(),
+            db_session.query(Position).count(),
+            db_session.query(PaperTransaction).count(),
+        )
+
+        class _Reason:
+            message = "evaluation is not SUCCESS"
+
+        class _Gate:
+            candidate = None
+            eligible = False
+            blocking_reasons = (_Reason(),)
+
+        monkeypatch.setattr(
+            "app.services.candidate_production.evaluate_strategy_gate",
+            lambda *args, **kwargs: _Gate())
+        with pytest.raises(ProducerError) as exc:
+            run_core(db_session)
+        assert exc.value.code == "CANDIDATE_NOT_ELIGIBLE"
+        assert "evaluation is not SUCCESS" in str(exc.value)
+        after = (
+            db_session.query(StrategyExecution).count(),
+            db_session.query(PaperOrder).count(),
+            db_session.query(Position).count(),
+            db_session.query(PaperTransaction).count(),
+        )
+        assert before == after == (0, 0, 0, 0)
+
+
+class TestMeasuredInputEdges:
+    """Defensive 'missing stays missing' branches that the main flows never
+    reach with a well-formed fixture."""
+
+    def test_prior_oi_state_with_no_keys_is_empty(self, db_session):
+        assert _prior_oi_state(db_session, [], REF_TS) == {}
+
+    def test_prior_oi_stays_missing_when_the_row_is_absent(self, db_session):
+        """D1's real contract: an absent history row maps to ``None``, never to
+        a measured ``0.0`` (the NULL branch is unreachable — see the triage
+        note: ``option_candles.open_interest`` is NOT NULL with a 0.0 default,
+        so storage itself can never express a missing OI)."""
+        state = _prior_oi_state(db_session, all_keys(), REF_TS)
+        assert state == {key: None for key in all_keys()}
+
+    def test_atm_iv_is_missing_when_no_side_measures_iv(self):
+        chain = make_chain()
+        for row in chain["chain"]:
+            for name in ("call", "put"):
+                row[name]["iv"] = None
+        sides = list(_build_side_index(chain).values())
+        assert _atm_iv(sides, 25000.0) is None
+
+    def test_absent_leg_is_missing_never_a_zero_quote(self):
+        chain = make_chain()
+        chain["chain"][0]["put"]["ltp"] = None
+        observation = _chain_observation(
+            chain, symbol="NIFTY", expiry=EXPIRY, received_at=REF_TS)
+        row = next(r for r in observation.chain if r.strike == 25000.0)
+        assert row.put is None
+        assert row.call is not None
+
+    def test_unusable_strike_rows_are_dropped_from_the_observation(self):
+        chain = make_chain()
+        chain["chain"].append(
+            {"strike": None, "call": {"ltp": 1.0}, "put": {"ltp": 1.0}})
+        observation = _chain_observation(
+            chain, symbol="NIFTY", expiry=EXPIRY, received_at=REF_TS)
+        assert [r.strike for r in observation.chain] == [25000.0, 25100.0]
+
+
+# ---------------------------------------------------------------------------
+# Async-wrapper fail-closed paths (evidence acquisition boundaries)
+# ---------------------------------------------------------------------------
+
+def _wrapper(db, request, *, fetch_chain, resolve_keys=None):
+    return produce_candidate_and_execute(
+        "user-day50", db, request, _prices(),
+        token_resolver=lambda _db, _user: "test-md-token",
+        fetch_chain=fetch_chain,
+        resolve_keys=resolve_keys or _injected_keys,
+        now_fn=lambda: REF_TS,
+    )
+
+
+def _no_rows_written(db):
+    return (
+        db.query(StrategyExecution).count(),
+        db.query(PaperOrder).count(),
+        db.query(Position).count(),
+        db.query(PaperTransaction).count(),
+    )
+
+
+@pytest.mark.anyio
+async def test_wrapper_rejects_a_multi_expiry_request(db_session):
+    from app.schemas import ExecutionLegIn
+    from app.services.paper_execution import PaperExecutionError
+
+    request = _request()
+    request.legs = list(request.legs)
+    request.legs[1] = ExecutionLegIn(
+        symbol="NIFTY", expiration_date="2026-10-31",
+        strike_price=25100.0, option_type="call", action="buy",
+        quantity=1, lot_size=65)
+
+    async def must_not_fetch(symbol, expiry, token):
+        raise AssertionError("no broker read before the expiry gate")
+
+    with pytest.raises(PaperExecutionError) as exc:
+        await _wrapper(db_session, request, fetch_chain=must_not_fetch)
+    assert exc.value.code == "CANDIDATE_NOT_ELIGIBLE"
+    assert "single-expiry" in str(exc.value)
+    assert _no_rows_written(db_session) == (0, 0, 0, 0)
+
+
+@pytest.mark.anyio
+async def test_wrapper_fails_closed_when_the_chain_read_raises(db_session):
+    from app.services.paper_execution import PaperExecutionError
+
+    async def exploding(symbol, expiry, token):
+        raise RuntimeError("broker unreachable")
+
+    with pytest.raises(PaperExecutionError) as exc:
+        await _wrapper(db_session, _request(), fetch_chain=exploding)
+    assert exc.value.code == "CHAIN_DATA_MISSING"
+    assert _no_rows_written(db_session) == (0, 0, 0, 0)
+
+
+@pytest.mark.anyio
+async def test_wrapper_fails_closed_when_key_resolution_raises(db_session):
+    from app.services.paper_execution import PaperExecutionError
+
+    async def ok_fetch(symbol, expiry, token):
+        return make_chain()
+
+    async def exploding_keys(legs, token):
+        raise RuntimeError("resolver unreachable")
+
+    with pytest.raises(PaperExecutionError) as exc:
+        await _wrapper(db_session, _request(), fetch_chain=ok_fetch,
+                       resolve_keys=exploding_keys)
+    assert exc.value.code == "CHAIN_DATA_MISSING"
+    assert _no_rows_written(db_session) == (0, 0, 0, 0)
+
+
+@pytest.mark.anyio
+async def test_wrapper_passes_a_domain_failure_through_unwrapped(db_session):
+    """A ``PaperExecutionError`` raised by a boundary is already the right
+    failure: it must reach the caller unchanged, never be re-wrapped into a
+    generic CHAIN_DATA_MISSING that would hide the real reason."""
+    from app.services.paper_execution import PaperExecutionError
+
+    async def unauthorized(symbol, expiry, token):
+        raise PaperExecutionError("MARKET_DATA_UNAUTHORIZED", "not connected")
+
+    async def forbidden(legs, token):
+        raise PaperExecutionError("MARKET_DATA_UNAUTHORIZED", "not connected")
+
+    async def ok_fetch(symbol, expiry, token):
+        return make_chain()
+
+    with pytest.raises(PaperExecutionError) as exc:
+        await _wrapper(db_session, _request(), fetch_chain=unauthorized)
+    assert exc.value.code == "MARKET_DATA_UNAUTHORIZED"
+    assert "not connected" in str(exc.value)
+
+    with pytest.raises(PaperExecutionError) as exc:
+        await _wrapper(db_session, _request(), fetch_chain=ok_fetch,
+                       resolve_keys=forbidden)
+    assert exc.value.code == "MARKET_DATA_UNAUTHORIZED"
+    assert _no_rows_written(db_session) == (0, 0, 0, 0)
+
+
+@pytest.mark.anyio
+async def test_wrapper_fails_closed_on_an_unpriceable_chain(db_session):
+    from app.services.paper_execution import PaperExecutionError
+
+    async def unpriceable(symbol, expiry, token):
+        chain = make_chain()
+        for row in chain["chain"]:
+            for name in ("call", "put"):
+                row[name]["ltp"] = None
+        return chain
+
+    with pytest.raises(PaperExecutionError) as exc:
+        await _wrapper(db_session, _request(), fetch_chain=unpriceable)
+    assert exc.value.code == "CHAIN_DATA_MISSING"
+    assert _no_rows_written(db_session) == (0, 0, 0, 0)
