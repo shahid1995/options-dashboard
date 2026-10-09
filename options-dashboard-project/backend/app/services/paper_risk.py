@@ -61,18 +61,26 @@ PAPER_ENTRY_POLICY = RiskPolicy(
 
 
 def _request_leg_keys(legs: list) -> list[tuple]:
-    """Normalized per-leg identity for an ExecutionLegIn request list."""
+    """Normalized per-leg identity for an ExecutionLegIn request list.
+
+    ``ExecutionLegIn.quantity`` is LOTS and ``lot_size`` is CONTRACTS PER
+    LOT, while a genuine candidate's ``OptionLeg.quantity`` is CONTRACTS, so
+    the request's position size is ``quantity × lot_size`` contracts.  The
+    comparison stays EXACT: a different quantity or a different lot size is a
+    different position, so the leg binding is never weakened.
+    """
     keys = []
     for leg in legs:
         direction = PositionDirection.LONG if leg.action == "buy" \
             else PositionDirection.SHORT
         keys.append((leg.expiration_date, leg.strike_price,
-                     leg.option_type.lower(), direction, float(leg.quantity)))
+                     leg.option_type.lower(), direction,
+                     float(leg.quantity) * float(leg.lot_size)))
     return keys
 
 
 def _candidate_leg_keys(legs: tuple[OptionLeg, ...]) -> list[tuple]:
-    """Normalized per-leg identity for genuine domain OptionLegs."""
+    """Normalized per-leg identity for genuine domain OptionLegs (CONTRACTS)."""
     return [(leg.expiry, leg.strike, leg.option_type.value.lower(),
              leg.direction, float(leg.quantity)) for leg in legs]
 
