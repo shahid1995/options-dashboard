@@ -74,7 +74,6 @@ from app.brokers.domain.enums import BROKER_ID_UPSTOX
 from app.brokers.gateway import gateway
 from app.intelligence.contracts import (
     IntelligenceDirection,
-    MarketRegime,
     RegimeLabel,
     TimeHorizon,
 )
@@ -99,7 +98,6 @@ from app.quant.contracts import CalculationContext
 from app.quant.scenarios import (
     OptionLeg,
     PositionDirection,
-    ScenarioPoint,
     evaluate_portfolio,
 )
 # The repository's SINGLE owned GEX convention (docs/GEX_V1_0_SPEC.md,

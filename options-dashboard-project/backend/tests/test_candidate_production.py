@@ -42,7 +42,6 @@ from app.models import (
 from app.services import historical_gex, token_store
 from app.services.candidate_production import (
     OI_HISTORY_MAX_AGE,
-    OI_HISTORY_MIN_LAG,
     ProducerError,
     _apply_identities,
     _atm_iv,
