@@ -61,7 +61,7 @@ PIT (naive IST completed bars) semantics do NOT apply to this live path.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from math import isfinite
 from typing import Any, Callable
@@ -87,7 +87,6 @@ from app.intelligence.positioning import (
     StrikePositioning,
     classify_chain,
     compute_metrics,
-    evaluate_positioning,
 )
 from app.intelligence.regime import RegimeInput, evaluate_regime
 from app.intelligence.synthesis import SynthesisInput, evaluate_synthesis
@@ -103,6 +102,11 @@ from app.quant.scenarios import (
     ScenarioPoint,
     evaluate_portfolio,
 )
+# The repository's SINGLE owned GEX convention (docs/GEX_V1_0_SPEC.md,
+# Invariant 16).  Reused verbatim so the Day-30 GEX factor is a measurement
+# of real gamma/OI rather than a fabricated placeholder; no second GEX
+# formula is introduced here.
+from app.services.historical_gex import compute_raw_gex, compute_signed_gex
 from app.strike_ranking.contracts import (
     FactorObservation,
     OptionType,
@@ -125,7 +129,7 @@ from app.strategy_evaluation.contracts import (
 )
 from app.strategy_evaluation.evaluation import evaluate_strategy
 from app.strategy_lifecycle.lifecycle import evaluate_strategy_gate
-from app.utils.market_time import to_ist_naive
+from app.utils.market_time import MARKET_OPEN, to_ist_naive
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -174,10 +178,12 @@ class ChainSide:
 
     instrument_key: str | None
     strike: float
+    market_side: str  # "call" | "put" — the broker DATA side, not the trade side
     ltp: float
     oi: float | None
     volume: float | None
     iv: float | None
+    gamma: float | None
     bid: float | None
     ask: float | None
     quote_ts: datetime | None
@@ -342,59 +348,51 @@ def _chain_observation(
     )
 
 
-def _quality(observation, *, reference_ts: datetime) -> QualityResult:
+def _quality(observation, *, received_at: datetime) -> QualityResult:
     """Measure chain quality with the REAL Day-12 engine.
 
     The previous implementation returned a hard-coded EXCELLENT/100 with no
     dimensions, which is fabricated evidence: it asserted measured freshness,
     completeness, validity and provenance that were never measured, and no
-    quality requirement could ever fail because of it.  The engine is
-    deterministic and takes an explicit ``reference_time``, so the producer's
-    own authoritative reference timestamp is used — this introduces no second
-    wall-clock read.
+    quality requirement could ever fail because of it.
+
+    Freshness is evaluated against the SERVER RECEIPT time, not against the
+    broker's own quote timestamp.  The Day-12 engine computes
+    ``age = reference_time - observation.market_timestamp``, so bounding the
+    engine by the broker timestamp would make every snapshot age 0 by
+    construction — a stale snapshot could never be detected as stale.  Two
+    meanings are kept distinct here:
+
+    * ``reference_timestamp`` (the candidate's authoritative market/evidence
+      time) remains the broker's own quote timestamp;
+    * ``received_at`` (captured once per request) is the freshness clock.
+
+    No second wall-clock read is introduced: the engine is bounded by the
+    request's single captured receipt time.
     """
     from app.market_data.quality import MarketDataQualityEngine
 
     return MarketDataQualityEngine().evaluate(
-        observation, reference_time=reference_ts)
+        observation, reference_time=received_at)
 
 
-def _extract_sides(chain: dict) -> list[ChainSide]:
-    """Flatten canonical chain rows into measured sides.
-
-    A row contributes a side only when its strike is positive and its LTP
-    is a positive number; everything else stays missing (never coerced).
-    """
-    out: list[ChainSide] = []
-    for row in chain.get("chain", []):
-        strike = _finite(row.get("strike"))
-        if strike is None or strike <= 0:
-            continue
-        for side_name in ("call", "put"):
-            side = row.get(side_name) or {}
-            ltp = _finite(side.get("ltp"))
-            if ltp is None or ltp <= 0:
-                continue
-            out.append(ChainSide(
-                instrument_key=side.get("instrument_key"),
-                strike=strike,
-                ltp=ltp,
-                oi=_finite(side.get("oi")),
-                volume=_finite(side.get("volume")),
-                iv=_finite(side.get("iv")),
-                bid=_finite(side.get("bid_price")),
-                ask=_finite(side.get("ask_price")),
-                quote_ts=_parse_broker_ts(side.get("quote_timestamp")),
-            ))
-    return out
-
-
-def _reference_ts(sides: list[ChainSide], received_at: datetime) -> datetime:
+def _reference_ts_from_index(
+    index: dict[tuple[float, str], ChainSide], received_at: datetime,
+) -> datetime:
     """Authoritative reference timestamp of the evidence: the broker's own
-    quote timestamp when present (latest across sides), else the recorded
-    receive-at moment of the fetch.  No second wall-clock read."""
-    stamped = [s.quote_ts for s in sides if s.quote_ts is not None]
+    quote timestamp when present (latest across the identity-bound index
+    sides), else the recorded receive-at moment of the fetch.  No second
+    wall-clock read.
+
+    This is the single evidence-clock source for Slice A: the index is built
+    once from the canonical chain rows and reused for every lookup, so the
+    reference timestamp cannot describe a different row set than the one the
+    candidate actually measures.
+    """
+    stamped = [s.quote_ts for s in index.values() if s.quote_ts is not None]
     return max(stamped) if stamped else received_at
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -454,17 +452,37 @@ def _delta_oi(current_oi: float | None, prior_oi: float | None) -> float | None:
 def _spot_history(
     db: Session, reference_ts: datetime, count: int = REGIME_PRICE_MOVES,
 ) -> tuple[tuple[float, ...], float | None]:
-    """Prior stored NIFTY closes strictly before the reference timestamp
-    (oldest→newest) plus the immediately-prior close.  Real stored candles
-    only — nothing interpolated.  The cutoff is expressed on the stored
-    naive-IST candle clock, the clock ``NiftyCandle.open_time`` is written
-    in."""
+    """Prior stored NIFTY closes of the REFERENCE SESSION, strictly before the
+    reference timestamp (oldest→newest), plus the immediately-prior close.
+
+    Real stored candles only — nothing interpolated.  Three bounds are
+    applied, all on the stored naive-IST candle clock that
+    ``NiftyCandle.open_time`` is written in (``app.utils.market_time``):
+
+    * the explicit underlying predicate ``symbol == "NIFTY"`` — the evidence
+      chain is NIFTY-only (Slice A), and a foreign symbol's closes are not
+      NIFTY market history;
+    * ``open_time < cutoff`` — history is strictly prior to the snapshot;
+    * ``open_time >= session open (09:15 IST) of the cutoff's own date`` — the
+      repository's own session boundary (``app.utils.market_time.MARKET_OPEN``),
+      so a PREVIOUS session's closes can never be presented as this snapshot's
+      spot/regime/flow/institutional/synthesis evidence.
+
+    When the reference session holds no (or too little) genuine history the
+    result is empty/partial rather than borrowed stale rows: the caller gets
+    missing evidence and the chain fails closed instead of silently reusing
+    yesterday's closes.
+    """
     cutoff = _candle_clock(reference_ts)
+    session_open = cutoff.replace(
+        hour=MARKET_OPEN[0], minute=MARKET_OPEN[1], second=0, microsecond=0)
     candles = db.execute(
         select(NiftyCandle)
         .where(
+            NiftyCandle.symbol == SLICE_A_UNDERLYING,
             NiftyCandle.interval == OC_INTERVAL,
             NiftyCandle.open_time < cutoff,
+            NiftyCandle.open_time >= session_open,
         )
         .order_by(NiftyCandle.open_time.desc())
         .limit(count)
@@ -487,31 +505,66 @@ def _calc_context(reference_ts: datetime) -> CalculationContext:
     )
 
 
+def _contract_quantity(leg: dict) -> float:
+    """The leg's CONTRACT quantity (``quantity`` is LOTS × ``lot_size``)."""
+    return float(leg["quantity"]) * float(leg["lot_size"])
+
+
+def _contract_legs(legs: list[dict]) -> list[dict]:
+    """Request legs with their CONTRACT quantity resolved.
+
+    ``ExecutionLegIn.quantity`` is LOTS and ``lot_size`` is CONTRACTS PER
+    LOT, while the domain ``OptionLeg.quantity`` is CONTRACTS.  Every
+    candidate/payoff/risk figure must therefore run on
+    ``contracts = lots × lot_size``; passing lots directly would understate
+    payoff and risk by the lot size.  The user-facing request contract is
+    unchanged.  A leg without a positive quantity/lot size is not riskable and
+    fails closed — the lot size is never silently assumed to be 1.
+    """
+    resolved: list[dict] = []
+    for leg in legs:
+        lots = _finite(leg.get("quantity"))
+        lot_size = _finite(leg.get("lot_size"))
+        if lots is None or lots <= 0 or lot_size is None or lot_size <= 0:
+            raise ProducerError(
+                "CANDIDATE_NOT_ELIGIBLE",
+                "every requested leg needs a positive quantity (LOTS) and "
+                "lot_size (CONTRACTS PER LOT); entry fails closed")
+        resolved.append({**leg, "contract_quantity": lots * lot_size})
+    return resolved
+
+
 def _classify_tail(legs: list[dict]) -> TailClass:
-    """Structural payoff tail from leg directions (classification, not a
-    probability).  A short call is gain-capped (bounded loss) only when a
-    long call exists at an equal-or-higher strike; a long call is capped
-    only when a short call exists at a strictly higher strike (symmetric
-    for puts with lower strikes).  Short puts never carry unlimited loss.
-    Uncovered short call ⇒ UNLIMITED_LOSS; uncapped long leg ⇒
-    UNLIMITED_GAIN; fully covered spreads ⇒ NONE."""
-    long_calls = [leg for leg in legs
-                  if leg["direction"] == "buy" and leg["option_type"] == "call"]
-    short_calls = [leg for leg in legs
-                   if leg["direction"] == "sell" and leg["option_type"] == "call"]
-    long_puts = [leg for leg in legs
-                 if leg["direction"] == "buy" and leg["option_type"] == "put"]
-    short_puts = [leg for leg in legs
-                  if leg["direction"] == "sell" and leg["option_type"] == "put"]
-    for sc in short_calls:
-        if not any(lc["strike_price"] >= sc["strike_price"] for lc in long_calls):
-            return TailClass.UNLIMITED_LOSS
-    for lc in long_calls:
-        if not any(scr["strike_price"] > lc["strike_price"] for scr in short_calls):
-            return TailClass.UNLIMITED_GAIN
-    for lp in long_puts:
-        if not any(sp["strike_price"] < lp["strike_price"] for sp in short_puts):
-            return TailClass.UNLIMITED_GAIN
+    """Structural payoff tail from the SIGNED CONTRACT quantities.
+
+    Classification only — never a probability and never a second payoff
+    engine: the existing Day-18 quant engine remains authoritative for P&L.
+    The tail is decided by each option side's NET signed contract exposure, so
+    ratio structures are classified correctly; a strike-order-only check is
+    not sufficient (it cannot tell 2× short from 1× long):
+
+    * calls, net signed contracts < 0 ⇒ short-call exposure remains above
+      every long call ⇒ UNLIMITED_LOSS;
+    * calls, net signed contracts > 0 ⇒ uncapped long-call exposure ⇒
+      UNLIMITED_GAIN;
+    * puts, net signed contracts > 0 ⇒ uncapped long-put exposure ⇒
+      UNLIMITED_GAIN.  A net SHORT put is never UNLIMITED_LOSS: a put's
+      intrinsic value is capped at its own strike, so short-put loss is
+      structurally bounded;
+    * net-flat exposure on both sides ⇒ NONE (fully covered / bounded).
+    """
+    net_calls = 0.0
+    net_puts = 0.0
+    for leg in legs:
+        signed = _SIDE_SIGN[leg["direction"]] * _contract_quantity(leg)
+        if leg["option_type"] == "call":
+            net_calls += signed
+        else:
+            net_puts += signed
+    if net_calls < 0:
+        return TailClass.UNLIMITED_LOSS
+    if net_calls > 0 or net_puts > 0:
+        return TailClass.UNLIMITED_GAIN
     return TailClass.NONE
 
 
@@ -557,6 +610,18 @@ def _expiry_payoff(
     dropped as genuinely missing (the result is then PARTIAL), never
     zero-filled.  Raises ``ProducerError`` when no grid point prices
     completely (fail closed).
+
+    SAMPLE SEMANTICS (audited Day-50 decision, stated explicitly rather than
+    implied): ``max_profit`` / ``max_loss`` are the extremes of THIS sampled
+    grid — ±10% of the observed spot about expiry — and are NOT claimed to be
+    global structural extremes.  The Day-31 ``PayoffEvidence`` contract this
+    feeds declares no global-extreme requirement (it consumes the supplied
+    metrics verbatim and never re-derives a curve), and structural
+    unboundedness is carried separately and exactly by ``tail``.  No Day-33
+    rule consumes a global extreme either: ``PAPER_ENTRY_POLICY`` leaves every
+    numeric loss limit unconfigured, and no threshold is invented here.  The
+    grid is therefore the approved Day-50 evidence basis, and this docstring
+    is its record.
     """
     context = _calc_context(reference_ts)
     grid = [spot * (1.0 + frac) for frac in
@@ -587,7 +652,7 @@ def _expiry_payoff(
 
     net = 0.0
     for leg in legs:
-        net += _SIDE_SIGN[leg["direction"]] * leg["ltp"] * float(leg["quantity"])
+        net += _SIDE_SIGN[leg["direction"]] * leg["ltp"] * _contract_quantity(leg)
 
     # Each sample carries its own spot label: when a grid point is dropped
     # the P&L series is shorter than the grid, so pairing the two by
@@ -651,14 +716,64 @@ def _liquidity_evidence(
 # Strike-ranking factor scores (measured inputs only)
 # ---------------------------------------------------------------------------
 
-def _spread_score(side: ChainSide) -> float:
+def _spread_measure(side: ChainSide) -> tuple[float, float] | None:
+    """Measured ``(score, spread_bps)`` for a two-sided quote, else ``None``.
+
+    ``None`` means genuinely unmeasured: a one-sided or inverted book is not
+    a spread, and scoring it neutral would present fabricated liquidity as a
+    measurement.
+    """
     if side.bid is None or side.ask is None or side.bid <= 0 or side.ask < side.bid:
-        return 0.5  # unmeasured → neutral score, never a fabricated spread
+        return None
     mid = (side.bid + side.ask) / 2.0
     if mid <= 0:
-        return 0.5
+        return None
     spread_bps = (side.ask - side.bid) / mid * 10_000.0
-    return max(0.0, min(1.0, 1.0 - spread_bps / 200.0))
+    if not isfinite(spread_bps):
+        return None
+    return max(0.0, min(1.0, 1.0 - spread_bps / 200.0)), spread_bps
+
+
+def _side_signed_gex(side: ChainSide, spot: float) -> float | None:
+    """The MEASURED signed GEX of one chain side, or ``None``.
+
+    Computed with the repository's single owned convention
+    (``app.services.historical_gex`` → ``docs/GEX_V1_0_SPEC.md``): raw GEX =
+    gamma × OI × spot² × 0.01, signed ``CE = +raw`` / ``PE = −raw``.  Both
+    inputs are real broker measurements already carried by the canonical
+    chain (gamma from option Greeks, OI from market data).  When either is
+    absent — or when gamma is negative, the same exclusion the repository's
+    GEX ingestion applies — the value stays missing, so the GEX factor is
+    suppressed rather than fabricated to satisfy the nine-factor contract.
+    """
+    if spot <= 0 or side.oi is None or side.gamma is None:
+        return None
+    if side.gamma < 0 or side.oi <= 0:
+        return None
+    raw = compute_raw_gex(side.gamma, side.oi, spot)
+    if not isfinite(raw):
+        return None
+    return compute_signed_gex(
+        "CE" if side.market_side == "call" else "PE", raw)
+
+
+def _gex_reference(
+    index: dict[tuple[float, str], ChainSide], spot: float,
+) -> float | None:
+    """GEX normalisation reference: the snapshot's largest |signed GEX|.
+
+    The Day-30 contract requires this boundary to supply a normalized
+    suitability in [0,1], while the GEX spec forbids inventing a fixed
+    magnitude threshold ("thresholds must not be hard-coded without
+    historical validation").  Slice A therefore normalizes each strike's
+    measured |signed GEX| against the largest |signed GEX| measured in the
+    SAME snapshot — deterministic, snapshot-local and threshold-free.
+    ``None`` when the snapshot carries no measured GEX at all.
+    """
+    magnitudes = [abs(value) for value in
+                  (_side_signed_gex(side, spot) for side in index.values())
+                  if value is not None]
+    return max(magnitudes) if magnitudes else None
 
 
 def _distance_score(strike: float, spot: float) -> float:
@@ -666,38 +781,82 @@ def _distance_score(strike: float, spot: float) -> float:
     return max(0.0, 1.0 - distance_pct / 5.0)
 
 
+def _measured_factor(
+    factor: RankingFactor, score: float | None, raw: float | None,
+    provenance: Provenance,
+) -> FactorObservation:
+    """A factor that is usable ONLY when its measurement exists.
+
+    ``score is None`` means the market measurement behind this factor is
+    genuinely absent: the factor is emitted in the Day-12 ``INSUFFICIENT``
+    state, which the existing Day-30 ``rank_strikes`` mechanism treats as
+    unusable and therefore SUPPRESSES the candidate.  A measured value —
+    including a measured zero — is emitted as a usable factor.  Missing
+    evidence is never converted into a usable score here (no ``0.0`` volume
+    score, no neutral spread/GEX, no IV-derived score without a measured IV).
+    """
+    if score is None:
+        return FactorObservation(
+            factor=factor, score=0.0, state=QualityState.INSUFFICIENT,
+            raw=None, provenance=provenance)
+    return FactorObservation(
+        factor=factor, score=score, raw=raw, provenance=provenance)
+
+
 def _strike_factors(
-    side: ChainSide, delta_oi: float, spot: float, provenance: Provenance,
+    side: ChainSide, delta_oi: float | None, spot: float,
+    provenance: Provenance, gex_reference: float | None = None,
 ) -> tuple[FactorObservation, ...]:
+    """The nine Day-30 factors: each a MEASUREMENT, or INSUFFICIENT.
+
+    Every market factor is emitted only from a measurement actually present
+    in this snapshot; an absent measurement yields an INSUFFICIENT factor and
+    the candidate is suppressed by the existing Day-30 ranking mechanism
+    rather than ranked on invented numbers.
+    """
     iv = _scale_iv(side.iv)
+    iv_measured = iv if (iv is not None and iv > 0) else None
+    spread = _spread_measure(side)
+    signed_gex = _side_signed_gex(side, spot)
+    gex_score = None
+    if signed_gex is not None and gex_reference is not None:
+        gex_score = min(abs(signed_gex) / gex_reference, 1.0)
+    volume = side.volume
     return (
-        FactorObservation(
-            factor=RankingFactor.LIQUIDITY,
-            score=min((side.volume or 0.0) / 100_000.0, 1.0),
-            raw=side.volume, provenance=provenance),
-        FactorObservation(
-            factor=RankingFactor.SPREAD_QUALITY, score=_spread_score(side),
-            raw=None, provenance=provenance),
-        FactorObservation(
-            factor=RankingFactor.IV, score=min(iv or 0.0, 1.0),
-            raw=iv, provenance=provenance),
-        FactorObservation(
-            factor=RankingFactor.GREEKS, score=min((iv or 0.0) * 4.0, 1.0),
-            raw=iv, provenance=provenance),
-        FactorObservation(
-            factor=RankingFactor.POSITIONING,
-            score=min(abs(delta_oi) / STRENGTH_REFERENCE_OI, 1.0),
-            raw=delta_oi, provenance=provenance),
-        # Measured per-strike GEX is not acquired in Slice A; the factor is
-        # carried neutral so ranking stays explicit about it (score, not a
-        # fabricated GEX measurement).
-        FactorObservation(
-            factor=RankingFactor.GEX, score=0.5, raw=None,
-            provenance=provenance),
+        _measured_factor(
+            RankingFactor.LIQUIDITY,
+            min(volume / 100_000.0, 1.0) if volume is not None else None,
+            volume, provenance),
+        _measured_factor(
+            RankingFactor.SPREAD_QUALITY,
+            spread[0] if spread is not None else None,
+            spread[1] if spread is not None else None, provenance),
+        _measured_factor(
+            RankingFactor.IV,
+            min(iv_measured, 1.0) if iv_measured is not None else None,
+            iv_measured, provenance),
+        _measured_factor(
+            RankingFactor.GREEKS,
+            min(iv_measured * 4.0, 1.0) if iv_measured is not None else None,
+            iv_measured, provenance),
+        _measured_factor(
+            RankingFactor.POSITIONING,
+            (min(abs(delta_oi) / STRENGTH_REFERENCE_OI, 1.0)
+             if delta_oi is not None else None),
+            delta_oi, provenance),
+        _measured_factor(
+            RankingFactor.GEX, gex_score, signed_gex, provenance),
         FactorObservation(
             factor=RankingFactor.DISTANCE_TO_SPOT,
             score=_distance_score(side.strike, spot),
             raw=abs(side.strike - spot), provenance=provenance),
+        # Declared components of THIS producer's own ranking objective
+        # (``objective_id="day50-candidate-production"``), not market
+        # measurements: the Day-30 contract requires the upstream boundary to
+        # supply these normalized suitabilities, and Slice A's objective and
+        # risk appetite are favourable by declaration (every numeric Day-33
+        # limit is unconfigured in PAPER_ENTRY_POLICY).  No market
+        # measurement is claimed for either factor.
         FactorObservation(
             factor=RankingFactor.STRATEGY_OBJECTIVE, score=1.0,
             raw=None, provenance=provenance),
@@ -722,6 +881,60 @@ def _directional(direction: IntelligenceDirection | None) -> IntelligenceDirecti
         IntelligenceDirection.BULLISH, IntelligenceDirection.BEARISH) else None
 
 
+def _resolved_identity_map(
+    legs: list[dict], instrument_keys: list[str | None],
+) -> dict[tuple[float, str], str | None]:
+    """The RESOLVED broker instrument key for each requested (strike, side).
+
+    ``instrument_keys`` is positional against ``legs`` (the adapter's
+    ``resolve_instrument_keys`` preserves request order), so this is the one
+    place where a requested leg's broker identity — read from the broker's own
+    chain payload, never constructed from strike text — is associated with its
+    ``(strike, option type)`` identity.  There is no second identity source.
+    """
+    if len(instrument_keys) != len(legs):
+        raise ProducerError(
+            "IDENTITY_MISMATCH",
+            "the broker returned a different number of instrument identities "
+            "than there are requested legs; entry fails closed")
+    return {
+        (float(leg["strike_price"]), leg["option_type"]): (key or None)
+        for leg, key in zip(legs, instrument_keys)
+    }
+
+
+def _apply_identities(
+    index: dict[tuple[float, str], ChainSide],
+    identity: dict[tuple[float, str], str | None],
+) -> dict[tuple[float, str], ChainSide]:
+    """Bind each measured chain side to its authoritative broker identity.
+
+    The RESOLVED key wins for a requested leg (the canonical
+    ``transform_chain`` shape carries no per-side ``instrument_key`` at all).
+    When the snapshot does carry a key for that same side it must AGREE with
+    the resolved key: a disagreement means the chain row and the broker
+    resolution name different contracts, which fails closed instead of
+    silently trusting either one.  A side with no resolved counterpart (a
+    strike nobody requested) keeps the broker key its own row carries, and
+    stays missing when it carries none — a missing identity suppresses the
+    strike through D1 rather than being guessed from strike text.
+    """
+    bound: dict[tuple[float, str], ChainSide] = {}
+    for key, side in index.items():
+        resolved = identity.get(key)
+        snapshot_key = side.instrument_key
+        if resolved is not None and snapshot_key is not None \
+                and snapshot_key != resolved:
+            raise ProducerError(
+                "IDENTITY_MISMATCH",
+                f"the canonical chain row for {side.strike:g} "
+                f"{side.market_side} names broker instrument "
+                f"{snapshot_key!r} while the broker resolved {resolved!r} for "
+                "the requested leg; entry fails closed")
+        bound[key] = replace(side, instrument_key=resolved or snapshot_key)
+    return bound
+
+
 # ---------------------------------------------------------------------------
 # Pure evidence → candidate core (no HTTP, no wall clock beyond inputs)
 # ---------------------------------------------------------------------------
@@ -742,11 +955,14 @@ def produce_candidate_core(
     """Assemble genuine evidence and run the existing Day-20 → Day-32 chain.
 
     ``legs`` entries carry ``expiration_date / strike_price / option_type /
-    action / quantity``.  Raises ``ProducerError`` whenever genuine evidence
-    cannot produce an eligible candidate — nothing is fabricated.
+    action / quantity`` (LOTS) and ``lot_size`` (CONTRACTS PER LOT); the
+    candidate itself is built on CONTRACTS (``quantity × lot_size``).  Raises
+    ``ProducerError`` whenever genuine evidence cannot produce an eligible
+    candidate — nothing is fabricated.
     """
-    sides = _extract_sides(chain)
-    if not sides:
+    legs = _contract_legs(legs)
+    chain_rows = chain.get("chain") or []
+    if not chain_rows:
         raise ProducerError(
             "CHAIN_DATA_MISSING", "the option chain carried no usable rows")
     spot = _finite(chain.get("underlying_spot_price"))
@@ -754,17 +970,29 @@ def produce_candidate_core(
         raise ProducerError(
             "CHAIN_DATA_MISSING", "chain carried no underlying spot price")
 
-    # The flat sides list loses the call/put distinction; rebuild the
-    # per-(strike, market-side) index from the raw rows.
-    side_index = _build_side_index(chain)
+    # One identity-bound index, built once straight from the canonical chain
+    # rows.  The canonical ``transform_chain`` shape carries no per-side
+    # ``instrument_key``, so identity is never read from the strike text and
+    # never assumed when the canonical payload omits it.
+    side_index = _apply_identities(
+        _build_side_index(chain),
+        _resolved_identity_map(legs, instrument_keys),
+    )
+    if not side_index:
+        raise ProducerError(
+            "CHAIN_DATA_MISSING",
+            "the canonical chain carried no priceable rows after identity "
+            "binding; entry fails closed")
 
     provenance = _provenance(received_at)
-    reference_ts = _reference_ts(sides, received_at)
+    reference_ts = _reference_ts_from_index(side_index, received_at)
     spot_change = (spot - prev_spot) if prev_spot is not None else None
     expiry = str(legs[0]["expiration_date"]) if legs else None
-    # Quality is MEASURED over this snapshot by the real Day-12 engine
-    # (never asserted).  The engine is bounded by the producer's own
-    # authoritative reference timestamp, so no second clock read is added.
+    # Quality is MEASURED over this snapshot by the real Day-12 engine (never
+    # asserted).  Freshness is judged against this request's captured receipt
+    # time while ``reference_ts`` stays the broker's own market clock, so no
+    # second wall-clock read is added and a stale snapshot cannot appear
+    # fresh merely because its own quote stamp was used as "now".
     quality = _quality(
         _chain_observation(
             chain,
@@ -772,28 +1000,27 @@ def produce_candidate_core(
             expiry=expiry or "",
             received_at=received_at,
         ),
-        reference_ts=reference_ts,
+        received_at=received_at,
     )
+    # D1 ΔOI is only meaningful against a measured GEX scale, so the
+    # snapshot-local GEX reference is computed once from the same rows.
+    gex_reference = _gex_reference(side_index, spot)
+    sides = list(side_index.values())
 
     # -- measured per-strike rows with D1 ΔOI --------------------------------
-    key_by_market_side: dict[tuple[float, str], str | None] = {}
-    for row in chain.get("chain", []):
-        strike = _finite(row.get("strike"))
-        if strike is None or strike <= 0:
-            continue
-        for side_name in ("call", "put"):
-            side = row.get(side_name) or {}
-            key_by_market_side[(strike, side_name)] = side.get("instrument_key")
-
     def _delta_for(strike: float, side_name: str) -> float | None:
-        key = key_by_market_side.get((strike, side_name))
-        if key is None:
+        """ΔOI for one measured side, keyed by its AUTHORITATIVE identity.
+
+        The prior observation is looked up with the RESOLVED broker
+        instrument key (the identity the canonical chain rows carry after
+        ``_apply_identities``), never with strike text and never with a key
+        the canonical payload may or may not hold.  A side with no identity
+        has no ΔOI, so it is suppressed by the existing D1 rule.
+        """
+        side = side_index.get((strike, side_name))
+        if side is None or side.instrument_key is None:
             return None
-        return _delta_oi(
-            next((s.oi for s in sides
-                  if s.strike == strike and s.instrument_key == key), None),
-            prior_oi_by_key.get(key),
-        )
+        return _delta_oi(side.oi, prior_oi_by_key.get(side.instrument_key))
 
     rows: list[StrikePositioning] = []
     strike_deltas: dict[tuple[float, str], float | None] = {}
@@ -827,7 +1054,6 @@ def produce_candidate_core(
         spot=spot,
         spot_change=spot_change,
     )
-    positioning_result = evaluate_positioning(positioning_input)
     positioning_metrics = compute_metrics(positioning_input)
     positioning_label = classify_chain(
         positioning_metrics.net_chain_oi_change, spot_change)
@@ -945,7 +1171,8 @@ def produce_candidate_core(
             option_type=_SIDE_TO_OPTION_TYPE[side_name],
             strike=strike,
             expiry=expiry,
-            factors=_strike_factors(side, delta, spot, provenance),
+            factors=_strike_factors(
+                side, delta, spot, provenance, gex_reference),
             opportunity=opportunity,
             quality=quality,
         ))
@@ -993,7 +1220,9 @@ def produce_candidate_core(
             option_type=_SIDE_TO_SIDE[side_name],
             strike=strike,
             expiry=expiry,
-            quantity=float(leg["quantity"]),
+            # Domain quantity is CONTRACTS (lots × lot_size), so payoff, risk
+            # and scenario evidence all run on the real position size.
+            quantity=float(leg["contract_quantity"]),
             direction=(PositionDirection.LONG if leg["action"] == "buy"
                        else PositionDirection.SHORT),
             entry_price=side.ltp,
@@ -1089,10 +1318,12 @@ def _build_side_index(chain: dict) -> dict[tuple[float, str], ChainSide]:
             index[(strike, side_name)] = ChainSide(
                 instrument_key=side.get("instrument_key"),
                 strike=strike,
+                market_side=side_name,
                 ltp=ltp,
                 oi=_finite(side.get("oi")),
                 volume=_finite(side.get("volume")),
                 iv=_finite(side.get("iv")),
+                gamma=_finite(side.get("gamma")),
                 bid=_finite(side.get("bid_price")),
                 ask=_finite(side.get("ask_price")),
                 quote_ts=_parse_broker_ts(side.get("quote_timestamp")),
@@ -1111,7 +1342,19 @@ async def _default_fetch_chain(symbol: str, expiry: str, token: str) -> dict:
 
 async def _default_resolve_keys(legs: list[dict], token: str) -> list[str | None]:
     """Broker instrument keys via the existing adapter rule — read from the
-    raw chain payload, never constructed from strike text."""
+    raw chain payload, never constructed from strike text.
+
+    Known non-blocking follow-up (audited Day-50 finding, deferred on
+    purpose): the adapter's ``resolve_instrument_keys`` performs its own raw
+    chain read, so a new entry fetches the broker chain twice — once
+    canonicalized for evidence/pricing and once raw for identity.  Reusing
+    that single read would require the canonical ``transform_chain`` contract
+    to carry a per-side ``instrument_key``, i.e. a change to the broker
+    adapter's identity contract, which is out of this remediation's scope.
+    Identity coherence is NOT affected: both reads are the same broker's
+    payload for the same expiry, and any disagreement between a snapshot key
+    and a resolved key fails closed in ``_apply_identities``.
+    """
     adapter = gateway.create(BROKER_ID_UPSTOX, access_token=token)
     resolved = await adapter.resolve_instrument_keys([
         {"symbol": "NIFTY", "expiry": leg["expiration_date"],
@@ -1209,7 +1452,8 @@ async def produce_candidate_and_execute(
             "strike_price": float(leg.strike_price),
             "option_type": leg.option_type.lower(),
             "action": leg.action,
-            "quantity": float(leg.quantity),
+            "quantity": float(leg.quantity),   # LOTS
+            "lot_size": float(leg.lot_size),  # CONTRACTS PER LOT
         }
         for leg in request.legs
     ]
@@ -1253,9 +1497,22 @@ async def produce_candidate_and_execute(
             "broker instrument keys could not be resolved from the live "
             "chain; order was not executed") from exc
 
-    # 4. Authoritative reference timestamp from the chain evidence itself.
-    sides = _extract_sides(chain)
-    reference_ts = _reference_ts(sides, received_at)
+    # 4. Authoritative reference timestamp from the SAME identity-bound index
+    #    the candidate core will build.  Slice A no longer reads a separate flat
+    #    ``sides`` list for the evidence clock: that would let the wrapper's
+    #    ``reference_ts`` be computed from a different row set than the one the
+    #    candidate actually measures, so the reference timestamp and the
+    #    candidate's evidence could silently diverge.
+    side_index = _apply_identities(
+        _build_side_index(chain),
+        _resolved_identity_map(legs, instrument_keys),
+    )
+    if not side_index:
+        raise _fail(
+            "CHAIN_DATA_MISSING",
+            "the canonical chain carried no priceable rows after identity "
+            "binding; order was not executed")
+    reference_ts = _reference_ts_from_index(side_index, received_at)
 
     # 5. D1 prior-OI state from server-side OptionCandle history.
     prior_oi_by_key = _prior_oi_state(

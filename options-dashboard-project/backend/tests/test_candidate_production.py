@@ -17,6 +17,7 @@ an entry needing them fails closed.
 
 from __future__ import annotations
 
+import inspect
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -28,6 +29,8 @@ from sqlalchemy.pool import StaticPool
 
 from app.db import Base, get_db
 from app.main import app
+from app.market_data.contracts import Provenance
+from app.market_data.quality import QualityDimension, QualityState
 from app.models import (
     NiftyCandle,
     OptionCandle,
@@ -36,21 +39,36 @@ from app.models import (
     Position,
     StrategyExecution,
 )
-from app.services import token_store
+from app.services import historical_gex, token_store
 from app.services.candidate_production import (
     OI_HISTORY_MAX_AGE,
     OI_HISTORY_MIN_LAG,
     ProducerError,
+    _apply_identities,
     _build_side_index,
+    _chain_observation,
+    _classify_tail,
+    _contract_legs,
+    _contract_quantity,
+    _gex_reference,
+    _measured_factor,
     _prior_oi_state,
+    _quality,
+    _reference_ts_from_index,
+    _resolved_identity_map,
+    _side_signed_gex,
+    _spot_history,
+    _strike_factors,
     produce_candidate_and_execute,
     produce_candidate_core,
 )
 from app.routers.deps import SESSION_COOKIE_NAME
 from app.services.paper_execution import PaperExecutionError
+from app.strike_ranking.contracts import RankingFactor
 from app.strategy_evaluation.contracts import (
     DimensionState,
     PayoffExpirySemantics,
+    TailClass,
 )
 from app.utils.market_time import is_market_hours, to_ist_naive
 
@@ -114,11 +132,11 @@ def _ist_clock(moment):
     return converted
 
 
-def _side(ltp, oi, chg_oi, volume, iv, key, bid=None, ask=None):
+def _side(ltp, oi, chg_oi, volume, iv, key, bid=None, ask=None, gamma=None):
     return {
         "ltp": ltp, "oi": oi, "chg_oi": chg_oi, "volume": volume,
         "iv": iv, "instrument_key": key, "bid_price": bid, "ask_price": ask,
-        "quote_timestamp": QUOTE_TS,
+        "gamma": gamma, "quote_timestamp": QUOTE_TS,
     }
 
 
@@ -129,6 +147,7 @@ def make_chain(
     ce_oi=1_200_000.0, pe_oi=1_100_000.0,
     ce_delta_oi=250_000.0, pe_delta_oi=-80_000.0,
     volume=150_000.0, iv=14.0,
+    gamma=0.05,
     bid=198.0, ask=202.0,
     pe_bid=178.0, pe_ask=182.0,
     with_keys=True,
@@ -144,18 +163,18 @@ def make_chain(
             {
                 "strike": 25000.0,
                 "call": _side(ce_ltp, ce_oi, ce_delta_oi, volume, iv, ce_key,
-                              bid, ask),
+                              bid, ask, gamma=gamma),
                 "put": _side(pe_ltp, pe_oi, pe_oi + pe_delta_oi, volume, iv,
-                             pe_key, pe_bid, pe_ask),
+                             pe_key, pe_bid, pe_ask, gamma=gamma),
             },
             {
                 "strike": 25100.0,
                 "call": _side(ce_ltp * 0.5, ce_oi * 0.6, ce_delta_oi * 0.4,
                               volume * 0.6, iv, KEY_25100_CE, bid * 0.5,
-                              ask * 0.5),
+                              ask * 0.5, gamma=gamma * 0.5),
                 "put": _side(pe_ltp * 2.2, pe_oi * 1.4, 40_000.0,
                              volume * 1.3, iv, KEY_25100_PE, pe_bid * 2.2,
-                             pe_ask * 2.2),
+                             pe_ask * 2.2, gamma=gamma * 0.5),
             },
         ],
     }
@@ -168,16 +187,18 @@ KEY_25100_PE = "NSE_FO|2002|2026-09-24"
 
 
 def make_legs(direction="sell", strike=25000.0, option_type="call",
-              quantity=1):
+              quantity=1, lot_size=65):
     """Default request: a covered bear call spread (bounded payoff)."""
     return [
         {
             "expiration_date": EXPIRY, "strike_price": 25000.0,
-            "option_type": "call", "action": "sell", "quantity": 1,
+            "option_type": "call", "action": "sell", "quantity": quantity,
+            "lot_size": lot_size,
         },
         {
             "expiration_date": EXPIRY, "strike_price": 25100.0,
-            "option_type": "call", "action": "buy", "quantity": 1,
+            "option_type": "call", "action": "buy", "quantity": quantity,
+            "lot_size": lot_size,
         },
     ]
 
@@ -222,18 +243,25 @@ def prior_oi_map(db, keys, reference_ts=REF_TS):
     return _prior_oi_state(db, keys, reference_ts)
 
 
-def run_core(db, chain=None, legs=None, prior_oi=None, *, received_at=None,
-             spot_closes_rows=None):
-    """Drive the real producer core over the fixture (fail-closed path)."""
+def run_core(db, chain=None, legs=None, prior_oi=None, *, keys=None,
+             received_at=None, spot_closes_rows=None):
+    """Drive the real producer core over the fixture (fail-closed path).
+
+    ``keys`` is ``instrument_keys``: positional against ``legs`` (the
+    adapter's ``resolve_instrument_keys`` preserves request order), i.e. one
+    resolved broker key per requested leg, NOT one per chain side.  The
+    default is the fixture's two requested call legs.
+    """
     chain = chain if chain is not None else make_chain()
     legs = legs if legs is not None else make_legs()
-    keys = [side.get("instrument_key")
-            for row in chain["chain"]
-            for side_name in ("call", "put")
-            for side in [row.get(side_name) or {}]
-            if side.get("instrument_key")]
+    keys = keys if keys is not None else [KEY_25000_CE, KEY_25100_CE]
     if prior_oi is None:
-        prior_oi = {key: 1_000_000.0 for key in keys}
+        prior_oi = _prior_oi_state(db, keys, REF_TS)
+        if any(v is None for v in prior_oi.values()):
+            raise AssertionError(
+                "test fixture did not seed eligible prior-OI history for the "
+                "requested legs; run_core requires eligible prior OI via the "
+                "real D1 rule")
     closes = spot_closes_rows
     if closes is None:
         closes, prev = _spot_closes_tuple(db)
@@ -509,7 +537,10 @@ async def test_wrapper_full_path_executes_through_choke_point(db_session):
         return make_chain()
 
     async def fake_keys(legs, token):
-        return [KEY_25000_CE, KEY_25000_PE, KEY_25100_CE, KEY_25100_PE]
+        # One resolved key per requested leg (preserves request order), not
+        # one key per chain side. The fixture's two requested call legs resolve
+        # to KEY_25000_CE and KEY_25100_CE.
+        return [KEY_25000_CE, KEY_25100_CE]
 
     def fake_token(db, user_id):
         return "test-md-token"
@@ -611,7 +642,10 @@ async def test_wrapper_zero_mutation_when_gate_rejects(db_session):
         return make_chain()
 
     async def fake_keys(legs, token):
-        return all_keys()
+        # One resolved key per requested leg (preserves request order), not
+        # one key per chain side.  The fixture's two requested call legs
+        # resolve to KEY_25000_CE and KEY_25100_CE.
+        return [KEY_25000_CE, KEY_25100_CE]
 
     def fake_token(db, user_id):
         return "test-md-token"
@@ -725,7 +759,10 @@ class TestRoute:
             return make_chain()
 
         async def fake_keys(legs, token):
-            return all_keys()
+            # One resolved key per requested leg (preserves request order), not
+            # one key per chain side. The fixture's two requested call legs
+            # resolve to KEY_25000_CE and KEY_25100_CE.
+            return [KEY_25000_CE, KEY_25100_CE]
 
         async def fake_resolve_prices(access_token, symbol, legs, **_kwargs):
             # ``chain_sink`` (Issue #118) is accepted and left empty here so
@@ -784,7 +821,10 @@ class TestRoute:
             return make_chain()
 
         async def fake_keys(legs, token):
-            return all_keys()
+            # One resolved key per requested leg (preserves request order), not
+            # one key per chain side. The fixture's two requested call legs
+            # resolve to KEY_25000_CE and KEY_25100_CE.
+            return [KEY_25000_CE, KEY_25100_CE]
 
         async def fake_resolve_prices(access_token, symbol, legs, **_kwargs):
             # ``chain_sink`` (Issue #118) is accepted and left empty here so
@@ -858,7 +898,10 @@ class TestRoute:
             return make_chain()
 
         async def fake_keys(legs, token):
-            return all_keys()
+            # One resolved key per requested leg (preserves request order), not
+            # one key per chain side. The fixture's two requested call legs
+            # resolve to KEY_25000_CE and KEY_25100_CE.
+            return [KEY_25000_CE, KEY_25100_CE]
 
         async def fake_resolve_prices(access_token, symbol, legs, **_kwargs):
             return _prices()
@@ -914,8 +957,13 @@ def _identity(db_session):
 
 
 async def _injected_keys(legs, token):
-    """Injected broker instrument-key resolver (async, like the real one)."""
-    return all_keys()
+    """Injected broker instrument-key resolver (async, like the real one).
+
+    One resolved key per requested leg (preserves request order), not one key
+    per chain side. The fixture's two requested call legs resolve to
+    KEY_25000_CE and KEY_25100_CE.
+    """
+    return [KEY_25000_CE, KEY_25100_CE]
 
 
 class TestSliceASymbolScope:
@@ -1064,7 +1112,7 @@ class TestMeasuredEvidenceQuality:
             _chain_observation(
                 make_chain(), symbol="NIFTY", expiry=EXPIRY,
                 received_at=REF_TS),
-            reference_ts=REF_TS,
+            received_at=REF_TS,
         )
 
         # The fabrication this replaced had no dimensions at all and never
@@ -1095,7 +1143,7 @@ class TestMeasuredEvidenceQuality:
         quality = _quality(
             _chain_observation(
                 crossed, symbol="NIFTY", expiry=EXPIRY, received_at=REF_TS),
-            reference_ts=REF_TS,
+            received_at=REF_TS,
         )
 
         assert quality.quality_state is not QualityState.EXCELLENT
@@ -1141,14 +1189,21 @@ class TestExpiryPayoffScan:
                  (-0.10, -0.075, -0.05, -0.025, 0.0, 0.025, 0.05, 0.075, 0.10))
 
     def _legs(self):
-        """Short 100 call / long 105 call (the fixture's spread shape)."""
+        """Short 100 call / long 105 call (the fixture's spread shape).
+
+        ``_expiry_payoff`` runs ``_contract_quantity`` on each leg, so every
+        leg passed to it must carry a positive ``lot_size`` (the payoff scan
+        tests use quantity=1, lot_size=1 -> 1 contract).
+        """
         return [
             {"expiration_date": "2026-10-29", "strike_price": 100.0,
              "option_type": "call", "action": "sell", "quantity": 1.0,
-             "direction": "sell", "ltp": 4.0, "quant_leg": object()},
+             "direction": "sell", "lot_size": 1.0, "ltp": 4.0,
+             "quant_leg": object()},
             {"expiration_date": "2026-10-29", "strike_price": 105.0,
              "option_type": "call", "action": "buy", "quantity": 1.0,
-             "direction": "buy", "ltp": 10.0, "quant_leg": object()},
+             "direction": "buy", "lot_size": 1.0, "ltp": 10.0,
+             "quant_leg": object()},
         ]
 
     def _payoff(self, pnl_for_spot, drop=None):
@@ -1263,3 +1318,491 @@ async def _produce(db_session, *, fetch_chain=None):
         resolve_keys=_injected_keys,
         now_fn=lambda: REF_TS,
     )
+
+
+# ---------------------------------------------------------------------------
+# Day-50 Slice A remediation regressions (PR #130)
+#
+# Each block below guards one of the corrected contracts against the defect
+# that was live at committed HEAD f2286f7: a flat linear ΔOI scan, a dead
+# ``evaluate_positioning`` call, identity read from strike text, fabricated
+# factor/GEX scores, a freshness clock bounded by its own quote stamp,
+# session-blind spot history, lots passed off as contracts, and a direction-
+# only tail classifier.  They are written against the repository's OWN
+# fixtures and sessions — no second test harness.
+# ---------------------------------------------------------------------------
+
+def _prov() -> Provenance:
+    return Provenance(
+        source="UPSTOX",
+        collection_mode="live",
+        received_at=REF_TS,
+        normalization_version="test",
+        contract_version="1",
+        transformation_id="day50-slice-a-remediation",
+    )
+
+
+def _index(chain=None, keys=None):
+    """The producer's real identity-bound index for the fixture chain."""
+    chain = chain if chain is not None else make_chain()
+    legs = make_legs()
+    keys = keys if keys is not None else [KEY_25000_CE, KEY_25100_CE]
+    return _apply_identities(
+        _build_side_index(chain), _resolved_identity_map(legs, keys))
+
+
+class TestIdentityBinding:
+    """requested (strike, option type) → resolved broker instrument key →
+    canonical chain side → validated binding, failing closed on every
+    disagreement.  The resolved key is read from the broker payload, never
+    constructed from strike text."""
+
+    def test_resolved_key_binds_onto_a_canonical_side_that_carries_none(self):
+        # ``with_keys=False`` mirrors the canonical ``transform_chain`` shape:
+        # no per-side instrument_key for the requested leg.
+        bound = _index(chain=make_chain(with_keys=False))
+        assert bound[(25000.0, "call")].instrument_key == KEY_25000_CE
+        assert bound[(25100.0, "call")].instrument_key == KEY_25100_CE
+        # an unrequested side with no identity of its own stays missing —
+        # never guessed from the strike text
+        assert bound[(25000.0, "put")].instrument_key is None
+        # an unrequested side that does carry a broker key keeps it
+        assert bound[(25100.0, "put")].instrument_key == KEY_25100_PE
+
+    def test_snapshot_and_resolved_key_disagreement_fails_closed(self):
+        with pytest.raises(ProducerError) as excinfo:
+            _index(keys=[KEY_25000_CE, "NSE_FO|9999|2026-09-24"])
+        assert excinfo.value.code == "IDENTITY_MISMATCH"
+
+    def test_identity_count_must_match_the_request(self):
+        with pytest.raises(ProducerError) as excinfo:
+            _resolved_identity_map(make_legs(), [KEY_25000_CE])
+        assert excinfo.value.code == "IDENTITY_MISMATCH"
+
+    def test_missing_resolved_key_suppresses_the_requested_strike(
+            self, db_session):
+        """The broker resolves no key for the requested call legs: they carry
+        no identity, so they can never earn a ΔOI, while the chain's unrequested
+        put sides still rank normally.  The entry fails closed on the
+        identity-less leg instead of being priced off strike text."""
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+        with pytest.raises(ProducerError) as excinfo:
+            run_core(
+                db_session,
+                keys=[None, None],
+                prior_oi={KEY_25000_PE: 1_000_000.0,
+                          KEY_25100_PE: 1_000_000.0},
+            )
+        assert excinfo.value.code == "CANDIDATE_NOT_ELIGIBLE"
+        assert "suppressed" in str(excinfo.value)
+
+    def test_missing_snapshot_side_fails_closed(self, db_session):
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+        chain = make_chain()
+        chain["chain"] = chain["chain"][:1]  # the 25100 strike is absent
+        with pytest.raises(ProducerError) as excinfo:
+            run_core(db_session, chain=chain)
+        assert excinfo.value.code == "CHAIN_DATA_MISSING"
+
+    def test_missing_current_oi_suppresses_the_strike(self, db_session):
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+        chain = make_chain()
+        for row in chain["chain"]:
+            row["call"]["oi"] = None
+        with pytest.raises(ProducerError) as excinfo:
+            run_core(db_session, chain=chain)
+        assert excinfo.value.code == "EVIDENCE_INSUFFICIENT"
+
+    def test_missing_prior_oi_is_already_covered_by_the_d1_suite(self, db_session):
+        """Explicit record of the fifth fail-closed case (missing prior OI)
+        so the identity contract above is enumerated completely: it is
+        asserted by ``TestProducerCore.test_missing_prior_oi_fails_closed``.
+        """
+        db_session.add_all(spot_closes())
+        db_session.commit()
+        with pytest.raises(ProducerError) as excinfo:
+            run_core(db_session, prior_oi={key: None for key in all_keys()})
+        assert "ΔOI history" in str(excinfo.value)
+
+
+class TestIndexedDeltaOiLookup:
+    """Codacy HIGH: the committed PR scanned a flat ``sides`` list for every
+    candidate (O(N²)).  The corrected path is one keyed index lookup per
+    (strike, option side) against the identity-bound side."""
+
+    def test_delta_is_resolved_from_the_identity_bound_key(self, db_session):
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+        produced = run_core(db_session)
+        ranked = {r.candidate_id: r for r in produced.ranked_strikes.ranked}
+        positioning = next(
+            c for c in ranked["strike:25000:call"].contributions
+            if c.factor is RankingFactor.POSITIONING)
+        # current OI 1_200_000 − prior 950_000, where the prior row was found
+        # by the RESOLVED broker instrument key of that exact (strike, side)
+        assert positioning.raw == 1_200_000.0 - 950_000.0
+        assert positioning.state is not QualityState.INSUFFICIENT
+
+    def test_prior_oi_under_another_identity_never_satisfies_d1(
+            self, db_session):
+        """A prior observation keyed by a different instrument is not this
+        side's history — ΔOI stays missing and the entry fails closed."""
+        db_session.add_all(spot_closes())
+        db_session.commit()
+        with pytest.raises(ProducerError) as excinfo:
+            run_core(db_session,
+                     prior_oi={"NSE_FO|9999|2026-09-24": 950_000.0})
+        assert excinfo.value.code == "EVIDENCE_INSUFFICIENT"
+
+    def test_no_flat_side_list_or_per_candidate_scan_remains(self):
+        """Structural guard for the static-analysis finding: no
+        ``key_by_market_side`` map, no ``_extract_sides`` flat list, and no
+        linear scan over ``sides`` inside the producer — the lookup is
+        ``side_index.get((strike, side_name))``."""
+        from app.services import candidate_production as cp
+
+        module_src = inspect.getsource(cp)
+        assert "key_by_market_side" not in module_src
+        assert not hasattr(cp, "_extract_sides")
+        assert "for s in sides" not in module_src
+        assert "for side in sides" not in module_src
+
+        core_src = inspect.getsource(cp.produce_candidate_core)
+        assert "side_index.get((strike, side_name))" in core_src
+
+
+class TestDeadPositioningComputation:
+    """Codacy HIGH: ``positioning_result = evaluate_positioning(...)`` was
+    computed and never read.  ``evaluate_positioning`` is pure (it only
+    builds an ``IntelligenceResult`` from the same input), so the dead work is
+    removed rather than silenced with ``_ = ...``."""
+
+    def test_evaluate_positioning_is_neither_called_nor_imported(self):
+        from app.services import candidate_production as cp
+
+        module_src = inspect.getsource(cp)
+        assert "evaluate_positioning(" not in module_src
+        assert "positioning_result" not in module_src
+        # the intelligence path still runs on exactly the two values the
+        # downstream code consumes
+        assert "compute_metrics(positioning_input)" in module_src
+        assert "classify_chain(" in module_src
+
+    def test_removing_the_dead_call_does_not_change_the_live_path(
+            self, db_session):
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+        produced = run_core(db_session)
+        assert produced.opportunity is not None
+        assert produced.candidate.lifecycle_state.value == "ELIGIBLE"
+        assert produced.evaluation.reference_timestamp == REF_TS
+
+
+class TestMissingFactorSuppression:
+    """A missing market measurement must never become usable numeric
+    evidence: it is emitted ``INSUFFICIENT``, which the existing Day-30
+    ranking treats as unusable."""
+
+    @staticmethod
+    def _call_side(**overrides):
+        chain = make_chain()
+        chain["chain"][0]["call"].update(overrides)
+        return _build_side_index(chain)[(25000.0, "call")]
+
+    @staticmethod
+    def _factors(side, *, delta=250_000.0, gex_reference=None):
+        return {f.factor: f for f in _strike_factors(
+            side, delta, 25000.0, _prov(), gex_reference)}
+
+    def test_absent_measurement_is_insufficient_not_a_usable_zero(self):
+        obs = _measured_factor(RankingFactor.LIQUIDITY, None, None, _prov())
+        assert obs.state is QualityState.INSUFFICIENT
+        assert obs.raw is None
+
+    def test_measured_value_stays_usable(self):
+        obs = _measured_factor(RankingFactor.LIQUIDITY, 0.5, 50_000.0, _prov())
+        assert obs.state is QualityState.EXCELLENT
+        assert obs.raw == 50_000.0
+
+    def test_every_absent_market_input_is_suppressed(self):
+        factors = self._factors(self._call_side(
+            volume=None, iv=None, gamma=None,
+            bid_price=None, ask_price=None))
+        for factor in (RankingFactor.LIQUIDITY, RankingFactor.SPREAD_QUALITY,
+                       RankingFactor.IV, RankingFactor.GREEKS,
+                       RankingFactor.GEX):
+            assert factors[factor].state is QualityState.INSUFFICIENT, factor
+        # measured inputs are still measured (this is not a blanket reset)
+        assert factors[RankingFactor.POSITIONING].state \
+            is QualityState.EXCELLENT
+        assert factors[RankingFactor.DISTANCE_TO_SPOT].state \
+            is QualityState.EXCELLENT
+
+    def test_measured_inputs_stay_usable(self):
+        factors = self._factors(self._call_side(),
+                                gex_reference=_gex_reference(
+                                    _build_side_index(make_chain()), 25000.0))
+        for factor in (RankingFactor.LIQUIDITY, RankingFactor.SPREAD_QUALITY,
+                       RankingFactor.IV, RankingFactor.GREEKS,
+                       RankingFactor.POSITIONING, RankingFactor.GEX):
+            assert factors[factor].state is not QualityState.INSUFFICIENT, factor
+
+    def test_no_neutral_placeholder_survives_in_the_factor_path(self):
+        from app.services import candidate_production as cp
+
+        src = inspect.getsource(cp._strike_factors)
+        assert "score=0.5" not in src
+        assert "_spread_score" not in src
+
+
+class TestMeasuredGex:
+    """GEX is measured only from real gamma × OI, with the repository's own
+    single convention (``gamma × OI × spot² × 0.01``, CE +raw / PE −raw).
+    Missing inputs stay missing — never a neutral placeholder."""
+
+    @staticmethod
+    def _call_side(**overrides):
+        chain = make_chain()
+        chain["chain"][0]["call"].update(overrides)
+        return _build_side_index(chain)[(25000.0, "call")]
+
+    def test_uses_the_repository_formula_and_sign_convention(self):
+        side = self._call_side()
+        expected = historical_gex.compute_raw_gex(0.05, 1_200_000.0, 25000.0)
+        assert expected == 0.05 * 1_200_000.0 * 25000.0 ** 2 * 0.01
+        assert _side_signed_gex(side, 25000.0) == expected  # CE → +raw
+
+    def test_put_side_is_negative_raw(self):
+        side = _build_side_index(make_chain())[(25000.0, "put")]
+        assert _side_signed_gex(side, 25000.0) == \
+            -historical_gex.compute_raw_gex(0.05, 1_100_000.0, 25000.0)
+
+    @pytest.mark.parametrize("overrides", [
+        {"oi": None}, {"gamma": None}, {"oi": 0.0}, {"gamma": -0.05},
+    ])
+    def test_missing_or_invalid_inputs_stay_unmeasured(self, overrides):
+        assert _side_signed_gex(self._call_side(**overrides), 25000.0) is None
+
+    def test_reference_is_the_snapshot_maximum(self):
+        index = _build_side_index(make_chain())
+        assert _gex_reference(index, 25000.0) == max(
+            abs(v) for v in
+            (_side_signed_gex(s, 25000.0) for s in index.values())
+            if v is not None)
+
+    def test_snapshot_without_measured_gex_has_no_reference(self):
+        chain = make_chain()
+        for row in chain["chain"]:
+            row["call"]["gamma"] = None
+            row["put"]["gamma"] = None
+        assert _gex_reference(_build_side_index(chain), 25000.0) is None
+
+    def test_gex_factor_is_normalised_against_the_snapshot_reference(self):
+        index = _build_side_index(make_chain())
+        side = index[(25000.0, "call")]
+        factors = {f.factor: f for f in _strike_factors(
+            side, 250_000.0, 25000.0, _prov(),
+            _gex_reference(index, 25000.0))}
+        assert factors[RankingFactor.GEX].state \
+            is not QualityState.INSUFFICIENT
+        assert 0.0 < factors[RankingFactor.GEX].score <= 1.0
+        # no reference ⇒ the factor cannot be normalised ⇒ suppressed
+        bare = {f.factor: f for f in _strike_factors(
+            side, 250_000.0, 25000.0, _prov(), None)}
+        assert bare[RankingFactor.GEX].state is QualityState.INSUFFICIENT
+
+
+class TestFreshnessClock:
+    """Freshness is judged against the single captured ``received_at``;
+    ``reference_ts`` stays the broker's own quote timestamp as provenance."""
+
+    @staticmethod
+    def _freshness(quality):
+        return next(d for d in quality.dimensions
+                    if d.dimension is QualityDimension.FRESHNESS)
+
+    @staticmethod
+    def _quote_at(stamp):
+        chain = make_chain()
+        for row in chain["chain"]:
+            for name in ("call", "put"):
+                row[name]["quote_timestamp"] = stamp
+        return chain
+
+    def test_reference_clock_is_the_broker_quote_of_the_bound_index(self):
+        index = _index()
+        assert _reference_ts_from_index(index, REF_TS) == REF_TS  # QUOTE_TS
+        assert index[(25000.0, "call")].instrument_key == KEY_25000_CE
+
+    def test_reference_clock_falls_back_to_received_at(self):
+        index = _build_side_index(self._quote_at(None))
+        assert _reference_ts_from_index(index, REF_TS) == REF_TS
+
+    def test_stale_quote_is_aged_against_the_receipt_clock(self):
+        """A 3-hour-old broker quote must be aged by ``received_at``.  Using
+        the broker stamp as its own clock would make every snapshot age 0 and
+        a stale snapshot could never be detected as stale."""
+        chain = self._quote_at("24-Sep-2026 07:05:00")  # 3h before REF_TS
+        observation = _chain_observation(
+            chain, symbol="NIFTY", expiry=EXPIRY, received_at=REF_TS)
+
+        stale = _quality(observation, received_at=REF_TS)
+        fresh = _quality(observation, received_at=REF_TS - timedelta(hours=3))
+
+        assert stale.reference_time == REF_TS
+        assert self._freshness(stale).score == 0.0
+        assert any("stale" in i.message.lower() for i in stale.issues)
+        # the identical observation judged at its own quote time is fresh, so
+        # the difference is purely the receipt clock
+        assert self._freshness(fresh).score == 1.0
+
+
+class TestSpotHistoryBoundaries:
+    """NIFTY-only, 3-minute, strictly-prior, current-session-bounded spot
+    history — previous sessions and foreign symbols are never borrowed."""
+
+    @staticmethod
+    def _add(db, *, open_time, close, symbol="NIFTY", interval="3min"):
+        db.add(NiftyCandle(
+            symbol=symbol, interval=interval, open_time=open_time,
+            open=close, high=close, low=close, close=close, volume=1000))
+
+    def test_foreign_symbol_is_never_nifty_spot_history(self, db_session):
+        self._add(db_session, symbol="BANKNIFTY", close=45000.0,
+                  open_time=_ist_clock(REF_TS) - timedelta(minutes=9))
+        db_session.commit()
+        assert _spot_history(db_session, REF_TS) == ((), None)
+
+    def test_wrong_interval_is_excluded(self, db_session):
+        self._add(db_session, interval="1min", close=22450.0,
+                  open_time=_ist_clock(REF_TS) - timedelta(minutes=9))
+        db_session.commit()
+        assert _spot_history(db_session, REF_TS) == ((), None)
+
+    def test_previous_session_closes_are_never_borrowed(self, db_session):
+        yesterday = _ist_clock(REF_TS) - timedelta(days=1)
+        for i in range(8):
+            self._add(db_session, close=22000.0 + i,
+                      open_time=yesterday - timedelta(minutes=3 * i))
+        self._add(db_session, close=22450.0,
+                  open_time=_ist_clock(REF_TS) - timedelta(minutes=9))
+        db_session.commit()
+        closes, prev = _spot_history(db_session, REF_TS, count=8)
+        assert closes == (22450.0,)
+        assert prev == 22450.0
+
+    def test_insufficient_current_session_history_is_reported_short(
+            self, db_session):
+        """Only two current-session closes exist and eight are asked for: the
+        caller receives exactly two — never padded with yesterday's rows."""
+        base = _ist_clock(REF_TS) - timedelta(minutes=9)
+        for i in range(2):
+            self._add(db_session, close=22400.0 + i * 10,
+                      open_time=base - timedelta(minutes=3 * (1 - i)))
+        yesterday = _ist_clock(REF_TS) - timedelta(days=1)
+        for i in range(8):
+            self._add(db_session, close=22000.0 + i,
+                      open_time=yesterday - timedelta(minutes=3 * i))
+        db_session.commit()
+        closes, _ = _spot_history(db_session, REF_TS, count=8)
+        assert closes == (22400.0, 22410.0)
+
+
+class TestContractUnits:
+    """``ExecutionLegIn.quantity`` is LOTS, ``lot_size`` is CONTRACTS PER LOT,
+    and the domain ``OptionLeg.quantity`` is CONTRACTS (1 lot × 65 = 65)."""
+
+    def test_contract_quantity_is_lots_times_lot_size(self):
+        assert _contract_quantity({"quantity": 1, "lot_size": 65}) == 65.0
+        assert _contract_quantity({"quantity": 2, "lot_size": 65}) == 130.0
+
+    @pytest.mark.parametrize("leg", [
+        {"quantity": 1.0},                  # no lot size at all
+        {"quantity": 1.0, "lot_size": 0.0},  # zero lot size
+        {"quantity": 0.0, "lot_size": 65.0},  # no size
+        {"quantity": -1.0, "lot_size": 65.0},  # negative
+    ])
+    def test_unriskable_lot_contract_fails_closed(self, leg):
+        # the lot size is never silently assumed to be 1
+        with pytest.raises(ProducerError):
+            _contract_legs([leg])
+
+    def test_candidate_legs_carry_contracts_not_lots(self, db_session):
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+        produced = run_core(
+            db_session, legs=make_legs(quantity=2, lot_size=65))
+        assert [leg.quantity for leg in produced.evaluation.legs] == \
+            [130.0, 130.0]
+
+    def test_payoff_and_tail_run_on_the_same_contract_quantity(
+            self, db_session):
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+        produced = run_core(db_session)
+        # 1 lot × 65 contracts per lot on both legs of the bear call spread
+        assert [leg.quantity for leg in produced.evaluation.legs] == \
+            [65.0, 65.0]
+
+
+class TestQuantityAwareTailClassification:
+    """Structural tail from NET SIGNED CONTRACT exposure, not strike order:
+    a ratio short call stays UNLIMITED_LOSS and a 1×1 vertical stays bounded.
+    Classification only — the Day-18 quant engine remains the P&L authority."""
+
+    @staticmethod
+    def _leg(action, option_type, strike, lots, lot_size=1):
+        return {"direction": action, "option_type": option_type,
+                "strike_price": strike, "quantity": float(lots),
+                "lot_size": float(lot_size), "ltp": 100.0}
+
+    def test_uncovered_short_call_is_unlimited_loss(self):
+        assert _classify_tail([self._leg("sell", "call", 25000.0, 1)]) \
+            is TailClass.UNLIMITED_LOSS
+
+    def test_ratio_short_call_is_still_unlimited_loss(self):
+        # short 2 / long 1 at the higher strike leaves net short exposure
+        legs = [self._leg("sell", "call", 25000.0, 2),
+                self._leg("buy", "call", 25100.0, 1)]
+        assert _classify_tail(legs) is TailClass.UNLIMITED_LOSS
+
+    def test_ratio_scales_with_lot_size_not_with_leg_count(self):
+        legs = [self._leg("sell", "call", 25000.0, 2, lot_size=65),
+                self._leg("buy", "call", 25100.0, 1, lot_size=65)]
+        assert _classify_tail(legs) is TailClass.UNLIMITED_LOSS
+
+    def test_net_long_call_exposure_is_unlimited_gain(self):
+        legs = [self._leg("buy", "call", 25000.0, 2),
+                self._leg("sell", "call", 25100.0, 1)]
+        assert _classify_tail(legs) is TailClass.UNLIMITED_GAIN
+
+    def test_uncapped_long_call_is_unlimited_gain(self):
+        assert _classify_tail([self._leg("buy", "call", 25000.0, 1)]) \
+            is TailClass.UNLIMITED_GAIN
+
+    def test_one_by_one_vertical_is_bounded_not_unlimited_gain(self):
+        # a normal 1×1 vertical must NOT be mislabelled UNLIMITED_GAIN
+        legs = [self._leg("buy", "call", 25000.0, 1),
+                self._leg("sell", "call", 25100.0, 1)]
+        assert _classify_tail(legs) is TailClass.NONE
+
+    def test_net_short_put_is_never_unlimited_loss(self):
+        # a put's intrinsic value is capped at its own strike
+        assert _classify_tail([self._leg("sell", "put", 24800.0, 1)]) \
+            is TailClass.NONE
+
+    def test_net_flat_exposure_on_both_sides_is_none(self):
+        legs = [self._leg("buy", "call", 25000.0, 1),
+                self._leg("sell", "call", 25000.0, 1)]
+        assert _classify_tail(legs) is TailClass.NONE

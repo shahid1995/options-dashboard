@@ -60,14 +60,21 @@ def _opportunity_for(client_order_id: str):
 
 def _genuine_leg(leg) -> OptionLeg:
     """Mirror the Day-33 ``_leg`` builder for one ExecutionLegIn, honoring
-    its expiry so multi-expiry legacy intents stay genuine."""
+    its expiry so multi-expiry legacy intents stay genuine.
+
+    ``ExecutionLegIn.quantity`` is LOTS and ``lot_size`` is CONTRACTS PER
+    LOT, while the domain ``OptionLeg.quantity`` is CONTRACTS: the seeded
+    candidate must carry ``quantity × lot_size`` contracts so the genuine
+    Day-32/33 leg binding matches the execution request exactly (the same
+    rule the production producer applies).
+    """
     direction = PositionDirection.LONG if leg.action == "buy" \
         else PositionDirection.SHORT
     return OptionLeg(
         option_type=Side.CALL if leg.option_type.lower() == "call" else Side.PUT,
         strike=float(leg.strike_price),
         expiry=leg.expiration_date,
-        quantity=float(leg.quantity),
+        quantity=float(leg.quantity) * float(leg.lot_size),
         direction=direction,
         entry_price=100.0,
         implied_volatility=0.2,
