@@ -74,7 +74,6 @@ from app.brokers.domain.enums import BROKER_ID_UPSTOX
 from app.brokers.gateway import gateway
 from app.intelligence.contracts import (
     IntelligenceDirection,
-    RegimeLabel,
     TimeHorizon,
 )
 from app.intelligence.flow import FlowInput, evaluate_flow

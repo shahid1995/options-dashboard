@@ -456,7 +456,6 @@ class TestProducerCore:
     def test_stale_prior_oi_fails_closed(self, db_session):
         db_session.add_all(spot_closes())
         db_session.commit()
-        stale = {key: 900_000.0 for key in all_keys()}  # provided but stale-tested below
         # Prove the D1 rule rejects stale at the state layer:
         db_session.add_all(prior_candles(
             all_keys(), 950_000.0, age=OI_HISTORY_MAX_AGE + timedelta(hours=1)))
@@ -531,8 +530,6 @@ def _prices():
 
 @pytest.mark.anyio
 async def test_wrapper_full_path_executes_through_choke_point(db_session):
-    import asyncio
-
     db_session.add_all(prior_candles(all_keys(), 950_000.0))
     db_session.add_all(spot_closes())
     db_session.commit()
