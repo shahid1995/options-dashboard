@@ -38,6 +38,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.db import Base, get_db
 from app.main import app
+from app.routers.deps import SESSION_COOKIE_NAME
 from app.models import (
     Leg,
     PaperAccount,
@@ -58,13 +59,13 @@ from tests.test_day33_central_risk import (
     EXPIRY,
     NIFTY,
     _candidate_from_evaluation,
-    _evaluation,
     _leg,
     _opportunity,
     _payoff,
     _policy,
     _ranked,
 )
+from tests.test_day33_central_risk import _evaluation as _day33_evaluation
 from app.market_data.contracts import QualityState, Side
 from app.quant.scenarios import PositionDirection
 from app.strategy_evaluation.contracts import TailClass
@@ -76,6 +77,27 @@ from app.strategy_lifecycle.contracts import StrategyLifecycleState
 
 LOT = 50
 FILL_LTP = 125.28  # deliberately off-tick: must normalize to 125.30
+
+
+def _evaluation(*, opportunity=None, status_hint="success", **overrides):
+    """A genuine Day-31 evaluation whose legs are expressed in CONTRACTS.
+
+    ``OptionLeg.quantity`` is CONTRACTS, while an execution request states
+    LOTS + ``lot_size`` (``ExecutionLegIn.lot_size`` = contracts per lot).  A
+    seeded one-lot strategy is therefore ``LOT`` contracts on the candidate
+    side: without this the risk verdict would describe a position ``LOT``
+    times smaller than the one actually executed, and the request/candidate
+    leg binding would compare incompatible units.  The Day-33 evidence itself
+    is untouched — only the position size the evidence describes is expressed
+    in the domain's contract unit.
+    """
+    from dataclasses import replace
+
+    evaluation = _day33_evaluation(
+        opportunity=opportunity, status_hint=status_hint, **overrides)
+    return replace(evaluation, legs=tuple(
+        replace(leg, quantity=float(leg.quantity) * LOT)
+        for leg in evaluation.legs))
 
 
 @pytest.fixture(autouse=True)
@@ -121,11 +143,17 @@ def client(db_session):
 def logged_in(client, db_session):
     from tests.test_helpers import create_test_identity
     session_id, _ = create_test_identity(db_session, "tok-day34")
+    # Canonical transport: the HttpOnly session cookie — never a header.
+    client.cookies.set(SESSION_COOKIE_NAME, session_id)
     return session_id
 
 
 def _headers(session_id):
-    return {"X-Session-Id": session_id}
+    """Session credentials never travel in headers (repo AGENTS.md).  The
+    canonical browser transport is the HttpOnly session cookie, which the
+    ``logged_in`` fixture sets on the client; this stays a no-op so call
+    sites read explicitly."""
+    return {}
 
 
 def _counts(db):
@@ -174,16 +202,25 @@ def _blocking_evaluation(opportunity):
 
 
 def _request_legs(evaluation, *, lot_size: int = LOT):
-    """ExecutionLegIn legs mirroring the evaluation's genuine OptionLegs."""
+    """ExecutionLegIn legs mirroring the evaluation's genuine OptionLegs.
+
+    The candidate carries CONTRACTS; the request states the same position as
+    LOTS + ``lot_size``, so each leg is ``contracts / lot_size`` whole lots.
+    """
     from app.schemas import ExecutionLegIn
     legs = []
     for leg in evaluation.legs:
         option = leg.option_type.value.lower()
         action = "buy" if leg.direction is PositionDirection.LONG else "sell"
+        contracts = float(leg.quantity)
+        lots = contracts / lot_size
+        assert lots == int(lots) and int(lots) >= 1, (
+            f"candidate contracts {contracts} are not a whole number of "
+            f"{lot_size}-contract lots")
         legs.append(ExecutionLegIn(
             symbol=NIFTY, expiration_date=leg.expiry, strike_price=leg.strike,
             option_type=option, action=action,
-            quantity=int(leg.quantity), lot_size=lot_size,
+            quantity=int(lots), lot_size=lot_size,
         ))
     return legs
 
@@ -416,17 +453,32 @@ class TestCandidateRequiredRejections:
             }],
         }
         before = _counts(db_session)
-        # Market/chain resolution is valid (per mandate ordering: market-data
-        # resolution precedes candidate resolution), so the request reaches
-        # the Day-34 mutation choke point where the missing genuine
-        # Strategy Candidate is rejected pre-write.
+        # Day 50 / Issue #118 Slice A: the route produces the genuine
+        # candidate SERVER-SIDE before execution. A bare manual entry can no
+        # longer reach the choke point at all: it fails closed at the
+        # producer boundary (this test identity carries no broker
+        # market-data credential, so the producer rejects with
+        # MARKET_DATA_UNAUTHORIZED before acquiring any evidence). The
+        # fail-closed guarantee and zero mutation are unchanged; the
+        # choke-point-level STRATEGY_CANDIDATE_REQUIRED invariant for direct
+        # service calls remains covered by the Day-50 suite.
         with patch("app.routers.paper.resolve_market_prices",
                    new_callable=AsyncMock) as mock_prices:
             mock_prices.return_value = {(EXPIRY, 20000.0, "call"): 100.0}
             resp = client.post("/paper/executions",
                                headers=_headers(logged_in), json=payload)
         assert resp.status_code == 409
-        assert "STRATEGY_CANDIDATE_REQUIRED" in resp.json()["detail"]
+        detail = resp.json()["detail"]
+        # Day 50 / Issue #118 Slice A: the route produces the genuine candidate
+        # SERVER-SIDE before execution, so a bare manual entry can no longer
+        # reach the choke point at all — it fails closed at the producer
+        # boundary, because this identity carries no broker market-data
+        # credential.  Pinned exactly, not as a disjunction: the earlier guard
+        # is deterministic.  The fail-closed guarantee and zero mutation are
+        # unchanged, and the choke-point-level STRATEGY_CANDIDATE_REQUIRED
+        # invariant for direct service calls is covered by
+        # test_candidate_production.py::test_choke_point_still_rejects_missing_candidate_directly.
+        assert "MARKET_DATA_UNAUTHORIZED" in detail, detail
         assert _counts(db_session) == before
 
     def test_template_entry_rejected_with_zero_mutation(
@@ -552,3 +604,58 @@ class TestMissingEvidence:
                 prices=_prices_for(request_legs))
         assert exc_info.value.code in ("CANDIDATE_NOT_ELIGIBLE", "RISK_PARTIAL")
         assert _counts(db_session) == before
+
+
+class TestContractUnitBinding:
+    """Request/candidate leg binding must compare CONTRACTS on both sides.
+
+    ``ExecutionLegIn.quantity`` is LOTS and ``lot_size`` is CONTRACTS PER
+    LOT, while a genuine candidate's ``OptionLeg.quantity`` is CONTRACTS:
+    ``1 lot × 65 = 65 contracts``.  Without the conversion the request side
+    would report ``1`` against the candidate's ``65``, so every genuine
+    Day-32/33 entry would be rejected as a mismatched (unvetted) leg set —
+    and a smuggled leg count could never be detected dimensionally.
+    """
+
+    def test_one_lot_binds_to_the_candidates_contracts(self):
+        from app.services.paper_risk import legs_match_request
+
+        ev = _evaluation()
+        assert legs_match_request(ev.legs, _request_legs(ev)) is True
+
+    def test_more_lots_than_the_candidate_is_a_different_position(self):
+        from app.schemas import ExecutionLegIn
+        from app.services.paper_risk import legs_match_request
+
+        ev = _evaluation()
+        request = _request_legs(ev)
+        doubled = list(request)
+        doubled[0] = ExecutionLegIn(
+            symbol=doubled[0].symbol,
+            expiration_date=doubled[0].expiration_date,
+            strike_price=doubled[0].strike_price,
+            option_type=doubled[0].option_type,
+            action=doubled[0].action,
+            quantity=doubled[0].quantity * 2,   # twice as many LOTS
+            lot_size=doubled[0].lot_size,
+        )
+        assert legs_match_request(ev.legs, doubled) is False
+
+    def test_lot_size_participates_in_the_binding(self):
+        from app.schemas import ExecutionLegIn
+        from app.services.paper_risk import legs_match_request
+
+        ev = _evaluation()
+        request = _request_legs(ev)
+        unsized = list(request)
+        unsized[0] = ExecutionLegIn(
+            symbol=unsized[0].symbol,
+            expiration_date=unsized[0].expiration_date,
+            strike_price=unsized[0].strike_price,
+            option_type=unsized[0].option_type,
+            action=unsized[0].action,
+            quantity=1,          # 1 lot × 1 contract — not the risked size
+            lot_size=1,
+        )
+        assert legs_match_request(ev.legs, request) is True
+        assert legs_match_request(ev.legs, unsized) is False

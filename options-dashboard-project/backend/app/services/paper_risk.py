@@ -61,18 +61,26 @@ PAPER_ENTRY_POLICY = RiskPolicy(
 
 
 def _request_leg_keys(legs: list) -> list[tuple]:
-    """Normalized per-leg identity for an ExecutionLegIn request list."""
+    """Normalized per-leg identity for an ExecutionLegIn request list.
+
+    ``ExecutionLegIn.quantity`` is LOTS and ``lot_size`` is CONTRACTS PER
+    LOT, while a genuine candidate's ``OptionLeg.quantity`` is CONTRACTS, so
+    the request's position size is ``quantity × lot_size`` contracts.  The
+    comparison stays EXACT: a different quantity or a different lot size is a
+    different position, so the leg binding is never weakened.
+    """
     keys = []
     for leg in legs:
         direction = PositionDirection.LONG if leg.action == "buy" \
             else PositionDirection.SHORT
         keys.append((leg.expiration_date, leg.strike_price,
-                     leg.option_type.lower(), direction, float(leg.quantity)))
+                     leg.option_type.lower(), direction,
+                     float(leg.quantity) * float(leg.lot_size)))
     return keys
 
 
 def _candidate_leg_keys(legs: tuple[OptionLeg, ...]) -> list[tuple]:
-    """Normalized per-leg identity for genuine domain OptionLegs."""
+    """Normalized per-leg identity for genuine domain OptionLegs (CONTRACTS)."""
     return [(leg.expiry, leg.strike, leg.option_type.value.lower(),
              leg.direction, float(leg.quantity)) for leg in legs]
 
@@ -122,14 +130,30 @@ def execute_gated_paper_entry(
         PaperExecutionError,
         execute_strategy,
     )
+    from app.utils.symbols import normalize_underlying
 
-    symbol = str(symbol).upper()
+    symbol = normalize_underlying(symbol)
     strategy_identity = strategy_id or evaluation.strategy_id
     if strategy_id is not None and evaluation.strategy_id is not None \
             and strategy_id != evaluation.strategy_id:
         raise _not_eligible(
             "strategy_id does not match the genuine Day-31 evaluation "
             "strategy identity")
+
+    # Day-50 Fix A: every leg must name the approved request underlying.
+    # The candidate/evaluation evidence is bound to the top-level symbol
+    # only, while the executed order/position identity is persisted per
+    # leg — a mismatched leg symbol would let the executed instrument
+    # disagree with the risked candidate.  Enforced here so a DIRECT
+    # service call to this bridge cannot bypass the invariant; the schema
+    # and the choke point enforce the same rule (zero rows on rejection).
+    for leg in legs:
+        leg_underlying = normalize_underlying(getattr(leg, "symbol", None))
+        if leg_underlying != symbol:
+            raise _not_eligible(
+                f"leg underlying {leg_underlying!r} does not match the "
+                f"request underlying {symbol!r}; every execution leg must "
+                "trade the request's own underlying")
 
     if not legs_match_request(evaluation.legs, legs):
         raise PaperExecutionError(

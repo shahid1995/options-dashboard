@@ -3,6 +3,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, model_validator
 
+from app.utils.symbols import normalize_underlying
+
 # ---------------------------------------------------------------------------
 # UTC-aware datetime serialization (Phase: timestamp standardization)
 # ---------------------------------------------------------------------------
@@ -84,6 +86,33 @@ class ExecutionRequestIn(BaseModel):
     strategy_id: str | None = None
     starting_capital: float | None = Field(default=None, gt=0)
     legs: list[ExecutionLegIn] = Field(..., min_length=1)
+
+    @model_validator(mode="after")
+    def _bind_every_leg_to_the_request_underlying(self):
+        """Day-50 Fix A: one underlying per request, at the earliest boundary.
+
+        Each ``ExecutionLegIn`` carries its own ``symbol``, while the fill
+        prices, the candidate evidence and the risk verdict are all resolved
+        against the TOP-LEVEL ``symbol`` only.  A leg naming a different
+        underlying could therefore be priced off the wrong chain and
+        persisted under a foreign symbol.  Both levels are normalized
+        identically (strip + upper, the execution service's own convention)
+        and any leg that disagrees with the approved top-level underlying is
+        rejected here — before any broker, risk or database work.  The same
+        invariant is re-enforced server-side in the candidate producer, the
+        sanctioned bridge and the execution choke point, so no service-level
+        caller can bypass it either.
+        """
+        approved = normalize_underlying(self.symbol)
+        self.symbol = approved
+        for leg in self.legs:
+            leg.symbol = normalize_underlying(leg.symbol)
+            if leg.symbol != approved:
+                raise ValueError(
+                    f"leg underlying {leg.symbol!r} does not match the "
+                    f"request underlying {approved!r}; every execution leg "
+                    "must name the request's own underlying")
+        return self
 
 
 class ExitRequestIn(BaseModel):

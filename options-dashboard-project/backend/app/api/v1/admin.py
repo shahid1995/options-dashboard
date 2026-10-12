@@ -437,3 +437,539 @@ def audit(
 ):
     """Sanitized admin-audit activity (newest first)."""
     return {"events": list_admin_audit(db)}
+
+
+# ---------------------------------------------------------------------------
+# 6. Live option-candle verification (read-only capability probe)
+# ---------------------------------------------------------------------------
+#
+# In-process invocation seam for the existing Phase 7.9 probe
+# (``app.tools.live_verification.verify_option_candle_api``) on the Day-50
+# runtime.  The probe is credential-agnostic: this route supplies the
+# authenticated caller's OWN user-scoped market-data credential, resolved
+# through the canonical ``resolve_market_data_token`` path — never a
+# session token, a browser cookie, ``TokenBridge``, or the platform cache.
+#
+# The route is read-only against Upstox and persists nothing; the four
+# capability claims and ``live_option_oi_established`` keep their exact
+# probe semantics (no reinterpretation here).
+#
+# SCOPE IS NIFTY OPTIONS ONLY.  Authoritative expiry is resolved from NIFTY
+# contract metadata, so this route verifies ``NSE_FO`` NIFTY option contracts
+# and nothing else; every other instrument fails closed, before any credential
+# use or broker request.  The Day-50 strategy is NIFTY-only, so the seam
+# declares that limit instead of implying arbitrary exchange/underlying
+# support.
+
+
+class OptionCandleProbeIn(BaseModel):
+    """Read-only live option-candle verification request.
+
+    Deliberately identity-free: no user id and no connection id are
+    accepted — the probe always runs against the authenticated caller's
+    own authorization.
+    """
+
+    instrument_key: str
+    candle_date: str | None = None
+
+    @field_validator("instrument_key")
+    @classmethod
+    def _instrument_key_shape(cls, v: str) -> str:
+        """Apply the SAME grammar and normalization the probe itself requires.
+
+        The probe builds an authenticated Upstox URL path from this value, so
+        the request boundary reuses the probe's own validator instead of a
+        second, drifting copy.  Ordinary surrounding spaces are normalized;
+        ASCII control characters (C0 plus DEL) and the path, query and
+        fragment delimiters are rejected here.  Either way the key that every
+        downstream call receives is the normalized one.
+
+        The RAW value is what gets validated.  Stripping first would delete a
+        trailing CR/LF/TAB and make an injected control character look like
+        ordinary padding, so normalization happens only after the check.
+        Ordinary surrounding SPACES are still normalized, not rejected.
+        """
+        from app.tools.live_verification import _instrument_key_error
+
+        error = _instrument_key_error(v)
+        if error is not None:
+            raise ValueError(error)
+        return v.strip(" ") if isinstance(v, str) else v
+
+    @field_validator("candle_date")
+    @classmethod
+    def _candle_date_shape(cls, v: str | None) -> str | None:
+        """Strictly YYYY-MM-DD; alternate ISO forms are rejected, not converted.
+
+        date.fromisoformat() alone is not a validator: on Python 3.11+ it also
+        accepts 20261001, 2026-W40-4 and any other ISO 8601 shape, and that
+        original string is what reaches the historical URL path.  Only the
+        exact extended form is accepted.  Ordinary surrounding spaces are
+        normalized first, using the same single-character contract the
+        instrument key uses, so a control or non-ASCII separator is rejected
+        rather than silently deleted.
+        """
+        from app.tools.live_verification import _iso_date_error
+
+        if v is None:
+            return None
+        v = v.strip(" ")
+        if not v:
+            return None
+        error = _iso_date_error(v)
+        if error is not None:
+            raise ValueError(f"candle_date must be YYYY-MM-DD ({error})")
+        return v
+
+
+_ENDPOINT_FACT_KEYS = (
+    "status",
+    "http_status",
+    "error",
+    "extraction_error",
+    "candle_count",
+    "candle_array_length",
+    "open_interest_field_present",
+    "open_interest_non_null_count",
+    "open_interest_sample",
+    "timestamp_format_sample",
+    "timezone_offsets_observed",
+    "naive_ist_last_timestamp",
+    "malformed_row_count",
+)
+
+
+def _endpoint_facts(endpoint: Any) -> dict:
+    """Project one probe endpoint result to non-sensitive facts only."""
+    if not isinstance(endpoint, dict):
+        return {}
+    return {key: endpoint.get(key) for key in _ENDPOINT_FACT_KEYS}
+
+
+def _contract_expiry_iso(value: Any) -> str | None:
+    """Normalize a broker contract ``expiry`` value to ISO ``YYYY-MM-DD``.
+
+    The provider reports contract expiries in more than one calendar format;
+    only a value this function can parse to a real ISO date may be treated as
+    authoritative.  Anything else returns ``None`` so the caller fails closed.
+    """
+    from datetime import datetime as _dt
+
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y"):
+        try:
+            return _dt.strptime(candidate, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+# --- Supported universe (scope declaration) -------------------------------
+# This seam verifies ONE option universe: NIFTY option contracts, which the
+# broker keys under the ``NSE_FO`` segment for the NSE ``Nifty 50`` index
+# underlying.  The Day-50 production strategy is NIFTY-only, so the seam
+# declares that scope explicitly instead of implying support for an arbitrary
+# exchange or underlying.  Anything outside it fails closed.
+NIFTY_OPTION_SEGMENT = "NSE_FO"
+NIFTY_UNDERLYING_SYMBOL = "NIFTY"
+
+
+def _instrument_identity(instrument_key: str) -> str:
+    """The broker's canonical instrument identity for a requested key.
+
+    Upstox names the same option contract either ``NSE_FO|<id>`` or
+    ``NSE_FO|<id>|<dd-mm-yyyy>``; only the first two segments identify the
+    contract, and an expiry rendering is key text, never identity.  Identity is
+    therefore the first two segments, and the third segment is untrusted text
+    that must be cross-checked, never treated as authoritative.
+    """
+    return "|".join(instrument_key.split("|")[:2])
+
+
+def _supports_nifty_option_identity(instrument_key: Any) -> bool:
+    """True only for a key inside the seam's supported NIFTY option universe.
+
+    The universe is declared, not discovered: this seam resolves authoritative
+    expiries from NIFTY contract metadata only, so a key in any other segment
+    (another exchange, an index, an equity) has no trustworthy answer here and
+    must not reach the broker.
+    """
+    if not isinstance(instrument_key, str):
+        return False
+    segments = instrument_key.strip().split("|")
+    if len(segments) < 2 or not segments[0] or not segments[1]:
+        return False
+    return segments[0] == NIFTY_OPTION_SEGMENT
+
+
+def _broker_identity(value: Any) -> str | None:
+    """Reduce ANY broker or caller key rendering to its canonical identity.
+
+    Both sides of every comparison pass through here, so the two-segment form
+    Upstox returns from ``/option/contract`` and the three-segment form the
+    candle endpoint accepts still name the same contract, and no expiry
+    rendering can ever take part in a match.
+    """
+    if not isinstance(value, str):
+        return None
+    segments = value.strip().split("|")
+    if len(segments) < 2 or not segments[0] or not segments[1]:
+        return None
+    return "|".join(segments[:2])
+
+
+def _row_expiry_agrees_with_itself(row: dict, authoritative_iso: str) -> bool:
+    """Reject a metadata row whose own key text contradicts its expiry field.
+
+    A row may legitimately arrive keyed as ``NSE_FO|<id>|<dd-mm-yyyy>``.  That
+    rendering must agree with the row's own ``expiry`` field; a row that
+    contradicts itself is not trustworthy, so the caller fails closed.
+    """
+    row_key = row.get("instrument_key")
+    if not isinstance(row_key, str):
+        return False
+    segments = row_key.strip().split("|")
+    if len(segments) <= 2:
+        return True
+    return _contract_expiry_iso(segments[2]) == authoritative_iso
+
+
+def _is_nifty_option_contract(row: dict, underlying_key: str) -> bool:
+    """True only when a contract row's OWN facts PROVE it is a NIFTY contract.
+
+    Cross-checks the facts the broker ships with every ``/option/contract`` row
+    so that a row which is not a NIFTY contract can never serve as NIFTY expiry
+    authority.
+
+    Fail-closed on absence as well as on contradiction: a fact that is missing,
+    empty, non-string, or not the expected NIFTY value all make the row
+    unusable.  Skipping an absent fact would let a row from an unknown universe
+    pass as NIFTY purely because it said nothing — silence is not consent.
+    """
+    for field, expected in (
+        ("segment", NIFTY_OPTION_SEGMENT),
+        ("underlying_key", underlying_key),
+        ("underlying_symbol", NIFTY_UNDERLYING_SYMBOL),
+    ):
+        declared = row.get(field)
+        if not isinstance(declared, str):
+            return False
+        # One normalization per field: the emptiness check and the comparison
+        # must agree on exactly the same value (Codacy: repeated ``.strip()``).
+        normalized = declared.strip()
+        if not normalized or normalized != expected:
+            return False
+    return True
+
+
+async def _resolve_authoritative_expiry(access_token: str, instrument_key: str) -> str | None:
+    """Resolve the broker's authoritative expiry for a NIFTY option key.
+
+    SCOPE IS NIFTY OPTIONS ONLY, deliberately and explicitly.  Contracts are
+    fetched for the NSE ``Nifty 50`` index underlying because
+    ``get_option_contracts`` takes an UNDERLYING key — handing it an option key
+    would query the wrong universe and could never be trusted.  No general
+    underlying-resolution architecture is invented here: a key outside this
+    universe returns ``None`` and the caller fails closed.
+
+    Matching compares BROKER-owned identity only.  The requested key and every
+    metadata row are reduced to their canonical first-two-segment form, so the
+    two-segment key ``/option/contract`` actually returns and the three-segment
+    key the candle endpoint accepts still name the same contract.  An expiry
+    embedded in the REQUESTED key stays untrusted text: it must agree with the
+    broker's own value, or the answer is ``None``.
+
+    ``None`` — so the caller fails closed — is returned when the key is outside
+    the supported universe, no row matches its identity, a matching row's
+    expiry cannot be parsed to a real date, a row contradicts itself, or two
+    rows disagree about the same contract.
+    """
+    from app.services.upstox import get_option_contracts
+    from app.tools.live_verification import NIFTY_INDEX_KEY
+
+    if not _supports_nifty_option_identity(instrument_key):
+        return None
+
+    payload = await get_option_contracts(access_token, NIFTY_INDEX_KEY)
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return None
+
+    identity = _instrument_identity(instrument_key)
+    expiries: set[str] = set()
+    for candidate in rows:
+        if not isinstance(candidate, dict):
+            continue
+        if _broker_identity(candidate.get("instrument_key")) != identity:
+            continue
+        if not _is_nifty_option_contract(candidate, NIFTY_INDEX_KEY):
+            continue
+        authoritative = _contract_expiry_iso(candidate.get("expiry"))
+        if authoritative is None:
+            # A matching row whose expiry cannot be read is not authority.
+            return None
+        if not _row_expiry_agrees_with_itself(candidate, authoritative):
+            return None
+        expiries.add(authoritative)
+
+    if len(expiries) != 1:
+        # No match at all, or the broker contradicts itself about this contract.
+        return None
+
+    authoritative = expiries.pop()
+
+    segments = instrument_key.split("|")
+    if len(segments) > 2:
+        # Key text carries its own expiry rendering.  Trusting it would be
+        # exactly the operator-supplied authority this seam must not have, and
+        # silently ignoring a disagreement would hide a wrong key.
+        if _contract_expiry_iso(segments[2]) != authoritative:
+            return None
+    return authoritative
+
+
+def _freshness_facts(freshness: Any) -> dict:
+    """Project the instrument-freshness evidence (no credential material)."""
+    if not isinstance(freshness, dict):
+        return {}
+    return {
+        "expiry_from_instrument_key": freshness.get("expiry_from_instrument_key"),
+        "key_implies_unexpired": freshness.get("key_implies_unexpired"),
+        "authoritative_expiry_date": freshness.get("authoritative_expiry_date"),
+        "authoritative_expiry_supplied": freshness.get("authoritative_expiry_supplied"),
+        "authoritative_expiry_valid": freshness.get("authoritative_expiry_valid"),
+        "authoritative_expiry_implies_unexpired": freshness.get(
+            "authoritative_expiry_implies_unexpired"
+        ),
+        "intraday_returned_current_session_candle": freshness.get(
+            "intraday_returned_current_session_candle"
+        ),
+        "verified_unexpired": freshness.get("verified_unexpired"),
+        "verified_reason": freshness.get("verified_reason"),
+    }
+
+
+#: Machine codes for the authoritative-expiry gate.  Identical strings are
+#: used for the HTTP error envelope and the durable audit reason, and both
+#: are kept below ``admin_audit.SECRETISH_VALUE``'s 28-character value shape
+#: so the audit record preserves the code instead of ``<redacted>``.
+EXPIRY_UNRESOLVED = "EXPIRY_UNRESOLVED"
+CONTRACT_METADATA_FAILED = "CONTRACT_METADATA_FAILED"
+
+
+def _fail_expiry_unresolved(db: Session, user: Any, body: Any) -> None:
+    """Audit and raise the ONE fail-closed answer for an unverifiable key.
+
+    Every reason the authoritative expiry could not be established shares this
+    response and this machine code, so nothing about the instrument is echoed
+    back: the key is outside the seam's supported NIFTY option universe, no
+    contract row matched its broker identity, a matching row's expiry was
+    unreadable or self-contradictory, the broker contradicted itself about the
+    contract, or an expiry embedded in the requested key disagreed with the
+    broker.  The detail states the declared scope rather than implying the seam
+    covers arbitrary exchange or underlying instruments.
+    """
+    record_admin_action(
+        db,
+        actor_user_id=user.user_id,
+        action="live_verification.option_candle",
+        target={
+            "instrument_key": body.instrument_key,
+            "candle_date": body.candle_date,
+        },
+        result="failed",
+        detail={"reason": EXPIRY_UNRESOLVED},
+    )
+    unresolved = HTTPException(
+        status_code=422,
+        detail=(
+            "No authoritative Upstox contract metadata matched this "
+            "instrument key, so its expiry could not be established; live "
+            "option freshness cannot be verified. This seam verifies NSE_FO "
+            "NIFTY option contracts only, and any expiry segment on the key is "
+            "untrusted text that must agree with the broker's own metadata."
+        ),
+    )
+    unresolved.error_code = EXPIRY_UNRESOLVED
+    raise unresolved
+
+
+@router.post("/live-verification/option-candle")
+async def verify_option_candle(
+    body: OptionCandleProbeIn,
+    user: AuthenticatedUser = Depends(_admin_guarded("live_verification.option_candle")),
+    db: Session = Depends(get_db),
+):
+    """POST /api/v1/admin/live-verification/option-candle — read-only probe.
+
+    In-process invocation seam for ``verify_option_candle_api``:
+
+        admin request -> caller user_id -> resolve_market_data_token(...)
+            -> MarketDataCredential.token (in memory only)
+            -> verify_option_candle_api(...)
+
+    Supported universe: ``NSE_FO`` NIFTY option contracts only.  An
+    instrument outside it cannot have its expiry resolved from trusted
+    server-side metadata and is refused up front with ``EXPIRY_UNRESOLVED``.
+
+    Authorization mirrors /acquisition/run: ``AdminUser`` at the HTTP
+    boundary plus the shared durable ``users.is_admin`` domain backstop.
+    The credential never leaves the process, is never returned, and no
+    probe data is persisted.  Only the sanitized verification facts are
+    returned, and the audit record carries safe metadata only.
+    """
+    # --- Durable admin backstop (shared with acquisition; no new gate) ---
+    try:
+        _authorize_acquisition_principal(db, user.user_id)
+    except PermissionError:
+        record_admin_action(
+            db,
+            actor_user_id=user.user_id,
+            action="live_verification.option_candle",
+            target={"instrument_key": body.instrument_key},
+            result="denied",
+            detail={"reason": "admin_required"},
+        )
+        raise HTTPException(status_code=403, detail="Admin privileges required.")
+
+    # --- Supported universe: NIFTY options only (fail closed, pre-credential) --
+    # Expiry authority exists in this seam only for NIFTY option contracts, so
+    # an out-of-scope key is refused here rather than after a credential
+    # lookup and a contract-metadata round trip that could never answer it.
+    if not _supports_nifty_option_identity(body.instrument_key):
+        _fail_expiry_unresolved(db, user, body)
+
+    # --- Caller-scoped credential only: no session/header/cache/bridge ---
+    from app.brokers.domain.enums import BROKER_ID_UPSTOX
+    from app.services.market_data_authorization import resolve_market_data_token
+
+    credential = resolve_market_data_token(db, user.user_id, BROKER_ID_UPSTOX.value)
+    if credential is None or not getattr(credential, "token", None):
+        record_admin_action(
+            db,
+            actor_user_id=user.user_id,
+            action="live_verification.option_candle",
+            target={
+                "instrument_key": body.instrument_key,
+                "candle_date": body.candle_date,
+            },
+            result="failed",
+            detail={"reason": "MARKET_DATA_NOT_CONNECTED"},
+        )
+        error = HTTPException(
+            status_code=403,
+            detail=(
+                "Market data is not connected. Add your Upstox Analytics Token "
+                "in Settings to run live verification."
+            ),
+        )
+        error.error_code = "MARKET_DATA_NOT_CONNECTED"
+        raise error
+
+    # --- Read-only probe, in-process; credential passed in memory only ---
+    from app.tools.live_verification import verify_option_candle_api
+
+    # --- Authoritative expiry: broker contract metadata ONLY -------------
+    # The probe judges freshness from the instrument's real expiry, and a live
+    # ``NSE_FO|<id>`` key carries none.  It is resolved server-side from the
+    # broker's own contract metadata for that EXACT key; it is never taken from
+    # the request body, from key text, or from operator input.  A key that
+    # cannot be matched fails closed before any candle request is made.
+    #
+    # NOTE: the two machine codes below are kept shorter than
+    # ``admin_audit.SECRETISH_VALUE``'s 28-character value shape so the SAME
+    # code survives into the durable audit trail; a longer code would be
+    # scrubbed to ``<redacted>`` there and the failure would become
+    # undiagnosable (the pre-existing ``MARKET_DATA_NOT_CONNECTED`` reason
+    # follows the same bound).
+    try:
+        authoritative_expiry = await _resolve_authoritative_expiry(
+            credential.token, body.instrument_key
+        )
+    except Exception as exc:  # noqa: BLE001 - audited, then surfaced as 502
+        record_admin_action(
+            db,
+            actor_user_id=user.user_id,
+            action="live_verification.option_candle",
+            target={
+                "instrument_key": body.instrument_key,
+                "candle_date": body.candle_date,
+            },
+            result="failed",
+            detail={
+                "reason": CONTRACT_METADATA_FAILED,
+                "error_class": type(exc).__name__,
+            },
+        )
+        error = HTTPException(
+            status_code=502, detail="Upstox contract metadata lookup failed."
+        )
+        error.error_code = CONTRACT_METADATA_FAILED
+        raise error from exc
+
+    if authoritative_expiry is None:
+        _fail_expiry_unresolved(db, user, body)
+
+    try:
+        result = await verify_option_candle_api(
+            credential.token,
+            body.instrument_key,
+            body.candle_date,
+            authoritative_expiry_date=authoritative_expiry,
+        )
+    except Exception as exc:  # noqa: BLE001 — audited, then surfaced as 502
+        record_admin_action(
+            db,
+            actor_user_id=user.user_id,
+            action="live_verification.option_candle",
+            target={
+                "instrument_key": body.instrument_key,
+                "candle_date": body.candle_date,
+            },
+            result="failed",
+            detail={"error_class": type(exc).__name__},
+        )
+        raise HTTPException(
+            status_code=502, detail="Live option verification probe failed."
+        ) from exc
+
+    payload = {
+        "status": result.get("status"),
+        "instrument_key": result.get("instrument_key"),
+        "probe_date_ist": result.get("probe_date_ist"),
+        "current_ist_date": result.get("current_ist_date"),
+        "endpoint_consistency": result.get("endpoint_consistency"),
+        "open_interest_consistency": result.get("open_interest_consistency"),
+        "intraday": _endpoint_facts(result.get("intraday")),
+        "historical": _endpoint_facts(result.get("historical")),
+        "instrument_freshness": _freshness_facts(result.get("instrument_freshness")),
+        "authoritative_expiry_source": result.get("authoritative_expiry_source"),
+        "claims": result.get("claims"),
+        "live_option_oi_established": result.get("live_option_oi_established"),
+        "conclusion": result.get("conclusion"),
+    }
+
+    record_admin_action(
+        db,
+        actor_user_id=user.user_id,
+        action="live_verification.option_candle",
+        target={
+            "instrument_key": body.instrument_key,
+            "candle_date": body.candle_date,
+        },
+        # The probe reports partial/error WITHOUT raising, so an unconditional
+        # "success" would let a failed or half-completed probe be recorded as a
+        # success in the durable audit trail.  Map the probe's own status onto
+        # the EXISTING audit vocabulary; no new enum is introduced.
+        result="success" if payload["status"] == "success" else "failed",
+        detail={
+            "status": payload["status"],
+            "live_option_oi_established": payload["live_option_oi_established"],
+        },
+    )
+    return payload
