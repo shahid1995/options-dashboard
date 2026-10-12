@@ -156,7 +156,15 @@ def make_chain(
     pe_bid=178.0, pe_ask=182.0,
     with_keys=True,
 ):
-    """Build a canonical chain fixture (same shape the Upstox mapper emits)."""
+    """Build a canonical chain fixture.
+
+    ``with_keys=True`` (the default) additionally stamps a per-side
+    ``instrument_key`` into each side — a shape ``_apply_identities``
+    supports (snapshot key must AGREE with the resolved key) but which the
+    REAL ``transform_chain`` mapper does NOT emit.  The canonical-mapper
+    tests below therefore run with ``with_keys=False`` or through the real
+    adapter, mirroring production exactly.
+    """
     ce_key = KEY_25000_CE if with_keys else None
     pe_key = KEY_25000_PE if with_keys else None
     return {
@@ -248,13 +256,16 @@ def prior_oi_map(db, keys, reference_ts=REF_TS):
 
 
 def run_core(db, chain=None, legs=None, prior_oi=None, *, keys=None,
-             received_at=None, spot_closes_rows=None):
+             received_at=None, spot_closes_rows=None, fill_prices=None):
     """Drive the real producer core over the fixture (fail-closed path).
 
     ``keys`` is ``instrument_keys``: positional against ``legs`` (the
     adapter's ``resolve_instrument_keys`` preserves request order), i.e. one
     resolved broker key per requested leg, NOT one per chain side.  The
-    default is the fixture's two requested call legs.
+    default is the fixture's two requested call legs.  ``fill_prices`` is
+    the router-resolved fill map (Day-50 Fix D); ``None`` exercises the
+    pure-core path where the fill basis is derived from the same snapshot
+    with the same tick-alignment helper the router uses.
     """
     chain = chain if chain is not None else make_chain()
     legs = legs if legs is not None else make_legs()
@@ -281,6 +292,7 @@ def run_core(db, chain=None, legs=None, prior_oi=None, *, keys=None,
         id_seed="test-order-1",
         strategy_id="paper-entry",
         legs=legs,
+        fill_prices=fill_prices,
     )
 
 
@@ -522,9 +534,16 @@ def _request(strategy_id=None, client_order_id="day50-test-order-1"):
 
 
 def _prices():
+    """The router-resolved fill prices for the fixture chain.
+
+    Single-snapshot invariant (Day-50 Fix D): these are exactly the
+    fixture chain's own tick-aligned LTPs — 25000 CE ltp 200.0 and 25100 CE
+    ltp 100.0 (``ce_ltp * 0.5``) — because ``resolve_market_prices``
+    derives them from the very snapshot the producer reuses.
+    """
     return {
         (EXPIRY, 25000.0, "call"): 200.0,
-        (EXPIRY, 25100.0, "call"): 80.0,
+        (EXPIRY, 25100.0, "call"): 100.0,
     }
 
 
@@ -1194,16 +1213,18 @@ class TestExpiryPayoffScan:
 
         ``_expiry_payoff`` runs ``_contract_quantity`` on each leg, so every
         leg passed to it must carry a positive ``lot_size`` (the payoff scan
-        tests use quantity=1, lot_size=1 -> 1 contract).
+        tests use quantity=1, lot_size=1 -> 1 contract).  ``fill_price`` is
+        the tick-aligned fill basis (Day-50 Fix D) — the payoff scan no
+        longer reads the raw mark.
         """
         return [
             {"expiration_date": "2026-10-29", "strike_price": 100.0,
              "option_type": "call", "action": "sell", "quantity": 1.0,
-             "direction": "sell", "lot_size": 1.0, "ltp": 4.0,
+             "direction": "sell", "lot_size": 1.0, "fill_price": 4.0,
              "quant_leg": object()},
             {"expiration_date": "2026-10-29", "strike_price": 105.0,
              "option_type": "call", "action": "buy", "quantity": 1.0,
-             "direction": "buy", "lot_size": 1.0, "ltp": 10.0,
+             "direction": "buy", "lot_size": 1.0, "fill_price": 10.0,
              "quant_leg": object()},
         ]
 
@@ -1766,7 +1787,7 @@ class TestQuantityAwareTailClassification:
     def _leg(action, option_type, strike, lots, lot_size=1):
         return {"direction": action, "option_type": option_type,
                 "strike_price": strike, "quantity": float(lots),
-                "lot_size": float(lot_size), "ltp": 100.0}
+                "lot_size": float(lot_size), "fill_price": 100.0}
 
     def test_uncovered_short_call_is_unlimited_loss(self):
         assert _classify_tail([self._leg("sell", "call", 25000.0, 1)]) \
@@ -2108,3 +2129,643 @@ async def test_wrapper_fails_closed_on_an_unpriceable_chain(db_session):
         await _wrapper(db_session, _request(), fetch_chain=unpriceable)
     assert exc.value.code == "CHAIN_DATA_MISSING"
     assert _no_rows_written(db_session) == (0, 0, 0, 0)
+
+
+# ---------------------------------------------------------------------------
+# Day-50 independent-review remediations (PR #130 follow-up)
+#
+# Fix A — every executed leg is bound to the request's own underlying at
+# every boundary (schema, producer wrapper, sanctioned bridge, choke point).
+# Fix B — partial identity-bound ΔOI coverage can never masquerade as a
+# chain-wide ΔOI aggregate (the canonical mapper emits no per-side keys).
+# Fix C — structural tail is decided by NET SIGNED CALL exposure only; a
+# long put is a BOUNDED gain, never UNLIMITED_GAIN.
+# Fix D — fill-basis evidence (entry premium / payoff / risk) runs on the
+# SAME tick-aligned price the paper engine records as the fill.
+# ---------------------------------------------------------------------------
+
+
+class TestUnderlyingLegBinding:
+    """Fix A — a leg's own ``symbol`` must name the request's underlying at
+    every boundary; mismatched legs are rejected BEFORE any broker work and
+    always with zero database mutation."""
+
+    def test_schema_rejects_a_foreign_underlying_leg(self):
+        from pydantic import ValidationError
+
+        from app.schemas import ExecutionLegIn, ExecutionRequestIn
+
+        with pytest.raises(ValidationError) as exc:
+            ExecutionRequestIn(
+                client_order_id="schema-mismatch-1",
+                symbol="NIFTY",
+                legs=[ExecutionLegIn(
+                    symbol="BANKNIFTY", expiration_date=EXPIRY,
+                    strike_price=25000.0, option_type="call", action="sell",
+                    quantity=1, lot_size=65)],
+            )
+        assert "does not match the request underlying" in str(exc.value)
+
+    def test_schema_normalises_both_levels_consistently(self):
+        from app.schemas import ExecutionLegIn, ExecutionRequestIn
+
+        request = ExecutionRequestIn(
+            client_order_id="schema-normalised-1",
+            symbol=" nifty ",
+            legs=[ExecutionLegIn(
+                symbol="Nifty", expiration_date=EXPIRY,
+                strike_price=25000.0, option_type="call", action="sell",
+                quantity=1, lot_size=65)],
+        )
+        assert request.symbol == "NIFTY"
+        assert [leg.symbol for leg in request.legs] == ["NIFTY"]
+
+    @pytest.mark.anyio
+    async def test_wrapper_rejects_a_foreign_underlying_leg_before_any_broker_work(
+            self, db_session):
+        def exploding_token(db, user_id):
+            raise AssertionError("no broker work for a mismatched leg")
+
+        async def exploding_fetch(symbol, expiry, token):
+            raise AssertionError("no evidence for a mismatched leg")
+
+        request = _request()
+        request.legs[0].symbol = "BANKNIFTY"
+
+        from app.services.paper_execution import PaperExecutionError
+
+        with pytest.raises(PaperExecutionError) as exc:
+            await produce_candidate_and_execute(
+                "user-day50", db_session, request, _prices(),
+                token_resolver=exploding_token,
+                fetch_chain=exploding_fetch,
+                resolve_keys=_injected_keys,
+                now_fn=lambda: REF_TS,
+            )
+        assert exc.value.code == "UNSUPPORTED_SYMBOL"
+        assert "BANKNIFTY" in str(exc.value)
+        assert _no_rows_written(db_session) == (0, 0, 0, 0)
+
+    @pytest.mark.anyio
+    async def test_multi_leg_request_with_one_mismatched_leg_is_rejected(
+            self, db_session):
+        """A two-leg NIFTY request whose SECOND leg names BANKNIFTY must be
+        rejected entirely — never partially executed."""
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+
+        request = _request()
+        request.legs[1].symbol = "BANKNIFTY"
+
+        from app.services.paper_execution import PaperExecutionError
+
+        async def must_not_fetch(symbol, expiry, token):
+            raise AssertionError("no broker read before the leg gate")
+
+        with pytest.raises(PaperExecutionError) as exc:
+            await produce_candidate_and_execute(
+                "user-day50", db_session, request, _prices(),
+                token_resolver=lambda db, user: "test-md-token",
+                fetch_chain=must_not_fetch,
+                now_fn=lambda: REF_TS,
+            )
+        assert exc.value.code == "UNSUPPORTED_SYMBOL"
+        assert "BANKNIFTY" in str(exc.value)
+        assert _no_rows_written(db_session) == (0, 0, 0, 0)
+
+    @pytest.mark.anyio
+    async def test_normalised_matching_nifty_legs_still_execute(
+            self, db_session):
+        """Case/whitespace differences normalize: matching NIFTY legs keep
+        working end-to-end and the PERSISTED identity is normalised NIFTY."""
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+
+        request = _request()
+        request.symbol = " nifty "
+        request.legs[0].symbol = "Nifty"
+        request.legs[1].symbol = "NIFTY "
+
+        async def fake_fetch(symbol, expiry, token):
+            return make_chain()
+
+        result = await produce_candidate_and_execute(
+            "user-day50", db_session, request, _prices(),
+            token_resolver=lambda db, user: "test-md-token",
+            fetch_chain=fake_fetch,
+            resolve_keys=_injected_keys,
+            now_fn=lambda: REF_TS,
+        )
+        assert result.status in ("FILLED", "PENDING")
+        orders = db_session.query(PaperOrder).all()
+        assert {order.symbol for order in orders} == {"NIFTY"}
+        assert db_session.query(StrategyExecution).one().symbol == "NIFTY"
+
+    def test_bridge_rejects_a_mismatched_leg_underlying_directly(
+            self, db_session):
+        """A DIRECT call to the sanctioned bridge with legs naming a foreign
+        underlying is rejected before the gate/risk/execution chain — the
+        service path cannot bypass the invariant."""
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+        produced = run_core(db_session)
+
+        from app.schemas import ExecutionLegIn
+        from app.services.paper_execution import PaperExecutionError
+        from app.services.paper_risk import execute_gated_paper_entry
+
+        foreign = [
+            ExecutionLegIn(
+                symbol="BANKNIFTY", expiration_date=EXPIRY,
+                strike_price=25000.0, option_type="call", action="sell",
+                quantity=1, lot_size=65),
+            ExecutionLegIn(
+                symbol="BANKNIFTY", expiration_date=EXPIRY,
+                strike_price=25100.0, option_type="call", action="buy",
+                quantity=1, lot_size=65),
+        ]
+        with pytest.raises(PaperExecutionError) as exc:
+            execute_gated_paper_entry(
+                "user-day50", db_session,
+                client_order_id="bridge-mismatch-1",
+                symbol="NIFTY",
+                legs=foreign,
+                opportunity=produced.opportunity,
+                ranked_strikes=produced.ranked_strikes,
+                evaluation=produced.evaluation,
+                prices=_prices(),
+                starting_capital=500000.0,
+                reference_timestamp=REF_TS,
+            )
+        assert exc.value.code == "CANDIDATE_NOT_ELIGIBLE"
+        assert "underlying" in str(exc.value)
+        assert _no_rows_written(db_session) == (0, 0, 0, 0)
+
+    def test_choke_point_rejects_a_mismatched_leg_underlying_directly(
+            self, db_session):
+        """The mutation choke point itself rejects a foreign-underlying leg
+        even when a GENUINE eligible candidate is supplied — zero rows."""
+        from types import SimpleNamespace
+
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+        produced = run_core(db_session)
+
+        from app.schemas import ExecutionLegIn
+        from app.services.paper_execution import (
+            PaperExecutionError,
+            execute_strategy,
+        )
+        from app.services.paper_risk import PAPER_ENTRY_POLICY
+
+        request = SimpleNamespace(
+            client_order_id="choke-mismatch-1",
+            symbol="NIFTY",
+            strategy_id="paper-entry",
+            strategy_tag="Day50Test",
+            starting_capital=500000.0,
+            legs=[
+                ExecutionLegIn(
+                    symbol="NIFTY", expiration_date=EXPIRY,
+                    strike_price=25000.0, option_type="call", action="sell",
+                    quantity=1, lot_size=65),
+                ExecutionLegIn(
+                    symbol="BANKNIFTY", expiration_date=EXPIRY,
+                    strike_price=25100.0, option_type="call", action="buy",
+                    quantity=1, lot_size=65),
+            ],
+        )
+        with pytest.raises(PaperExecutionError) as exc:
+            execute_strategy(
+                "user-day50", request, db_session, _prices(),
+                risk_candidate=produced.candidate,
+                risk_policy=PAPER_ENTRY_POLICY,
+                reference_timestamp=REF_TS,
+            )
+        assert exc.value.code == "CANDIDATE_LEG_MISMATCH"
+        assert "BANKNIFTY" in str(exc.value)
+        assert _no_rows_written(db_session) == (0, 0, 0, 0)
+
+    def test_route_rejects_a_foreign_underlying_leg_at_the_schema_boundary(
+            self, client, db_session):
+        session_id, _ = _identity(db_session)
+        response = client.post(
+            "/paper/executions",
+            json={
+                "client_order_id": "route-mismatch-1",
+                "symbol": "NIFTY",
+                "legs": [
+                    {"symbol": "BANKNIFTY", "expiration_date": EXPIRY,
+                     "strike_price": 25000, "option_type": "call",
+                     "action": "sell", "quantity": 1, "lot_size": 65},
+                ],
+            },
+            cookies={SESSION_COOKIE_NAME: session_id},
+        )
+        assert response.status_code == 422, response.text
+        assert _no_rows_written(db_session) == (0, 0, 0, 0)
+
+
+def _capture_intelligence(monkeypatch, captured):
+    """Capture the chain-level intelligence inputs/results non-invasively
+    (the real engines still run; nothing is stubbed)."""
+    from app.services import candidate_production as cp
+
+    real_metrics = cp.compute_metrics
+    real_flow = cp.evaluate_flow
+    real_inst = cp.evaluate_institutional
+
+    def metrics(inp):
+        out = real_metrics(inp)
+        captured["metrics_input"] = inp
+        captured["metrics_result"] = out
+        return out
+
+    def flow(inp):
+        captured["flow_input"] = inp
+        return real_flow(inp)
+
+    def inst(inp):
+        captured["inst_input"] = inp
+        return real_inst(inp)
+
+    monkeypatch.setattr(cp, "compute_metrics", metrics)
+    monkeypatch.setattr(cp, "evaluate_flow", flow)
+    monkeypatch.setattr(cp, "evaluate_institutional", inst)
+
+
+def _raw_upstox_payload():
+    """A minimal raw Upstox option-chain payload (the shape
+    ``transform_chain`` consumes: ``data[].call_options/put_options`` with
+    ``market_data``/``option_greeks``)."""
+    def side(ltp, oi, prev_oi, volume, gamma):
+        return {
+            "market_data": {
+                "ltp": ltp, "oi": oi, "prev_oi": prev_oi,
+                "volume": volume, "last_trade_time": QUOTE_TS,
+            },
+            "option_greeks": {
+                "iv": 14.0, "delta": 0.5, "gamma": gamma,
+                "theta": -0.1, "vega": 0.2,
+            },
+        }
+
+    return {"data": [
+        {"strike_price": 25000.0, "underlying_spot_price": 25000.0,
+         "call_options": side(200.03, 1_200_000, 950_000, 150_000, 0.05),
+         "put_options": side(180.0, 1_100_000, 950_000, 150_000, 0.05)},
+        {"strike_price": 25100.0,
+         "call_options": side(100.0, 720_000, 950_000, 90_000, 0.025),
+         "put_options": side(396.0, 1_540_000, 950_000, 195_000, 0.025)},
+    ]}
+
+
+class TestPartialDeltaOiCoverage:
+    """Fix B — the canonical mapper emits NO per-side instrument identity,
+    so only requested legs can ever resolve one.  Chain-wide ΔOI totals may
+    only be claimed when EVERY measured side carries an identity-bound ΔOI;
+    partial coverage propagates as MISSING through the existing contracts,
+    while per-leg ΔOI keeps establishing leg eligibility exactly as before.
+    No key is synthesized, no missing OI becomes zero, D1 windows and the
+    candidate gate are untouched."""
+
+    @staticmethod
+    def _canonical_chain():
+        from app.brokers.adapters.upstox.mapper import transform_chain
+
+        return transform_chain("NIFTY", EXPIRY, _raw_upstox_payload())
+
+    def test_real_mapper_output_carries_no_per_side_instrument_key(self):
+        chain = self._canonical_chain()
+        for row in chain["chain"]:
+            for name in ("call", "put"):
+                assert "instrument_key" not in row[name]
+        index = _build_side_index(chain)
+        assert all(side.instrument_key is None for side in index.values())
+        # Identity binding gives a key ONLY to the requested legs.
+        bound = _apply_identities(
+            index,
+            _resolved_identity_map(
+                make_legs(), [KEY_25000_CE, KEY_25100_CE]))
+        assert bound[(25000.0, "call")].instrument_key == KEY_25000_CE
+        assert bound[(25100.0, "call")].instrument_key == KEY_25100_CE
+        assert bound[(25000.0, "put")].instrument_key is None
+        assert bound[(25100.0, "put")].instrument_key is None
+
+    def test_canonical_mapper_chain_never_yields_a_chain_delta_oi_aggregate(
+            self, db_session, monkeypatch):
+        """PRODUCTION-REALISTIC: with the real mapper output and eligible
+        history for the requested legs only, the chain-level ΔOI inputs are
+        all missing — a single leg's ΔOI can never surface as the chain's
+        net ΔOI — while the existing rules still decide the rest (the
+        mapper emits no bid/ask, so ranking suppresses on the existing
+        INSUFFICIENT-spread rule and the producer fails closed)."""
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+        captured: dict = {}
+        _capture_intelligence(monkeypatch, captured)
+
+        with pytest.raises(ProducerError) as exc:
+            run_core(db_session, chain=self._canonical_chain())
+        # existing Day-30 rule (no bid/ask ⇒ INSUFFICIENT spread) suppresses
+        assert exc.value.code == "EVIDENCE_INSUFFICIENT"
+
+        rows = captured["metrics_input"].rows
+        assert rows, "the cascade must have run on the real chain rows"
+        assert all(row.call_oi_change is None and row.put_oi_change is None
+                   for row in rows)
+        metrics = captured["metrics_result"]
+        assert metrics.total_call_oi_change is None
+        assert metrics.total_put_oi_change is None
+        assert metrics.net_chain_oi_change is None
+        assert captured["flow_input"].net_ce_oi_change is None
+        assert captured["flow_input"].net_pe_oi_change is None
+        assert captured["inst_input"].net_call_oi_change is None
+        assert captured["inst_input"].net_put_oi_change is None
+
+    def test_partial_coverage_cannot_masquerade_but_legs_still_evaluate(
+            self, db_session, monkeypatch):
+        """With snapshot keys on every side but eligible history only for
+        the REQUESTED legs (the identity-bound partial-coverage case), the
+        chain aggregates stay missing while the requested legs are still
+        evaluated under the existing rules and the candidate is produced."""
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+        captured: dict = {}
+        _capture_intelligence(monkeypatch, captured)
+
+        produced = run_core(db_session)  # prior for the two requested keys
+
+        metrics = captured["metrics_result"]
+        assert metrics.total_call_oi_change is None   # not the 2 legs' sum
+        assert metrics.total_put_oi_change is None
+        assert metrics.net_chain_oi_change is None
+        assert captured["flow_input"].net_ce_oi_change is None
+        assert captured["inst_input"].net_call_oi_change is None
+        # OI LEVELS are genuinely measured per side and unaffected.
+        assert metrics.total_call_oi == 1_200_000.0 + 720_000.0
+
+        # The requested legs keep their identity-bound per-leg ΔOI: the
+        # Day-30 POSITIONING factor is a MEASUREMENT of that leg's history.
+        ranked = {r.candidate_id: r for r in produced.ranked_strikes.ranked}
+        positioning = next(
+            c for c in ranked["strike:25000:call"].contributions
+            if c.factor is RankingFactor.POSITIONING)
+        assert positioning.raw == 1_200_000.0 - 950_000.0
+        assert produced.candidate.lifecycle_state.value == "ELIGIBLE"
+
+    def test_full_chain_coverage_still_feeds_the_chain_aggregate(
+            self, db_session, monkeypatch):
+        """The complete-coverage path is preserved: when EVERY measured side
+        carries an identity whose history is eligible, the chain-wide ΔOI
+        totals are the real sums over the whole snapshot."""
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+        captured: dict = {}
+        _capture_intelligence(monkeypatch, captured)
+
+        run_core(db_session, prior_oi=prior_oi_map(db_session, all_keys()))
+
+        expected_ce = (1_200_000.0 - 950_000.0) + (720_000.0 - 950_000.0)
+        expected_pe = (1_100_000.0 - 950_000.0) + (1_540_000.0 - 950_000.0)
+        metrics = captured["metrics_result"]
+        assert metrics.total_call_oi_change == expected_ce
+        assert metrics.total_put_oi_change == expected_pe
+        assert metrics.net_chain_oi_change == expected_ce + expected_pe
+        assert captured["flow_input"].net_ce_oi_change == expected_ce
+        assert captured["flow_input"].net_pe_oi_change == expected_pe
+
+    @pytest.mark.anyio
+    async def test_live_contract_without_history_stays_fail_closed(
+            self, db_session):
+        """The Fix B coverage rule must NOT turn the production
+        no-history situation into evidence: with zero stored prior OI the
+        entry still fails closed with zero writes (the documented live-
+        contract behaviour, re-asserted against the new coverage rule)."""
+        db_session.add_all(spot_closes())
+        db_session.commit()
+        assert db_session.query(OptionCandle).count() == 0
+
+        async def fake_fetch(symbol, expiry, token):
+            return self._canonical_chain()
+
+        from app.services.paper_execution import PaperExecutionError
+
+        with pytest.raises(PaperExecutionError) as exc:
+            await produce_candidate_and_execute(
+                "user-day50", db_session, _request(), _prices(),
+                token_resolver=lambda db, user: "test-md-token",
+                fetch_chain=fake_fetch,
+                resolve_keys=_injected_keys,
+                now_fn=lambda: REF_TS,
+            )
+        assert exc.value.code == "EVIDENCE_INSUFFICIENT"
+        assert _no_rows_written(db_session) == (0, 0, 0, 0)
+
+
+class TestStructuralTailCallSideOnly:
+    """Fix C — structural unboundedness is decided by NET SIGNED CALL
+    exposure alone.  A long put's gain is capped at its strike (the
+    underlying cannot fall below zero), so put exposure alone is always
+    bounded in BOTH directions."""
+
+    @staticmethod
+    def _leg(action, option_type, strike, lots, lot_size=1):
+        return {"direction": action, "option_type": option_type,
+                "strike_price": strike, "quantity": float(lots),
+                "lot_size": float(lot_size), "fill_price": 100.0}
+
+    def test_standalone_long_put_is_bounded_not_unlimited_gain(self):
+        assert _classify_tail([self._leg("buy", "put", 24800.0, 1)]) \
+            is TailClass.NONE
+
+    def test_multi_lot_long_put_is_bounded(self):
+        assert _classify_tail([
+            self._leg("buy", "put", 24800.0, 3, lot_size=65)]) \
+            is TailClass.NONE
+
+    def test_net_long_put_combination_is_bounded(self):
+        # long 2 × 24800 put, short 1 × 24600 put — net long puts, no calls
+        legs = [self._leg("buy", "put", 24800.0, 2),
+                self._leg("sell", "put", 24600.0, 1)]
+        assert _classify_tail(legs) is TailClass.NONE
+
+    def test_long_put_with_net_flat_calls_is_bounded(self):
+        # long put + a fully covered call pair: bounded whatever the puts do
+        legs = [self._leg("buy", "put", 24800.0, 1),
+                self._leg("buy", "call", 25000.0, 1),
+                self._leg("sell", "call", 25000.0, 1)]
+        assert _classify_tail(legs) is TailClass.NONE
+
+    def test_standalone_long_call_is_unlimited_gain(self):
+        assert _classify_tail([self._leg("buy", "call", 25000.0, 1)]) \
+            is TailClass.UNLIMITED_GAIN
+
+    def test_uncovered_short_call_is_unlimited_loss(self):
+        assert _classify_tail([self._leg("sell", "call", 25000.0, 1)]) \
+            is TailClass.UNLIMITED_LOSS
+
+    def test_short_call_ratio_spread_with_residual_short_calls_is_loss(self):
+        # short 2 × 25000 call / long 1 × 25100 call: net short calls remain
+        legs = [self._leg("sell", "call", 25000.0, 2),
+                self._leg("buy", "call", 25100.0, 1)]
+        assert _classify_tail(legs) is TailClass.UNLIMITED_LOSS
+
+    def test_one_by_one_call_vertical_is_bounded(self):
+        legs = [self._leg("buy", "call", 25000.0, 1),
+                self._leg("sell", "call", 25100.0, 1)]
+        assert _classify_tail(legs) is TailClass.NONE
+
+    def test_standalone_short_put_is_bounded(self):
+        assert _classify_tail([self._leg("sell", "put", 24800.0, 1)]) \
+            is TailClass.NONE
+
+    def test_net_flat_call_exposure_is_none(self):
+        legs = [self._leg("buy", "call", 25000.0, 1),
+                self._leg("sell", "call", 25000.0, 1)]
+        assert _classify_tail(legs) is TailClass.NONE
+
+
+class TestFillBasisPricing:
+    """Fix D — fill-basis evidence (OptionLeg.entry_price, payoff premium,
+    risk) runs on the SAME tick-aligned price the paper engine records as
+    the fill; the raw broker LTP stays a market observation; a fill price
+    that disagrees with the canonical snapshot fails closed."""
+
+    OFF_TICK_CE = 200.03      # → tick-aligned 200.05 (₹0.05 grid)
+    OFF_TICK_CE_FAR = 100.015  # the 25100 CE (ce_ltp × 0.5) → 100.0
+
+    @staticmethod
+    def _off_tick_chain():
+        return make_chain(ce_ltp=TestFillBasisPricing.OFF_TICK_CE)
+
+    @staticmethod
+    def _aligned_prices():
+        from app.services.paper_execution import round_option_price
+
+        return {
+            (EXPIRY, 25000.0, "call"):
+                round_option_price(TestFillBasisPricing.OFF_TICK_CE),
+            (EXPIRY, 25100.0, "call"):
+                round_option_price(TestFillBasisPricing.OFF_TICK_CE_FAR),
+        }
+
+    def test_off_tick_ltp_entry_price_is_the_tick_aligned_fill(
+            self, db_session):
+        from app.services.paper_execution import round_option_price
+
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+        chain = self._off_tick_chain()
+        prices = self._aligned_prices()
+        assert prices[(EXPIRY, 25000.0, "call")] == 200.05
+        assert prices[(EXPIRY, 25100.0, "call")] == 100.0
+
+        produced = run_core(db_session, chain=chain, fill_prices=prices)
+
+        legs = produced.evaluation.legs
+        assert [leg.entry_price for leg in legs] == [200.05, 100.0]
+        assert legs[0].entry_price == round_option_price(self.OFF_TICK_CE)
+        # the premium-based payoff values run on the FILL, never the raw mark
+        payoff = produced.evaluation.payoff_assessment
+        assert payoff.net_debit_credit == round(-200.05 * 65 + 100.0 * 65, 2)
+        # ...and are visibly NOT derived from the off-tick mark
+        assert payoff.net_debit_credit != round(
+            -self.OFF_TICK_CE * 65 + self.OFF_TICK_CE_FAR * 65, 2)
+        # the raw broker LTP remains the market observation in the chain
+        assert _build_side_index(chain)[(25000.0, "call")].ltp == \
+            self.OFF_TICK_CE
+
+    @pytest.mark.anyio
+    async def test_persisted_fill_agrees_with_the_fill_basis(
+            self, db_session):
+        """End-to-end: the price supplied to the fill-basis calculation is
+        the price the paper engine records on the PaperOrder fills."""
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+
+        async def off_tick_fetch(symbol, expiry, token):
+            return self._off_tick_chain()
+
+        result = await produce_candidate_and_execute(
+            "user-day50", db_session, _request(), self._aligned_prices(),
+            token_resolver=lambda db, user: "test-md-token",
+            fetch_chain=off_tick_fetch,
+            resolve_keys=_injected_keys,
+            now_fn=lambda: REF_TS,
+        )
+        assert result.status in ("FILLED", "PENDING")
+        fills = {order.strike: order.fill_price
+                 for order in db_session.query(PaperOrder).all()}
+        assert fills == {25000.0: 200.05, 25100.0: 100.0}
+        # the persisted fills ARE the tick-aligned values the fill-basis
+        # calculation consumed (never the off-tick marks 200.03 / 100.015)
+        assert set(fills.values()) == set(self._aligned_prices().values())
+
+    @pytest.mark.anyio
+    async def test_fill_price_disagreeing_with_the_snapshot_fails_closed(
+            self, db_session):
+        """A routed fill price that disagrees with the same snapshot's
+        tick-aligned LTP is an inconsistent pricing source — rejected with
+        zero mutation, never silently mixed into the evidence."""
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+
+        disagreeing = self._aligned_prices()
+        disagreeing[(EXPIRY, 25000.0, "call")] = 199.95
+
+        from app.services.paper_execution import PaperExecutionError
+
+        async def off_tick_fetch(symbol, expiry, token):
+            return self._off_tick_chain()
+
+        with pytest.raises(PaperExecutionError) as exc:
+            await produce_candidate_and_execute(
+                "user-day50", db_session, _request(), disagreeing,
+                token_resolver=lambda db, user: "test-md-token",
+                fetch_chain=off_tick_fetch,
+                resolve_keys=_injected_keys,
+                now_fn=lambda: REF_TS,
+            )
+        assert exc.value.code == "EXECUTION_FAILED"
+        assert "single-snapshot" in str(exc.value)
+        assert _no_rows_written(db_session) == (0, 0, 0, 0)
+
+    @pytest.mark.anyio
+    async def test_missing_routed_fill_price_fails_closed(self, db_session):
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+
+        from app.services.paper_execution import PaperExecutionError
+
+        async def fake_fetch(symbol, expiry, token):
+            return make_chain()
+
+        with pytest.raises(PaperExecutionError) as exc:
+            await produce_candidate_and_execute(
+                "user-day50", db_session, _request(), {},
+                token_resolver=lambda db, user: "test-md-token",
+                fetch_chain=fake_fetch,
+                resolve_keys=_injected_keys,
+                now_fn=lambda: REF_TS,
+            )
+        assert exc.value.code == "CHAIN_DATA_MISSING"
+        assert _no_rows_written(db_session) == (0, 0, 0, 0)
+
+    def test_tick_rounding_and_mark_observation_behaviour_are_intact(self):
+        from app.services.paper_execution import round_option_price
+
+        assert round_option_price(self.OFF_TICK_CE) == 200.05
+        assert round_option_price(200.0) == 200.0
+        assert round_option_price(None) is None

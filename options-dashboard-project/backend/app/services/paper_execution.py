@@ -36,6 +36,8 @@ from datetime import datetime, timezone
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.utils.symbols import normalize_underlying
+
 from app.models import (
     BulkExitRecord,
     Leg,
@@ -358,7 +360,7 @@ def execute_strategy(
     reference is stored on ``execution_metadata`` in the SAME transaction.
     """
     now = _now()
-    symbol = request.symbol.upper()
+    symbol = normalize_underlying(request.symbol)
 
     existing = db.scalar(
         select(StrategyExecution).where(
@@ -382,6 +384,25 @@ def execute_strategy(
             "Gate -> Day-33 Central Risk). Manual/custom entries without a "
             "candidate are rejected. Paper order was not executed.",
         )
+    # Day-50 Fix A: every executed leg must name the request's own
+    # underlying.  Order and position identity are persisted PER LEG
+    # (``leg_symbol`` below), so a leg carrying a foreign underlying would
+    # silently create an instrument the risk verdict never described — the
+    # candidate identity, risk evaluation, price resolution and persisted
+    # identity must all agree on the underlying.  Normalization is the
+    # shared ``normalize_underlying`` convention, and the check runs BEFORE
+    # the first DB write so a rejection always leaves zero rows.
+    for leg in request.legs:
+        leg_underlying = normalize_underlying(leg.symbol)
+        if leg_underlying != symbol:
+            raise PaperExecutionError(
+                "CANDIDATE_LEG_MISMATCH",
+                f"Execution leg underlying {leg_underlying!r} does not "
+                f"match the request underlying {symbol!r}; every leg must "
+                "trade the same underlying the request (and its risk "
+                "verdict) describes. Paper order was not executed.",
+            )
+
     # The risked legs must be the executed legs (multiset equality).
     from app.services.paper_risk import legs_match_request
 
@@ -480,7 +501,7 @@ def execute_strategy(
         # by the router; the belt-and-braces normalization below guarantees
         # no legacy caller can write an off-tick fill.
         fill_price = round_option_price(prices[(leg.expiration_date, leg.strike_price, leg.option_type)])
-        leg_symbol = leg.symbol.upper()
+        leg_symbol = normalize_underlying(leg.symbol)
 
         order = PaperOrder(
             user_id=user_id,

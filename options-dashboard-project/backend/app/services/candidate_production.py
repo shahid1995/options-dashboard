@@ -104,6 +104,13 @@ from app.quant.scenarios import (
 # of real gamma/OI rather than a fabricated placeholder; no second GEX
 # formula is introduced here.
 from app.services.historical_gex import compute_raw_gex, compute_signed_gex
+# Phase 5.2.1 tick alignment — the ONE fill-price convention, owned by the
+# execution service.  The producer derives its fill-basis prices with this
+# same helper so the candidate's entry premium/payoff/risk basis is, by
+# construction, the price the paper engine will record as the fill
+# (Day-50 Fix D).  No import cycle: paper_execution imports only models,
+# schemas and utils.
+from app.services.paper_execution import round_option_price
 from app.strike_ranking.contracts import (
     FactorObservation,
     OptionType,
@@ -127,6 +134,7 @@ from app.strategy_evaluation.contracts import (
 from app.strategy_evaluation.evaluation import evaluate_strategy
 from app.strategy_lifecycle.lifecycle import evaluate_strategy_gate
 from app.utils.market_time import MARKET_OPEN, to_ist_naive
+from app.utils.symbols import normalize_underlying
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -532,36 +540,41 @@ def _contract_legs(legs: list[dict]) -> list[dict]:
 
 
 def _classify_tail(legs: list[dict]) -> TailClass:
-    """Structural payoff tail from the SIGNED CONTRACT quantities.
+    """Structural payoff tail from the SIGNED CONTRACT exposure of the CALLS.
 
     Classification only — never a probability and never a second payoff
     engine: the existing Day-18 quant engine remains authoritative for P&L.
-    The tail is decided by each option side's NET signed contract exposure, so
-    ratio structures are classified correctly; a strike-order-only check is
-    not sufficient (it cannot tell 2× short from 1× long):
+    Structural unboundedness lives ONLY on the call side, so the tail is
+    decided by the NET signed call contracts (ratio structures classify
+    correctly; a strike-order-only check cannot tell 2× short from 1× long):
 
-    * calls, net signed contracts < 0 ⇒ short-call exposure remains above
+    * net signed call contracts < 0 ⇒ short-call exposure remains above
       every long call ⇒ UNLIMITED_LOSS;
-    * calls, net signed contracts > 0 ⇒ uncapped long-call exposure ⇒
+    * net signed call contracts > 0 ⇒ uncapped long-call exposure ⇒
       UNLIMITED_GAIN;
-    * puts, net signed contracts > 0 ⇒ uncapped long-put exposure ⇒
-      UNLIMITED_GAIN.  A net SHORT put is never UNLIMITED_LOSS: a put's
-      intrinsic value is capped at its own strike, so short-put loss is
-      structurally bounded;
-    * net-flat exposure on both sides ⇒ NONE (fully covered / bounded).
+    * puts NEVER create an unbounded tail in either direction.  The
+      underlying price cannot fall below zero, so a long put's gain is
+      capped at its own strike (bounded gain — previously misclassified as
+      UNLIMITED_GAIN merely for being long a put) and a short put's loss is
+      capped at its own strike (bounded loss);
+    * net-flat call exposure ⇒ NONE, whatever the puts do (fully covered /
+      bounded).
+
+    Structural unboundedness is deliberately kept distinct from the sampled
+    ±10% payoff grid: ``PayoffEvidence.max_profit``/``max_loss`` are SAMPLED
+    extremes, while ``tail`` is the exact structural statement.
     """
     net_calls = 0.0
-    net_puts = 0.0
     for leg in legs:
         signed = _SIDE_SIGN[leg["direction"]] * _contract_quantity(leg)
         if leg["option_type"] == "call":
             net_calls += signed
-        else:
-            net_puts += signed
     if net_calls < 0:
         return TailClass.UNLIMITED_LOSS
-    if net_calls > 0 or net_puts > 0:
+    if net_calls > 0:
         return TailClass.UNLIMITED_GAIN
+    # Net-flat call exposure: bounded whatever the put side does (both put
+    # directions are capped at the put's own strike).
     return TailClass.NONE
 
 
@@ -601,9 +614,11 @@ def _expiry_payoff(
     The terminal payoff is the portfolio's P&L evaluated through
     ``evaluate_portfolio`` at ``time_to_expiry = 0`` (the engine's intrinsic
     convention) over a deterministic spot grid around the observed spot.
-    Entry premium per leg is the measured chain LTP signed by direction —
-    no independent payoff formula is implemented here.  A grid point the
-    engine cannot price completely — or that comes back non-finite — is
+    Entry premium per leg is the leg's FILL price signed by direction —
+    the tick-aligned price the paper engine records (Day-50 Fix D), never
+    the raw mark — and no independent payoff formula is implemented here.
+    A grid point the engine cannot price completely — or that comes back
+    non-finite — is
     dropped as genuinely missing (the result is then PARTIAL), never
     zero-filled.  Raises ``ProducerError`` when no grid point prices
     completely (fail closed).
@@ -649,7 +664,8 @@ def _expiry_payoff(
 
     net = 0.0
     for leg in legs:
-        net += _SIDE_SIGN[leg["direction"]] * leg["ltp"] * _contract_quantity(leg)
+        net += (_SIDE_SIGN[leg["direction"]] * leg["fill_price"]
+                * _contract_quantity(leg))
 
     # Each sample carries its own spot label: when a grid point is dropped
     # the P&L series is shorter than the grid, so pairing the two by
@@ -948,12 +964,18 @@ def produce_candidate_core(
     strategy_id: str,
     legs: list[dict],
     underlying: str = SLICE_A_UNDERLYING,
+    fill_prices: dict | None = None,
 ) -> ProducedCandidate:
     """Assemble genuine evidence and run the existing Day-20 → Day-32 chain.
 
     ``legs`` entries carry ``expiration_date / strike_price / option_type /
     action / quantity`` (LOTS) and ``lot_size`` (CONTRACTS PER LOT); the
-    candidate itself is built on CONTRACTS (``quantity × lot_size``).  Raises
+    candidate itself is built on CONTRACTS (``quantity × lot_size``).  When
+    ``fill_prices`` (the router-resolved ``(expiry, strike, option_type) →
+    price`` map) is supplied, every requested leg's price is cross-checked
+    against this snapshot's tick-aligned LTP and any disagreement or absence
+    fails closed — the fill-basis evidence and the executed fill can never
+    come from different pricing sources (Day-50 Fix D).  Raises
     ``ProducerError`` whenever genuine evidence cannot produce an eligible
     candidate — nothing is fabricated.
     """
@@ -1019,24 +1041,52 @@ def produce_candidate_core(
             return None
         return _delta_oi(side.oi, prior_oi_by_key.get(side.instrument_key))
 
-    rows: list[StrikePositioning] = []
+    # -- per-side ΔOI keyed by AUTHORITY identity (Day-50 Fix B) ------------
+    # ``strike_deltas`` is the PER-LEG eligibility evidence: each side's ΔOI
+    # is resolved against its authoritative broker instrument key, and it
+    # feeds the Day-30 POSITIONING factor and the requested-leg eligibility
+    # gate below exactly as before.
     strike_deltas: dict[tuple[float, str], float | None] = {}
+    for row in chain.get("chain", []):
+        strike = _finite(row.get("strike"))
+        if strike is None or strike <= 0:
+            continue
+        strike_deltas[(strike, "call")] = _delta_for(strike, "call")
+        strike_deltas[(strike, "put")] = _delta_for(strike, "put")
+
+    # CHAIN-WIDE ΔOI is a different measurement and may only be claimed
+    # when it genuinely covers the whole measured snapshot.  The canonical
+    # ``transform_chain`` output carries NO per-side instrument identity, so
+    # only requested legs can resolve one — every other side then lacks
+    # eligible prior-OI history.  Summing whichever ΔOI values happen to be
+    # present (the previous behaviour) presented a single requested leg's
+    # ΔOI as the chain's net ΔOI and drove positioning/flow/institutional/
+    # synthesis as if the chain-wide change had been measured.  Coverage is
+    # therefore explicit: unless EVERY measured side of this snapshot
+    # carries an identity-bound ΔOI, the chain-level rows below carry NO
+    # ΔOI at all, and the existing contracts propagate it as MISSING
+    # (``None`` → PARTIAL/UNCLASSIFIED downstream) — never a partial sum,
+    # never a synthesized key, never a fabricated directional read.  OI
+    # LEVELS and volumes are unaffected: they are genuinely measured per
+    # side by the canonical payload.
+    chain_delta_oi_complete = bool(side_index) and all(
+        strike_deltas.get(key) is not None for key in side_index)
+
+    rows: list[StrikePositioning] = []
     for row in chain.get("chain", []):
         strike = _finite(row.get("strike"))
         if strike is None or strike <= 0:
             continue
         call_side = row.get("call") or {}
         put_side = row.get("put") or {}
-        call_delta = _delta_for(strike, "call")
-        put_delta = _delta_for(strike, "put")
-        strike_deltas[(strike, "call")] = call_delta
-        strike_deltas[(strike, "put")] = put_delta
         rows.append(StrikePositioning(
             strike=strike,
             call_oi=_finite(call_side.get("oi")),
             put_oi=_finite(put_side.get("oi")),
-            call_oi_change=call_delta,
-            put_oi_change=put_delta,
+            call_oi_change=(strike_deltas[(strike, "call")]
+                            if chain_delta_oi_complete else None),
+            put_oi_change=(strike_deltas[(strike, "put")]
+                           if chain_delta_oi_complete else None),
             call_volume=_finite(call_side.get("volume")),
             put_volume=_finite(put_side.get("volume")),
         ))
@@ -1213,6 +1263,31 @@ def produce_candidate_core(
                 "genuine ranking evidence (missing ΔOI history or unusable "
                 "factors); entry fails closed",
             )
+        # Day-50 Fix D: FILL-basis, not mark-basis.  ``side.ltp`` remains
+        # the raw broker market observation carried by the chain evidence;
+        # the entry premium / payoff / risk basis must be the SAME
+        # tick-aligned price the execution engine records as the fill
+        # (Phase 5.2.1 ``round_option_price``).  When the caller supplied
+        # the router-resolved fill prices they are CROSS-CHECKED against
+        # this snapshot's tick-aligned LTP: a missing or disagreeing price
+        # fails closed, so a second, inconsistent pricing source can never
+        # silently enter the evidence chain (single-snapshot invariant).
+        aligned = round_option_price(side.ltp)
+        if fill_prices is not None:
+            routed = fill_prices.get(
+                (leg["expiration_date"], strike, side_name))
+            if routed is None:
+                raise ProducerError(
+                    "CHAIN_DATA_MISSING",
+                    f"no validated fill price was resolved for requested "
+                    f"leg {strike:g} {side_name}; entry fails closed")
+            if routed != aligned:
+                raise ProducerError(
+                    "EXECUTION_FAILED",
+                    f"the resolved fill price {routed!r} for leg "
+                    f"{strike:g} {side_name} disagrees with the canonical "
+                    f"evidence snapshot's tick-aligned LTP {aligned!r}; "
+                    "entry fails closed (single-snapshot pricing)")
         quant_leg = OptionLeg(
             option_type=_SIDE_TO_SIDE[side_name],
             strike=strike,
@@ -1222,7 +1297,9 @@ def produce_candidate_core(
             quantity=float(leg["contract_quantity"]),
             direction=(PositionDirection.LONG if leg["action"] == "buy"
                        else PositionDirection.SHORT),
-            entry_price=side.ltp,
+            # Fill basis: the tick-aligned price that will actually execute
+            # and persist — never the raw mark (Fix D).
+            entry_price=aligned,
             implied_volatility=_scale_iv(side.iv) or _atm_iv(sides, spot),
             # The MEASURED Day-12 state for this snapshot — never a
             # hard-coded EXCELLENT.
@@ -1233,7 +1310,7 @@ def produce_candidate_core(
         payoff_legs.append({**leg, "strike_price": strike,
                             "option_type": side_name,
                             "direction": leg["action"],
-                            "quant_leg": quant_leg, "ltp": side.ltp})
+                            "quant_leg": quant_leg, "fill_price": aligned})
 
     payoff = _expiry_payoff(payoff_legs, spot, reference_ts, provenance)
     atm_iv = _atm_iv(sides, spot)
@@ -1424,7 +1501,13 @@ async def produce_candidate_and_execute(
     #     that underlying, so any other supported instrument must fail closed
     #     here — before any broker/session work — rather than be processed
     #     and mislabelled under NIFTY evidence.
-    symbol = str(request.symbol).upper()
+    #     Day-50 Fix A: each leg's OWN symbol is part of the request
+    #     identity.  Prices, evidence and risk are all resolved against the
+    #     top-level symbol, while the executed order/position is persisted
+    #     per leg — so a leg naming a different underlying must be rejected
+    #     HERE, before token resolution or any broker read, and the same
+    #     invariant is re-enforced at the bridge and the choke point.
+    symbol = normalize_underlying(request.symbol)
     if symbol != SLICE_A_UNDERLYING:
         raise _fail(
             "UNSUPPORTED_SYMBOL",
@@ -1432,6 +1515,15 @@ async def produce_candidate_and_execute(
             f"only; the Day-28→Day-33 evidence chain is sourced from "
             f"{SLICE_A_UNDERLYING} history, so {symbol} cannot produce a "
             "genuine candidate. Order was not executed.")
+    for leg in request.legs:
+        leg_underlying = normalize_underlying(leg.symbol)
+        if leg_underlying != symbol:
+            raise _fail(
+                "UNSUPPORTED_SYMBOL",
+                f"execution leg underlying {leg_underlying!r} does not "
+                f"match the request underlying {symbol!r}; every leg must "
+                "trade the request's own underlying. Order was not "
+                "executed.")
 
     # 1. Server-side broker market-data authorization (existing mechanism).
     try:
@@ -1532,6 +1624,9 @@ async def produce_candidate_and_execute(
             strategy_id=strategy_id,
             legs=legs,
             underlying=symbol,
+            # Fix D: the fill-basis evidence runs on the very prices this
+            # request will execute and persist (cross-checked fail-closed).
+            fill_prices=prices,
         )
     except ProducerError as exc:
         raise _fail(exc.code, str(exc)) from exc

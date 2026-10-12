@@ -130,14 +130,30 @@ def execute_gated_paper_entry(
         PaperExecutionError,
         execute_strategy,
     )
+    from app.utils.symbols import normalize_underlying
 
-    symbol = str(symbol).upper()
+    symbol = normalize_underlying(symbol)
     strategy_identity = strategy_id or evaluation.strategy_id
     if strategy_id is not None and evaluation.strategy_id is not None \
             and strategy_id != evaluation.strategy_id:
         raise _not_eligible(
             "strategy_id does not match the genuine Day-31 evaluation "
             "strategy identity")
+
+    # Day-50 Fix A: every leg must name the approved request underlying.
+    # The candidate/evaluation evidence is bound to the top-level symbol
+    # only, while the executed order/position identity is persisted per
+    # leg — a mismatched leg symbol would let the executed instrument
+    # disagree with the risked candidate.  Enforced here so a DIRECT
+    # service call to this bridge cannot bypass the invariant; the schema
+    # and the choke point enforce the same rule (zero rows on rejection).
+    for leg in legs:
+        leg_underlying = normalize_underlying(getattr(leg, "symbol", None))
+        if leg_underlying != symbol:
+            raise _not_eligible(
+                f"leg underlying {leg_underlying!r} does not match the "
+                f"request underlying {symbol!r}; every execution leg must "
+                "trade the request's own underlying")
 
     if not legs_match_request(evaluation.legs, legs):
         raise PaperExecutionError(
