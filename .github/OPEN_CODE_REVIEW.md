@@ -249,3 +249,5 @@ OpenCodeReview operates independently alongside:
 - **Human/authorized agent** — Final decision
 
 No AI reviewer depends on another. Each provides independent analysis.
+
+<!-- OpenCodeReview smoke test comment -->
