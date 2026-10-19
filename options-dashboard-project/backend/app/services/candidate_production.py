@@ -1069,8 +1069,29 @@ def produce_candidate_core(
     # never a synthesized key, never a fabricated directional read.  OI
     # LEVELS and volumes are unaffected: they are genuinely measured per
     # side by the canonical payload.
+    #
+    # The coverage set is every valid-strike RAW side whose finite measured
+    # OI contributes to the chain-wide OI LEVELS below — not merely the sides
+    # admitted to ``side_index``.  The priceability index drops any side whose
+    # LTP is unusable, yet such a side's real OI still enters the chain-wide
+    # levels; deriving completeness from ``side_index`` alone let it escape
+    # the coverage test, so a partial ΔOI sum over only the priceable sides
+    # could be presented as the chain's net ΔOI (the raw-chain coverage
+    # defect, Fix B residual).  Measured OI and volume are preserved
+    # unchanged; only the completeness decision broadens to every
+    # OI-contributing raw side.
+    def _oi_contributing_sides():
+        for row in chain.get("chain", []):
+            strike = _finite(row.get("strike"))
+            if strike is None or strike <= 0:
+                continue
+            for side_name in ("call", "put"):
+                if _finite((row.get(side_name) or {}).get("oi")) is not None:
+                    yield (strike, side_name)
+
     chain_delta_oi_complete = bool(side_index) and all(
-        strike_deltas.get(key) is not None for key in side_index)
+        strike_deltas.get(key) is not None
+        for key in _oi_contributing_sides())
 
     rows: list[StrikePositioning] = []
     for row in chain.get("chain", []):

@@ -2520,6 +2520,76 @@ class TestPartialDeltaOiCoverage:
         assert positioning.raw == 1_200_000.0 - 950_000.0
         assert produced.candidate.lifecycle_state.value == "ELIGIBLE"
 
+    def test_unpriced_oi_side_cannot_masquerade_as_full_chain_coverage(
+            self, db_session, monkeypatch):
+        """Raw-chain coverage defect (Fix B residual): completeness was
+        derived from ``side_index`` (the priceability index, which drops any
+        side whose LTP is unusable), while the positioning OI LEVELS are
+        summed over every raw row's finite measured OI.  A raw side carrying
+        real OI and volume but no usable LTP therefore contributed its OI to
+        the chain-wide levels while its (missing) ΔOI escaped the coverage
+        test entirely — so a partial ΔOI sum over only the priceable sides
+        could be presented as the chain's net ΔOI.
+
+        Here every PRICEABLE side has identity-bound, eligible ΔOI (so the
+        old, narrower ``side_index``-only check reads COMPLETE), but an extra
+        non-requested raw strike carries finite positive OI + measured volume
+        with LTP=0 → omitted from ``side_index`` and with no ΔOI.  Coverage
+        must be INCOMPLETE: the chain aggregates stay MISSING (never the
+        partial sum) while the requested legs still evaluate on their own
+        measured evidence and the OI levels stay genuinely measured.
+        """
+        db_session.add_all(prior_candles(all_keys(), 950_000.0))
+        db_session.add_all(spot_closes())
+        db_session.commit()
+        captured: dict = {}
+        _capture_intelligence(monkeypatch, captured)
+
+        # Base fixture: every priceable side carries a snapshot key, and we
+        # seed eligible prior-OI for ALL of them, so the old narrow
+        # (side_index-only) completeness check reads COMPLETE.
+        base = make_chain()
+        # Add a NON-REQUESTED raw strike whose sides have finite OI + measured
+        # volume but UNUSABLE LTP (0.0) → excluded from side_index, no ΔOI.
+        base["chain"].append({
+            "strike": 25200.0,
+            "call": _side(0.0, 500_000.0, None, 100_000.0, 14.0, None,
+                          None, None, gamma=0.03),
+            "put": _side(0.0, 400_000.0, None, 90_000.0, 14.0, None,
+                         None, None, gamma=0.03),
+        })
+
+        produced = run_core(
+            db_session, chain=base,
+            prior_oi=prior_oi_map(db_session, all_keys()))
+
+        # The 25200 sides are NOT priceable → not in side_index …
+        index = _build_side_index(base)
+        assert (25200.0, "call") not in index
+        assert (25200.0, "put") not in index
+        # … but their finite OI genuinely contributes to the chain-wide levels.
+        metrics = captured["metrics_result"]
+        assert metrics.total_call_oi == 1_200_000.0 + 720_000.0 + 500_000.0
+
+        # COVERAGE is incomplete (the 25200 sides carry no ΔOI), so the
+        # chain-wide ΔOI aggregates must be MISSING — never the partial
+        # 4-side sum the old side_index-only check would have called complete.
+        assert metrics.total_call_oi_change is None
+        assert metrics.total_put_oi_change is None
+        assert metrics.net_chain_oi_change is None
+        assert captured["flow_input"].net_ce_oi_change is None
+        assert captured["flow_input"].net_pe_oi_change is None
+        assert captured["inst_input"].net_call_oi_change is None
+        assert captured["inst_input"].net_put_oi_change is None
+
+        # The requested legs still evaluate on their own measured ΔOI …
+        ranked = {r.candidate_id: r for r in produced.ranked_strikes.ranked}
+        positioning = next(
+            c for c in ranked["strike:25000:call"].contributions
+            if c.factor is RankingFactor.POSITIONING)
+        assert positioning.raw == 1_200_000.0 - 950_000.0
+        assert produced.candidate.lifecycle_state.value == "ELIGIBLE"
+
     def test_full_chain_coverage_still_feeds_the_chain_aggregate(
             self, db_session, monkeypatch):
         """The complete-coverage path is preserved: when EVERY measured side
