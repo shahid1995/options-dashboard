@@ -120,6 +120,31 @@ Every substantive completion report should state:
 
 Do not imply deployment or production verification unless it actually occurred.
 
-## 10. Final Rule
+## 10. ChatGPT engineering-supervisor boundary (Markdown-only authoring)
+
+ChatGPT's role is planning, brainstorming, research, architecture analysis, code
+and diff review, test/CI evidence interpretation, writing coding-agent prompts
+and scoped tasks, preparing issues and pull requests, and supervising authorised
+coding agents. It may inspect code, run verification, and create or edit
+repository Markdown documentation.
+
+**ChatGPT must not create, edit, delete, generate, or apply patches to any
+non-Markdown repository file.** This includes application/runtime source,
+tests, scripts, dependency manifests, configuration, CI/workflow files,
+migrations, SQL/schema artifacts, build files, and generated assets. There are
+no exceptions for a small change, a test-only change, or a supposedly necessary
+fix. Reading or testing code is allowed; modifying repository code is not.
+
+When implementation work is needed, ChatGPT prepares the plan, acceptance
+criteria, issue, PR materials, or coding-agent prompt and lets an authorised
+coding agent perform the non-Markdown changes. ChatGPT then independently
+reviews the resulting diff and verification evidence. Any branch, commit, or
+PR whose repository file changes ChatGPT authors must contain Markdown files
+only.
+
+This boundary does not grant authority to merge, deploy, change production data,
+or override the Founder's separate approval requirements.
+
+## 11. Final Rule
 
 **Do not guess when the repository can tell you. Do not change what was not authorized. Do not call work complete without evidence.**
