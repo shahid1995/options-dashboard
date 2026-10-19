@@ -60,14 +60,21 @@ def _opportunity_for(client_order_id: str):
 
 def _genuine_leg(leg) -> OptionLeg:
     """Mirror the Day-33 ``_leg`` builder for one ExecutionLegIn, honoring
-    its expiry so multi-expiry legacy intents stay genuine."""
+    its expiry so multi-expiry legacy intents stay genuine.
+
+    ``ExecutionLegIn.quantity`` is LOTS and ``lot_size`` is CONTRACTS PER
+    LOT, while the domain ``OptionLeg.quantity`` is CONTRACTS: the seeded
+    candidate must carry ``quantity × lot_size`` contracts so the genuine
+    Day-32/33 leg binding matches the execution request exactly (the same
+    rule the production producer applies).
+    """
     direction = PositionDirection.LONG if leg.action == "buy" \
         else PositionDirection.SHORT
     return OptionLeg(
         option_type=Side.CALL if leg.option_type.lower() == "call" else Side.PUT,
         strike=float(leg.strike_price),
         expiry=leg.expiration_date,
-        quantity=float(leg.quantity),
+        quantity=float(leg.quantity) * float(leg.lot_size),
         direction=direction,
         entry_price=100.0,
         implied_volatility=0.2,
@@ -126,4 +133,32 @@ def day34_gated_seeding(monkeypatch):
     monkeypatch.setattr("app.routers.paper.execute_strategy", gated_execute)
     monkeypatch.setattr(
         "app.services.paper_execution.execute_strategy", gated_execute)
+
+    # Day 50 (Issue #118): the production route no longer calls bare
+    # execute_strategy — it produces the genuine candidate server-side via
+    # candidate_production.produce_candidate_and_execute first.  Legacy
+    # suites seed through that SAME production seam: the wrapper acquires
+    # no broker evidence at all and hands the bare intent to the genuine
+    # Day-28→Day-33 chain below (no fabricated evidence; the real engines
+    # decide eligibility exactly as before).
+    from app.services.candidate_production import (
+        produce_candidate_and_execute as _real_producer,
+    )
+
+    async def seeded_producer(user_id, db, request, prices, **kwargs):
+        candidate = _genuine_candidate_for(request)
+        if candidate is None:
+            # Genuine chain cannot produce eligibility — leave the real
+            # producer to fail closed exactly as it does in production.
+            return await _real_producer(user_id, db, request, prices, **kwargs)
+        return _real_execute_strategy(
+            user_id, request, db, prices,
+            risk_candidate=candidate,
+            risk_policy=PAPER_ENTRY_POLICY,
+        )
+
+    monkeypatch.setattr(
+        "app.services.candidate_production.produce_candidate_and_execute",
+        seeded_producer,
+    )
     yield
