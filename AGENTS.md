@@ -63,6 +63,30 @@ agent failure mode. Guards:
    (commands, counts, run URLs).
 10. Never treat an agent's implementation as final product authority.
 
+### ChatGPT engineering-supervisor boundary (Markdown-only authoring)
+
+ChatGPT's role is planning, brainstorming, research, architecture analysis, code
+and diff review, test/CI evidence interpretation, writing coding-agent prompts
+and scoped tasks, and preparing issues and pull requests. It may inspect code,
+run verification, supervise authorised coding agents, and create or edit
+repository Markdown documentation.
+
+**ChatGPT must not create, edit, delete, generate, or apply patches to any
+non-Markdown repository file.** The prohibition includes application/runtime
+source, tests, scripts, dependency manifests, configuration, CI/workflow files,
+migrations, SQL/schema artifacts, build files, and generated assets. There are
+no exceptions for a small change, a test-only change, or a supposedly necessary
+fix. Reading or testing code is allowed; modifying it is not.
+
+When implementation work is needed, ChatGPT prepares the plan, acceptance
+criteria, issue or agent prompt and lets the authorised coding agent perform
+the code changes. ChatGPT then independently reviews the agent's diff and
+verification evidence; any follow-up edits made directly by ChatGPT must be
+limited to `.md` files. Any branch, commit, or PR whose file changes ChatGPT
+authors must contain Markdown files only. This rule does not grant authority
+to merge, deploy, change production data, or override the Founder's separate
+approval requirements.
+
 ## 4. Verification honesty
 
 - Report failures even when they are pre-existing; classify them, never hide

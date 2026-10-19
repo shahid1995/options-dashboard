@@ -125,3 +125,9 @@ Founder acceptance.
    ever run under a different creator/owner role, the default-privilege
    configuration MUST be re-applied for that role as part of the role
    change — it does not follow automatically (ADR-018).
+
+21. **ChatGPT is Markdown-only for repository file changes.** ChatGPT may
+    plan, research, review, verify, supervise coding agents, write prompts, and
+    author Markdown documentation, but it must not create or modify non-`.md`
+    repository files. The enforceable boundary and delegation workflow live in
+    [`AGENTS.md`](AGENTS.md) under the ChatGPT engineering-supervisor boundary.

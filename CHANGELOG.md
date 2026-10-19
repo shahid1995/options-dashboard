@@ -8,6 +8,21 @@ Format: date — change — reference.
 
 ---
 
+## 2026-10-19 — ChatGPT Markdown-only engineering-supervisor boundary (Issue #131)
+
+- Amended the Spec Kit constitution to version 1.1.0 and added a binding
+  operating rule: ChatGPT may plan, research, review, verify, supervise coding
+  agents, write prompts, prepare issues/PRs, and edit Markdown documentation,
+  but must not create or modify non-Markdown repository files.
+- Linked the rule from `AI.md` and recorded it in `INVARIANTS.md`; detailed
+  enforcement lives in `AGENTS.md`. Code changes remain the responsibility
+  of an authorised coding agent.
+- Documentation-only governance amendment. No source, test, script, workflow,
+  configuration, migration, dependency, or build files changed. Delivered in a
+  separate Draft PR; no merge, deployment, or production data action authorised.
+
+---
+
 ## 2026-09-26 — PR #106 production cutover: migration serialization + future-table privilege defaults (ADR-017/ADR-018)
 
 - Merged PR #106 (`fix(db): serialize production migrations`, head `c5d2f7e`,
