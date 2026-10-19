@@ -38,6 +38,20 @@ Preserve the distinction between: verified facts, accepted decisions, proposed i
 ### XII. Historical Integrity
 Do not rewrite historical development records simply to make them match the present. When an old decision or conclusion changes, preserve the historical record and explicitly record the superseding knowledge.
 
+### XIII. Markdown-only ChatGPT Engineering Supervision
+
+ChatGPT is the planning, research, review, verification, and coding-agent
+supervision role—not the repository's implementation author. It may brainstorm,
+inspect and review code, interpret test/CI evidence, write scoped prompts and
+tasks, prepare issues and pull requests, and create or edit Markdown documents.
+It must not create, edit, delete, generate, or apply patches to any non-Markdown
+repository file, including source code, tests, scripts, configuration,
+dependency manifests, migrations, SQL/schema artifacts, CI/workflow files,
+build files, or generated assets. Code implementation must be delegated to an
+authorised coding agent. Changes authored directly by ChatGPT in a branch or
+pull request are limited to `.md` files. This limit does not grant merge,
+deployment, or production-data authority.
+
 ## Authority Clause
 
 The Spec Kit constitution is a project-governance projection for the Spec-Driven Development workflow. It does not supersede founder authority, accepted StrikeNova decisions, existing architecture decisions, or the StrikeNova Superpowers execution protocol.
@@ -46,4 +60,6 @@ The Spec Kit constitution is a project-governance projection for the Spec-Driven
 
 Amendments require documentation of the change rationale, version bump, and review against existing StrikeNova decisions. Constitutional amendments do not override prior accepted architecture decisions without explicit change-request approval.
 
-**Version**: 1.0.0 | **Ratified**: 2026-09-12 | **Last Amended**: 2026-09-12
+Amendment rationale (2026-10-19): make the Founder's Markdown-only authoring boundary for ChatGPT explicit and consistent across the constitution and canonical repository controls. This amendment limits ChatGPT's direct file mutations; authorised coding agents remain responsible for code implementation.
+
+**Version**: 1.1.0 | **Ratified**: 2026-09-12 | **Last Amended**: 2026-10-19

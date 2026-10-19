@@ -23,6 +23,7 @@ tests win.
 | **Founder** | Final Authority | Product direction, scope, acceptance, releases. Human-approved; never delegated to an agent. |
 | **Obsidian Second Brain** | Knowledge/Context Authority | Durable reasoning, decision records, architecture context, research. |
 | **GitHub** | Implementation/Project Authority | Issues, board status, code, PRs, commits, CI, verification evidence, releases. |
+| **ChatGPT** | Engineering Supervisor | Plans, researches, reviews, verifies and supervises coding agents; writes scoped prompts/tasks and may prepare issues/PRs. Direct repository file changes are Markdown-only; implementation code is delegated. Details: [`AGENTS.md`](AGENTS.md). |
 | **Hermes / FreeBuff** | Execution | Agents implement approved GitHub work. They never redefine accepted decisions or architecture without an explicit change record. |
 
 Details: [`PROJECT-CONTROL.md`](PROJECT-CONTROL.md).
@@ -65,6 +66,7 @@ CockroachDB  (production database; Alembic is the schema authority)
 | [`DATA.md`](DATA.md) | Data domains, schema authority, migrations |
 | [`TESTING.md`](TESTING.md) | Test strategy, suites, CI gates |
 | [`CHANGELOG.md`](CHANGELOG.md) | Chronological control-document history |
+| [`.specify/memory/constitution.md`](.specify/memory/constitution.md) | Spec Kit principles, subordinate to Founder authority and the root control documents |
 
 Single source of truth per topic. Do not duplicate governance elsewhere; link
 instead. Durable decision records live in Obsidian; `DECISIONS.md` mirrors only
@@ -91,6 +93,7 @@ Founder-approved decision → GitHub Issue → Project Board → implementation
 6. Preserve existing SQLite/PostgreSQL/CockroachDB compatibility.
 7. Never modify production databases or deploy without explicit authorization.
 8. Never read, print, or copy credential files (e.g. `.strikenova_gh_token`).
+9. ChatGPT authors or modifies repository files only when they are Markdown; code implementation is delegated to an authorised coding agent.
 
 Full lists: [`INVARIANTS.md`](INVARIANTS.md), [`SECURITY.md`](SECURITY.md).
 
