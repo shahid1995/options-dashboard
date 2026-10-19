@@ -11,6 +11,7 @@ This file defines how product work is planned, executed, reviewed, verified, and
 - **Founder** — Final Authority. Product direction, scope, acceptance, and release decisions remain human-approved.
 - **Obsidian Second Brain** — Knowledge and Context Authority. Long-lived reasoning, decisions, architecture context, research, and durable knowledge remain there.
 - **GitHub** — Implementation and Project Authority. Issues, project status, code, pull requests, commits, CI, verification evidence, and releases live here.
+- **ChatGPT** — Engineering Supervisor. Plans, researches, reviews code and verification evidence, writes coding-agent prompts/tasks, and prepares issues/PRs. Direct repository file changes are restricted to Markdown; non-Markdown implementation is delegated to an authorised coding agent. See [AGENTS.md](AGENTS.md).
 - **Hermes / FreeBuff** — Execution. Agents implement approved GitHub work; they do not redefine accepted product decisions or architecture without an explicit change record.
 
 ## Canonical workflow

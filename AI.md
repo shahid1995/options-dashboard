@@ -55,6 +55,8 @@ If the apparent conflict cannot be resolved from these sources, stop and surface
 
 ## 4. Source-of-Truth Boundaries
 
+**ChatGPT engineering-supervisor boundary:** ChatGPT may plan, research, brainstorm, review code/diffs, interpret tests and CI evidence, supervise authorised coding agents, prepare prompts/issues/PRs, and author Markdown docs. It must not create or modify non-Markdown repository files; implementation code is delegated to an authorised coding agent. Detailed rule: [AGENTS.md](AGENTS.md).
+
 - **GitHub:** implementation authority.
 - **Obsidian:** knowledge/context authority.
 - **Founder:** final authority for product and architectural decisions.
