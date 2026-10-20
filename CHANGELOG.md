@@ -106,6 +106,34 @@ Historical collection should therefore not be enabled implicitly merely because 
 
 Do not treat startup table creation or local SQLite behavior as the production schema authority.
 
+### 2026-10-20 — Anonymous registration cannot link credentials
+
+**Category:** Security
+
+**Change**
+
+`POST /auth/register` now fails closed for every pre-existing email address with one generic `409` response. It no longer attaches or replaces a local password on an existing account, including OAuth-created accounts that had no password, and it no longer returns the existing account's `user_id`.
+
+**Why**
+
+An unauthenticated caller could submit the email address of an existing Google/Upstox-created account and choose its local password, then sign in with it — account takeover without any ownership proof. The previous branch also distinguished OAuth accounts from local accounts in its response, which was an enumeration oracle.
+
+**Impact**
+
+Endpoints: `POST /auth/register`. No schema, session, verification, broker-authorization, or frontend contract change. Legitimate new registrations and OAuth sign-in are unchanged.
+
+**Verification**
+
+New regression tests in `backend/tests/test_auth_router.py` cover OAuth (Google and Upstox) and local pre-existing accounts, non-authentication of the attacker password, enumeration resistance, and continued Google sign-in. See the pull request for commands and results.
+
+**Related decision/invariant**
+
+SECURITY.md §12.1; INV-007 (credential ownership) and INV-024 (server-boundary authentication).
+
+**Commit/PR**
+
+See the `security/auth-register-no-password-linking` pull request.
+
 ---
 
 ## Change-entry template

@@ -405,6 +405,17 @@ The current implementation:
 
 Password verification failures must not leak whether an account or credential component exists beyond what the application's authentication contract intentionally exposes.
 
+### 12.1 Anonymous registration cannot link credentials
+
+An unauthenticated registration request is not proof of ownership of an existing account. `POST /auth/register` therefore fails closed for every pre-existing email address with the same generic `409` response, regardless of the account's identity source (local email/password, Google, or broker OAuth):
+
+- it does not create or replace `password_hash`;
+- it does not overwrite `display_name`, status, identity source, verification state, or broker associations;
+- it does not create a session;
+- it does not reveal whether the address belongs to a local or OAuth-created account.
+
+Linking a local password to an OAuth-created account requires a separate, explicitly designed flow that proves ownership — authenticated plus recent authentication, or a verified single-use, expiry-bound token. Supplying an existing address is never sufficient proof on its own.
+
 ---
 
 ## 13. Paper-trading security boundary

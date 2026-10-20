@@ -1,4 +1,5 @@
 from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -8,6 +9,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.config import settings
 from app.db import Base, get_db
+from app.identity import User, UserSession, hash_password
 from app.main import app
 from app.services import token_store, upstox
 
@@ -364,3 +366,153 @@ def test_register_response_exposes_no_secrets(client):
     assert "password" not in body
     assert "password_hash" not in body
     assert body["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# Security: anonymous registration must never link credentials to an
+# existing account (P1 account-takeover regression)
+# ---------------------------------------------------------------------------
+
+ATTACKER_PASSWORD = "AttackerPass123!"
+
+
+def _seed_existing_user(db, email, *, identity_source, password=None,
+                        display_name="Existing Owner", **extra):
+    """Seed a pre-existing account directly, bypassing the registration route."""
+    user = User(
+        id=str(uuid4()),
+        email=email,
+        password_hash=hash_password(password) if password else None,
+        display_name=display_name,
+        status="active",
+        identity_source=identity_source,
+        **extra,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def _snapshot(user):
+    """Every persisted User column, so any unintended write is detected."""
+    return {column.key: getattr(user, column.key) for column in user.__table__.columns}
+
+
+@pytest.mark.parametrize(
+    "identity_source,extra",
+    [
+        ("google", {"google_sub": "google-sub-attacked"}),
+        (
+            "upstox",
+            {"broker_provider": "UPSTOX", "broker_user_id": "upstox-user-attacked"},
+        ),
+    ],
+)
+def test_register_never_sets_a_password_on_an_existing_oauth_account(
+    client, db_session, identity_source, extra
+):
+    """Anonymous POST /auth/register must not attach a password to an OAuth user."""
+    email = f"oauth-{identity_source}@test.com"
+    user = _seed_existing_user(
+        db_session, email, identity_source=identity_source,
+        display_name="OAuth Owner", **extra,
+    )
+    before = _snapshot(user)
+
+    resp = _register_user(client, email, ATTACKER_PASSWORD, "Attacker")
+
+    # Generic, enumeration-resistant failure — no identity disclosure and no
+    # false claim that a password was attached.
+    assert resp.status_code == 409
+    assert resp.json() == {"detail": "An account with this email already exists"}
+    assert "user_id" not in resp.json()
+    assert "session_id" not in resp.json()
+    assert resp.headers.get("set-cookie") is None
+    assert db_session.query(UserSession).count() == 0
+
+    # The existing account is byte-for-byte unchanged: no password, no profile
+    # overwrite, no identity-source/verification/broker association change.
+    db_session.expire_all()
+    after = _snapshot(db_session.query(User).filter(User.id == user.id).one())
+    assert after == before
+    assert after["password_hash"] is None
+
+    # The attacker-chosen password does not authenticate the pre-existing user.
+    login = _login_email(client, email, ATTACKER_PASSWORD)
+    assert login.status_code == 401
+    assert login.headers.get("set-cookie") is None
+
+
+def test_duplicate_registration_preserves_an_existing_local_account(client, db_session):
+    """A duplicate anonymous registration must not rewrite a local account."""
+    email = "local-owner@test.com"
+    assert _register_user(client, email, "OriginalPass123!", "Original Name").status_code == 200
+
+    user = db_session.query(User).filter(User.email == email).one()
+    before = _snapshot(user)
+    sessions_before = db_session.query(UserSession).count()
+
+    resp = _register_user(client, email, ATTACKER_PASSWORD, "Attacker")
+
+    assert resp.status_code == 409
+    assert resp.json() == {"detail": "An account with this email already exists"}
+    assert "user_id" not in resp.json()
+    assert resp.headers.get("set-cookie") is None
+    assert db_session.query(UserSession).count() == sessions_before
+
+    db_session.expire_all()
+    after = _snapshot(db_session.query(User).filter(User.id == user.id).one())
+    assert after == before
+
+    # Original credentials still work; the attacker-chosen password does not.
+    assert _login_email(client, email, "OriginalPass123!").status_code == 200
+    assert _login_email(client, email, ATTACKER_PASSWORD).status_code == 401
+
+
+def test_duplicate_registration_does_not_distinguish_account_type(client, db_session):
+    """OAuth-created and local accounts must produce an identical response."""
+    _seed_existing_user(
+        db_session, "enum-oauth@test.com", identity_source="google",
+        google_sub="google-sub-enum",
+    )
+    assert _register_user(client, "enum-local@test.com", "OriginalPass123!").status_code == 200
+
+    oauth_resp = _register_user(client, "enum-oauth@test.com", ATTACKER_PASSWORD)
+    local_resp = _register_user(client, "enum-local@test.com", ATTACKER_PASSWORD)
+
+    assert oauth_resp.status_code == 409
+    assert local_resp.status_code == 409
+    assert oauth_resp.json() == local_resp.json()
+    assert oauth_resp.headers.get("set-cookie") == local_resp.headers.get("set-cookie")
+
+
+def test_blocked_password_link_leaves_oauth_sign_in_working(client, db_session, monkeypatch):
+    """The fix must not disable legitimate Google sign-in for the account."""
+    import app.routers.auth as auth_mod
+
+    monkeypatch.setattr(
+        auth_mod,
+        "_verify_google_token",
+        lambda credential, expected_nonce: {
+            "sub": "google-sub-still-works",
+            "email": "still-oauth@test.com",
+            "name": "Still OAuth",
+        },
+    )
+
+    first = client.post(
+        "/auth/google",
+        json={"credential": "fake", "state": token_store.create_google_oauth_state()},
+    )
+    assert first.status_code == 200
+    user_id = first.json()["user"]["user_id"]
+
+    assert _register_user(client, "still-oauth@test.com", ATTACKER_PASSWORD).status_code == 409
+
+    second = client.post(
+        "/auth/google",
+        json={"credential": "fake", "state": token_store.create_google_oauth_state()},
+    )
+    assert second.status_code == 200
+    assert second.json()["user"]["user_id"] == user_id

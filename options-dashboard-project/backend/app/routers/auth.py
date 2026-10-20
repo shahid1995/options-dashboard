@@ -325,17 +325,20 @@ def register(
     if len(password) > 128:
         raise HTTPException(status_code=422, detail="Password must be 128 characters or fewer")
 
-    # Check if email already exists
+    # An anonymous registration request proves nothing about ownership of an
+    # existing account, so it must never attach or replace local credentials.
+    # Every pre-existing account shape fails closed with the same generic
+    # response: otherwise the route both enables account takeover (an attacker
+    # supplies an OAuth user's email and chooses their password) and leaks
+    # whether the address belongs to an OAuth or a local account.
+    # Linking a local password to an existing account requires a separate
+    # authenticated + recent-authentication (or verified single-use token)
+    # flow, which this endpoint deliberately does not implement.
     existing = db.query(User).filter(User.email == email).one_or_none()
     if existing is not None:
-        if existing.identity_source == "email" and existing.password_hash:
-            raise HTTPException(status_code=409, detail="An account with this email already exists")
-        # OAuth-created account with same email — link the password
-        existing.password_hash = hash_password(password)
-        if display_name:
-            existing.display_name = display_name
-        db.commit()
-        return {"ok": True, "message": "Password set for existing account", "user_id": existing.id}
+        raise HTTPException(
+            status_code=409, detail="An account with this email already exists"
+        )
 
     user = User(
         id=str(uuid4()),
