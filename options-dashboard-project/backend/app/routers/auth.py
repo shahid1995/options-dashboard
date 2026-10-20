@@ -1496,8 +1496,11 @@ def account_register(
     through the provider-neutral transport. No session is created — the user
     must verify their email before logging in.
 
-    Enumeration protection: a duplicate local registration returns the same
-    200 shape as a fresh one without creating accounts or tokens.
+    Enumeration protection: any pre-existing account gets the same generic 200
+    shape as a fresh registration, without creating accounts or tokens.
+
+    Ownership: an anonymous request proves nothing about ownership of an
+    existing account, so it never attaches or replaces a local password.
     """
     email = account_security.normalize_email(email)
     detail = account_security.validate_registration(email, password)
@@ -1506,19 +1509,21 @@ def account_register(
 
     existing = db.query(User).filter(User.email == email).one_or_none()
     if existing is not None:
-        if existing.identity_source == "email" and existing.password_hash:
-            # Enumeration-resistant generic response; no state change.
-            return {
-                "ok": True,
-                "message": "Check your email to verify your account.",
-            }
-        # OAuth-linked account (google/upstox) without a local password:
-        # setting a password follows the legacy /auth/register contract.
-        existing.password_hash = hash_password(password)
-        if display_name:
-            existing.display_name = display_name
-        db.commit()
-        return {"ok": True, "message": "Check your email to verify your account."}
+        # Fail closed for every pre-existing account.  Submitting an existing
+        # address is not proof of ownership, so this request must never attach
+        # or replace a local password, overwrite profile/identity fields, issue
+        # verification or recovery tokens, or create a session.  Otherwise an
+        # anonymous caller could set a password on an OAuth-created account
+        # (Google/Upstox have no password_hash) and then log in as that user.
+        # The response is identical for local, Google and Upstox accounts, so
+        # it also preserves enumeration resistance.
+        # Adding a local password to an existing account requires a separate
+        # authenticated + recent-authentication (or verified single-use token)
+        # flow, which is deliberately not implemented here.
+        return {
+            "ok": True,
+            "message": "Check your email to verify your account.",
+        }
 
     user = User(
         id=str(uuid4()),
