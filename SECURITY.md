@@ -105,13 +105,13 @@ credential handling above is unchanged.)*
 An unauthenticated registration request is not proof of ownership of an
 existing account. On this branch the legacy `POST /auth/register` route fails
 closed for **every** pre-existing email address — local email/password,
-Google, and Upstox/broker-OAuth accounts alike:
+Google, and Upstox/broker-OAuth accounts alike. For those requests the route:
 
-- it never hashes, attaches, or replaces `password_hash`;
-- it does not overwrite `display_name`, `status`, `identity_source`,
+- never hashes, attaches, or replaces `password_hash`;
+- never overwrites `display_name`, `status`, `identity_source`,
   verification state, or broker associations;
-- it creates no session or cookie, issues no token, and sends no email;
-- it never returns the existing account's `user_id` or any account identifier.
+- creates no session or cookie, issues no token, and sends no email;
+- never returns the existing account's `user_id` or any account identifier.
 
 The blocked attempt receives the same generic `200` body
 (`{"ok": true, "message": "If this email is not already registered, your
@@ -119,15 +119,16 @@ account has been created."}`) that existing local accounts already received, so
 the response no longer distinguishes an OAuth-created account from a local one
 and no longer claims a password was set.
 
-Deliberate contract note: this branch keeps the route's existing non-enumerating
-`200` shape instead of the `409` used by the `main` fix (PR #135). A `409` is a
-status-level existence oracle and this branch's
+Deliberate contract note: this branch keeps the route's existing status-level
+contract — always `200`, never a `409` — instead of the `409` used by the `main`
+fix (PR #135). A `409` is a status-level existence oracle, and this branch's
 `tests/test_auth_security_gaps.py::test_register_does_not_leak_existing_email`
-explicitly forbids it on this route. The duplicate response still differs from a
+explicitly forbids it on this route. The status code is therefore
+non-enumerating; the body is not. The duplicate response still differs from a
 freshly created account's response (which carries `message: "Account created"`
-and a `user_id`), so account existence remains inferable from the body; making
-the legacy route fully non-enumerating needs a separate product/API decision and
-is **not** claimed here.
+and a `user_id`), so account existence remains inferable from the body. Making
+the legacy route fully non-enumerating — identical bodies for both outcomes —
+needs a separate product/API decision and is **not** claimed here.
 
 Linking a local password to an OAuth-created account requires a separate,
 explicitly designed flow that proves ownership — authenticated plus recent

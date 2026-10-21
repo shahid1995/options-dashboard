@@ -299,7 +299,9 @@ def _oauth_user(db_session, email, *, identity_source, **extra):
     return user
 
 
-ATTACKER_PASSWORD = "AttackerPass123!"
+# Synthetic per-run credential: the attack case needs an arbitrary password,
+# not a fixed literal that could be mistaken for a real one.
+ATTACKER_PASSWORD = f"attacker-{uuid4().hex}"
 
 
 def _user_snapshot(user):
@@ -413,7 +415,10 @@ class TestLegacyRegistrationCannotLinkAnExistingAccount:
     ):
         """A repeat registration for a local account changes nothing and the
         original credential keeps working."""
-        user = _create_active_user(db_session, email="local-owner@test.com")
+        owner_password = f"local-{uuid4().hex}"
+        user = _create_active_user(
+            db_session, email="local-owner@test.com", password=owner_password
+        )
         before = _user_snapshot(user)
         counts_before = self._counts(db_session)
 
@@ -435,7 +440,7 @@ class TestLegacyRegistrationCannotLinkAnExistingAccount:
         # Original password still authenticates; the attacker password does not.
         ok = client.post(
             "/auth/login-email",
-            json={"email": "local-owner@test.com", "password": "password123"},
+            json={"email": "local-owner@test.com", "password": owner_password},
         )
         assert ok.status_code == 200
         assert ok.cookies.get(SESSION_COOKIE_NAME)
