@@ -903,3 +903,50 @@ class TestGoogleMandatoryNonceBinding:
             # This will pass nonce/issuer pre-flight checks but fail at PyJWT exp check
             result = _verify_google_token(token, expected_nonce="valid-nonce")
             assert result is None  # Rejected: expired JWT
+
+
+# ---------------------------------------------------------------------------
+# Test: legacy registration fix does not disturb Google sign-in
+# ---------------------------------------------------------------------------
+
+
+class TestGoogleSignInAfterBlockedLegacyRegistration:
+    """The legacy password-linking fix must leave OAuth sign-in untouched."""
+
+    @patch("app.routers.auth._verify_google_token")
+    def test_blocked_legacy_registration_then_google_sign_in(self, mock_verify, client, db):
+        mock_verify.return_value = {
+            "sub": "google-sub-after-fix",
+            "email": "after-fix@gmail.com",
+            "name": "Google Owner",
+        }
+
+        # An account created by Google sign-in has no local password.
+        first = client.post(
+            "/auth/google", json={"credential": "fake-jwt", "state": _make_valid_state()}
+        )
+        assert first.status_code == 200
+        user = db.query(User).filter(User.google_sub == "google-sub-after-fix").one()
+        assert user.identity_source == "google"
+        assert user.password_hash is None
+
+        # An anonymous legacy registration for the same address is refused and
+        # cannot attach a password.
+        blocked = client.post(
+            "/auth/register",
+            json={"email": user.email, "password": "AttackerPass123!"},
+        )
+        assert blocked.status_code == 200
+        assert "user_id" not in blocked.text
+
+        # Legitimate Google sign-in still works and the account stays OAuth-only.
+        second = client.post(
+            "/auth/google", json={"credential": "fake-jwt", "state": _make_valid_state()}
+        )
+        assert second.status_code == 200
+        assert _login_session_id(second)
+
+        db.expire_all()
+        user = db.query(User).filter(User.id == user.id).one()
+        assert user.password_hash is None
+        assert user.identity_source == "google"
