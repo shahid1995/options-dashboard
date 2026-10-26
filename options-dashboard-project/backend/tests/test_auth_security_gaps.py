@@ -7,6 +7,7 @@ Covers gaps identified in Phase 1 audit:
   K. Session security — secure cookie properties
 """
 
+import secrets
 import time
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -533,13 +534,12 @@ class TestLegacyRegistrationCannotLinkAnExistingAccount:
         assert after["status"] == before["status"]
         assert after["password_hash"] is None
 
-    def test_genuinely_new_registration_still_creates_an_account(
-        self, client, db_session
-    ):
+    def test_genuinely_new_registration_still_creates_an_account(self, client, db_session):
         """Preserved behaviour: a new address still registers and can log in."""
+        synthetic_password = secrets.token_urlsafe(12)
         resp = client.post(
             "/auth/register",
-            json={"email": "brand-new@test.com", "password": "NewOwnerPass123!"},
+            json={"email": "brand-new@test.com", "password": synthetic_password},
         )
 
         assert resp.status_code == 200
@@ -555,6 +555,6 @@ class TestLegacyRegistrationCannotLinkAnExistingAccount:
 
         login = client.post(
             "/auth/login-email",
-            json={"email": "brand-new@test.com", "password": "NewOwnerPass123!"},
+            json={"email": "brand-new@test.com", "password": synthetic_password},
         )
         assert login.status_code == 200
