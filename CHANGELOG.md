@@ -8,6 +8,27 @@ Format: date — change — reference.
 
 ---
 
+## 2026-10-21 — Legacy registration can no longer link credentials to an existing account
+
+- `POST /auth/register` (`backend/app/routers/auth.py`) now fails closed for
+  every pre-existing email address. It no longer writes the submitted
+  password onto a Google/Upstox-created account, no longer overwrites
+  `display_name`, and no longer returns the existing account's `user_id` with a
+  `"Password set for existing account"` message.
+- All pre-existing account shapes receive the route's existing generic `200`
+  body, so the response no longer distinguishes OAuth-created from local
+  accounts. New-account registration, OAuth sign-in, and the route's rate limit
+  are unchanged; no session, token, or email is produced for a blocked attempt.
+- Residual, explicitly out of scope: the duplicate response still differs from a
+  fresh registration (which returns `user_id`), so existence remains inferable
+  from the body; full non-enumeration needs a separate product/API decision.
+  `POST /auth/account/register` on this branch still has the password-linking
+  branch and is fixed by PR #136.
+- References: `SECURITY.md` §6.1; propagation of the `main` fix in PR #135 to
+  the Day-50 line.
+
+---
+
 ## 2026-09-26 — PR #106 production cutover: migration serialization + future-table privilege defaults (ADR-017/ADR-018)
 
 - Merged PR #106 (`fix(db): serialize production migrations`, head `c5d2f7e`,
