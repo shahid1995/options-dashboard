@@ -99,6 +99,15 @@ credential handling above is unchanged.)*
   stored **hashed** (`hash_session_id`) in `UserSession`/`BrokerToken` rows.
 - Agents never read, print, copy, decode, or expose credential files
   (including `.strikenova_gh_token`) — [`AGENTS.md`](AGENTS.md) §5.
+- Anonymous registration never attaches local credentials to an existing
+  account. `POST /auth/account/register` fails closed for every pre-existing
+  email — no `password_hash`, `display_name`, status, identity-source,
+  verification-state or broker-field write, no session, no verification or
+  reset token, and no account identifier in the response. Submitting an
+  address is never proof of ownership: adding a local password to an
+  OAuth-created account requires a separate authenticated +
+  recent-authentication (or verified single-use token) flow. The legacy
+  `POST /auth/register` is remediated separately (`security/auth-register-no-password-linking`, PR #135 on `main`).
 
 ## 7. Server authority
 

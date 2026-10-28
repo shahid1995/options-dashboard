@@ -13,6 +13,7 @@ StrikeNova User and manage durable UserSessions. They NEVER invoke the broker
 gateway. GET /auth/login remains the broker OAuth initiation route.
 """
 
+import secrets
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 from uuid import uuid4
@@ -116,6 +117,34 @@ def _local_user(
     db.commit()
     db.refresh(user)
     return user
+
+
+def _oauth_user(db, email, *, identity_source, display_name="OAuth Owner", **extra):
+    """Create an OAuth-created (Google/Upstox) user with no local password."""
+    user = User(
+        id=str(uuid4()),
+        email=email,
+        password_hash=None,
+        display_name=display_name,
+        status="active",
+        identity_source=identity_source,
+        **extra,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+# Per-run synthetic credential, never a repository literal, so no hardcoded
+# password enters the source. 16 URL-safe characters always satisfies the
+# application's 8–128 character registration policy.
+ATTACKER_PASSWORD = secrets.token_urlsafe(12)
+
+
+def _user_snapshot(user):
+    """Every persisted User column, so any unintended write is detected."""
+    return {column.key: getattr(user, column.key) for column in user.__table__.columns}
 
 
 ACCOUNT = "/auth/account"
@@ -522,6 +551,200 @@ class TestAccountRegistration:
         assert users == 1
         after = db_session.query(EmailVerificationToken).count()
         assert after == before  # no new token for the duplicate attempt
+
+
+class TestAccountRegistrationCannotLinkAnExistingAccount:
+    """P1 regression: an anonymous registration request must never attach or
+    replace credentials (or any other field) on a pre-existing account.
+
+    An attacker who supplies an OAuth user's email plus a chosen password used
+    to obtain a working local password on that account and could then sign in
+    through the account login route without any ownership proof.
+    """
+
+    GENERIC = {"ok": True, "message": "Check your email to verify your account."}
+
+    @staticmethod
+    def _counts(db):
+        from app.identity import EmailVerificationToken, PasswordResetToken
+
+        return (
+            db.query(EmailVerificationToken).count(),
+            db.query(PasswordResetToken).count(),
+            db.query(UserSession).count(),
+        )
+
+    def _assert_row_and_artifacts_unchanged(self, db_session, user, before, counts_before):
+        db_session.expire_all()
+        after = _user_snapshot(db_session.query(User).filter(User.id == user.id).one())
+        assert after == before
+        assert self._counts(db_session) == counts_before
+        return after
+
+    @pytest.mark.parametrize(
+        "identity_source,extra",
+        [
+            ("google", {"google_sub": "google-sub-attacked"}),
+            (
+                "upstox",
+                {"broker_provider": "UPSTOX", "broker_user_id": "upstox-attacked"},
+            ),
+        ],
+    )
+    def test_oauth_account_cannot_gain_a_local_password(
+        self, client, db_session, identity_source, extra
+    ):
+        email = f"{identity_source}-victim@example.com"
+        user = _oauth_user(db_session, email, identity_source=identity_source, **extra)
+        before = _user_snapshot(user)
+        counts_before = self._counts(db_session)
+
+        resp = client.post(
+            f"{ACCOUNT}/register",
+            json={
+                "email": email,
+                "password": ATTACKER_PASSWORD,
+                "display_name": "Attacker Chosen",
+            },
+        )
+
+        # Same generic response as a fresh registration: no identity, no
+        # password-link claim, and no authentication artifact.
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == self.GENERIC
+        assert "session_id" not in resp.json()
+        assert "user_id" not in resp.text
+        assert SESSION_COOKIE_NAME not in resp.headers.get("set-cookie", "")
+
+        # No verification email was issued for the pre-existing account.
+        from app.services.email import get_sent_messages
+
+        assert get_sent_messages() == []
+
+        # Every persisted column, plus token/session counts, is unchanged.
+        after = self._assert_row_and_artifacts_unchanged(
+            db_session, user, before, counts_before
+        )
+        assert after["password_hash"] is None
+        assert after["display_name"] == before["display_name"]
+
+        # The attacker-chosen password authenticates nothing, at either
+        # local-login boundary.
+        account_login = client.post(
+            f"{ACCOUNT}/login", json={"email": email, "password": ATTACKER_PASSWORD}
+        )
+        assert account_login.status_code == 401
+        assert SESSION_COOKIE_NAME not in account_login.headers.get("set-cookie", "")
+
+        legacy_login = client.post(
+            "/auth/login-email", json={"email": email, "password": ATTACKER_PASSWORD}
+        )
+        assert legacy_login.status_code == 401
+
+    def test_duplicate_local_registration_preserves_the_account(
+        self, client, db_session
+    ):
+        # Per-run synthetic credential for the legitimate owner account, so no
+        # additional password literal sits in the repository.
+        owner_password = secrets.token_urlsafe(12)
+        user = _local_user(
+            db_session, email="local-owner@example.com", password=owner_password
+        )
+        before = _user_snapshot(user)
+        counts_before = self._counts(db_session)
+
+        resp = client.post(
+            f"{ACCOUNT}/register",
+            json={
+                "email": "local-owner@example.com",
+                "password": ATTACKER_PASSWORD,
+                "display_name": "Attacker Chosen",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == self.GENERIC
+        assert self._assert_row_and_artifacts_unchanged(
+            db_session, user, before, counts_before
+        ) == before
+
+        # Original credentials keep working; the attacker password does not.
+        ok = client.post(
+            f"{ACCOUNT}/login",
+            json={"email": "local-owner@example.com", "password": owner_password},
+        )
+        assert ok.status_code == 200
+        bad = client.post(
+            f"{ACCOUNT}/login",
+            json={"email": "local-owner@example.com", "password": ATTACKER_PASSWORD},
+        )
+        assert bad.status_code == 401
+
+    def test_response_does_not_distinguish_account_type(self, client, db_session):
+        google = _oauth_user(
+            db_session, "enum-google@example.com",
+            identity_source="google", google_sub="google-sub-enum",
+        )
+        upstox = _oauth_user(
+            db_session, "enum-upstox@example.com",
+            identity_source="upstox",
+            broker_provider="UPSTOX", broker_user_id="upstox-enum",
+        )
+        local = _local_user(db_session, email="enum-local@example.com")
+        targets = [
+            (user.id, user.email, _user_snapshot(user))
+            for user in (google, upstox, local)
+        ]
+
+        responses = [
+            client.post(
+                f"{ACCOUNT}/register",
+                json={"email": email, "password": ATTACKER_PASSWORD},
+            )
+            for _id, email, _before in targets
+        ]
+
+        assert [r.status_code for r in responses] == [200, 200, 200]
+        assert responses[0].json() == responses[1].json() == responses[2].json() == self.GENERIC
+        assert {r.headers.get("set-cookie") for r in responses} == {None}
+
+        # Identical response *and* identical (untouched) rows for all three
+        # account shapes: the generic body is not a thin disguise over a
+        # silent password write.
+        db_session.expire_all()
+        for user_id, _email, before in targets:
+            after = _user_snapshot(db_session.query(User).filter(User.id == user_id).one())
+            assert after == before
+
+    def test_existing_oauth_account_stays_unauthenticated_and_unverified(
+        self, client, db_session
+    ):
+        """No session is created and the account's status is not touched, so an
+        OAuth account never becomes locally authenticatable or verified by an
+        anonymous registration."""
+        user = _oauth_user(
+            db_session, "no-session@example.com",
+            identity_source="google", google_sub="google-sub-no-session",
+        )
+        before = _user_snapshot(user)
+        counts_before = self._counts(db_session)
+
+        resp = client.post(
+            f"{ACCOUNT}/register",
+            json={"email": user.email, "password": ATTACKER_PASSWORD},
+        )
+        assert resp.status_code == 200
+
+        # The TestClient keeps cookies: the registration issued none, so the
+        # session endpoint must still reject the caller.
+        session = client.get(f"{ACCOUNT}/session")
+        assert session.status_code == 401
+
+        after = self._assert_row_and_artifacts_unchanged(
+            db_session, user, before, counts_before
+        )
+        assert after["status"] == before["status"]
+        assert after["password_hash"] is None
 
 
 class TestEmailVerification:
