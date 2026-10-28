@@ -13,6 +13,7 @@ StrikeNova User and manage durable UserSessions. They NEVER invoke the broker
 gateway. GET /auth/login remains the broker OAuth initiation route.
 """
 
+import secrets
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 from uuid import uuid4
@@ -135,7 +136,10 @@ def _oauth_user(db, email, *, identity_source, display_name="OAuth Owner", **ext
     return user
 
 
-ATTACKER_PASSWORD = "AttackerPass123!"
+# Per-run synthetic credential, never a repository literal, so no hardcoded
+# password enters the source. 16 URL-safe characters always satisfies the
+# application's 8–128 character registration policy.
+ATTACKER_PASSWORD = secrets.token_urlsafe(12)
 
 
 def _user_snapshot(user):
