@@ -644,8 +644,11 @@ class TestAccountRegistrationCannotLinkAnExistingAccount:
     def test_duplicate_local_registration_preserves_the_account(
         self, client, db_session
     ):
+        # Per-run synthetic credential for the legitimate owner account, so no
+        # additional password literal sits in the repository.
+        owner_password = secrets.token_urlsafe(12)
         user = _local_user(
-            db_session, email="local-owner@example.com", password="OriginalPass123!"
+            db_session, email="local-owner@example.com", password=owner_password
         )
         before = _user_snapshot(user)
         counts_before = self._counts(db_session)
@@ -668,7 +671,7 @@ class TestAccountRegistrationCannotLinkAnExistingAccount:
         # Original credentials keep working; the attacker password does not.
         ok = client.post(
             f"{ACCOUNT}/login",
-            json={"email": "local-owner@example.com", "password": "OriginalPass123!"},
+            json={"email": "local-owner@example.com", "password": owner_password},
         )
         assert ok.status_code == 200
         bad = client.post(
