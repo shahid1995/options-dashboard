@@ -10,7 +10,10 @@ jobs:
   open-code-review:
     name: OpenCodeReview Analysis
     runs-on: ubuntu-latest
-    
+    env:
+      # Disable the CLI's background updater so it cannot replace the pinned executable mid-job.
+      OCR_NO_UPDATE: '1'
+
     # SECURITY: Gate automatic PR reviews to prevent abuse of the OpenRouter credential.
     # 
     # Automatic reviews run only when:
