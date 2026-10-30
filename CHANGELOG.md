@@ -34,6 +34,16 @@ Do not add entries for:
 
 ---
 
+### 2026-10-30 — Primary independent engineering review
+
+**Category:** Engineering governance / AI-agent operating contract
+
+- The Founder designated ChatGPT as StrikeNova's primary independent engineering reviewer for substantive engineering work.
+- The review role is separate from Hermes / FreeBuff implementation and evaluates scoped changes, repository contracts, tests, security, quantitative/data integrity, and material operational risks using direct evidence.
+- Review verdicts must disclose coverage and limitations; automated review and CI are supporting evidence, not substitutes for independent review.
+- The Founder retains final requirements, risk-acceptance, PR acceptance, merge, release, and deployment authority. Review is read-only by default; implementation changes require separate authorization.
+- Detailed responsibilities, verdicts, finding dispositions, and authority limits are defined in `PROJECT-CONTROL.md`.
+
 ## Current baseline
 
 ### 2026-09 — Runtime topology
