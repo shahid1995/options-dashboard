@@ -12,6 +12,69 @@ This file defines how product work is planned, executed, reviewed, verified, and
 - **Obsidian Second Brain** — Knowledge and Context Authority. Long-lived reasoning, decisions, architecture context, research, and durable knowledge remain there.
 - **GitHub** — Implementation and Project Authority. Issues, project status, code, pull requests, commits, CI, verification evidence, and releases live here.
 - **Hermes / FreeBuff** — Execution. Agents implement approved GitHub work; they do not redefine accepted product decisions or architecture without an explicit change record.
+- **Primary Independent Engineering Reviewer (currently ChatGPT)** — Independent technical assessment of substantive engineering work, implementation evidence, tests, and material risks. The reviewer advises the Founder; it does not own product decisions, implementation, acceptance, or release authority.
+
+## Primary Independent Engineering Reviewer
+
+The Founder has designated **ChatGPT as StrikeNova's primary independent engineering reviewer**. This is a review and verification role, separate from Hermes / FreeBuff implementation work.
+
+### Review responsibility
+
+For substantive engineering changes, the reviewer independently assesses the actual proposed change and its evidence. Review depth must be proportionate to risk; authentication, authorization, broker credentials, user ownership, paper execution, positions/orders, quantitative calculations, persistence/migrations, concurrency, and deployment/runtime boundaries require especially careful review.
+
+The reviewer must:
+
+1. Establish the exact repository, PR, base commit, head commit, and changed-file scope.
+2. Read applicable repository instructions, requirements, invariants, accepted decisions, architecture, security, data, and testing guidance.
+3. Inspect the complete relevant diff and trace affected callers, consumers, schemas, configuration, error paths, and state transitions. A PR description or automated-review summary is not a substitute.
+4. Evaluate specification compliance separately from engineering quality, including correctness, security, user/data isolation, quantitative integrity, test quality, maintainability, performance, and operability where relevant.
+5. Challenge tests for independent expected values, meaningful negative/boundary cases, isolation, and ability to detect the original defect.
+6. Run safe, relevant checks when tools and environments permit; otherwise identify exactly what evidence is missing and who or what must provide it.
+7. Reconcile conflicting evidence and distinguish confirmed facts, reasoned inferences, historical information, and unverified claims.
+8. Report findings before recommendations, ordered by severity, with confidence, exact location, trigger/preconditions, impact, supporting evidence, and the smallest remediation direction.
+9. State the review verdict and all material coverage gaps. A zero-finding result must not hide files, behaviors, or verification layers that were not examined.
+
+### Review verdicts
+
+Use these explicit verdicts:
+
+- **Pass** — the scoped requirements and material risks are supported by fresh, proportionate evidence, with no material unresolved finding.
+- **Partial** — useful evidence exists, but a material path, environment, requirement, or verification layer remains unverified.
+- **Fail** — direct evidence demonstrates a material requirement failure, defect, or unacceptable risk.
+- **Inconclusive** — available evidence is conflicting or insufficient for a defensible decision.
+
+Severity and confidence are separate. Use Critical / High / Medium / Low for impact and High / Medium / Low for confidence. Do not elevate style preferences into defects. Do not call a failure pre-existing or flaky without evidence.
+
+### Independence and evidence
+
+- The reviewer must inspect primary repository evidence and must not accept an implementer's summary, another AI agent's assertion, green CI, code coverage, or a clean automated-review result as proof beyond what that evidence actually exercises.
+- Automated reviewers and scanners are supplementary signals. They can identify useful leads, but they do not replace this independent review.
+- The reviewer must not review only selected files and describe the result as a full-PR review. The report must disclose any selection, truncation, inaccessible file, unavailable environment, or unrun check.
+- Review findings are not implementation instructions to silently expand scope. Adjacent issues should be recorded and routed through the issue/decision process.
+
+### Authority and action limits
+
+The Founder remains the final authority for requirements, product and architecture decisions, risk acceptance, PR acceptance, merge, release, and deployment. The independent reviewer:
+
+- does not redefine an accepted requirement or invariant;
+- does not approve product scope or accept residual business risk on the Founder's behalf;
+- does not implement fixes or modify application source by default;
+- does not merge, deploy, change production/staging systems, mutate databases, enable providers, or access/use secrets unless the Founder separately and explicitly authorizes the specific action;
+- may update Markdown governance documentation only when the Founder expressly requests or authorizes that documentation change.
+
+Each material finding must receive a visible disposition: corrected with fresh evidence, demonstrated not to be a defect with supporting evidence, deferred to a tracked issue with explicit risk treatment, or explicitly accepted by the Founder. An unresolved Critical or High finding should normally block acceptance; any exception must be an explicit Founder decision recorded in the relevant GitHub issue or PR. A reviewer verdict is technical advice and evidence, not a merge permission.
+
+### Review record
+
+The PR or linked review report should record:
+
+- exact base/head SHAs and scope reviewed;
+- requirements and invariants considered;
+- verdict and review coverage;
+- findings with severity, confidence, location, evidence, impact, and remediation direction;
+- commands/checks run, environment, exit status, and limitations;
+- finding dispositions and unresolved risks;
+- confirmation that no merge or deployment was performed as part of review.
 
 ## Canonical workflow
 
@@ -32,7 +95,11 @@ Pull Request
         ↓
 Automated verification
         ↓
-Review / acceptance
+Primary independent engineering review
+        ↓
+Finding disposition + re-verification when needed
+        ↓
+Founder acceptance
         ↓
 Merge
         ↓
@@ -152,7 +219,8 @@ A work item reaches **Done** only when all applicable conditions are true:
 - browser/runtime verification passes when applicable;
 - security checks pass when applicable;
 - documentation/decision records are updated when required;
-- PR review is complete;
+- the primary independent engineering review is complete for substantive engineering changes, and material findings have a documented disposition;
+- Founder acceptance is recorded;
 - merged commit is identified;
 - remaining follow-up work is captured as separate issues.
 
