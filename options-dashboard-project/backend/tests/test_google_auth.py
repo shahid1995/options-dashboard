@@ -11,6 +11,7 @@ Covers:
 """
 
 import json
+import secrets
 import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
@@ -932,9 +933,10 @@ class TestGoogleSignInAfterBlockedLegacyRegistration:
 
         # An anonymous legacy registration for the same address is refused and
         # cannot attach a password.
+        synthetic_password = secrets.token_urlsafe(12)
         blocked = client.post(
             "/auth/register",
-            json={"email": user.email, "password": "AttackerPass123!"},
+            json={"email": user.email, "password": synthetic_password},
         )
         assert blocked.status_code == 200
         assert "user_id" not in blocked.text
