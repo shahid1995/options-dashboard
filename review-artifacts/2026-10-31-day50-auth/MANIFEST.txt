@@ -1,0 +1,61 @@
+StrikeNova — Day-50 Authentication Integration Patch Export
+============================================================
+Exported: 2026-10-30 (local workspace only — not pushed, not published)
+Task: artifact-export for independent review by ChatGPT
+
+CANDIDATE VERIFICATION (worktree .wt-cand-5466e85e)
+----------------------------------------------------
+Branch            : hermes/combined-day50-authfix-5466e85e
+HEAD commit       : fac9ead0df4e2f54e447fee048c52ee1b79cbc8d
+Tree SHA          : a86968cb936c933e066b9d7ae7bb8c2f85211e3d
+Worktree status   : clean (no unstaged/staged/untracked changes)
+Base commit       : 68c2427843692e6326a01ded794dcbb67a6aaaac (Day-50 base, PR #130 head)
+
+Merge ancestry (verified, --no-ff):
+  e8c929c2b3ba462296f12aeeee9b3a8c2b49534c  parents: 68c2427843692e6326a01ded794dcbb67a6aaaac
+                                                     4aacedb626d7764e858069ec47863ee2edcf54b9 (PR #136 head)
+  ef4a3432e98c086c810cd39a783bbf66befe18c7  parents: e8c929c2b3ba462296f12aeeee9b3a8c2b49534c
+                                                     3acab33c2f0db98558a9642a824fa306f1597a13 (hygiene commit)
+  fac9ead0df4e2f54e447fee048c52ee1b79cbc8d  parent : ef4a3432e98c086c810cd39a783bbf66befe18c7 (docs reconciliation)
+
+ARTIFACT 1
+----------
+Filename        : day50_auth_integration_candidate.patch
+Source range    : 68c2427843692e6326a01ded794dcbb67a6aaaac..fac9ead0df4e2f54e447fee048c52ee1b79cbc8d
+Byte size       : 35698 bytes (813 lines)
+SHA-256         : e51e77288071b860b4cfe7edc4ffb92ad30a723d85b750e14e42fbf1a60cba30
+Files (6)       : CHANGELOG.md
+                  SECURITY.md
+                  options-dashboard-project/backend/app/routers/auth.py
+                  options-dashboard-project/backend/tests/test_auth_account_flows.py
+                  options-dashboard-project/backend/tests/test_auth_security_gaps.py
+                  options-dashboard-project/backend/tests/test_google_auth.py
+Diffstat        : 6 files changed, 679 insertions(+), 30 deletions(-)
+Integrity       : byte-identical to `git diff 68c24278..fac9ead0` (cmp OK)
+Apply-check     : PASS forward onto clean worktree at 68c24278 (git apply --check)
+                  PASS reverse against candidate state (git apply --check --reverse)
+
+ARTIFACT 2
+----------
+Filename        : pr137_test_hygiene.patch
+Source range    : eaddbc23b617e889b392c98b9e2c198c57767f93 (PR #137 head)
+                  ..3acab33c2f0db98558a9642a824fa306f1597a13 (hygiene commit)
+Byte size       : 1027 bytes
+SHA-256         : 40374acaa7a18a5c37641dd8f24a99fc59ad217dde548343d61b6548ee739a38
+Files (1)       : options-dashboard-project/backend/tests/test_google_auth.py
+Change          : replaces hardcoded test password literal "AttackerPass123!"
+                  with per-run secrets.token_urlsafe(12) synthetic value
+                  (adds `import secrets`); test-only, no production code.
+Integrity       : byte-identical to `git diff eaddbc23..3acab33` (cmp OK)
+Apply-check     : PASS forward onto exact PR #137 source eaddbc23 (git apply --check)
+
+REGENERATION NOTE
+-----------------
+Neither artifact was regenerated, reformatted, or edited for this export.
+Hashes above were computed after final content was fixed; both export copies
+were verified byte-identical (cmp) to their originals in artifacts/.
+
+PUSH / MERGE STATUS
+-------------------
+Nothing pushed. No GitHub branch created, no PR opened, no PR status changed.
+No merge of #130/#136/#137. main and all remote branches untouched.
