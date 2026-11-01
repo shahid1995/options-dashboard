@@ -666,23 +666,27 @@ def register(
     if len(password) > 128:
         raise HTTPException(status_code=422, detail="Password must be 128 characters or fewer")
 
-    # Check if email already exists
+    # An anonymous registration request proves nothing about ownership of an
+    # existing account, so it must never attach or replace local credentials.
+    # Before this check, an OAuth-created user (google/upstox) who shared an
+    # email with the submitted address had this attacker-chosen password
+    # written onto the row, which made the account locally authenticatable
+    # through POST /auth/login-email without any ownership proof.
+    #
+    # Every pre-existing account shape now fails closed with the same generic
+    # response: no password write, no profile/identity/verification/broker
+    # update, no session, no token, no email, and no account identifier.
+    # Linking a local password to an existing account requires a separate
+    # ownership-proof flow (authenticated with recent authentication, or a
+    # verified single-use expiry-bound token); this route does not implement
+    # it.
     existing = db.query(User).filter(User.email == email).one_or_none()
     if existing is not None:
-        if existing.identity_source == "email" and existing.password_hash:
-            # Account enumeration protection: return 200 with generic message
-            # instead of 409 which would leak that the email is registered
-            logger.info(
-                "Registration attempted for existing email",
-                extra={"event": "auth.register.existing_email", "email_domain": email.split("@")[-1]},
-            )
-            return {"ok": True, "message": "If this email is not already registered, your account has been created."}
-        # OAuth-created account with same email — link the password
-        existing.password_hash = hash_password(password)
-        if display_name:
-            existing.display_name = display_name
-        db.commit()
-        return {"ok": True, "message": "Password set for existing account", "user_id": existing.id}
+        logger.info(
+            "Registration attempted for existing email",
+            extra={"event": "auth.register.existing_email", "email_domain": email.split("@")[-1]},
+        )
+        return {"ok": True, "message": "If this email is not already registered, your account has been created."}
 
     user = User(
         id=str(uuid4()),
