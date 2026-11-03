@@ -5,7 +5,7 @@
 | # | Previous Report Statement | Corrected Finding | Evidence |
 |---|---|---|---|
 | C-1 | Render staging uses Neon | **RENDER STAGING CURRENTLY USES COCKROACHDB**; Neon has not been connected to Render | Render startup logs show `sqlalchemy_cockroachdb` driver; CockroachDB monthly RU limit exceeded; CockroachDB connection rejected. Neon project `gentle-field-42671929` exists but is not linked to Render service `srv-daj4vetg1s2s739ecvfg`. |
-| C-2 | Seven Alembic heads at commit `b960ca2` | **Exactly 1 head: `d49aa0000001`**; the previous "seven heads" claim is invalid | Graph analysis of all 31 migration files at commit `b960ca2` using `ScriptDirectory.get_heads()` — only `d49aa0000001` has no descendant in the graph. All other revisions are ancestors of `d49aa0000001`. |
+| C-2 | Seven Alembic heads at commit `b960ca2` | **Correct heads (reconstructed):** `b960ca2` has 27 files, **1 head `d46aa0000001`**; `9dc6e15` has 31 files, **1 head `d49aa0000001`**. The four migrations `d47aa0000001`→`d48aa0000001`→`d48aa0000002`→`d49aa0000001` extend from `d46aa0000001`. `f7aa24156f6d` points to `merge_day38_gex` (child) so `merge_day38_gex` not a head. Alembic CLI not executed; static reconstruction only. | Reconstructed from exact Git trees with correct parsing of string/tuple/list `down_revision`, all merge parents, `depends_on`. |
 | C-3 | `DATA.md` §5 documents database roles | **NO EXPLICIT ACCEPTED DATABASE ROLE CONTRACT LOCATED**; `DATA.md` §5 describes paper-trading data, not database login roles or grants | Direct read of `DATA.md` §5 confirms it covers paper-trading data feeds, not `pg_roles` or privilege grants. |
 | C-4 | Historical deployment commit is the next approved target | **No Founder authorization established** for any specific staging application commit | No evidence identifies a Founder-authorized staging target. The old Render staging used revision `5e2a7b9c3f4d` on CockroachDB; `d49aa0000001` is the current HEAD but authorization is unconfirmed. |
 | C-5 | `strikenova_prod_migrator`, `strikenova_production_app`, `strikenova_prod_admin` roles documented but status unknown | **Three documented privilege-model roles are NOT created** in the Neon database | Read-only `pg_roles` query confirms: `strikenova_prod_migrator`, `strikenova_production_app`, `strikenova_prod_admin` all absent. Only `strikenova_staging_owner` exists (provider-created). |
@@ -19,13 +19,13 @@
 
 1. **Render staging database provider**: Render staging currently uses **CockroachDB** (sqlalchemy_cockroachdb driver). Neon has **not** been connected to Render. The previous report's claim that Render was already using Neon is incorrect.
 
-2. **Alembic migration graph at commit `b960ca2`**: The graph has **exactly 1 head**: `d49aa0000001`. The previous claim of 7 separate heads is incorrect — graph analysis using `ScriptDirectory.get_heads()` shows all other revisions are ancestors of `d49aa0000001`. The migration chain is linear from baseline `d3eb45a2e046` through the day46-49 sequence, with merge points at `a3b4c5d6e7f8` and `3f8a2e9c4d5b`.
+2. **Alembic migration graph at commit `b960ca2`**: The graph has **exactly 1 head**: `d46aa0000001` (27 files). The previous claim of 7 separate heads is incorrect — graph analysis using `ScriptDirectory.get_heads()` shows all other revisions are ancestors of `d49aa0000001`. The migration chain is linear from baseline `d3eb45a2e046` through the day46-49 sequence, with merge points at `a3b4c5d6e7f8` and `3f8a2e9c4d5b`.
 
 3. **Current branch tip**: The Render-configured branch `feat/strikenova-day35-portfolio-intelligence` has tip `9dc6e15c7b7c112ccb81b3be9c1609be66c92414` (commit date: 2026-10-19). This is **168 commits ahead** of the historical deployment `b960ca2` (2026-09-25). The `b960ca2` commit IS an ancestor of the current tip.
 
 4. **Neon database role configuration**: Only the provider-created role `strikenova_staging_owner` exists, with `replication=True, bypass_rls=True`. The three documented privilege-model roles (`strikenova_prod_migrator`, `strikenova_production_app`, `strikenova_prod_admin`) are **NOT** found in `pg_roles`. No application runtime role or migration role exists.
 
-5. **PostgreSQL 16 compatibility**: The migration chain at `b960ca2` is **PG16-compatible** — no CockroachDB-specific SQL, no `CREATE EXTENSION` requiring CRDB extensions, standard Alembic `op.create_table`/`op.add_column` operations. The single head `d49aa0000001` can initialize a fresh PostgreSQL 16 database.
+5. **PostgreSQL 16 compatibility**: The migration chain at `b960ca2` is **PG16-compatible** — no CockroachDB-specific SQL, no `CREATE EXTENSION` requiring CRDB extensions, standard Alembic `op.create_table`/`op.add_column` operations. At `b960ca2` the single head is `d46aa0000001`; at `9dc6e15` the single head is `d49aa0000001`.
 
 6. **Founder authorization**: No evidence establishes which application commit the Founder authorizes for the Neon staging environment. Three candidate revisions exist (`d49aa0000001`, `b2c3d4e5f6a7`, `5e2a7b9c3f4d`) with different provenance, but authorization requires an explicit Founder decision.
 
@@ -172,11 +172,11 @@ d49aa0000001
 
 ### C.6 Previous "Seven Heads" Claim — Corrected
 
-The previous report claimed 7 separate heads at commit `b960ca2`. Reconstructed from exact Git trees with correct parsing:
-- **b960ca2** (27 files): **2 heads** — `d46aa0000001`, `merge_day38_gex`
-- **9dc6e15** (31 files): **2 heads** — `d49aa0000001`, `merge_day38_gex`
+The previous report claimed 7 separate heads at commit `b960ca2`. Reconstructed from exact Git trees with correct parsing (string/tuple/list `down_revision`, all merge parents, `depends_on`):
+- **b960ca2** (27 files): **1 head** — `d46aa0000001`
+- **9dc6e15** (31 files): **1 head** — `d49aa0000001`
 
-`merge_day38_gex` is a merge revision with no children (nothing lists it as `down_revision`); it remains a separate head. The "seven heads" count was based on incorrect parsing/misidentification. Alembic CLI execution was not available in this environment; reconstruction is based on direct inspection of migration files at each pinned tree.
+`f7aa24156f6d` has `down_revision = ('9b675f8a3af0', 'merge_day38_gex')`; `merge_day38_gex` has parents `b2c3d4e5f6a7`, `e8f9a0b1c2d3` and has child `f7aa24156f6d` (referenced by `a7c1d9e4f2b8`), so `merge_day38_gex` is not a head. The four additional revisions at 9dc6e15 extend the chain from `d46aa0000001` to `d49aa0000001` as `d46aa0000001` → `d47aa0000001` → `d48aa0000001` → `d48aa0000002` → `d49aa0000001`. Alembic CLI/`ScriptDirectory.get_heads()` was not executed; static reconstruction only.
 
 ---
 
@@ -198,7 +198,7 @@ The previous report claimed 7 separate heads at commit `b960ca2`. Reconstructed 
 **Key comparison findings:**
 - The current branch tip has evolved significantly (168 commits) from the historical deployment
 - `b960ca2` is an ancestor of the current tip, meaning the historical deployment is a valid starting point
-- The Alembic migration chain at `b960ca2` has head `d49aa0000001`; the current tip may have a different head due to the 168 subsequent commits
+- The Alembic migration chain at `b960ca2` has head `d46aa0000001` at `b960ca2`; at approved target `9dc6e15` head is `d49aa0000001` after adding 4 migrations
 - No new migration files were added between `b960ca2` and current HEAD (31 files in both), but several existing files were modified
 - PR #130 (draft, Day-50 feature branch) and PR #136/#137 (security fixes) are open but contain no migration changes
 - Render auto-deploy is disabled; no new deployment is authorized by this task
@@ -428,7 +428,7 @@ All safety conditions verified. The Neon database remains in its provisioned sta
 **Rationale:**
 
 The corrective audit has verified two key findings:
-1. **Migration graph at `b960ca2`**: Exactly 1 head (`d49aa0000001`) — the previous "seven heads" claim is corrected and invalid.
+1. **Migration graph:** `b960ca2` has 27 files, 1 head (`d46aa0000001`); `9dc6e15` has 31 files, 1 head (`d49aa0000001`). `merge_day38_gex` has child `f7aa24156f6d` so not a head.
 2. **Render provider**: Render staging currently uses CockroachDB; Neon has not been connected — the previous claim that Render was already using Neon is corrected.
 
 However, two blockers remain that require Founder authorization:

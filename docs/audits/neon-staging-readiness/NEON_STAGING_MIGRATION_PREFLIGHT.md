@@ -38,10 +38,10 @@
 
 | Commit | Migration files | Heads (reconstructed) | Notes |
 |---|---:|---|---|
-| Historical Render deployment `b960ca2f20f0c15bf2e59f3d894ccb66d8b0f3ba` | 27 | `d46aa0000001`, `merge_day38_gex` (2 heads) | Does **not** contain `d47aa0000001`, `d48aa0000001`, `d48aa0000002`, `d49aa0000001`. `merge_day38_gex` is a merge head with no children. |
-| Approved staging target `9dc6e15c7b7c112ccb81b3be9c1609be66c92414` | 31 | `d49aa0000001`, `merge_day38_gex` (2 heads) | Adds 4 migrations: `d47aa0000001` → `d48aa0000001` → `d48aa0000002` → `d49aa0000001` extending linearly from `d46aa0000001`. Graph reconstruction handled string/tuple/list `down_revision` and all merge parents; `depends_on` checked. Alembic CLI not available in this environment. Target upgrade path reaches `d49aa0000001`. |
+| Historical Render deployment `b960ca2f20f0c15bf2e59f3d894ccb66d8b0f3ba` | 27 | `d46aa0000001` (1 head) | Does **not** contain `d47aa0000001`, `d48aa0000001`, `d48aa0000002`, `d49aa0000001`. |
+| Approved staging target `9dc6e15c7b7c112ccb81b3be9c1609be66c92414` | 31 | `d49aa0000001` (1 head) | Adds 4 migrations: `d47aa0000001` → `d48aa0000001` → `d48aa0000002` → `d49aa0000001` extending linearly from `d46aa0000001` (`d46aa0000001` → `d47aa0000001` → `d48aa0000001` → `d48aa0000002` → `d49aa0000001`). `f7aa24156f6d` has `down_revision = ('9b675f8a3af0', 'merge_day38_gex')`; `merge_day38_gex` has parents `b2c3d4e5f6a7`, `e8f9a0b1c2d3` and has child `f7aa24156f6d` (referenced by `a7c1d9e4f2b8`), so not a head. Graph reconstruction handled string/tuple/list `down_revision` and all merge parents; `depends_on` checked. Alembic CLI/`ScriptDirectory.get_heads()` not executed; static reconstruction only. |
 
-**Target head for upgrade:** `d49aa0000001` (separate from `merge_day38_gex` branch head).
+**Target head for upgrade:** `d49aa0000001`. At the approved target tree there is exactly one head; `alembic upgrade head` is not ambiguous.
 
 ---
 

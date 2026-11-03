@@ -24,7 +24,7 @@
 
 ## Pre-Execution Checks (No Actions Taken)
 
-- [x] Migration history corrected from exact Git trees (b960ca2: 27 files/heads `d46aa0000001`, `merge_day38_gex`; 9dc6e15: 31 files/heads `d49aa0000001`, `merge_day38_gex` via 4 added migrations). Graph reconstructed with string/tuple/list `down_revision` and merge parents.
+- [x] Migration history corrected from exact Git trees (b960ca2: 27 files, 1 head `d46aa0000001`; 9dc6e15: 31 files, 1 head `d49aa0000001` via 4 added migrations `d47aa0000001`→`d48aa0000001`→`d48aa0000002`→`d49aa0000001`). `f7aa24156f6d` points to `merge_day38_gex` (has child) so not a head. Graph reconstructed with string/tuple/list `down_revision`, all merge parents, `depends_on`. Alembic CLI/`ScriptDirectory.get_heads()` not executed; static reconstruction only.
 - [x] Application code supports `STRIKENOVA_MIGRATION_DATABASE_URL` (no code changes needed)
 - [x] ADR-016/017/018 accepted and understood
 - [x] CI evidence qualified (runs at a016887, not exact 9dc6e15; not Neon-specific)
