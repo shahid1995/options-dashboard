@@ -1,137 +1,263 @@
 # Neon Staging Privilege Proposal
 
-**Purpose**: Propose a staging-specific least-privilege database-role architecture for the Neon `strikenova_staging` database, consistent with accepted ADR-016/017/018.
+**Purpose:** Propose a staging-scoped least-privilege identity pair for the Neon `strikenova_staging` database, consistent with the *accepted* ADR-016 / ADR-017 / ADR-018, and document the PostgreSQL 16 role-membership conditions that make the proposal correct.
 
-**Scope**: Read-only inspection; no roles created, altered, or granted. SQL statements are review-only proposals requiring separate Founder authorization.
+**Scope:** Documentation only. No role created, altered, granted, or dropped. No database contacted. **All SQL below is review-only, unexecuted, and untested.** No role-membership rehearsal of any kind has been performed.
 
-**Founder-approved application target**:
+**Founder-approved application target** (application version approval: **COMPLETE**):
 - Repository: `shahid1995/options-dashboard`
 - Branch: `feat/strikenova-day35-portfolio-intelligence`
 - Application commit: `9dc6e15c7b7c112ccb81b3be9c1609be66c92414`
-- Alembic head: `d49aa0000001` (application version approval: **COMPLETE**)
+- Expected Alembic head: `d49aa0000001`
 
-**Authorization gates (separate):**
-- Staging privilege model implementation: **PENDING** (separate Founder authorization)
-- Neon migration execution: **PENDING** (separate Founder authorization)
-- Render-Neon integration & deployment: **PENDING** (separate Founder authorization)
+**Authorization gates (all separate):**
+| # | Gate | Status |
+|---|---|---|
+| 1 | Application version | **COMPLETE** |
+| 2 | Staging privilege implementation (this document) | **PENDING** |
+| 3 | Neon migration execution | **PENDING** |
+| 4 | Render–Neon integration & deployment | **PENDING** |
 
----
-
-## 1. Accepted Architecture (ADR-016/017/018)
-
-Per DECISIONS.md (accepted):
-
-- **ADR-016 (Runtime/migration database identity separation, opt-in):** `STRIKENOVA_MIGRATION_DATABASE_URL` runs Alembic under a dedicated migration identity; runtime credential can be restricted to DML with no schema ownership/DDL. When unset, behavior is identical to historical single-identity model.
-- **ADR-017 (Migration serialization via transactional lease lock):** Single-row transactional lease lock (`_migration_lock`) acquired around Alembic execution using the migration identity URL. Bootstraps on empty database. Configuration requires `MIGRATION_LOCK_TTL_SECONDS >= 2`.
-- **ADR-018 (Production future-table privilege defaults, migrator-creator scope):** Default privileges bound to the migration/creator role so future tables/sequences receive runtime DML (+ USAGE) privileges. Grant is DML-only; runtime never receives CREATE/ALTER/DROP/ownership/admin/role-management privileges.
-
-**Application support (verified):** `config.py` defines `STRIKENOVA_MIGRATION_DATABASE_URL`; `db.py` resolves migration URL via `resolve_migration_database_url()` (precedence: explicit/CLI → `STRIKENOVA_MIGRATION_DATABASE_URL` → `DATABASE_URL`), provides `_migration_engine_url()`, `_migration_lock_url()` (both use migration resolver), and `_run_alembic_migrations()` uses migration identity when configured; `alembic/env.py` delegates to `resolve_migration_database_url()`; `app/_migration_lock.py` implements transactional lease lock with bootstrap on empty DB. **No application source changes required to enable separation.**
-
-`DATA.md` §5 describes paper-trading data, not database roles/grants. The privilege model is governed by accepted ADR-016/017/018, not `DATA.md`.
+Gate 1 authorizes *which application version*. It does not authorize creating roles, granting privileges, or applying migrations.
 
 ---
 
-## 2. Actual Existing Role State (Neon `strikenova_staging` database, read-only)
+## 1. Accepted Architecture (ADR-016 / ADR-017 / ADR-018)
 
-| Role | LOGIN | SUPERUSER | CREATEDB | CREATEROLE | REPLICATION | BYPASSRLS | Purpose |
+These are **Accepted** decisions in [`DECISIONS.md`](../../../DECISIONS.md), not proposals. This document links to them rather than restating them.
+
+| Record | What it settles |
+|---|---|
+| **ADR-016** — Runtime/migration database identity separation (opt-in) | `STRIKENOVA_MIGRATION_DATABASE_URL` runs Alembic under a dedicated migration identity; the runtime credential can then be limited to DML with no schema ownership. Unset ⇒ historical single-identity behaviour. |
+| **ADR-017** — Migration serialization via transactional lease lock | A single-row lease (`_migration_lock`) is acquired around Alembic execution using the migration identity. Bootstraps on an empty database. Requires `MIGRATION_LOCK_TTL_SECONDS >= 2`. |
+| **ADR-018** — Production future-table privilege defaults (migrator-creator scope) | Default privileges are bound to the migration/creator role so future tables and sequences carry runtime DML (+ sequence `USAGE`). Runtime never receives CREATE/ALTER/DROP/ownership/admin/role-management. |
+
+**Accepted production contract:** [`DATA.md` §5](../../../DATA.md) — "Production privilege model (database `strikenova`)" — is the accepted database-role contract. It documents `strikenova_production_app` (DML only), `strikenova_prod_migrator` (DDL + migration lock), `strikenova_prod_runtime` (NOLOGIN, owns the application tables), `strikenova_prod_admin` (break-glass), the two `pg_default_acl` rows bound to `strikenova_prod_migrator`, and the warning that **defaults do not follow a creator-role change**.
+
+It is *not* paper-trading data and it is not a staging document. This proposal mirrors its shape for staging; it does not create a second governance system (see `AGENTS.md` §5).
+
+**Application support already exists (no source change required):** `app/config.py` defines `STRIKENOVA_MIGRATION_DATABASE_URL`; `app/db.py` resolves the migration URL via `resolve_migration_database_url()` (precedence: explicit/CLI → `STRIKENOVA_MIGRATION_DATABASE_URL` → `DATABASE_URL`) and uses it for the migration engine, the lease, and `_run_alembic_migrations()`; `alembic/env.py` delegates to the same resolver; `app/_migration_lock.py` implements ADR-017.
+
+---
+
+## 2. Observed Staging Role State (earlier read-only inspection)
+
+**Source and date qualification.** The table below records an *earlier* read-only `pg_roles` inspection of Neon project `gentle-field-42671929`, database `strikenova_staging`. That inspection has no separately recorded timestamp in these artifacts; the only dated evidence surviving from the same pass is the Render startup-log inspection dated **2026-11-02**. **The catalog was not re-read during this documentation-only pass.**
+
+| Role | LOGIN | SUPERUSER | CREATEDB | CREATEROLE | REPLICATION | BYPASSRLS | Origin |
 |---|---|---|---|---|---|---|---|
-| `cloud_admin` | True | True | True | True | True | True | Neon internal — superuser |
-| `neon_service` | True | False | True | True | True | True | Neon internal |
-| `neon_superuser` | False | False | True | True | True | False | Neon internal |
-| `strikenova_staging_owner` | True | False | True | True | **True** | **True** | Provider-created, connection-holding role |
-| `pg_*`/`neon_*`/`cloud_*` | System roles | — | — | — | — | — | PostgreSQL/Neon infrastructure |
+| `cloud_admin` | yes | yes | yes | yes | yes | yes | Neon internal |
+| `neon_service` | yes | no | yes | yes | yes | yes | Neon internal |
+| `neon_superuser` | no | no | yes | yes | yes | no | Neon internal |
+| `strikenova_staging_owner` | yes | no | yes | yes | **yes** | **yes** | Neon-created (provider) |
 
-**Observations:**
-- Only `strikenova_staging_owner` exists as an application-present role.
-- `strikenova_staging_owner` has `replication=True, bypass_rls=True` (excessive for typical application connectivity). 
-- Documented privilege-model roles (`strikenova_prod_migrator`, `strikenova_production_app`, `strikenova_prod_admin`) are **NOT present** in Neon.
-- The provider-created `strikenova_staging_owner` may safely remain a provider/setup identity outside normal application runtime if replaced by properly scoped identities, but altering it is not recommended without a documented technical requirement.
+**Reading this correctly:**
 
----
-
-## 3. Staging-Specific Two-Identity Model (Proposed)
-
-Following ADR-016/017/018, staging should use two identities where possible:
-
-1. **Migration/creator identity** (used for Alembic migrations and migration lock bootstrap/ownership) — needs schema DDL, ability to create/manage objects and run lock bootstrap on empty DB, and must be the role bound by `ALTER DEFAULT PRIVILEGES` for future tables/sequences (per ADR-018).
-2. **Runtime DML identity** (used by application at runtime) — needs only CONNECT/USAGE, DML on existing/future tables, and USAGE on sequences. No DDL, no ownership, no role-management, no cluster-admin privileges.
-
-A separate read-only login role is **not proposed by default** unless there is an actual application requirement. Administrative/break-glass access should remain through the authorized Neon provider account, not a separate broadly privileged database login role created ad hoc.
-
-**Staging naming (do not mix prod names):** Use `strikenova_staging_migrator` / `strikenova_staging_app` (or equivalent staging-scoped names). Do not copy `strikenova_prod_*` names without explicit mapping/explanation.
+- `strikenova_staging_owner` is the only application-present role. Its `replication`, `bypass_rls`, `createdb`, and `createrole` attributes exceed what a staging application connection needs. It is also the identity that *can* create roles (`CREATEROLE`), so gate 2 is executable through it if authorized.
+- The `strikenova_prod_*` identities from `DATA.md` §5 belong to the **production** database `strikenova`. Their absence from a staging database is expected and is **not** an implementation failure.
+- No broad break-glass *database login* is proposed for staging. Break-glass administration for staging stays with the authorized Neon provider account. (Production's `strikenova_prod_admin` is a production-only artifact.)
 
 ---
 
-## 4. PostgreSQL 16 SQL Requirements (Correctness)
+## 3. Proposed Staging Identities
 
-- `TEMPORARY` is a **database privilege**, not a schema privilege. Do not propose `GRANT CREATE TEMPORARY TABLES ON SCHEMA public ...` as a schema privilege grant.
-- `CREATE` on a schema does not grant ownership rights over existing tables.
-- Table ownership affects ALTER/DROP and index management.
-- Default privileges must be configured for the **actual migration creator role** using `ALTER DEFAULT PRIVILEGES FOR ROLE <migrator_role> IN SCHEMA public ...`
-- Must address both **future tables** and **future sequences** (USAGE/SELECT/UPDATE as appropriate per ADR-018).
-- Treat existing objects and future objects separately.
-- Migration role must be able to bootstrap `_migration_lock` on an empty database and own/manage objects created by migrations.
-- Runtime identity must receive only necessary DML and sequence privileges; no DDL, ownership, role-management, or cluster-administration.
-- Do **not** propose a standalone `CREATE INDEX` privilege — correct ownership model is required.
-- Do **not** label SQL as tested unless actually tested. If a disposable PG16 environment is available, rehearsal may only occur in isolated scratch environment (never Neon/CockroachDB); otherwise mark untested with exact evidence gap.
+| Identity | Type | Proposed role |
+|---|---|---|
+| `strikenova_staging_migrator` | Migration / creator | Owns and creates schema objects; runs Alembic and the ADR-017 lease bootstrap; is the role that `ALTER DEFAULT PRIVILEGES` must be bound to (ADR-018) |
+| `strikenova_staging_app` | Runtime DML | `CONNECT`, schema `USAGE`, `SELECT/INSERT/UPDATE/DELETE` on tables, `USAGE` on sequences. No DDL, no ownership, no role management, no cluster attributes |
+| `strikenova_staging_owner` | Provider/setup | Neon-created. Left as-is unless a documented technical requirement justifies altering it |
+
+Staging names are staging-scoped on purpose. Do **not** reuse `strikenova_prod_*` names for staging, and do not import production identities into `strikenova_staging`.
+
+A read-only login is not proposed by default: no current application requirement establishes one, and an unused role is standing attack surface.
 
 ---
 
-## 5. Review-Only Proposed SQL (Template, Not Executed)
+## 4. PostgreSQL 16 Role-Membership Semantics
 
-*These are templates for review only. Actual role names, ownership, and grants must be validated against the target database state. Requires separate Founder authorization.* 
+This section is the part previous revisions of this document got wrong or omitted. Statements follow the PostgreSQL 16 documentation:
+[`ALTER DEFAULT PRIVILEGES`](https://www.postgresql.org/docs/16/sql-alterdefaultprivileges.html) ·
+[Role Membership](https://www.postgresql.org/docs/16/role-membership.html) ·
+[`SET ROLE`](https://www.postgresql.org/docs/16/sql-set-role.html) ·
+[`GRANT`](https://www.postgresql.org/docs/16/sql-grant.html)
+
+### 4.1 Who may alter default privileges
+
+- A role can alter **its own** default privileges.
+- It can also alter the default privileges **of roles of which it is a member**. Per the reference page: *"While you can change your own default privileges and the defaults of roles that you are a member of…"*.
+- Therefore, to execute `ALTER DEFAULT PRIVILEGES FOR ROLE strikenova_staging_migrator …`, the executing role must **be** `strikenova_staging_migrator` **or be a member of it**.
+
+### 4.2 Defaults apply per creating role — membership does not transfer them
+
+The same sentence continues: *"…at object creation time, new object permissions are only affected by the default privileges of the current role, and are not inherited from any roles in which the current role is a member."*
+
+Consequences that matter here:
+
+- If migrations connect as `strikenova_staging_owner` and create tables, then **`strikenova_staging_migrator`'s defaults do not apply** to those tables. The objects are created by the owner, so the owner's (empty) defaults apply.
+- Being a *member* of the migrator does not fix this. Membership changes which privileges are available; it does not change `current_user`, which is what selects the default ACL.
+- **Migrations must actually create objects as `strikenova_staging_migrator`.** Two supported ways:
+  1. Connect as `strikenova_staging_migrator` directly (simplest; one connection string in `STRIKENOVA_MIGRATION_DATABASE_URL`), or
+  2. Connect as an administrative role and `SET ROLE strikenova_staging_migrator` before running the migration, for the duration of the session.
+
+### 4.3 `SET ROLE` needs the `SET` membership option
+
+PostgreSQL 16 membership carries independent options — `INHERIT`, `SET`, and `ADMIN`. Per the Role Membership page, a member may `SET ROLE` to a role only when there is a chain of membership grants **each with `SET TRUE`** (the default when unspecified):
 
 ```sql
--- Migration/creator identity (staging)
+GRANT strikenova_staging_migrator TO <admin_role> WITH INHERIT TRUE, SET TRUE;
+```
+
+After `SET ROLE`, *"any database objects created are considered owned by the group role not the login role"* — which is exactly the behaviour ADR-018 requires.
+
+`INHERIT` alone is **not** sufficient for this path: inheriting a role's privileges does not change the current role, so the migrator's default privileges still would not be applied to objects you create as yourself.
+
+### 4.4 Ownership follows the creating role
+
+Objects are normally owned by the role that executed the creation statement (i.e. `current_user`, which `SET ROLE` changes). So:
+
+- Tables and indexes created by `strikenova_staging_migrator` are owned by it, matching ADR-018's "migrator-creator" scope.
+- `_migration_lock` bootstrapped by the migrator is owned by the migrator, matching ADR-017 and `DATA.md` §5.
+- Ownership carries implicit `ALTER`/`DROP`/index rights. Never hand ownership to the runtime identity.
+
+### 4.5 Existing objects are not covered by defaults
+
+`ALTER DEFAULT PRIVILEGES` *"allows you to set the privileges that will be applied to objects created in the future"* and *"does not affect privileges assigned to already-existing objects."*
+
+- **Future objects:** handled by the two `ALTER DEFAULT PRIVILEGES` statements in §6.
+- **Existing objects:** require explicit `GRANT … ON ALL TABLES IN SCHEMA` / `ON ALL SEQUENCES IN SCHEMA` at the moment they exist. On a brand-new empty database this set is empty, so the explicit grants are a no-op — but they must be re-run if any object is ever created before the defaults are installed.
+
+### 4.6 Who should run the default-privilege statements
+
+Three arrangements work; the first is recommended.
+
+| Arrangement | How | Membership condition |
+|---|---|---|
+| **A. Run as the migrator** (recommended) | Connect as `strikenova_staging_migrator` and execute `ALTER DEFAULT PRIVILEGES … GRANT …` without a `FOR ROLE` clause | None — the role is acting for itself |
+| **B. Run as an administrator that is a member** | Connect as the administrative role, execute `ALTER DEFAULT PRIVILEGES FOR ROLE strikenova_staging_migrator …` | Must be a member of `strikenova_staging_migrator` |
+| **C. Run as an administrator, `SET ROLE` first** | `SET ROLE strikenova_staging_migrator;` then arrangement A | Membership with `SET TRUE` |
+
+Note that arrangement B changes the migrator's defaults while the session remains the administrator; it does **not** make subsequent object creation in that session count as the migrator. To create objects as the migrator you need A or C.
+
+**PG16 strictness caution.** The documented precondition for the `FOR ROLE` form is membership. PostgreSQL 16 introduced separate `INHERIT`/`SET`/`ADMIN` options, and some commands enforce the `SET` option where earlier releases accepted bare membership. Granting membership `WITH INHERIT TRUE, SET TRUE` satisfies the documented precondition and keeps arrangement C available, avoiding that ambiguity. Verify the behaviour on a disposable PostgreSQL 16 instance before relying on arrangement B alone.
+
+### 4.7 One more PG16 detail: schema `public`
+
+From PostgreSQL 15 onward, `CREATE` on schema `public` is **no longer granted to `PUBLIC`**; the schema is owned by `pg_database_owner` and `USAGE` is still granted to `PUBLIC`. A fresh Neon PostgreSQL 16 database therefore does **not** let a new login role create tables in `public` by default. `strikenova_staging_migrator` must be given `USAGE, CREATE` on schema `public` explicitly (§6), and `strikenova_staging_app` must be given `USAGE` explicitly rather than relying on the `PUBLIC` grant.
+
+### 4.8 Membership checklist before running anything
+
+1. `strikenova_staging_migrator` and `strikenova_staging_app` exist and are `LOGIN`.
+2. The identity that runs migrations is either the migrator, or a member with `SET TRUE` that performs `SET ROLE` first.
+3. `strikenova_staging_migrator` holds `USAGE, CREATE` on schema `public`.
+4. `strikenova_staging_app` holds `USAGE` on schema `public` and `CONNECT` on the database.
+5. The default privileges in §6 are installed **for** `strikenova_staging_migrator` **before** the first migration creates tables.
+6. `pg_default_acl` shows exactly the two intended rows for the migrator (inspect with `\ddp`).
+7. Runtime identity holds no `CREATE`, no ownership, no `CREATEROLE`/`CREATEDB`/`SUPERUSER`/`REPLICATION`/`BYPASSRLS`.
+
+---
+
+## 5. PostgreSQL 16 SQL Correctness Constraints
+
+- `TEMPORARY` is a **database**-level privilege. Do not write `GRANT CREATE TEMPORARY TABLES ON SCHEMA public …`; that is not valid schema-privilege syntax.
+- `CREATE` on a schema does not confer ownership of existing objects.
+- Ownership governs `ALTER`, `DROP`, and index management; there is no standalone `CREATE INDEX` privilege to grant.
+- Default privileges must be bound to the **actual creating role** via `FOR ROLE`, in the schema where objects are created.
+- Cover both future **tables** and future **sequences**. ADR-018's accepted grant is `SELECT, INSERT, UPDATE, DELETE` on tables and `USAGE` on sequences; `USAGE` already permits `nextval` and `currval`. Add sequence `SELECT`/`UPDATE` only if a concrete need for `setval` is demonstrated.
+- Per-schema defaults are **added to** global defaults; a per-schema `REVOKE` cannot remove a global grant.
+- Treat existing objects and future objects separately (§4.5).
+
+---
+
+## 6. Review-Only Proposed SQL — NOT EXECUTED, NOT TESTED
+
+> Templates for review. Role names, ownership, and grants must be validated against the target database before use. Executing any of this requires **separate Founder authorization** (gate 2). Nothing here has been run against Neon, CockroachDB, or any PostgreSQL instance.
+
+```sql
+-- 1. Create the identities. Passwords are provisioned out of band (§7);
+--    never place a password literal in a committed file.
 CREATE ROLE strikenova_staging_migrator LOGIN;
+CREATE ROLE strikenova_staging_app     LOGIN;
 
--- Grant connection/schema usage
-GRANT CONNECT ON DATABASE <staging_db_name> TO strikenova_staging_migrator;
+-- 2. Database connection.
+GRANT CONNECT ON DATABASE strikenova_staging TO strikenova_staging_migrator;
+GRANT CONNECT ON DATABASE strikenova_staging TO strikenova_staging_app;
+
+-- 3. Schema access. PG16 does not grant CREATE on public to PUBLIC.
 GRANT USAGE, CREATE ON SCHEMA public TO strikenova_staging_migrator;
+GRANT USAGE         ON SCHEMA public TO strikenova_staging_app;
 
--- (Optional) Ensure migrator can manage lock table; ownership comes naturally if created by it
+-- 4. Existing objects (empty set on a fresh database; re-run if objects predate the defaults).
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES    IN SCHEMA public TO strikenova_staging_app;
+GRANT USAGE                          ON ALL SEQUENCES IN SCHEMA public TO strikenova_staging_app;
 
--- Runtime DML identity (staging)
-CREATE ROLE strikenova_staging_app LOGIN;
-
-GRANT CONNECT ON DATABASE <staging_db_name> TO strikenova_staging_app;
-GRANT USAGE ON SCHEMA public TO strikenova_staging_app;
-
--- Grant on existing objects if needed (separate from defaults)
--- GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO strikenova_staging_app;
--- GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO strikenova_staging_app;
-
--- Default privileges for FUTURE objects created by migrator role (ADR-018)
+-- 5. Future objects created BY THE MIGRATOR (ADR-018). Run as the migrator
+--    (arrangement A) or as a member of it (arrangement B / C).
 ALTER DEFAULT PRIVILEGES FOR ROLE strikenova_staging_migrator IN SCHEMA public
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO strikenova_staging_app;
 ALTER DEFAULT PRIVILEGES FOR ROLE strikenova_staging_migrator IN SCHEMA public
-  GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO strikenova_staging_app;
+  GRANT USAGE ON SEQUENCES TO strikenova_staging_app;
+
+-- 6. Optional, only if migrations are run by an administrative session that
+--    relies on SET ROLE (arrangement C).
+-- GRANT strikenova_staging_migrator TO <admin_role> WITH INHERIT TRUE, SET TRUE;
 ```
 
-**Notes on correctness:**
-- Default privileges are bound to the creator role (`FOR ROLE strikenova_staging_migrator`). If migrations run under a different role, defaults must be adjusted.
-- Existing objects require explicit grants; defaults only affect future objects.
-- Migration role needs `CREATE` on schema to create tables/indexes as needed; ownership model follows ADR-018.
-- Do not grant `REPLICATION` or `BYPASSRLS` to application identities.
-- TEMPORARY is controlled differently (database privilege) — not granted via `ON SCHEMA public` in this form.
-- Administrative access remains via Neon provider account (no broad admin login role proposed here).
+**Why each block is shaped that way:**
+
+- Block 5 binds to the **creator**, not to the runtime role. Bound to the wrong role, it is inert.
+- Block 5 is only effective if migrations truly create objects as `strikenova_staging_migrator` (§4.2).
+- Block 4 cannot substitute for block 5: it covers objects that already exist.
+- No `REPLICATION`, no `BYPASSRLS`, no `CREATEDB`, no `CREATEROLE`, no ownership, and no schema `CREATE` is granted to `strikenova_staging_app`.
+- Schema ownership (`public` belongs to `pg_database_owner`) is deliberately left alone.
 
 ---
 
-## 6. Implementation Notes & Gaps
+## 7. Credential Prerequisite
 
-- **Activation:** To use separate identities, set `STRIKENOVA_MIGRATION_DATABASE_URL` to the migrator connection string; runtime uses `DATABASE_URL` as the app identity. This is supported by existing code.
-- **Migration lock:** Lock uses migration identity URL (ADR-017); bootstrap works on empty DB.
-- **No code changes required** to enable the model; only configuration (env vars) and role/grant setup (authorized separately).
-- **Testing:** Role behavior untested unless rehearsed in isolated scratch PostgreSQL 16 environment. Neon/CockroachDB must not be used for rehearsal. If unavailable, evidence gap must remain explicit.
-- **Provider role:** `strikenova_staging_owner` has `replication=True, bypass_rls=True` — review necessity; do not alter without documented technical requirement.
+Login roles are inert until credentials exist, and credentials are not part of this proposal:
+
+- Connection credentials for `strikenova_staging_migrator` and `strikenova_staging_app` must be provisioned through an **approved provider or secret-management process** — the Neon console/API or the deployment platform's secret store (gate 4 for Render).
+- Never commit a plaintext password, connection string, token, or secret to the repository, these documents, logs, or issue text.
+- Never paste credentials into agent chat. Set them in the platform's secret store.
+- Prefer interactive/secret-managed password setting (for example `\password` in `psql`) or the provider's role-password API over a password literal in SQL.
+- Rotate on exposure; the staging database should hold no long-lived shared credential.
 
 ---
 
-## 7. Founder Decision Required
+## 8. Verification Plan (read-only, NOT PERFORMED)
 
-**This proposal requires separate Founder authorization.** Options:
-- **Option A:** Authorize creation of staging migrator/app identities with grants per ADR-016/017/018 and configure `STRIKENOVA_MIGRATION_DATABASE_URL` / `DATABASE_URL` appropriately.
-- **Option B:** Document the gap and operate with current single-identity configuration (and note security implications).
+To be executed only after gate 2 authorization and only with read-only statements:
 
-No roles have been created or modified as part of this audit.
+| Check | Statement | Expected |
+|---|---|---|
+| Roles exist with intended attributes | `SELECT rolname, rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls FROM pg_roles WHERE rolname LIKE 'strikenova_staging_%' ORDER BY 1;` | migrator/app `LOGIN`, all elevated attributes `false` |
+| Defaults installed for the migrator only | `\ddp` (or `SELECT defaclrole::regrole, defaclnamespace::regnamespace, defaclobjtype, defaclacl FROM pg_default_acl;`) | Exactly two rows, both `defaclrole = strikenova_staging_migrator` |
+| Schema privileges | `SELECT has_schema_privilege('strikenova_staging_migrator','public','CREATE'), has_schema_privilege('strikenova_staging_app','public','CREATE');` | `true, false` |
+| Runtime cannot create in schema | `SET ROLE strikenova_staging_app; CREATE TABLE public.__deny_probe(a int);` | Must fail; probe removed if it somehow succeeds |
+| Membership setup | `SELECT r.rolname AS member, g.rolname AS granted, m.inherit_option, m.set_option FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.member JOIN pg_roles g ON g.oid=m.roleid;` | Matches the chosen arrangement (§4.6) |
+
+These are **plans**, not results. No query in this section has been run.
+
+---
+
+## 9. Explicit Gaps
+
+1. **No execution.** No role exists that this document proposes. No `GRANT`, `ALTER DEFAULT PRIVILEGES`, or `SET ROLE` has been run.
+2. **No rehearsal.** No disposable PostgreSQL 16 instance was used to validate §4 or §6. The membership behaviour described is documentation-derived, including the PG16 `SET`-option caution in §4.6.
+3. **No fresh catalog read.** §2 is an earlier observation; the current `pg_roles`/`pg_default_acl` state of `strikenova_staging` has not been re-verified.
+4. **No migration.** No migration has been applied to `strikenova_staging`; the database is assumed to be the existing empty Neon database.
+5. **Provider role untouched.** `strikenova_staging_owner` retains `replication`, `bypass_rls`, `createdb`, `createrole`. Removing those attributes is a separate decision with its own risk (it may be the only path to administer the database).
+
+---
+
+## 10. Founder Decision Required
+
+| Option | Content | Consequence |
+|---|---|---|
+| **A** | Authorize creating `strikenova_staging_migrator` and `strikenova_staging_app` per §6, set `STRIKENOVA_MIGRATION_DATABASE_URL` to the migrator and `DATABASE_URL` to the app identity, then run the §8 read-only checks | Staging matches ADR-016/017/018; residual provider-role breadth remains |
+| **B** | Defer implementation and run staging single-identity under `strikenova_staging_owner` | Simpler, but the application keeps `replication`, `bypass_rls`, `createrole`, and DDL capability; ADR-016 stays unused in staging |
+| **C** | Option A, plus a documented justification to alter the provider role's attributes | Narrowest staging posture; requires a separate technical justification and its own authorization |
+
+Authorization for this gate is **not** authorization to apply migrations (gate 3) or to change Render (gate 4).
+
+**Status of this document:** `PROPOSAL — REVIEW ONLY — UNEXECUTED — UNTESTED — AWAITING SEPARATE FOUNDER AUTHORIZATION`

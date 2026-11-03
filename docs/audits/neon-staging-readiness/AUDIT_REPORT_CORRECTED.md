@@ -1,39 +1,74 @@
-# Corrective Independent Audit: Render Provider, Migration Graph, and Neon Role Verification
+# Corrective Independent Audit: Render Provider, Migration Graph, Founder Approval, and Neon Role Verification
 
-## Change Log — Corrections from Previous Report (AUDIT_REPORT.md)
+**Document status:** Final corrected audit (this pass removes residual defects left by the previous two correction passes).
 
-| # | Previous Report Statement | Corrected Finding | Evidence |
+**Scope of this document:** Documentation only. No database connection or mutation, no role creation/alteration/grant, no migration execution, no secret access, no environment-variable change, no infrastructure or provider change, and no pull-request state change were performed in producing it.
+
+## Pinned references used throughout
+
+| Label | Value | Source qualification |
+|---|---|---|
+| Repository | `shahid1995/options-dashboard` | — |
+| Historical Render deployment commit | `b960ca2f20f0c15bf2e59f3d894ccb66d8b0f3ba` (2026-09-24) | Render deployment history (`dep-dar4go17lnhs73a0mfm0`, deployed 2026-09-25) |
+| Founder-approved application target | `9dc6e15c7b7c112ccb81b3be9c1609be66c92414` (2026-10-19), branch `feat/strikenova-day35-portfolio-intelligence` | Branch tip re-verified at publication via `git ls-remote` (2026-11-03) |
+| Approved expected Alembic head | `d49aa0000001` | Static graph reconstruction from the exact pinned tree |
+| Neon project / database | `gentle-field-42671929` / `strikenova_staging` (PostgreSQL 16) | Neon project metadata from the earlier audit pass |
+| Render service | `strikenova-api-staging` (`srv-daj4vetg1s2s739ecvfg`) | Render service metadata from the earlier audit pass |
+
+---
+
+## 0. Correction ledger for this pass
+
+Each row records an obsolete statement that existed in the previous revision of this report and its correction.
+
+| # | Defect in the previous revision | Correction | Evidence |
 |---|---|---|---|
-| C-1 | Render staging uses Neon | **RENDER STAGING CURRENTLY USES COCKROACHDB**; Neon has not been connected to Render | Render startup logs show `sqlalchemy_cockroachdb` driver; CockroachDB monthly RU limit exceeded; CockroachDB connection rejected. Neon project `gentle-field-42671929` exists but is not linked to Render service `srv-daj4vetg1s2s739ecvfg`. |
-| C-2 | Seven Alembic heads at commit `b960ca2` | **Correct heads (reconstructed):** `b960ca2` has 27 files, **1 head `d46aa0000001`**; `9dc6e15` has 31 files, **1 head `d49aa0000001`**. The four migrations `d47aa0000001`→`d48aa0000001`→`d48aa0000002`→`d49aa0000001` extend from `d46aa0000001`. `f7aa24156f6d` points to `merge_day38_gex` (child) so `merge_day38_gex` not a head. Alembic CLI not executed; static reconstruction only. | Reconstructed from exact Git trees with correct parsing of string/tuple/list `down_revision`, all merge parents, `depends_on`. |
-| C-3 | `DATA.md` §5 documents database roles | **NO EXPLICIT ACCEPTED DATABASE ROLE CONTRACT LOCATED**; `DATA.md` §5 describes paper-trading data, not database login roles or grants | Direct read of `DATA.md` §5 confirms it covers paper-trading data feeds, not `pg_roles` or privilege grants. |
-| C-4 | Historical deployment commit is the next approved target | **No Founder authorization established** for any specific staging application commit | No evidence identifies a Founder-authorized staging target. The old Render staging used revision `5e2a7b9c3f4d` on CockroachDB; `d49aa0000001` is the current HEAD but authorization is unconfirmed. |
-| C-5 | `strikenova_prod_migrator`, `strikenova_production_app`, `strikenova_prod_admin` roles documented but status unknown | **Three documented privilege-model roles are NOT created** in the Neon database | Read-only `pg_roles` query confirms: `strikenova_prod_migrator`, `strikenova_production_app`, `strikenova_prod_admin` all absent. Only `strikenova_staging_owner` exists (provider-created). |
-| C-6 | Provider-created `strikenova_staging_owner` has normal privileges | **`strikenova_staging_owner` has `replication=True, bypass_rls=True`** — excessive for a staging connection-holder | Neon role catalog query confirms `replication=True, bypass_rls=True` on `strikenova_staging_owner`. |
+| D-1 | "No Founder authorization established"; "application target not authorized"; "staging application commit not identifiable" | **Application version approval is COMPLETE** — branch `feat/strikenova-day35-portfolio-intelligence`, commit `9dc6e15c7b7c112ccb81b3be9c1609be66c92414`, expected head `d49aa0000001` | `git ls-remote` at publication returns `9dc6e15…` as that branch's tip; `b960ca2` is an ancestor of `9dc6e15` (168 commits ahead) |
+| D-2 | "`b960ca2` contains 31 migration files" | `b960ca2` contains **27** migration files | `git ls-tree -r` on the exact tree |
+| D-3 | A 31-row inventory presented as the `b960ca2` inventory | The 31-row inventory belongs to `9dc6e15`; `b960ca2` has its own 27-row inventory (§C.1, §C.2) | Tree-by-tree enumeration |
+| D-4 | `b960ca2` contains `d47aa0000001`, `d48aa0000001`, `d48aa0000002`, `d49aa0000001` | Those four revisions are **absent** at `b960ca2` and first appear at `9dc6e15` | Set difference of revision IDs between the two trees |
+| D-5 | `b960ca2` has head `d49aa0000001` | `b960ca2` has head **`d46aa0000001`** | Graph reconstruction (§C.4) |
+| D-6 | Two heads at each pinned commit (`d46aa0000001`/`d49aa0000001` plus `merge_day38_gex`) | **Exactly one head each**: `d46aa0000001` at `b960ca2`, `d49aa0000001` at `9dc6e15` | §C.4; `merge_day38_gex` has a child |
+| D-7 | "`merge_day38_gex` is a merge revision with no children" | `merge_day38_gex` **has a child**: `f7aa24156f6d` declares `down_revision = ('9b675f8a3af0', 'merge_day38_gex')` | `f7aa24156f6d_merge_day39_broker_sync_day38_gex_heads.py` |
+| D-8 | "No new migration files were added between `b960ca2` and the current HEAD" | **Four** migration files were added | §C.2 |
+| D-9 | "`3f8a2e9c4d5b` has `down_revision = None`" | `3f8a2e9c4d5b` has `down_revision = ('9e4d8c2a1f7b', 'b3e5f8a1c7d2')` | `3f8a2e9c4d5b_merge_capability_backfill.py` |
+| D-10 | "Graph analysis using `ScriptDirectory.get_heads()`" | `ScriptDirectory.get_heads()` and the Alembic CLI were **never executed**; every head result here is static reconstruction | §C.7 |
+| D-11 | "No accepted database-role contract"; "`DATA.md` §5 describes paper-trading data"; "no ADRs or decision documents" | **Accepted architecture exists**: ADR-016/017/018 are *Accepted* in `DECISIONS.md`, and `DATA.md` §5 is titled "Production privilege model (database `strikenova`)" | `DECISIONS.md` (ADR-016, ADR-017, ADR-018), `DATA.md` §5 |
+| D-12 | Absence of `strikenova_prod_*` identities from staging graded `FAIL` | Those identities are **production-database** identities for `strikenova`; staging identities are a separate *proposed* pair | `DATA.md` §5; §G |
+| D-13 | Recommendation asking the Founder to choose among migration revisions | Obsolete — the application target is already approved (`9dc6e15`, head `d49aa0000001`) | §E |
+| D-14 | `PARTIALLY CORRECTED — …` status labels; "without both decisions" | Replaced by the four-gate status in §A and §K | — |
+| D-15 | "Candidate 2: `b2c3d4e5f6a7` (origin/main head)" | `b2c3d4e5f6a7` is an **Alembic revision ID** (`add_gex_provenance_columns`), not a commit; `origin/main` tip is a different SHA | `git cat-file -t b2c3d4e5f6a7` fails; `git ls-remote origin refs/heads/main` returns `e62f196f7d3530943a8669c6ded41c74b55bf77d` |
 
 ---
 
 ## A. Executive Summary
 
-**Corrected findings:**
+**Authorization state (four separate items — do not conflate them):**
 
-1. **Render staging database provider**: Render staging currently uses **CockroachDB** (sqlalchemy_cockroachdb driver). Neon has **not** been connected to Render. The previous report's claim that Render was already using Neon is incorrect.
+| # | Item | Status |
+|---|---|---|
+| 1 | Application version approved for staging | **COMPLETE** — `feat/strikenova-day35-portfolio-intelligence` @ `9dc6e15c7b7c112ccb81b3be9c1609be66c92414`, expected head `d49aa0000001` |
+| 2 | Staging privilege implementation (role creation/grants) | **PENDING** — separate Founder authorization required |
+| 3 | Neon migration execution | **PENDING** — separate Founder authorization required |
+| 4 | Render–Neon integration and deployment | **PENDING** — separate Founder authorization required |
 
-2. **Alembic migration graph at commit `b960ca2`**: The graph has **exactly 1 head**: `d46aa0000001` (27 files). The previous claim of 7 separate heads is incorrect — graph analysis using `ScriptDirectory.get_heads()` shows all other revisions are ancestors of `d49aa0000001`. The migration chain is linear from baseline `d3eb45a2e046` through the day46-49 sequence, with merge points at `a3b4c5d6e7f8` and `3f8a2e9c4d5b`.
+Application-version approval authorizes *which code* is intended. It does **not** authorize creating roles, applying migrations, or changing Render.
 
-3. **Current branch tip**: The Render-configured branch `feat/strikenova-day35-portfolio-intelligence` has tip `9dc6e15c7b7c112ccb81b3be9c1609be66c92414` (commit date: 2026-10-19). This is **168 commits ahead** of the historical deployment `b960ca2` (2026-09-25). The `b960ca2` commit IS an ancestor of the current tip.
+**Substantive findings:**
 
-4. **Neon database role configuration**: Only the provider-created role `strikenova_staging_owner` exists, with `replication=True, bypass_rls=True`. The three documented privilege-model roles (`strikenova_prod_migrator`, `strikenova_production_app`, `strikenova_prod_admin`) are **NOT** found in `pg_roles`. No application runtime role or migration role exists.
+1. **Render staging database provider.** Render staging currently runs on **CockroachDB** (`sqlalchemy_cockroachdb` driver, monthly RU limit exceeded, connections rejected). Neon has **not** been connected to Render. The Neon project `gentle-field-42671929` was provisioned independently of the Render service.
 
-5. **PostgreSQL 16 compatibility**: The migration chain at `b960ca2` is **PG16-compatible** — no CockroachDB-specific SQL, no `CREATE EXTENSION` requiring CRDB extensions, standard Alembic `op.create_table`/`op.add_column` operations. At `b960ca2` the single head is `d46aa0000001`; at `9dc6e15` the single head is `d49aa0000001`.
+2. **Migration graph, historical deployment (`b960ca2`).** 27 migration files, **exactly one head: `d46aa0000001`**. This corroborates ADR-016, whose validation record describes the migrator identity running "the full 27-revision chain from empty to `d46aa0000001`".
 
-6. **Founder authorization**: No evidence establishes which application commit the Founder authorizes for the Neon staging environment. Three candidate revisions exist (`d49aa0000001`, `b2c3d4e5f6a7`, `5e2a7b9c3f4d`) with different provenance, but authorization requires an explicit Founder decision.
+3. **Migration graph, approved target (`9dc6e15`).** 31 migration files, **exactly one head: `d49aa0000001`**. The four added revisions extend the approved head linearly: `d46aa0000001` → `d47aa0000001` → `d48aa0000001` → `d48aa0000002` → `d49aa0000001`.
 
-**Remaining blockers:**
-- Staging application commit not identifiable (Founder decision required)
-- Documented privilege-model roles not implemented in Neon (Founder decision required)
+4. **No ambiguity at the target.** Because the approved tree has one head, `alembic upgrade head` resolves to `d49aa0000001` unambiguously. This is a static conclusion; nothing was executed.
 
-**Status**: `PARTIALLY CORRECTED — MIGRATION GRAPH VERIFIED, APPLICATION TARGET NOT AUTHORIZED`
+5. **Neon role state.** The earlier read-only catalog inspection found only the provider-created `strikenova_staging_owner` as an application-present role. That role carries `replication=True` and `bypass_rls=True`. The catalog was **not** re-read during this documentation-only pass.
+
+6. **Accepted architecture is not missing.** ADR-016 (identity separation via `STRIKENOVA_MIGRATION_DATABASE_URL`), ADR-017 (transactional lease lock `_migration_lock`), and ADR-018 (default privileges scoped to the migrator/creator role) are all *Accepted* in `DECISIONS.md`. `DATA.md` §5 is the accepted production privilege model for database `strikenova`. What is missing for staging is *implementation* of a staging-scoped identity pair, not architecture or decision authority.
+
+7. **PostgreSQL 16 compatibility.** The approved chain is PG16-compatible by static inspection: no CockroachDB-only SQL in the PostgreSQL path, standard `op.create_table` / `op.add_column` / `op.execute` operations. One file changed between the two pinned trees (`e5f6a7b8c9d0`) but only to split the CockroachDB branch from the PostgreSQL branch; the PostgreSQL path is unchanged (`ALTER TABLE users DROP CONSTRAINT IF EXISTS uq_users_broker_identity`).
 
 ---
 
@@ -51,30 +86,30 @@
 | Last successful deployment | `dep-dar4go17lnhs73a0mfm0` on 2026-09-25 | Render deployment history |
 | Deployed commit SHA | `b960ca2f20f0c15bf2e59f3d894ccb66d8b0f3ba` | Render deployment history |
 | Commit message | Merge PR #98, Day-46 alert transaction boundary | Render deployment history |
-| Database driver at startup | `sqlalchemy_cockroachdb` | Render logs, Nov 2, 2026 |
+| Database driver at startup | `sqlalchemy_cockroachdb` | Render startup logs, Nov 2, 2026 |
 | CockroachDB connection status | Monthly RU limit exceeded; connections rejected | Render logs, Nov 2, 2026 |
-| Neon connected to Render | **No** | Render has not been authorized to use Neon; separate Neon project `gentle-field-42671929` exists independently |
+| Neon connected to Render | **No** | Neon project exists independently; no Render configuration change is authorized or recorded |
 
-**Key distinction:** The historical successful deployment (Sept 25, 2026) used CockroachDB. The currently configured branch tip has evolved since then (168 additional commits), but auto-deploy remains disabled and no new deployment is authorized. Neon project `gentle-field-42671929` was provisioned separately and is not linked to the Render service.
+**Key distinction.** The historical successful deployment (2026-09-25) used CockroachDB at `b960ca2`. The configured branch has since advanced 168 commits to the approved target `9dc6e15`, but auto-deploy remains disabled and no new deployment is authorized. Moving Render onto Neon is gate 4 of §A and is not performed.
 
 ---
 
-## C. Correct Migration Graph at Commit `b960ca2`
+## C. Migration Graph
 
-### C.1 Migration File Inventory (31 files)
+Both graphs below were reconstructed by enumerating `alembic/versions/*.py` in each pinned tree, parsing `revision`, `down_revision`, and `depends_on` as Python literals (string, tuple, and list forms all handled), collecting every parent from every declaration, and treating a revision as a head only when no other revision names it.
 
-All 31 migration files at commit `b960ca2`:
+### C.1 Inventory at the historical deployment — `b960ca2` (27 files)
 
-| # | File | Revision | down_revision |
+| # | File | Revision | `down_revision` |
 |---|---|---|---|
 | 1 | `125e1807df8d_add_broker_connection_foundation.py` | `125e1807df8d` | `d3eb45a2e046` |
-| 2 | `3f8a2e9c4d5b_merge_capability_backfill.py` | `3f8a2e9c4d5b` | `(9e4d8c2a1f7b, b3e5f8a1c7d2)` |
-| 3 | `5e2a7b9c3f4d_merge_google_sub_main.py` | `5e2a7b9c3f4d` | `(3f8a2e9c4d5b, c7d3e5f8a9b2)` |
+| 2 | `3f8a2e9c4d5b_merge_capability_backfill.py` | `3f8a2e9c4d5b` | `('9e4d8c2a1f7b', 'b3e5f8a1c7d2')` |
+| 3 | `5e2a7b9c3f4d_merge_google_sub_main.py` | `5e2a7b9c3f4d` | `('3f8a2e9c4d5b', 'c7d3e5f8a9b2')` |
 | 4 | `9b675f8a3af0_day39_add_broker_sync_idempotency_and_.py` | `9b675f8a3af0` | `e8f9a0b1c2d3` |
 | 5 | `9e4d8c2a1f7b_capability_separation_backfill.py` | `9e4d8c2a1f7b` | `f7a3c2d1e94b` |
 | 6 | `a0deb75ad22f_add_password_hash_to_users_for_email_.py` | `a0deb75ad22f` | `125e1807df8d` |
 | 7 | `a1b2c3d4e5f6_correct_trading_status_backfill.py` | `a1b2c3d4e5f6` | `b8c9f1d2e34a` |
-| 8 | `a3b4c5d6e7f8_merge_day41_2_cross_d1_and_broker_authorizations.py` | `a3b4c5d6e7f8` | `(e2b4c6d8f0a1, f1a2b3c4d5e6)` |
+| 8 | `a3b4c5d6e7f8_merge_day41_2_cross_d1_and_broker_authorizations.py` | `a3b4c5d6e7f8` | `('e2b4c6d8f0a1', 'f1a2b3c4d5e6')` |
 | 9 | `a7c1d9e4f2b8_day41_add_broker_raw_observation.py` | `a7c1d9e4f2b8` | `f7aa24156f6d` |
 | 10 | `b2c3d4e5f6a7_add_gex_provenance_columns.py` | `b2c3d4e5f6a7` | `a1b2c3d4e5f6` |
 | 11 | `b3e5f8a1c7d2_day41_add_fill_ledger_tables.py` | `b3e5f8a1c7d2` | `a7c1d9e4f2b8` |
@@ -84,180 +119,158 @@ All 31 migration files at commit `b960ca2`:
 | 15 | `d3eb45a2e046_baseline_initial_schema_with_all_tables.py` | `d3eb45a2e046` | `None` (baseline) |
 | 16 | `d45aa0000001_day45_admin_control_plane.py` | `d45aa0000001` | `f4a9b8c2d1e7` |
 | 17 | `d46aa0000001_day46_notification_events.py` | `d46aa0000001` | `d45aa0000001` |
-| 18 | `d47aa0000001_day47_durable_background_jobs.py` | `d47aa0000001` | `d46aa0000001` |
-| 19 | `d48aa0000001_historical_data_governance.py` | `d48aa0000001` | `d47aa0000001` |
-| 20 | `d48aa0000002_historical_ingestion_dataset_mapping_snapshot.py` | `d48aa0000002` | `d48aa0000001` |
-| 21 | `d49aa0000001_normalize_iv_observation_timestamps_to_ist.py` | `d49aa0000001` | `d48aa0000002` |
-| 22 | `d9e0f1a2b3c4_uq_broker_identity_global.py` | `d9e0f1a2b3c4` | `5e2a7b9c3f4d` |
-| 23 | `e2b4c6d8f0a1_day41_2_cross_d1_family_lock_and_s2_evidence.py` | `e2b4c6d8f0a1` | `5e2a7b9c3f4d` |
-| 24 | `e5f6a7b8c9d0_uq_users_broker_identity_active.py` | `e5f6a7b8c9d0` | `d9e0f1a2b3c4` |
-| 25 | `e8f9a0b1c2d3_add_trade_lifecycle_tables.py` | `e8f9a0b1c2d3` | `125e1807df8d` |
-| 26 | `e9f8a7b6c5d4_issue17_gap_research_schema.py` | `e9f8a7b6c5d4` | `c1d2e3f4a5b6` |
-| 27 | `f1a2b3c4d5e6_broker_authorization_table_and_carry_forward.py` | `f1a2b3c4d5e6` | `e5f6a7b8c9d0` |
-| 28 | `f4a9b8c2d1e7_issue78_chain_value_provenance.py` | `f4a9b8c2d1e7` | `e9f8a7b6c5d4` |
-| 29 | `f7a3c2d1e94b_add_capability_separation_columns.py` | `f7a3c2d1e94b` | `a0deb75ad22f` |
-| 30 | `f7aa24156f6d_merge_day39_broker_sync_day38_gex_heads.py` | `f7aa24156f6d` | `(9b675f8a3af0, merge_day38_gex)` |
-| 31 | `merge_day38_gex.py` | `merge_day38_gex` | `('b2c3d4e5f6a7', 'e8f9a0b1c2d3')` |
+| 18 | `d9e0f1a2b3c4_uq_broker_identity_global.py` | `d9e0f1a2b3c4` | `5e2a7b9c3f4d` |
+| 19 | `e2b4c6d8f0a1_day41_2_cross_d1_family_lock_and_s2_evidence.py` | `e2b4c6d8f0a1` | `5e2a7b9c3f4d` |
+| 20 | `e5f6a7b8c9d0_uq_users_broker_identity_active.py` | `e5f6a7b8c9d0` | `d9e0f1a2b3c4` |
+| 21 | `e8f9a0b1c2d3_add_trade_lifecycle_tables.py` | `e8f9a0b1c2d3` | `125e1807df8d` |
+| 22 | `e9f8a7b6c5d4_issue17_gap_research_schema.py` | `e9f8a7b6c5d4` | `c1d2e3f4a5b6` |
+| 23 | `f1a2b3c4d5e6_broker_authorization_table_and_carry_forward.py` | `f1a2b3c4d5e6` | `e5f6a7b8c9d0` |
+| 24 | `f4a9b8c2d1e7_issue78_chain_value_provenance.py` | `f4a9b8c2d1e7` | `e9f8a7b6c5d4` |
+| 25 | `f7a3c2d1e94b_add_capability_separation_columns.py` | `f7a3c2d1e94b` | `a0deb75ad22f` |
+| 26 | `f7aa24156f6d_merge_day39_broker_sync_day38_gex_heads.py` | `f7aa24156f6d` | `('9b675f8a3af0', 'merge_day38_gex')` |
+| 27 | `merge_day38_gex.py` | `merge_day38_gex` | `('b2c3d4e5f6a7', 'e8f9a0b1c2d3')` |
 
-### C.2 Graph Structure
+**Absent at this tree:** `d47aa0000001`, `d48aa0000001`, `d48aa0000002`, `d49aa0000001`.
 
-The migration graph has the following lineage:
+**Head:** `d46aa0000001` (exactly one).
 
-**Baseline chain** (from `d3eb45a2e046`):
+### C.2 Inventory at the approved target — `9dc6e15` (31 files)
+
+The 27 files in §C.1 are all still present. One of them changed content (`e5f6a7b8c9d0`, see §C.6) without changing its `revision` or `down_revision`. Four files are new:
+
+| # | File | Revision | `down_revision` |
+|---|---|---|---|
+| 28 | `d47aa0000001_day47_durable_background_jobs.py` | `d47aa0000001` | `d46aa0000001` |
+| 29 | `d48aa0000001_historical_data_governance.py` | `d48aa0000001` | `d47aa0000001` |
+| 30 | `d48aa0000002_historical_ingestion_dataset_mapping_snapshot.py` | `d48aa0000002` | `d48aa0000001` |
+| 31 | `d49aa0000001_normalize_iv_observation_timestamps_to_ist.py` | `d49aa0000001` | `d48aa0000002` |
+
+**Added head chain:** `d46aa0000001` → `d47aa0000001` → `d48aa0000001` → `d48aa0000002` → `d49aa0000001`.
+
+**Head:** `d49aa0000001` (exactly one).
+
+### C.3 Graph structure
+
+Six revisions carry multiple parents and create the graph's only branches:
+
+- `b8c9f1d2e34a` — list form `['a0deb75ad22f', '9e4d8c2a1f7b']`: joins the password-hash path and the capability-separation path.
+- `3f8a2e9c4d5b` — tuple form `('9e4d8c2a1f7b', 'b3e5f8a1c7d2')`: joins the capability-separation path and the fill-ledger path.
+- `5e2a7b9c3f4d` — tuple form `('3f8a2e9c4d5b', 'c7d3e5f8a9b2')`: joins the capability-backfill merge and the Google-sub index path.
+- `a3b4c5d6e7f8` — tuple form `('e2b4c6d8f0a1', 'f1a2b3c4d5e6')`: joins the two Day-41 branches.
+- `merge_day38_gex` — tuple form `('b2c3d4e5f6a7', 'e8f9a0b1c2d3')`: joins the GEX-provenance path and the trade-lifecycle path.
+- `f7aa24156f6d` — tuple form `('9b675f8a3af0', 'merge_day38_gex')`: closes the Day-38/Day-39 merge pair into a single line.
+
+After `f7aa24156f6d` the graph is a single line:
+
 ```
-d3eb45a2e046 (None)
-    → 125e1807df8d
-        → e8f9a0b1c2d3
-            → merge_day38_gex (one of two parents)
-        → a0deb75ad22f
-            → f7a3c2d1e94b
-                → 9e4d8c2a1f7b
-                    → 3f8a2e9c4d5b (one of two parents: 9e4d8c2a1f7b, b3e5f8a1c7d2)
-                    → 5e2a7b9c3f4d (one of two parents: 3f8a2e9c4d5b, c7d3e5f8a9b2)
-                        → e2b4c6d8f0a1 → a3b4c5d6e7f8 (merge)
-                        → d9e0f1a2b3c4 → e5f6a7b8c9d0 → f1a2b3c4d5e6 → a3b4c5d6e7f8 (other parent of merge)
-                        → (also: 9b675f8a3af0 via f7aa24156f6d)
-                        → c7d3e5f8a9b2 (via tuple down_revision)
-a0deb75ad22f branch:
-    → f7a3c2d1e94b → 9e4d8c2a1f7b (converges with above at 9e4d8c2a1f7b → 3f8a2e9c4d5b)
-b8c9f1d2e34a branch (Google sub):
-    → a1b2c3d4e5f6 → b2c3d4e5f6a7 → merge_day38_gex (other parent: b2c3d4e5f6a7, e8f9a0b1c2d3)
-c7d3e5f8a9b2 branch (Google sub index):
-    → b8c9f1d2e34a (same as above)
+f7aa24156f6d → a7c1d9e4f2b8 → b3e5f8a1c7d2 → 3f8a2e9c4d5b
+    → 5e2a7b9c3f4d → a3b4c5d6e7f8 → c1d2e3f4a5b6 → e9f8a7b6c5d4
+    → f4a9b8c2d1e7 → d45aa0000001 → d46aa0000001
+    → [ d47aa0000001 → d48aa0000001 → d48aa0000002 → d49aa0000001 ]   (approved target only)
+```
 
-**Merge points:**
-- `a3b4c5d6e7f8`: merge of `e2b4c6d8f0a1` and `f1a2b3c4d5e6` (converges both paths through `5e2a7b9c3f4d`)
-- `3f8a2e9c4d5b`: merge of `9e4d8c2a1f7b` and `b3e5f8a1c7d2`
+`merge_day38_gex` is therefore **not** a head at either pinned tree: it is a parent of `f7aa24156f6d`, which is in turn a parent of `a7c1d9e4f2b8`.
 
-### C.3 Actual Heads (Reconstructed from Exact Git Trees)
+**`depends_on`:** no migration file in either tree declares `depends_on` (the symbol is absent or `None` throughout), so it contributes no additional edges.
 
-**Reconstruction (direct file inspection, Alembic CLI not available):**
-- **b960ca2** (`b960ca2f20f0c15bf2e59f3d894ccb66d8b0f3ba`, 27 files): **2 heads** — `d46aa0000001`, `merge_day38_gex`
-- **9dc6e15** (`9dc6e15c7b7c112ccb81b3be9c1609be66c92414`, 31 files): **2 heads** — `d49aa0000001`, `merge_day38_gex`
+### C.4 Heads
 
-**Notes:**
-- `merge_day38_gex` has down_revision `(b2c3d4e5f6a7, e8f9a0b1c2d3)` (merge) and no revision points to it as down_revision; it is a separate branch head.
-- Target approved commit head for application upgrade is `d49aa0000001` (added via `d47aa0000001` → `d48aa0000001` → `d48aa0000002` → `d49aa0000001` extending from `d46aa0000001`).
-- Reconstruction handled string, tuple/list `down_revision`, all merge parents, and `depends_on` declarations.
+| Pinned tree | Migration files | Heads | Count |
+|---|---:|---|---:|
+| `b960ca2f20f0c15bf2e59f3d894ccb66d8b0f3ba` (historical deployment) | 27 | `d46aa0000001` | **1** |
+| `9dc6e15c7b7c112ccb81b3be9c1609be66c92414` (approved target) | 31 | `d49aa0000001` | **1** |
 
-### C.4 Ancestry of the Head (`d49aa0000001`)
+The previously reported "seven heads" count and the intermediate "two heads (`…`, `merge_day38_gex`)" count are both invalid. `merge_day38_gex` was misread as childless because its consumer (`f7aa24156f6d`) declares it as a *tuple* member rather than a bare string.
+
+### C.5 Ancestry of the approved head
+
+Walked from the approved head towards the root; `(merge of A, B)` marks a revision whose `down_revision` names more than one parent:
 
 ```
 d49aa0000001
-    → d48aa0000002
-        → d48aa0000001
-            → d47aa0000001
-                → d46aa0000001
-                    → d45aa0000001
-                        → f4a9b8c2d1e7
-                            → e9f8a7b6c5d4
-                                → c1d2e3f4a5b6
-                                    → a3b4c5d6e7f8 (merge)
-                                        ├─── e2b4c6d8f0a1 → 5e2a7b9c3f4d
-                                        └─── f1a2b3c4d5e6 → e5f6a7b8c9d0 → d9e0f1a2b3c4 → 5e2a7b9c3f4d
-                                → (also via other path)
-                            → (back up the chain)
-                        → (back up the chain)
-                    → (back up the chain)
-                → (back up the chain)
-            → (back up the chain)
-        → (back up the chain)
-    → (back up the chain through 9e4d8c2a1f7b → 3f8a2e9c4d5b → 5e2a7b9c3f4d, etc.)
+→ d48aa0000002 → d48aa0000001 → d47aa0000001 → d46aa0000001
+→ d45aa0000001 → f4a9b8c2d1e7 → e9f8a7b6c5d4 → c1d2e3f4a5b6
+→ a3b4c5d6e7f8            (merge of e2b4c6d8f0a1, f1a2b3c4d5e6)
+     e2b4c6d8f0a1 → 5e2a7b9c3f4d
+     f1a2b3c4d5e6 → e5f6a7b8c9d0 → d9e0f1a2b3c4 → 5e2a7b9c3f4d
+→ 5e2a7b9c3f4d            (merge of 3f8a2e9c4d5b, c7d3e5f8a9b2)
+     3f8a2e9c4d5b         (merge of 9e4d8c2a1f7b, b3e5f8a1c7d2)
+          9e4d8c2a1f7b → f7a3c2d1e94b → a0deb75ad22f → 125e1807df8d → d3eb45a2e046
+          b3e5f8a1c7d2 → a7c1d9e4f2b8 → f7aa24156f6d
+     c7d3e5f8a9b2 → b8c9f1d2e34a   (merge of a0deb75ad22f, 9e4d8c2a1f7b)
+          → a1b2c3d4e5f6 → b2c3d4e5f6a7 → merge_day38_gex
+f7aa24156f6d              (merge of 9b675f8a3af0, merge_day38_gex)
+     9b675f8a3af0 → e8f9a0b1c2d3 → 125e1807df8d
+     merge_day38_gex      (merge of b2c3d4e5f6a7, e8f9a0b1c2d3)
 ```
 
-### C.5 Merge Points
+Single root: `d3eb45a2e046` (`down_revision = None`, the only such file). Single leaf: `d49aa0000001` at the approved target, `d46aa0000001` at the historical deployment.
 
-- `a3b4c5d6e7f8`: Merge revision with two down_revisions (`e2b4c6d8f0a1`, `f1a2b3c4d5e6`). Both paths converge on `5e2a7b9c3f4d`.
-- `3f8a2e9c4d5b`: Merge revision with two down_revisions (`9e4d8c2a1f7b`, `b3e5f8a1c7d2`).
+### C.6 What changed between the two pinned trees
 
-### C.6 Previous "Seven Heads" Claim — Corrected
+- 27 → 31 migration files: **four** added (§C.2), **none** removed.
+- Exactly **one** existing file changed content: `e5f6a7b8c9d0_uq_users_broker_identity_active.py`. The change splits the dialect branches so CockroachDB drops the backing unique index (`DROP INDEX IF EXISTS users@uq_users_broker_identity CASCADE`) while PostgreSQL keeps `ALTER TABLE users DROP CONSTRAINT IF EXISTS uq_users_broker_identity`. `revision` and `down_revision` are unchanged, so the graph is unaffected and the PostgreSQL 16 path is unchanged.
+- No file's `revision` or `down_revision` changed between the two trees.
 
-The previous report claimed 7 separate heads at commit `b960ca2`. Reconstructed from exact Git trees with correct parsing (string/tuple/list `down_revision`, all merge parents, `depends_on`):
-- **b960ca2** (27 files): **1 head** — `d46aa0000001`
-- **9dc6e15** (31 files): **1 head** — `d49aa0000001`
+### C.7 Method and limitations
 
-`f7aa24156f6d` has `down_revision = ('9b675f8a3af0', 'merge_day38_gex')`; `merge_day38_gex` has parents `b2c3d4e5f6a7`, `e8f9a0b1c2d3` and has child `f7aa24156f6d` (referenced by `a7c1d9e4f2b8`), so `merge_day38_gex` is not a head. The four additional revisions at 9dc6e15 extend the chain from `d46aa0000001` to `d49aa0000001` as `d46aa0000001` → `d47aa0000001` → `d48aa0000001` → `d48aa0000002` → `d49aa0000001`. Alembic CLI/`ScriptDirectory.get_heads()` was not executed; static reconstruction only.
+- Method: static reconstruction from the exact objects in each pinned Git tree. `revision`, `down_revision`, and `depends_on` parsed as Python literals; string, tuple, and list forms all handled; every parent collected; heads derived as revisions referenced by no other revision.
+- **The Alembic CLI was not run.** `ScriptDirectory.get_heads()`, `alembic heads`, `alembic history`, and `alembic upgrade` were **not executed** at any point in this audit. No statement in this report should be read as a result of executing Alembic.
+- No database was contacted. No `alembic_version` state was read or written.
 
 ---
 
-## D. Current Branch-Tip Comparison
+## D. Pinned Commit Comparison
 
-| Item | Historical Deployment `b960ca2` | Current Branch Tip `9dc6e15c7b7c112ccb81b3be9c1609be66c92414` |
+| Item | Historical deployment `b960ca2` | Approved target `9dc6e15` |
 |---|---|---|
-| Branch | `feat/strikenova-day35-portfolio-intelligence` (configured on Render) | `feat/strikenova-day35-portfolio-intelligence` (GitHub remote) |
+| Branch | `feat/strikenova-day35-portfolio-intelligence` (configured on Render) | `feat/strikenova-day35-portfolio-intelligence` |
 | Commit SHA | `b960ca2f20f0c15bf2e59f3d894ccb66d8b0f3ba` | `9dc6e15c7b7c112ccb81b3be9c1609be66c92414` |
-| Commit date | 2026-09-25 | 2026-10-19 |
-| Commit message | Merge PR #98, Day-46 alert transaction boundary | Merge PR #132, docs/chatgpt-markdown-only-boundary-131 |
-| Descends from `b960ca2` | — | **Yes** — `b960ca2` IS an ancestor of current tip |
-| Commits added after `b960ca2` | — | **168 commits** (from `b960ca2` to current tip) |
-| Migration files at deployment | 31 files (same set as analyzed) | 31 files (some modified, no new files added between `b960ca2` and current HEAD) |
-| Alembic heads | 1 head: `d49aa0000001` | 1 head: latest revision in chain (may differ from `d49aa0000001` due to new migrations) |
-| PostgreSQL compatibility | PG16-compatible (no CRDB-specific SQL) | Same codebase; PG16-compatible |
-| Unmerged dependencies | None (auto-deploy disabled) | 168 commits of evolution; PR #130 open (draft, no migration changes), PR #136, #137 (security only) |
+| Commit date | 2026-09-24 | 2026-10-19 |
+| Commit message | Merge pull request #98 from `shahid1995/fix/day46-alert-transaction-boundary` | Merge pull request #132 from `shahid1995/docs/chatgpt-markdown-only-boundary-131` |
+| Relationship | Ancestor of the approved target | Descendant of the historical deployment |
+| Commits between them | — | 168 |
+| Migration files | 27 | 31 |
+| Alembic heads (static) | `d46aa0000001` (1) | `d49aa0000001` (1) |
+| Migration files added after this point | 4 (`d47aa0000001`, `d48aa0000001`, `d48aa0000002`, `d49aa0000001`) | — |
+| PostgreSQL 16 compatibility | Compatible by static inspection | Compatible by static inspection |
+| Deployed to Render | Yes — `dep-dar4go17lnhs73a0mfm0`, 2026-09-25, on CockroachDB | **No** — auto-deploy disabled, no deployment authorized |
+| Application approval | Historical provenance only | **Founder-approved application version** |
 
-**Key comparison findings:**
-- The current branch tip has evolved significantly (168 commits) from the historical deployment
-- `b960ca2` is an ancestor of the current tip, meaning the historical deployment is a valid starting point
-- The Alembic migration chain at `b960ca2` has head `d46aa0000001` at `b960ca2`; at approved target `9dc6e15` head is `d49aa0000001` after adding 4 migrations
-- No new migration files were added between `b960ca2` and current HEAD (31 files in both), but several existing files were modified
-- PR #130 (draft, Day-50 feature branch) and PR #136/#137 (security fixes) are open but contain no migration changes
-- Render auto-deploy is disabled; no new deployment is authorized by this task
+**Branch-tip qualification.** At the time this document was written, `git ls-remote origin refs/heads/feat/strikenova-day35-portfolio-intelligence` returned `9dc6e15c7b7c112ccb81b3be9c1609be66c92414`, so the approved commit *was* the live branch tip at publication. That is a point-in-time observation, not a standing guarantee: the approved target is identified by commit SHA, not by "whatever the branch tip is".
+
+**Open pull requests.** PR #130 (draft, Day-50 feature branch), #136, and #137 (security) were not inspected for migration content in this pass and were not modified in any way.
 
 ---
 
-## E. Migration Target Comparison
+## E. Revision Provenance (historical context only)
 
-### E.1 Candidate 1: `d49aa0000001` (HEAD of 31-revision chain at `b960ca2`)
+Earlier revisions of this report asked the Founder to select among "candidate revisions". That question is obsolete: the application version is approved (`9dc6e15`, expected head `d49aa0000001`). The following is retained only as provenance for the historical deployment.
 
-| Aspect | Details |
-|---|---|
-| Commit SHA | `d49aa0000001` (also: `d49aa0000001_normalize_iv_observation_timestamps_to_ist.py`) |
-| Alembic head(s) | **1 head: `d49aa0000001`** — unambiguous `alembic upgrade head` target |
-| Graph completeness | Complete 31-revision linear chain from baseline `d3eb45a2e046` |
-| Fresh PostgreSQL 16 compatibility | **PG16-compatible** — no CockroachDB-specific SQL, standard Alembic operations only |
-| Chain status | Linear from baseline; merge at `a3b4c5d6e7f8` with two parent paths that both converge on `5e2a7b9c3f4d` |
-| Risk level | Low — single well-defined head, no ambiguity |
-| Application context | Latest revision in the 31-revision development chain; continues from old staging revision `5e2a7b9c3f4d` |
+### E.1 `5e2a7b9c3f4d` — old Render/CockroachDB staging head
 
-### E.2 Candidate 2: `b2c3d4e5f6a7` (origin/main head)
+- Merge revision, `down_revision = ('3f8a2e9c4d5b', 'c7d3e5f8a9b2')`.
+- **Not a head** at either pinned tree: it has multiple descendants, including `e2b4c6d8f0a1`, `d9e0f1a2b3c4`, and the whole path through `a3b4c5d6e7f8` to `d49aa0000001`.
+- It was the last revision deployed to the old Render staging environment on CockroachDB. The CockroachDB deployment context is not an authorized recovery target; the revision itself is ordinary PostgreSQL-compatible Alembic.
+- Position: ancestor of the approved head `d49aa0000001`.
 
-| Aspect | Details |
-|---|---|
-| Commit SHA | `b2c3d4e5f6a7` |
-| Alembic head(s) | **1 head: `b2c3d4e5f6a7`** — but only 3 migration files tracked in origin/main's tree |
-| Graph completeness | Incomplete — only 3 migration files in origin/main's alembic/versions, vs. 31 in HEAD chain |
-| Fresh PostgreSQL 16 compatibility | Unknown — origin/main chain is separate from the 31-revision HEAD lineage |
-| Chain status | Separate minimal chain; only 7 revisions tracked; never served as staging target |
-| Risk level | High — would require applying 28 additional migrations from the HEAD lineage to reach feature parity; branch has never been the staging target |
-| Application context | origin/main head; separate chain from the development lineage; 711 commits ahead of origin/main in the full repo history |
+### E.2 `b2c3d4e5f6a7` — Alembic revision, **not** a commit
 
-### E.3 Candidate 3: `5e2a7b9c3f4d` (old Render staging head)
+- `revision = b2c3d4e5f6a7`, `down_revision = a1b2c3d4e5f6`, file `b2c3d4e5f6a7_add_gex_provenance_columns.py`.
+- One of the two parents of `merge_day38_gex`; **not a head**.
+- The previous revision of this report described it as "origin/main head" with "3 migration files tracked". That was a category error: `b2c3d4e5f6a7` is not a Git object (`git cat-file -t` fails), and the actual `origin/main` tip is `e62f196f7d3530943a8669c6ded41c74b55bf77d`. No claim about `origin/main`'s migration inventory is made here, because it was not established in this pass.
 
-| Aspect | Details |
-|---|---|
-| Commit SHA | `5e2a7b9c3f4d` |
-| Alembic head(s) | **Not a head** — has descendants `e2b4c6d8f0a1` and `d9e0f1a2b3c4`, which continue to merge `a3b4c5d6e7f8` → `d49aa0000001` |
-| Graph position | Ancestor of `d49aa0000001`; old Render/CockroachDB staging deployed at this revision on Sept-13 |
-| Fresh PostgreSQL 16 compatibility | PG16-compatible — the revision itself uses standard Alembic operations; the chain continues from it |
-| Chain status | Earlier point in the same chain as `d49aa0000001`; old Render staging used this on CockroachDB (prohibited platform) |
-| Risk level | Medium — revision is valid PostgreSQL, but the CockroachDB deployment context is prohibited; the chain continues to `d49aa0000001` |
-| Application context | Last Render staging deployment revision (Sept 13, 2026); used on CockroachDB which the Founder has not authorized for recovery |
+### E.3 `d49aa0000001` — approved head
 
-### E.4 Summary Comparison
-
-| Criterion | `d49aa0000001` | `b2c3d4e5f6a7` | `5e2a7b9c3f4d` |
-|---|---|---|---|
-| Alembic head count | 1 (unambiguous) | 1 (but incomplete graph) | N/A (not a head; has descendants) |
-| PG16 compatibility | ✅ Confirmed | ⚠️ Unknown (separate chain) | ✅ Revision-level compatible |
-| Founder authorization | Not established | Not established | Not established (was Render/CockroachDB) |
-| Chain continuity | Linear from baseline | Separate minimal chain | Predecessor in same chain as `d49aa0000001` |
-| Recommended for fresh PG16 | ✅ Yes (primary candidate) | ❌ Not recommended (incomplete) | ⚠️ Viable but context tainted |
+- `down_revision = d48aa0000002`; data-normalization migration (IV observation timestamps to IST), batched, and a no-op on an empty database.
+- Single head at `9dc6e15`, reached by the linear chain from `d46aa0000001`.
+- This is the approved expected head. It is not a *deployment* target statement — applying it is gate 3 of §A and is not authorized.
 
 ---
 
-## F. Neon Role Security
+## F. Neon Role State (earlier read-only observation)
 
-### F.1 Actual Role Catalog (read-only inspection)
+**Source and date qualification.** The catalog below was read in the *earlier* audit pass with a read-only `pg_roles` query against Neon project `gentle-field-42671929`, database `strikenova_staging`. That inspection has no separately recorded timestamp in these artifacts; the only dated evidence surviving from the same pass is the Render startup-log inspection dated **2026-11-02**. **The Neon role catalog was not re-read during this documentation-only pass**, and nothing here should be read as a fresh verification. A re-read requires a separate, authorized task with database connectivity.
 
 | Role | LOGIN | SUPERUSER | CREATEDB | CREATEROLE | REPLICATION | BYPASSRLS | Purpose |
 |---|---|---|---|---|---|---|---|
@@ -265,183 +278,128 @@ The previous report claimed 7 separate heads at commit `b960ca2`. Reconstructed 
 | `neon_service` | True | False | True | True | True | True | Neon internal |
 | `neon_superuser` | False | False | True | True | True | False | Neon internal |
 | `strikenova_staging_owner` | True | False | True | True | **True** | **True** | Provider-created, connection-holding role |
-| All `pg_*` / `neon_*` / `cloud_*` roles | System roles | — | — | — | — | — | PostgreSQL/Neon infrastructure |
+| `pg_*` / `neon_*` / `cloud_*` | — | — | — | — | — | — | PostgreSQL/Neon infrastructure |
 
-### F.2 Documentation Gap
+**Observations, stated with their correct weight:**
 
-The three documented privilege-model roles are **NOT present**:
+1. `strikenova_staging_owner` is the only application-present role, and it is provider-created. It carries `replication=True` and `bypass_rls=True`, which exceed what a staging application connection needs. Its `CREATEROLE=True` also means it can create the proposed staging identities if that gate is authorized.
+2. The production identities defined in `DATA.md` §5 (`strikenova_production_app`, `strikenova_prod_migrator`, `strikenova_prod_runtime`, `strikenova_prod_admin`) are **not** expected in staging. They are the accepted identities for the *production* database `strikenova`; their absence here is not an implementation failure and must not be graded as one.
+3. There is no broad break-glass *database login* for staging, and that is not a defect: for staging, break-glass administration is intended to remain through the authorized Neon provider account. (Production's `strikenova_prod_admin` break-glass identity is a production-only artifact of `DATA.md` §5.)
 
-| Role | Expected Type | Status |
+**Grading (corrected):**
+
+| Item | Classification | Rationale |
 |---|---|---|
-| `strikenova_prod_migrator` | Migration (DDL capable) | **NOT CREATED** |
-| `strikenova_production_app` | Runtime (DML-only) | **NOT CREATED** |
-| `strikenova_prod_admin` | Break-glass administrative | **NOT CREATED** |
-
-### F.3 Privilege Excess on `strikenova_staging_owner`
-
-The provider-created `strikenova_staging_owner` has:
-- `replication=True` — allows replication operations, not required for application connectivity
-- `bypass_rls=True` — bypasses Row Level Security, a privileged attribute
-
-These attributes exceed what is needed for a staging database's connection-holding role. However, modifying them is outside the audit scope (no ALTER permitted).
-
-### F.4 No Application Roles Implemented
-
-Zero of the three documented privilege-model roles exist. The database has:
-- No mechanism for separating migration DDL from application DML
-- No dedicated runtime role
-- No break-glass path through the database itself (the break-glass path must remain through the authorized Neon account only)
-
-### F.5 Verdict
-
-| Classification | Rationale |
-|---|---|
-| `strikenova_staging_owner` | `WARNING` — Provider-created role has `replication=True, bypass_rls=True` (excessive for staging), but is the sole connection-holding role; no other roles exist to share the load |
-| `strikenova_prod_migrator` | `FAIL` — Role not created; documented privilege model not implemented |
-| `strikenova_production_app` | `FAIL` — Role not created; no DML-only runtime guardrails in place |
-| `strikenova_prod_admin` | `FAIL` — Role not created; no break-glass role via database; must rely on Neon account |
-| All `pg_*` / `neon_*` / `cloud_*` roles | `PASS` — System roles expected and correctly configured |
-
-### F.6 Critical Documentation Correction
-
-The previous report incorrectly cited `DATA.md` §5 as the documented database privilege model. **In the current repository, `DATA.md` §5 describes paper-trading data, not database login roles or grants.** No accepted database-role contract was located in the repository. The audit task requires identifying an accepted privilege-contract document; none exists in the current codebase.
-
-Search results for accepted database privilege contracts:
-- `DATA.md` §5: Paper-trading data (NOT database roles)
-- `SECURITY.md`: Not found in repository
-- `INVARIANTS.md`: Not found in repository
-- `DECISIONS.md`: Not found in repository
-- No ADRs or decision documents referencing database privilege contracts were located
-
-**Verdict: `NO EXPLICIT ACCEPTED DATABASE ROLE CONTRACT LOCATED`**
-
-The implementation exists (the `strikenova_staging_owner` role is present), but the documented privilege-model design specified in the audit task is absent. A proposed least-privilege design requiring separate Founder approval is discussed in Section G.
+| `strikenova_staging_owner` privilege breadth | `WARNING` | Provider-created role holds `replication`, `bypass_rls`, `createdb`, `createrole`. Not alterable under read-only authorization. |
+| Staging identity separation implemented | `PENDING` | Proposed in `NEON_STAGING_PRIVILEGE_PROPOSAL.md`; requires separate authorization. Not a "failure". |
+| `strikenova_prod_*` absent from staging | `NOT APPLICABLE` | Production-database identities; wrong database to test them in. |
+| No staging break-glass database login | `ACCEPTED BY DESIGN` | Provider-account administration is the intended staging model. |
+| System roles (`cloud_admin`, `neon_service`, `neon_superuser`) | `EXPECTED` | Neon platform infrastructure. |
 
 ---
 
-## G. Previous Report Corrections (Discrepancy Table)
+## G. Accepted Database Architecture vs Proposed Staging Identities
 
-See the "Change Log — Corrections from Previous Report" at the top of this document for the complete discrepancy table. The key corrections are:
+The previous revisions of this report claimed that no accepted privilege architecture, no ADRs, and no decision documents existed. That was incorrect. The repository contains `DECISIONS.md`, `INVARIANTS.md`, `SECURITY.md`, and `PROJECT-CONTROL.md` at the repository root, and the relevant decisions are *Accepted*:
 
-1. **Render provider**: CockroachDB (not Neon)
-2. **Alembic heads**: 1 head (`d49aa0000001`), not 7
-3. **`DATA.md` §5**: Paper-trading data (not database roles)
-4. **Founder authorization**: Not established for any staging target
-5. **Privilege-model roles**: Not created in Neon database
+| Record | Title | Status | Content relevant here |
+|---|---|---|---|
+| ADR-016 | Runtime/migration database identity separation (opt-in) | **Accepted** | `STRIKENOVA_MIGRATION_DATABASE_URL` runs Alembic under a dedicated migration identity; the runtime credential can then be restricted to DML with no schema ownership. Unset ⇒ historical single-identity behaviour. Validation record: migrator identity ran the full 27-revision chain from empty to `d46aa0000001`. |
+| ADR-017 | Migration serialization via transactional lease lock | **Accepted** | Single-row lease (`_migration_lock`) acquired around Alembic execution using the migration identity; bootstraps on an empty database; `MIGRATION_LOCK_TTL_SECONDS >= 2`. Manual CLI path remains operator-controlled. |
+| ADR-018 | Production future-table privilege defaults (migrator-creator scope) | **Accepted** | Default privileges bound to the migration/creator role for future tables and sequences; DML-only grant; runtime never receives CREATE/ALTER/DROP/ownership/admin/role-management. |
+
+`DATA.md` §5 is titled **"Production privilege model (database `strikenova`)"** — verified against live production metadata on 2026-09-26. It documents four production identities (`strikenova_production_app` DML-only, `strikenova_prod_migrator` DDL, `strikenova_prod_runtime` NOLOGIN owner, `strikenova_prod_admin` break-glass), the two `pg_default_acl` rows bound to `strikenova_prod_migrator`, `_migration_lock` ownership, and the warning that defaults do not follow a creator-role change. It is a database-role and grant contract, not paper-trading data. The previous claim that §5 covers paper-trading data was false and is withdrawn.
+
+**Distinct layers that must not be conflated:**
+
+| Layer | Names | Status |
+|---|---|---|
+| Accepted architecture (role *model*) | ADR-016 / ADR-017 / ADR-018 | **Accepted** in `DECISIONS.md` |
+| Accepted production identities (database `strikenova`) | `strikenova_production_app`, `strikenova_prod_migrator`, `strikenova_prod_runtime`, `strikenova_prod_admin` | Documented as the live production state in `DATA.md` §5 |
+| Proposed staging identities (database `strikenova_staging`) | `strikenova_staging_migrator`, `strikenova_staging_app` | **Proposed**, not created; see `NEON_STAGING_PRIVILEGE_PROPOSAL.md` |
+| Provider-created staging owner | `strikenova_staging_owner` | Exists (Neon-created) |
+
+The gap is therefore **implementation of staging-scoped identities**, not the existence of accepted architecture. Application support already exists: `app/config.py` defines `STRIKENOVA_MIGRATION_DATABASE_URL`; `app/db.py` resolves the migration URL through `resolve_migration_database_url()` (precedence: explicit/CLI → `STRIKENOVA_MIGRATION_DATABASE_URL` → `DATABASE_URL`) and uses it for the migration engine, the lock, and `_run_alembic_migrations()`; `alembic/env.py` delegates to the same resolver; `app/_migration_lock.py` implements the ADR-017 lease. **No application source change is required to enable separation.**
 
 ---
 
 ## H. Findings (Ranked)
 
-### Critical Findings
+### Critical
+
+| # | Finding | Evidence | Impact | Owner |
+|---|---|---|---|---|
+| C-1 | Render staging is on CockroachDB, not Neon | Startup logs show `sqlalchemy_cockroachdb`; RU limit exceeded; connections rejected | Render cannot serve against Neon until gate 4 is authorized and executed | Founder (gate 4) |
+| C-2 | Staging identity separation is not implemented | Only provider-created `strikenova_staging_owner` exists; no `strikenova_staging_migrator` / `strikenova_staging_app` | Application would run with a role holding `replication`, `bypass_rls`, `createdb`, `createrole` | Founder (gate 2) |
+
+### High
+
+| # | Finding | Evidence | Impact | Owner |
+|---|---|---|---|---|
+| H-1 | `strikenova_staging_owner` carries privileges beyond staging need | `replication=True`, `bypass_rls=True`, `createdb=True`, `createrole=True` (earlier read-only observation) | Larger blast radius if the staging connection string leaks | Founder (gate 2) |
+| H-2 | Two prior reports miscounted graph heads | Static reconstruction: 1 head each (`d46aa0000001`, `d49aa0000001`); `merge_day38_gex` has child `f7aa24156f6d` | Correction required for `alembic upgrade head` reasoning | Corrected in §C |
+
+### Medium
 
 | # | Finding | Evidence | Impact |
 |---|---|---|---|
-| C-1 | Render staging uses CockroachDB, not Neon | Render startup logs; `sqlalchemy_cockroachdb` driver; CockroachDB RU limit exceeded | Render cannot currently connect to Neon; separate Neon project exists |
-| C-2 | Documented privilege-model roles not implemented | `strikenova_prod_migrator`, `strikenova_production_app`, `strikenova_prod_admin` absent from `pg_roles` | No separation between migration DDL and application DML; audit task requirements unmet |
-| C-3 | No Founder authorization for staging application commit | No evidence identifies which commit the Founder authorizes | No single revision can be selected for the Neon staging environment without Founder direction |
+| M-1 | Prior reports misidentified `DATA.md` §5 and denied the ADRs | `DATA.md` §5 is the production privilege model; ADR-016/017/018 are Accepted | Corrected in §G; governance was never missing |
+| M-2 | Prior reports described `ScriptDirectory.get_heads()` as executed | No Alembic command was ever run in any audit pass | Corrected in §C.7; all head results are static |
+| M-3 | Prior reports presented a revision ID as a commit | `b2c3d4e5f6a7` is an Alembic revision; `git cat-file -t` fails | Corrected in §E.2 |
 
-### High Findings
-
-| # | Finding | Evidence | Impact |
-|---|---|---|---|
-| H-1 | `strikenova_staging_owner` has excessive privileges | `replication=True, bypass_rls=True` on provider-created role | Increased attack surface; role has capabilities beyond typical staging need |
-| H-2 | Alembic head count was misreported as 7 | Graph analysis shows exactly 1 head: `d49aa0000001` | Previous report's "seven heads" claim is invalid; only `d49aa0000001` is the actual head |
-
-### Medium Findings
+### Low
 
 | # | Finding | Evidence | Impact |
 |---|---|---|---|
-| M-1 | No accepted database-role contract located | Search of repository found no DECISIONS.md, INVARIANTS.md, or ADRs referencing database privilege model | Founder must decide: implement privilege model or document actual configuration |
-| M-2 | Migration graph "seven heads" claim is invalid | Graph analysis using `ScriptDirectory.get_heads()` yields 1 head, not 7 | Requires report correction; all other revisions are ancestors of `d49aa0000001` |
+| L-1 | List-form `down_revision` in `b8c9f1d2e34a` | `['a0deb75ad22f', '9e4d8c2a1f7b']` | Naive string-only parsing misses this edge and inflates head counts; handled by literal parsing |
+| L-2 | `d9e0f1a2b3c4` creates a global UNIQUE index | `CREATE UNIQUE INDEX` on `(broker, broker_account_id)` | Succeeds on an empty database; would abort on duplicates. No data exists in the target. |
+| L-3 | `d9e0f1a2b3c4`→`e5f6a7b8c9d0` drop path is dialect-split | PostgreSQL keeps `DROP CONSTRAINT IF EXISTS`; CockroachDB uses `DROP INDEX … CASCADE` | PostgreSQL 16 path unaffected by the change between the two trees |
 
-### Low Findings
-
-| # | Finding | Evidence | Impact |
-|---|---|---|---|
-| L-1 | Tuple down_revision in `b8c9f1d2e34a_add_google_sub_to_users.py` | `['a0deb75ad22f', '9e4d8c2a1f7b']` — branch point | Both branches are valid migration targets; which was intended for staging must be documented |
-| L-2 | `d9e0f1a2b3c4_uq_broker_identity_global.py` creates UNIQUE index | `CREATE UNIQUE INDEX` on `(broker, broker_account_id)` | Would abort if duplicates exist; on brand-new empty DB, succeeds; no data to cause failure |
-| L-3 | `3f8a2e9c4d5b_merge_capability_backfill.py` has `down_revision = None` | Suggests standalone entry point or different branching origin | May be the base of a separate branch; document if intended for staging |
-
-### Informational Findings
+### Informational
 
 | # | Finding | Evidence | Impact |
 |---|---|---|---|
-| I-1 | System roles (`cloud_admin`, `neon_service`, `neon_superuser`) have elevated attributes | `replication=True, bypass_rls=True` on internal roles | Expected for Neon platform infrastructure; not application-relevant |
-| I-2 | 168 commits between `b960ca2` and current branch tip | `git log b960ca2..9dc6e15` shows significant evolution | Render service has auto-deploy disabled; no new deployment authorized |
-| I-3 | Merge revision `a3b4c5d6e7f8` has two down_paths | Down_revision = `(e2b4c6d8f0a1, f1a2b3c4d5e6)` | Both paths are valid; choice matters for schema history continuity |
+| I-1 | 168 commits between the pinned commits | `git rev-list --count b960ca2..9dc6e15` | Auto-deploy disabled; no deployment authorized |
+| I-2 | No `depends_on` declarations in either tree | Literal parse of every migration file | Graph edges come only from `down_revision` |
+| I-3 | Six multi-parent revisions | `b8c9f1d2e34a`, `3f8a2e9c4d5b`, `5e2a7b9c3f4d`, `a3b4c5d6e7f8`, `merge_day38_gex`, `f7aa24156f6d` | Explains why head counting is error-prone without full parsing |
 
 ---
 
-## I. Decision Recommendation
+## I. Authorizations Outstanding
 
-### Decision 1: Authorized staging application commit
+The application version is decided. Three authorizations remain, each separate:
 
-The Founder must specify which application version is intended for the Neon staging environment. The three candidates, with evidence, are:
+1. **Staging privilege implementation** — authorize creating `strikenova_staging_migrator` and `strikenova_staging_app` with grants per ADR-016/017/018, and decide whether to alter the provider role's attributes. Proposal and review-only SQL: `NEON_STAGING_PRIVILEGE_PROPOSAL.md`. Login credentials must come from an approved provider/secret-management process; no plaintext secret may be committed.
+2. **Neon migration execution** — authorize `alembic upgrade head` against the existing empty `strikenova_staging` database. Instrument: `NEON_STAGING_EXECUTION_PLAN.md`, gate 3.
+3. **Render–Neon integration and deployment** — authorize changing Render's database configuration and redeploying. Not performed; auto-deploy remains disabled.
 
-1. **`d49aa0000001`** (HEAD revision) — Latest development chain (31 migrations). The Alembic chain continues from the old staging revision `5e2a7b9c3f4d` through `e2b4c6d8f0a1` → merge `a3b4c5d6e7f8` → ... → `d49aa0000001`. **Technically the most suitable** for a fresh PostgreSQL 16 database: single unambiguous head, PG16-compatible, linear chain from baseline.
-
-2. **`b2c3d4e5f6a7`** (origin/main head) — Separate minimal chain (7 revisions tracked). **Not recommended** for staging: this branch has never been the staging target and would require applying 28 additional migrations from the HEAD lineage to reach feature parity.
-
-3. **`5e2a7b9c3f4d`** (old Render staging head) — Earlier point in the same chain as `d49aa0000001`. The old Render/CockroachDB staging deployed at this revision on Sept-13. **Note**: The CockroachDB deployment is a prohibited platform, but the revision itself is valid PostgreSQL. If the Founder wants to restart from the last known good staging revision, this would be the choice — but the chain continues to `d49aa0000001`.
-
-**Required Founder action**: State which of the three revision sources is the authorized staging target, or provide an alternative commit SHA. If `d49aa0000001` is chosen, `alembic upgrade head` will unambiguously upgrade to that revision on the new Neon PostgreSQL 16 database.
-
-### Decision 2: Privilege model implementation
-
-The Founder must decide whether to implement the documented privilege-model roles per the audit task requirements:
-
-- **Option A**: Create the three roles (`strikenova_prod_migrator`, `strikenova_production_app`, `strikenova_prod_admin`) with documented grants. This would enable proper separation of migration DDL from application DML, satisfying the audit task's security requirements.
-
-- **Option B**: Acknowledge that the privilege model is not applicable to this Neon staging setup and document the actual role configuration in use (currently only `strikenova_staging_owner` exists with `replication=True, bypass_rls=True`).
-
-**Required Founder action**: Authorize role creation (Option A) or document the alternative (Option B). Without this decision, the database role security blocker remains.
-
-### Without both decisions, the status remains:
-
-`BLOCKED — STAGING APPLICATION COMMIT NOT IDENTIFIABLE` + `BLOCKED — DATABASE ROLE SECURITY NOT VERIFIED`
+No authorization exists for: touching production, modifying CockroachDB, altering Neon project settings, or modifying any pull request.
 
 ---
 
-## J. Final Safety Verification
+## J. Safety Verification
 
-Explicit confirmation that no prohibited action was performed:
-
-- [x] Neon remains empty — no migrations applied, no schema objects created
-- [x] No migrations were applied or stamped against Neon
-- [x] No roles, passwords or privileges were changed in Neon
-- [x] No Neon project settings were changed
-- [x] No CockroachDB cluster was activated or modified
-- [x] No Render environment variables, settings, branch or deployment were changed
-- [x] No production database or service was touched
-- [x] No application source code, migration files, or configuration were modified
-- [x] No GitHub branches, commits, pull requests or statuses were changed
-
-All safety conditions verified. The Neon database remains in its provisioned state, unchanged. The Render service configuration is undisturbed. The repository working tree is intact.
+- [x] Neon remains unmodified — no migrations applied, no `alembic_version` written, no schema objects created
+- [x] No roles created, altered, or granted; no passwords set
+- [x] No Neon project settings changed
+- [x] No CockroachDB cluster activated or modified
+- [x] No Render environment variable, setting, branch, or deployment changed
+- [x] No production database or service contacted
+- [x] No application source code, migration file, test, or configuration modified
+- [x] No credentials, connection strings, tokens, or secrets read, printed, or committed
+- [x] No branch created or deleted; PR #130/#136/#137 untouched; nothing merged
 
 ---
 
 ## K. Final Status
 
-`PARTIALLY CORRECTED — MIGRATION GRAPH VERIFIED, APPLICATION TARGET NOT AUTHORIZED`
+`APPLICATION VERSION APPROVED (COMPLETE) — STAGING PRIVILEGE IMPLEMENTATION, NEON MIGRATION EXECUTION, AND RENDER-NEON INTEGRATION PENDING SEPARATE FOUNDER AUTHORIZATION — NO DATABASE OR INFRASTRUCTURE ACTIONS TAKEN`
 
-**Rationale:**
+**Basis:**
 
-The corrective audit has verified two key findings:
-1. **Migration graph:** `b960ca2` has 27 files, 1 head (`d46aa0000001`); `9dc6e15` has 31 files, 1 head (`d49aa0000001`). `merge_day38_gex` has child `f7aa24156f6d` so not a head.
-2. **Render provider**: Render staging currently uses CockroachDB; Neon has not been connected — the previous claim that Render was already using Neon is corrected.
-
-However, two blockers remain that require Founder authorization:
-1. **Staging application commit not identifiable**: No evidence establishes which application commit the Founder authorizes for the Neon staging environment.
-2. **Database role security not verified**: The three documented privilege-model roles are not created in Neon; the provider-created `strikenova_staging_owner` has excessive privileges.
-
-Both blockers must be resolved before any Neon migration or Render configuration change is authorized.
-
-**Next steps (without executing):**
-- Founder to authorize the staging application commit (Decision 1).
-- Founder to authorize privilege-model role creation or document the alternative (Decision 2).
-- After both decisions are made, migrations can be safely applied to the fresh PostgreSQL 16 database.
-
----
+1. Application version: `feat/strikenova-day35-portfolio-intelligence` @ `9dc6e15c7b7c112ccb81b3be9c1609be66c92414`, expected head `d49aa0000001`. **Complete.**
+2. Migration graph: 27 files / 1 head (`d46aa0000001`) at `b960ca2`; 31 files / 1 head (`d49aa0000001`) at `9dc6e15`; four files added; `merge_day38_gex` is not a head. Static reconstruction only — Alembic was not executed.
+3. Architecture: ADR-016/017/018 Accepted; `DATA.md` §5 is the accepted production privilege model. Staging identity separation remains unimplemented and separately gated.
+4. Render remains on CockroachDB with auto-deploy disabled; Neon is not connected.
 
 **End of Corrective Independent Audit Report.**

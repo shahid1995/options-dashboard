@@ -1,87 +1,117 @@
 # Neon Staging Execution Plan
 
-**Purpose**: Numbered execution plan for Neon staging initialization/migration, showing what happens AFTER separate Founder authorization. No steps are executed by this documentation task.
+**Purpose:** Numbered plan for Neon staging privilege setup and migration, describing what happens **after** separate Founder authorization. **No step in this plan has been executed.**
 
-**Scope**: Planning only; no database changes, no role changes, no deployments.
+**Scope:** Planning only. No database change, no role change, no deployment, no credential access.
 
 **Founder-approved application target** (application version approval: **COMPLETE**):
 - Repository: `shahid1995/options-dashboard`
 - Branch: `feat/strikenova-day35-portfolio-intelligence`
 - Application commit: `9dc6e15c7b7c112ccb81b3be9c1609be66c92414`
-- Alembic head: `d49aa0000001`
+- Expected Alembic head: `d49aa0000001`
 
-**Target database:** Existing empty Neon PostgreSQL 16 database `strikenova_staging` (project `gentle-field-42671929`), AWS Singapore. **Not** a newly provisioned unrelated database.
+**Target database:** existing empty Neon PostgreSQL 16 database `strikenova_staging` (project `gentle-field-42671929`), AWS Singapore. **Not** a newly provisioned unrelated database, and **not** a disposable rehearsal instance.
 
-**Authorization gates (all separate, explicit authorization required):**
-1. **Application version** — **COMPLETE** (9dc6e15, head d49aa0000001)
-2. **Staging privilege model** — **PENDING**
-3. **Neon migration execution** — **PENDING**
-4. **Render-Neon integration & deployment** — **PENDING** (Render currently uses CockroachDB; auto-deploy disabled)
+**Authorization gates — all separate, each requiring explicit authorization:**
 
-**Configuration:** Use application's actual settings `DATABASE_URL` and optionally `STRIKENOVA_MIGRATION_DATABASE_URL` (ADR-016). Do **not** invent `NEON_DATABASE_URL`. Hosting platform is **Render** (remove any Railway references).
+| # | Gate | Status |
+|---|---|---|
+| 1 | Application version | **COMPLETE** (`9dc6e15`, expected head `d49aa0000001`) |
+| 2 | Staging privilege implementation | **PENDING** |
+| 3 | Neon migration execution | **PENDING** |
+| 4 | Render–Neon integration & deployment | **PENDING** (Render currently uses CockroachDB; auto-deploy disabled) |
 
----
+**Configuration names:** the application's own settings — `DATABASE_URL` (runtime) and optionally `STRIKENOVA_MIGRATION_DATABASE_URL` (migration identity, ADR-016). Do **not** invent `NEON_DATABASE_URL`.
 
-## Pre-Execution Checks (No Actions Taken)
-
-- [x] Migration history corrected from exact Git trees (b960ca2: 27 files, 1 head `d46aa0000001`; 9dc6e15: 31 files, 1 head `d49aa0000001` via 4 added migrations `d47aa0000001`→`d48aa0000001`→`d48aa0000002`→`d49aa0000001`). `f7aa24156f6d` points to `merge_day38_gex` (has child) so not a head. Graph reconstructed with string/tuple/list `down_revision`, all merge parents, `depends_on`. Alembic CLI/`ScriptDirectory.get_heads()` not executed; static reconstruction only.
-- [x] Application code supports `STRIKENOVA_MIGRATION_DATABASE_URL` (no code changes needed)
-- [x] ADR-016/017/018 accepted and understood
-- [x] CI evidence qualified (runs at a016887, not exact 9dc6e15; not Neon-specific)
-- [x] No Neon/CockroachDB/Render changes made
+**Platform:** **Render**. There are no Railway instructions in this plan.
 
 ---
 
-## Execution Plan (Only If All Gates Authorized)
+## Pre-Execution Checks (Already Satisfied — No Actions Taken)
 
-### Gate 1: Privilege Model (if using two-identity model) — Requires separate authorization
-1. **Review proposal** — Review `NEON_STAGING_PRIVILEGE_PROPOSAL.md` and decide Option A or B.
-2. **Create scoped roles** (if Option A) — Create staging migrator and app roles with correct grants per ADR-016/017/018. Use staging-scoped names (no mixing prod names). Apply defaults with `ALTER DEFAULT PRIVILEGES FOR ROLE <migrator> ...` for tables and sequences. Do **not** grant `REPLICATION`/`BYPASSRLS` to app identities. Do **not** propose invalid SQL (`CREATE TEMPORARY TABLES ON SCHEMA` as schema privilege). Do **not** alter provider role `strikenova_staging_owner` unless documented technical requirement exists.
-3. **Configure env vars** (if two-identity) — Set `STRIKENOVA_MIGRATION_DATABASE_URL` to migrator connection, `DATABASE_URL` to runtime app connection. Understand migration lock uses migration identity.
-4. **Verify roles** (read-only) — Confirm grants without modifying data.
+- [x] Migration history reconstructed from the exact pinned trees: `b960ca2` = 27 files, 1 head `d46aa0000001`; `9dc6e15` = 31 files, 1 head `d49aa0000001`, adding `d47aa0000001` → `d48aa0000001` → `d48aa0000002` → `d49aa0000001`.
+- [x] `merge_day38_gex` confirmed **not** a head: `f7aa24156f6d` declares it as a tuple `down_revision`, and `a7c1d9e4f2b8` descends from `f7aa24156f6d`.
+- [x] Graph parsed for string, tuple, and list `down_revision`; all merge parents collected; `depends_on` checked (none declared).
+- [x] **Alembic CLI / `ScriptDirectory.get_heads()` not executed** — all head results are static reconstruction.
+- [x] Application already supports `STRIKENOVA_MIGRATION_DATABASE_URL`; no application source change needed.
+- [x] ADR-016/017/018 read and confirmed *Accepted*; `DATA.md` §5 is the accepted production privilege model.
+- [x] CI evidence qualified (runs at `a016887`, not at the exact `9dc6e15` SHA; not Neon-specific; predates the four added revisions).
+- [x] No Neon, CockroachDB, or Render change made.
 
-### Gate 2: Migration Execution — Requires separate authorization  
-5. **Confirm target DB** — Confirm connecting to existing empty Neon `strikenova_staging` DB (not scratch). Distinguish from any disposable PG16 rehearsal.
-6. **Pre-migration check** — Ensure no `alembic_version` table or app tables exist (fresh empty DB). If not empty, do **not** proceed without explicit authorization and understanding.
-7. **Run migrations** — From `options-dashboard-project/backend/`, run `alembic upgrade head`. Use migration identity if configured (ADR-016); lock will serialize (ADR-017). Bootstrap on empty DB is supported.
-8. **Verify** — Confirm head is `d49aa0000001`, key tables exist. Do **not** guess unverified table counts.
+---
 
-### Gate 3: Render-Neon Integration & Deployment — Requires separate authorization
-9. **Review Render config** — Render currently uses CockroachDB; changing to Neon requires separate authorization. No changes made now.
-10. **Update env vars on Render** (if authorized) — Point to Neon appropriately; do **not** assume automatic cutover.
-11. **Deploy** (if authorized) — Follow Render's process; auto-deploy currently disabled.
-12. **Smoke tests** — Verify app connects with scoped runtime identity, migrations applied correctly.
+## Gate 2 — Staging Privilege Implementation (requires separate authorization)
 
-### Gate 4: Post-Deploy Verification
-13. **Validate identity separation** (if enabled) — Runtime identity cannot perform DDL; migrator owns objects per ADR-018.
-14. **Check lock behavior** — Understand startup lock behavior.
-15. **Document outcome** — Record results, any issues, and remaining gaps.
+1. **Review the proposal.** Read `NEON_STAGING_PRIVILEGE_PROPOSAL.md` and choose option A, B, or C. Nothing below runs before that decision.
+2. **Provision credentials out of band.** Obtain passwords for `strikenova_staging_migrator` and `strikenova_staging_app` from the approved Neon/provider process or the platform secret store. Never write a password, connection string, or token into a file, SQL script, log, or chat.
+3. **Create the two login roles** (review-only SQL in the proposal, §6). Do not grant `REPLICATION`, `BYPASSRLS`, `CREATEDB`, `CREATEROLE`, `SUPERUSER`, or object ownership to the runtime role.
+4. **Grant schema access.** `USAGE, CREATE` on schema `public` to the migrator; `USAGE` on `public` and `CONNECT` on the database to the app. In PostgreSQL 16, `public` no longer grants `CREATE` to `PUBLIC`, so this is explicit.
+5. **Install default privileges for the migrator** (ADR-018): `ALTER DEFAULT PRIVILEGES FOR ROLE strikenova_staging_migrator IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO strikenova_staging_app;` and `… GRANT USAGE ON SEQUENCES TO strikenova_staging_app;`
+   - Run this as the migrator, or as a role that is a member of it. Membership is the documented precondition for the `FOR ROLE` form; `WITH INHERIT TRUE, SET TRUE` also enables the `SET ROLE` path.
+   - Defaults affect **future** objects only. Existing objects need explicit `GRANT … ON ALL TABLES/SEQUENCES IN SCHEMA`.
+6. **Configure environment variables** (only if two-identity is authorized): `STRIKENOVA_MIGRATION_DATABASE_URL` → migrator connection; `DATABASE_URL` → runtime app connection.
+7. **Verify read-only** using the checks in the proposal §8 (`pg_roles`, `pg_default_acl` / `\ddp`, `has_schema_privilege`, membership options). Confirm the app identity cannot create in `public`.
+8. **Do not alter `strikenova_staging_owner`** unless a documented technical requirement and its own authorization exist. It currently holds `replication`, `bypass_rls`, `createdb`, `createrole`.
+
+**Gate 2 exit criteria:** migrator and app roles exist with the intended attributes; two `pg_default_acl` rows bound to the migrator; the app identity is DML-only; credentials live only in the secret store.
+
+---
+
+## Gate 3 — Neon Migration Execution (requires separate authorization)
+
+9. **Confirm the target.** Confirm the connection resolves to the existing empty Neon `strikenova_staging` database — not a scratch or rehearsal instance. Record the database name and project, never the credential.
+10. **Confirm emptiness.** Verify no `alembic_version` table and no application tables exist. If the database is not empty, stop and obtain explicit instruction; do not stamp, force, or downgrade on assumption.
+11. **Choose the executing identity.** Either connect as `strikenova_staging_migrator`, or connect as an authorized administrative role and `SET ROLE strikenova_staging_migrator` for the session. **Objects must be created by the migrator** — membership alone does not apply the migrator's default privileges at creation time.
+12. **Run the migration.** From `options-dashboard-project/backend/`, run `alembic upgrade head`. The single head at this tree is `d49aa0000001`, so the target is unambiguous. With the two-identity model the ADR-017 lease serializes execution and bootstraps on an empty database.
+13. **Verify.** Confirm `alembic_version` reports `d49aa0000001`, that the key tables exist, and that a table created by the migrator carries the runtime grants from the defaults. Do **not** assert an unverified table count.
+
+**Gate 3 exit criteria:** `alembic_version` = `d49aa0000001`; runtime identity can DML and cannot DDL; `_migration_lock` owned by the migrator and unlocked.
+
+---
+
+## Gate 4 — Render–Neon Integration & Deployment (requires separate authorization)
+
+14. **Review the Render configuration.** Render currently uses CockroachDB. Changing the database requires its own authorization; no change is made by this plan.
+15. **Update Render environment variables** (if authorized): point `DATABASE_URL` at the runtime identity and `STRIKENOVA_MIGRATION_DATABASE_URL` at the migrator identity through Render's secret store. Do not assume an automatic cutover.
+16. **Deploy** (if authorized). Auto-deploy is currently disabled; a deployment must be triggered deliberately.
+17. **Smoke test** against the deployed service: application connects with the runtime identity, startup migration is a no-op at head, and the ADR-017 lease behaves as documented.
+
+**Gate 4 exit criteria:** the service serves traffic from Neon using the runtime identity; startup migration reports "already current"; no credential appears in logs.
+
+---
+
+## Gate 5 — Post-Deploy Verification
+
+18. **Verify identity separation** — the runtime identity cannot perform DDL; tables are owned by the migrator; defaults remain bound to the migrator.
+19. **Verify lease behaviour** — one instance migrates, concurrent instances wait or fail closed.
+20. **Document the outcome** — record commands, observed values, and any residual gaps. Record the provider role's retained attributes as an accepted or open risk.
 
 ---
 
 ## Critical Notes
 
-- **Each action needs explicit authorization.** This plan does not authorize or execute anything.
-- **Target is existing empty Neon DB.** Distinguish from disposable PostgreSQL rehearsal.
-- **Use correct env var names:** `DATABASE_URL`, `STRIKENOVA_MIGRATION_DATABASE_URL`. No `NEON_DATABASE_URL`.
-- **Platform:** Render (not Railway). Remove Railway restart/logging instructions.
-- **Correct SQL only.** Follow PostgreSQL 16 semantics; no invalid grants.
-- **Separate gates.** Application approval is complete; others are separate.
-- **No unverified table counts.** Do not prescribe specific table counts.
-- **Migration lock & ownership:** Explain per ADR-017/018.
-- **Rehearsal separation:** If disposable PG16 rehearsal performed, clearly mark as separate from real Neon DB.
+- **Every step needs explicit authorization for its own gate.** Application approval (gate 1) authorizes nothing else.
+- **Target is the existing empty Neon database.** Distinguish it from any disposable PostgreSQL 16 rehearsal.
+- **Correct env var names only:** `DATABASE_URL`, `STRIKENOVA_MIGRATION_DATABASE_URL`. No `NEON_DATABASE_URL`.
+- **Platform is Render.** No Railway restart or logging instructions apply.
+- **PostgreSQL 16 semantics only.** `TEMPORARY` is a database privilege, not a schema privilege; there is no standalone `CREATE INDEX` grant; defaults never apply retroactively.
+- **Creation role matters.** Defaults bound to the migrator are inert unless objects are actually created by the migrator.
+- **No unverified table counts.** Report only what is observed.
+- **Never commit or log credentials.** Passwords come from the secret store.
 
 ---
 
 ## What This Plan Does NOT Do
 
-- Create roles or grants
-- Run migrations
-- Change Render configuration
-- Deploy
-- Modify application code
-- Touch production databases
+- Create or alter roles, or grant privileges
+- Run migrations or write `alembic_version`
+- Change Render configuration or deploy
+- Modify application source, migrations, or configuration
+- Touch production or CockroachDB
+- Read, print, or store credentials
 
 ---
+
+**Status:** `PLAN ONLY — NO STEP EXECUTED — GATES 2, 3, AND 4 PENDING SEPARATE FOUNDER AUTHORIZATION`
 
 **End of Execution Plan**
