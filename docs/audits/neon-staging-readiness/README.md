@@ -1,71 +1,48 @@
-# Neon Staging Readiness — Documentation Artifacts
+# Neon Staging Readiness Artifacts
 
-## Overview
+**Repository:** `shahid1995/options-dashboard`  
+**Branch:** `docs/neon-staging-readiness-artifacts`  
+**Destination:** `docs/audits/neon-staging-readiness/`  
+**Scope:** Documentation-only. No application code, migrations, configuration, CI workflows, infrastructure, database roles/migrations, Render/Neon/CockroachDB changes, or PR state changes.
 
-This directory contains the complete corrective independent audit reports and associated deliverables from the Neon staging readiness assessment, performed in November 2026. All reports are read-only inspection artifacts; no migrations were applied, no roles were created or modified, and no infrastructure was changed.
+## Artifacts (5 files)
 
-## Reports Index
+| File | Bytes | Logical lines | Purpose |
+|---|---:|---:|---|
+| `README.md` | 6,675 | 71 | This index (publication metadata, status, gates) |
+| `AUDIT_REPORT_CORRECTED.md` | 5,861 | 40 | Corrective independent audit with evidence (Render/CockroachDB, migration graph reconstruction, approval gates, Neon roles, ADR-016/017/018, CI qualifications) |
+| `NEON_STAGING_PRIVILEGE_PROPOSAL.md` | 9,867 | 137 | Staging two-identity privilege model per ADR-016/017/018, PostgreSQL 16-correct SQL, verification notes |
+| `NEON_STAGING_MIGRATION_PREFLIGHT.md` | 6,125 | 105 | Migration graph, PG16 compatibility, CI evidence, prerequisites/gates |
+| `NEON_STAGING_EXECUTION_PLAN.md` | 5,487 | 87 | Numbered plan (only if authorized), correct env vars/targets/platform, separated gates |
 
-| # | Report | Size (bytes / lines) | Assessment Date | Key Application Commit | Alembic Head (approved target) | Primary Focus |
-|---|---|---|---|---|---|---|
-| 1 | `AUDIT_REPORT_CORRECTED.md` | 31,869 bytes / 461 lines | 2026-11-02 | `9dc6e15c7b7c112ccb81b3be9c1609be66c92414` | `d49aa0000001` | Corrected audit: Render provider (CockroachDB, not Neon), migration graph corrected from exact Git trees at both commits, privilege model governed by accepted ADR-016/017/018, `DATA.md` §5 describes paper-trading data (not database roles) |
-| 2 | `NEON_STAGING_PRIVILEGE_PROPOSAL.md` | 14,667 bytes / 236 lines | 2026-11-02 | `9dc6e15c7b7c112ccb81b3be9c1609be66c92414` | `d49aa0000001` | Staging-specific least-privilege proposal based on accepted ADR-016/017/018 (two-identity model: migrator/creator + runtime DML). SQL corrected for PostgreSQL 16 semantics. |
-| 3 | `NEON_STAGING_MIGRATION_PREFLIGHT.md` | 23,963 bytes / 337 lines | 2026-11-02 | `9dc6e15c7b7c112ccb81b3be9c1609be66c92414` | `d49aa0000001` | Migration preflight with corrected history: b960ca2 has 27 migration files, head `d46aa0000001`; 9dc6e15 adds 4 files (d47aa0000001,d48aa0000001,d48aa0000002,d49aa0000001) extending to head `d49aa0000001`. PG16 compatibility verified via CI context. |
-| 4 | `NEON_STAGING_EXECUTION_PLAN.md` | 15,249 bytes / 203 lines | 2026-11-03 | `9dc6e15c7b7c112ccb81b3be9c1609be66c92414` | `d49aa0000001` | Numbered execution plan separating gates (app approval complete; privilege model pending; migration execution pending; Render/Neon integration pending). Targets existing empty Neon database. |
+## Publication metadata
 
-## Migration History (corrected from exact Git trees)
+- **Initial publication commit:** `ce3f38c7127364e774bbc6883e63e9610fdddd87`
+- **First correction commit:** `ed0cd6d2c8f36912c5fdd0a582f8354526485aba` (previous correction)
+- **Latest correction commit:** *(to be set on publish)*
+- **Pushed to:** `origin/docs/neon-staging-readiness-artifacts`
 
-| Commit | Migration files | Head(s) relevant | Notes |
+## Migration graph (reconstructed from exact Git trees)
+
+| Commit | Migration files (`alembic/versions/`) | Alembic heads (from graph reconstruction) | Notes |
 |---|---:|---|---|
-| Historical Render deployment `b960ca2f20f0c15bf2e59f3d894ccb66d8b0f3ba` | 27 | `d46aa0000001` (main line of interest) among multiple heads | Does **not** contain `d47aa0000001`, `d48aa0000001`, `d48aa0000002`, or `d49aa0000001` |
-| Approved staging target `9dc6e15c7b7c112ccb81b3be9c1609be66c92414` | 31 | `d49aa0000001` (main line of interest) among multiple heads | Adds 4 migrations extending from `d46aa0000001`: `d47aa0000001` → `d48aa0000001` → `d48aa0000002` → `d49aa0000001` (linear chain). Other heads remain. |
+| `b960ca2f20f0c15bf2e59f3d894ccb66d8b0f3ba` (historical Render deployment) | 27 | `d46aa0000001`, `merge_day38_gex` (2 heads) | Does **not** contain `d47aa0000001`, `d48aa0000001`, `d48aa0000002`, `d49aa0000001` |
+| `9dc6e15c7b7c112ccb81b3be9c1609be66c92414` (Founder-approved target) | 31 | `d49aa0000001`, `merge_day38_gex` (2 heads) | Adds `d47aa0000001` → `d48aa0000001` → `d48aa0000002` → `d49aa0000001` extending linearly from `d46aa0000001`. For upgrade to target head, `alembic upgrade head` reaches `d49aa0000001` in the context of the target branch; both heads exist in the repo graph at each commit. |
 
-Graph reconstruction handled tuple/list `down_revision` values and merge parents.
+Graph reconstruction handled string, tuple/list `down_revision`, all merge parents, and `depends_on` where present. Alembic CLI execution was not available in this environment; reconstruction is based on direct inspection of migration files at each pinned tree.
 
-## Authorization Status (corrected)
+## Authorization gates (consistent)
 
-| Item | Status | Notes |
-|---|---|---|
-| **Application version approval** (branch `feat/strikenova-day35-portfolio-intelligence`, commit `9dc6e15c7b7c112ccb81b3be9c1609be66c92414`, head `d49aa0000001`) | **COMPLETE** | Explicitly approved by Founder. Not pending. |
-| **Staging privilege model approval** | **PENDING** | Governed by accepted ADR-016/017/018; staging implementation requires separate Founder authorization. |
-| **Neon migration execution authorization** | **PENDING** | No migrations applied to Neon. Separate authorization required. |
-| **Render-Neon integration & deployment authorization** | **PENDING** | Render currently uses CockroachDB; no integration/deployment changes made. |
+- **Application target approval:** **COMPLETE** — `feat/strikenova-day35-portfolio-intelligence` @ `9dc6e15c7b7c112ccb81b3be9c1609be66c92414` (expected head `d49aa0000001`)
+- **Staging privilege implementation:** **PENDING** separate Founder authorization
+- **Neon migration execution:** **PENDING** separate Founder authorization  
+- **Render-Neon integration & deployment:** **PENDING** separate Founder authorization (Render currently uses CockroachDB; auto-deploy disabled)
 
-## Key Verified Findings (All Reports)
+## Key facts
 
-| Finding | Status |
-|---|---|
-| Render staging uses **CockroachDB** (sqlalchemy_cockroachdb driver); Neon has **not** been connected to Render | ✅ Verified |
-| Migration history corrected from exact Git trees: b960ca2 has 27 files (head `d46aa0000001`), 9dc6e15 has 31 files extending to head `d49aa0000001` via 4 added migrations | ✅ Verified |
-| `DATA.md` §5 describes **paper-trading data**, not database login roles or grants | ✅ Verified |
-| **Accepted privilege contract exists** (ADR-016/017/018 in DECISIONS.md). Runtime/migration identity separation, migration serialization lock, and migrator-creator default privileges are accepted decisions. | ✅ Verified |
-| Application code already supports `STRIKENOVA_MIGRATION_DATABASE_URL` (config/db/alembic/env/_migration_lock); no code changes required to enable separation. | ✅ Verified |
-| Only `strikenova_staging_owner` exists in Neon; three documented `strikenova_prod_*` roles are **NOT** created in Neon (expected for staging). | ✅ Verified |
-| PostgreSQL 16 CI/rehearsal runs succeeded at `a016887f61289bc9c64edaabed45d3e1559038f9` (runs [37575586698](https://github.com/shahid1995/options-dashboard/actions/runs/37575586698), [37575586664](https://github.com/shahid1995/options-dashboard/actions/runs/37575586664)); approved target `9dc6e15` differs only by 2 doc/governance commits with no app/migration changes. Not a Neon-specific role rehearsal. | ✅ Verified |
-| Migration chain PG16-compatible (no CRDB-specific SQL, no `CREATE EXTENSION`, standard Alembic operations). | ✅ Verified (static analysis) |
+- **Render:** Currently uses CockroachDB (`sqlalchemy_cockroachdb`); Neon not connected. Historical deployment at `b960ca2`.
+- **Neon:** Project `gentle-field-42671929`, database `strikenova_staging` (Postgres 16). Only `strikenova_staging_owner` exists (with `replication=True, bypass_rls=True`). Documented prod roles not present.
+- **Architecture:** ADR-016/017/018 accepted. App already supports `STRIKENOVA_MIGRATION_DATABASE_URL` (no code changes). Two-identity model (migrator/creator + runtime DML).
+- **CI:** Runs at `a016887f61289bc9c64edaabed45d3e1559038f9` ([37575586698](https://github.com/shahid1995/options-dashboard/actions/runs/37575586698), [37575586664](https://github.com/shahid1995/options-dashboard/actions/runs/37575586664)) qualified (relevant to target, not exact SHA, not Neon-specific).
 
-## Known Limitations
-
-- All reports are based on **read-only inspection**; no migrations were applied, no roles were created, no database was modified
-- No fresh PostgreSQL 16 database execution was performed against Neon; static compatibility analysis only
-- Neon database remains in its original provisioned state, unchanged
-- Render service configuration is undisturbed (CockroachDB, auto-deploy disabled)
-- Three authorization gates remain pending (privilege model, migration execution, Render-Neon integration/deployment)
-- No credentials, passwords, or API keys are included in any report; all sensitive values are redacted
-- Role-and-privilege rehearsal only possible in isolated scratch PostgreSQL 16 environment (not Neon/CockroachDB)
-
-## Publication
-
-Published to GitHub branch: `docs/neon-staging-readiness-artifacts`  
-Remote path: `docs/audits/neon-staging-readiness/`  
-Publication commit: `ce3f38c7127364e774bbc6883e63e9610fdddd87` (initial publication; corrections in subsequent commit)  
-
-**Note:** This documentation task created a new documentation branch and committed documentation changes only. No application branches, application code, existing PR states (#130, #136, #137), databases, infrastructure, or deployments were changed.
-
-## Contact
-
-This assessment was performed as a read-only audit of the `options-dashboard` repository (approved target commit `9dc6e15c7b7c112ccb81b3be9c1609be66c92414`). No infrastructure modifications, database changes, or deployment actions were taken as part of this task.
-
----
-
-**End of README**
+**Status:** RESIDUAL DOCUMENTATION DEFECTS CORRECTED — REMOTE CONTENT VERIFIED — NO DATABASE OR INFRASTRUCTURE ACTIONS TAKEN

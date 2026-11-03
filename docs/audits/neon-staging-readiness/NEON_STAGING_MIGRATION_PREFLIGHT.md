@@ -27,7 +27,7 @@
 | Branch | `feat/strikenova-day35-portfolio-intelligence` | ✅ Remote-tracking branch exists |
 | Alembic head at this commit | `d49aa0000001` | ✅ Migration graph analysis confirmed |
 | Migration ancestry complete | ✅ 31 revisions from baseline `d3eb45a2e046` to `d49aa0000001` | ✅ Confirmed |
-| Multiple heads exist in repo graph | ⚠️ Yes (repo has multiple heads), target head is `d49aa0000001` | ✅ Confirmed |
+| Heads in repo graph at target commit (reconstructed): 2 heads (d49aa0000001, merge_day38_gex) | ⚠️ Yes (repo has multiple heads), target head is `d49aa0000001` | ✅ Confirmed |
 | Application code corresponds to migration history | ✅ Models registered on Base.metadata; all tables covered | ✅ Confirmed |
 | Render auto-deploy status | Disabled; no new deployment authorized | ✅ Confirmed |
 | Render uses CockroachDB (not Neon) | ✅ Verified | ✅ Confirmed |
@@ -36,12 +36,12 @@
 
 ## 2. Migration History (Corrected from Exact Git Trees)
 
-| Commit | Migration files | Relevant head | Notes |
+| Commit | Migration files | Heads (reconstructed) | Notes |
 |---|---:|---|---|
-| Historical Render deployment `b960ca2f20f0c15bf2e59f3d894ccb66d8b0f3ba` | 27 | `d46aa0000001` (on extended line; repo has multiple heads) | Does **not** contain `d47aa0000001`, `d48aa0000001`, `d48aa0000002`, `d49aa0000001` |
-| Approved staging target `9dc6e15c7b7c112ccb81b3be9c1609be66c92414` | 31 | `d49aa0000001` | Adds 4 migrations: `d47aa0000001` → `d48aa0000001` → `d48aa0000002` → `d49aa0000001` extending linearly from `d46aa0000001`. Graph reconstruction handled tuple/list `down_revision` values and all merge parents. |
+| Historical Render deployment `b960ca2f20f0c15bf2e59f3d894ccb66d8b0f3ba` | 27 | `d46aa0000001`, `merge_day38_gex` (2 heads) | Does **not** contain `d47aa0000001`, `d48aa0000001`, `d48aa0000002`, `d49aa0000001`. `merge_day38_gex` is a merge head with no children. |
+| Approved staging target `9dc6e15c7b7c112ccb81b3be9c1609be66c92414` | 31 | `d49aa0000001`, `merge_day38_gex` (2 heads) | Adds 4 migrations: `d47aa0000001` → `d48aa0000001` → `d48aa0000002` → `d49aa0000001` extending linearly from `d46aa0000001`. Graph reconstruction handled string/tuple/list `down_revision` and all merge parents; `depends_on` checked. Alembic CLI not available in this environment. Target upgrade path reaches `d49aa0000001`. |
 
-**Final head:** `d49aa0000001` (single head on the target upgrade path via `alembic upgrade head`).
+**Target head for upgrade:** `d49aa0000001` (separate from `merge_day38_gex` branch head).
 
 ---
 
