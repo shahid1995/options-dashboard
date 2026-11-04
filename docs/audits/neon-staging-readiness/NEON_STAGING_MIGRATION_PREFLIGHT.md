@@ -74,10 +74,10 @@ Successful GitHub Actions runs exist at commit `a016887f61289bc9c64edaabed45d3e1
 - PostgreSQL and CockroachDB migration rehearsal — [run 37575586664](https://github.com/shahid1995/options-dashboard/actions/runs/37575586664)
 
 **Qualifications — read these before citing the runs:**
-- Relevant to the approved target because the application and migration files are unchanged between `a016887` and `9dc6e15` apart from documentation/governance commits. *(This claim was carried from the earlier audit pass; it was not re-derived commit-by-commit in this documentation pass.)*
+- The application and migration files are identical between `a016887` and `9dc6e15`: all 31 migration files have identical blob SHAs, and the two intervening commits changed only six governance/documentation files. *(This was re-derived from the exact tree comparison.)*
 - **Not** executed at the exact `9dc6e15` SHA.
 - **Not** a Neon-specific run, and **not** a Neon role-privilege rehearsal.
-- Covered the 27-revision chain then in the tree; the four revisions added by `9dc6e15` were **not** part of any CI run cited here.
+- The CI runs covered the 27-revision chain that existed at `a016887`; the four revisions added by `9dc6e15` were present in the tree (`d47aa0000001` through `d49aa0000001`) but were **not** part of any migration execution in those runs.
 - No migration has been applied to Neon.
 
 ---

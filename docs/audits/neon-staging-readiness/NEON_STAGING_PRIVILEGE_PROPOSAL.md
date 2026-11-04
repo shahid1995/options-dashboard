@@ -133,12 +133,16 @@ Three arrangements work; the first is recommended.
 | Arrangement | How | Membership condition |
 |---|---|---|
 | **A. Run as the migrator** (recommended) | Connect as `strikenova_staging_migrator` and execute `ALTER DEFAULT PRIVILEGES … GRANT …` without a `FOR ROLE` clause | None — the role is acting for itself |
-| **B. Run as an administrator that is a member** | Connect as the administrative role, execute `ALTER DEFAULT PRIVILEGES FOR ROLE strikenova_staging_migrator …` | Must be a member of `strikenova_staging_migrator` |
-| **C. Run as an administrator, `SET ROLE` first** | `SET ROLE strikenova_staging_migrator;` then arrangement A | Membership with `SET TRUE` |
+| **B. Run as an administrator that is a member** | Connect as the administrative role, execute `ALTER DEFAULT PRIVILEGES FOR ROLE strikenova_staging_migrator …` | Must have `INHERIT TRUE` membership path to `strikenova_staging_migrator`; bare membership or `INHERIT FALSE` is insufficient under PG16 |
+| **C. Run as an administrator, `SET ROLE` first** | `SET ROLE strikenova_staging_migrator;` then arrangement A | Must have `SET TRUE` on every membership edge in the path to `strikenova_staging_migrator` |
 
-Note that arrangement B changes the migrator's defaults while the session remains the administrator; it does **not** make subsequent object creation in that session count as the migrator. To create objects as the migrator you need A or C.
+Note that arrangement B sets the migrator's defaults for future objects via inherited role privileges, while arrangement C first changes the current role via `SET ROLE` so that subsequent object creation counts as the migrator. Arrangement B does **not** make subsequent object creation in that session count as the migrator — to create objects as the migrator you need A or C.
 
-**PG16 strictness caution.** The documented precondition for the `FOR ROLE` form is membership. PostgreSQL 16 introduced separate `INHERIT`/`SET`/`ADMIN` options, and some commands enforce the `SET` option where earlier releases accepted bare membership. Granting membership `WITH INHERIT TRUE, SET TRUE` satisfies the documented precondition and keeps arrangement C available, avoiding that ambiguity. Verify the behaviour on a disposable PostgreSQL 16 instance before relying on arrangement B alone.
+**PG16 strictness caution.** PostgreSQL 16 introduced separate `INHERIT`/`SET`/`ADMIN` membership options. The `FOR ROLE` form of `ALTER DEFAULT PRIVILEGES` requires a membership path with `INHERIT TRUE` (arrangement B) or a `SET ROLE` path with `SET TRUE` on every edge (arrangement C). Granting `WITH INHERIT TRUE, SET TRUE` satisfies both paths and keeps arrangement C available without ambiguity. Verify the behaviour on a disposable PostgreSQL 16 instance before relying on any arrangement in production.
+
+- `INHERIT TRUE`: permits the role to inherit privileges and satisfies the PG16 inherited-role precondition for arrangement B.
+- `SET TRUE`: permits `SET ROLE` to the target role; it is the separate condition required for arrangement C.
+- `ADMIN TRUE`: permits membership administration via `GRANT role TO member WITH ADMIN TRUE`; it is distinct from both `INHERIT` and `SET`. The example `WITH INHERIT TRUE, SET TRUE` supports both arrangement B and arrangement C, but the two options serve different purposes.
 
 ### 4.7 One more PG16 detail: schema `public`
 
@@ -147,7 +151,7 @@ From PostgreSQL 15 onward, `CREATE` on schema `public` is **no longer granted to
 ### 4.8 Membership checklist before running anything
 
 1. `strikenova_staging_migrator` and `strikenova_staging_app` exist and are `LOGIN`.
-2. The identity that runs migrations is either the migrator, or a member with `SET TRUE` that performs `SET ROLE` first.
+2. The identity that runs migrations is either the migrator, or a member with `INHERIT TRUE` that performs `SET ROLE` first (arrangement C), or a member with `INHERIT TRUE` alone for arrangement B.
 3. `strikenova_staging_migrator` holds `USAGE, CREATE` on schema `public`.
 4. `strikenova_staging_app` holds `USAGE` on schema `public` and `CONNECT` on the database.
 5. The default privileges in §6 are installed **for** `strikenova_staging_migrator` **before** the first migration creates tables.
@@ -190,23 +194,42 @@ GRANT USAGE         ON SCHEMA public TO strikenova_staging_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES    IN SCHEMA public TO strikenova_staging_app;
 GRANT USAGE                          ON ALL SEQUENCES IN SCHEMA public TO strikenova_staging_app;
 
--- 5. Future objects created BY THE MIGRATOR (ADR-018). Run as the migrator
---    (arrangement A) or as a member of it (arrangement B / C).
+-- 5. Arrangement A: Run as the migrator (recommended).
+--    Connect as strikenova_staging_migrator and execute ALTER DEFAULT PRIVILEGES
+--    without a FOR ROLE clause (the role acts for itself).
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO strikenova_staging_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT USAGE ON SEQUENCES TO strikenova_staging_app;
+
+-- 6. Arrangement B: Run as an administrator that is a member.
+--    The administrator must have INHERIT TRUE membership path to the migrator.
+--    Then, as the administrator, execute ALTER DEFAULT PRIVILEGES FOR ROLE.
 ALTER DEFAULT PRIVILEGES FOR ROLE strikenova_staging_migrator IN SCHEMA public
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO strikenova_staging_app;
 ALTER DEFAULT PRIVILEGES FOR ROLE strikenova_staging_migrator IN SCHEMA public
   GRANT USAGE ON SEQUENCES TO strikenova_staging_app;
 
--- 6. Optional, only if migrations are run by an administrative session that
---    relies on SET ROLE (arrangement C).
--- GRANT strikenova_staging_migrator TO <admin_role> WITH INHERIT TRUE, SET TRUE;
+-- 7. Arrangement C: Run as an administrator, SET ROLE first.
+--    The administrator must have SET TRUE on every membership edge.
+--    Then SET ROLE to the migrator and execute the default-privilege statements.
+SET ROLE strikenova_staging_migrator;
+ALTER DEFAULT PRIVILEGES FOR ROLE strikenova_staging_migrator IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO strikenova_staging_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE strikenova_staging_migrator IN SCHEMA public
+  GRANT USAGE ON SEQUENCES TO strikenova_staging_app;
+
+-- 8. Optional: Grant membership with INHERIT TRUE, SET TRUE (supports both B and C).
+--    GRANT strikenova_staging_migrator TO <admin_role> WITH INHERIT TRUE, SET TRUE;
 ```
 
 **Why each block is shaped that way:**
 
-- Block 5 binds to the **creator**, not to the runtime role. Bound to the wrong role, it is inert.
-- Block 5 is only effective if migrations truly create objects as `strikenova_staging_migrator` (§4.2).
-- Block 4 cannot substitute for block 5: it covers objects that already exist.
+- Block 5 binds to the creator role directly (no FOR ROLE needed); effective when migrations create objects as the migrator (§4.2).
+- Block 6 uses `FOR ROLE` with the administrator as executor; the administrator must already hold `INHERIT TRUE` membership (§4.6, arrangement B).
+- Block 7 uses `FOR ROLE` after `SET ROLE` changes the current role; requires `SET TRUE` on every membership edge (§4.6, arrangement C).
+- Block 8 is a permanent role grant that enables both arrangement B (via `INHERIT TRUE`) and arrangement C (via `SET TRUE`); the two options serve different purposes as documented in §4.6.
+- Block 4 cannot substitute for blocks 5/6/7: it covers objects that already exist; defaults only affect future objects.
 - No `REPLICATION`, no `BYPASSRLS`, no `CREATEDB`, no `CREATEROLE`, no ownership, and no schema `CREATE` is granted to `strikenova_staging_app`.
 - Schema ownership (`public` belongs to `pg_database_owner`) is deliberately left alone.
 
@@ -233,7 +256,7 @@ To be executed only after gate 2 authorization and only with read-only statement
 | Roles exist with intended attributes | `SELECT rolname, rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls FROM pg_roles WHERE rolname LIKE 'strikenova_staging_%' ORDER BY 1;` | migrator/app `LOGIN`, all elevated attributes `false` |
 | Defaults installed for the migrator only | `\ddp` (or `SELECT defaclrole::regrole, defaclnamespace::regnamespace, defaclobjtype, defaclacl FROM pg_default_acl;`) | Exactly two rows, both `defaclrole = strikenova_staging_migrator` |
 | Schema privileges | `SELECT has_schema_privilege('strikenova_staging_migrator','public','CREATE'), has_schema_privilege('strikenova_staging_app','public','CREATE');` | `true, false` |
-| Runtime cannot create in schema | `SET ROLE strikenova_staging_app; CREATE TABLE public.__deny_probe(a int);` | Must fail; probe removed if it somehow succeeds |
+| Runtime cannot create in schema | `SELECT has_schema_privilege('strikenova_staging_app','public','CREATE');` | `false` |
 | Membership setup | `SELECT r.rolname AS member, g.rolname AS granted, m.inherit_option, m.set_option FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.member JOIN pg_roles g ON g.oid=m.roleid;` | Matches the chosen arrangement (§4.6) |
 
 These are **plans**, not results. No query in this section has been run.

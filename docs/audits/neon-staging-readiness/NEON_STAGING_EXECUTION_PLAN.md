@@ -35,7 +35,7 @@
 - [x] **Alembic CLI / `ScriptDirectory.get_heads()` not executed** — all head results are static reconstruction.
 - [x] Application already supports `STRIKENOVA_MIGRATION_DATABASE_URL`; no application source change needed.
 - [x] ADR-016/017/018 read and confirmed *Accepted*; `DATA.md` §5 is the accepted production privilege model.
-- [x] CI evidence qualified (runs at `a016887`, not at the exact `9dc6e15` SHA; not Neon-specific; predates the four added revisions).
+- [x] CI evidence qualified (runs at `a016887`, not at the exact `9dc6e15` SHA. The migration trees are identical at both commits: all 31 migration files have the same blob SHAs; the two intervening commits changed only six governance/documentation files. Neither run was Neon-specific, and neither applied any migration to Neon.)
 - [x] No Neon, CockroachDB, or Render change made.
 
 ---

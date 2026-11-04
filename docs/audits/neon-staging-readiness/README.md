@@ -10,11 +10,11 @@
 
 | File | Bytes (UTF-8) | Logical lines | Purpose |
 |---|---:|---:|---|
-| `README.md` | 5829 | 62 | This index: publication metadata, migration graph, authorization gates |
+| `README.md` | 6071 | 62 | This index: publication metadata, migration graph, authorization gates |
 | `AUDIT_REPORT_CORRECTED.md` | 34291 | 405 | Corrective audit: Render provider, migration graph at both pinned trees, Founder approval, Neon role observation, accepted architecture, findings |
-| `NEON_STAGING_PRIVILEGE_PROPOSAL.md` | 20590 | 263 | Proposed staging identity pair with full PostgreSQL 16 role-membership semantics and review-only SQL |
-| `NEON_STAGING_MIGRATION_PREFLIGHT.md` | 8589 | 117 | Preflight: inventories, head results, PG16 compatibility, qualified CI evidence, prerequisites |
-| `NEON_STAGING_EXECUTION_PLAN.md` | 9216 | 117 | Numbered plan for gates 2–5 (privilege, migration, Render integration, post-deploy) |
+| `NEON_STAGING_PRIVILEGE_PROPOSAL.md` | 22889 | 263 | Proposed staging identity pair with full PostgreSQL 16 role-membership semantics and review-only SQL |
+| `NEON_STAGING_MIGRATION_PREFLIGHT.md` | 8674 | 117 | Preflight: inventories, head results, PG16 compatibility, qualified CI evidence, prerequisites |
+| `NEON_STAGING_EXECUTION_PLAN.md` | 9412 | 117 | Numbered plan for gates 2–5 (privilege, migration, Render integration, post-deploy) |
 
 ## Authorization state
 
@@ -51,7 +51,7 @@ Parsing handled string, tuple, and list `down_revision` forms, all merge parents
 - **Neon:** project `gentle-field-42671929`, database `strikenova_staging` (PostgreSQL 16). The earlier read-only catalog inspection found only the Neon-created `strikenova_staging_owner` as an application-present role, with `replication`, `bypass_rls`, `createdb`, and `createrole` set. The catalog was **not** re-read during this documentation pass.
 - **Architecture:** ADR-016 (identity separation via `STRIKENOVA_MIGRATION_DATABASE_URL`), ADR-017 (`_migration_lock` lease), and ADR-018 (default privileges bound to the migrator/creator) are **Accepted** in `DECISIONS.md`. `DATA.md` §5 is the accepted production privilege model for database `strikenova`. Application support already exists; no source change is required.
 - **Proposed staging identities** (`strikenova_staging_migrator`, `strikenova_staging_app`) are distinct from the accepted production identities (`strikenova_production_app`, `strikenova_prod_migrator`, `strikenova_prod_runtime`, `strikenova_prod_admin`) and from the provider-created `strikenova_staging_owner`.
-- **CI:** runs at `a016887f61289bc9c64edaabed45d3e1559038f9` — [37575586698](https://github.com/shahid1995/options-dashboard/actions/runs/37575586698), [37575586664](https://github.com/shahid1995/options-dashboard/actions/runs/37575586664). Qualified: not at the exact `9dc6e15` SHA, not Neon-specific, and predating the four added revisions.
+- **CI:** runs at `a016887f61289bc9c64edaabed45d3e1559038f9` — [37575586698](https://github.com/shahid1995/options-dashboard/actions/runs/37575586698), [37575586664](https://github.com/shahid1995/options-dashboard/actions/runs/37575586664). Qualified: runs were at commit `a016887`, not the exact `9dc6e15` SHA. The migration trees are identical at both commits: all 31 migration files have the same blob SHAs, and the two intervening commits changed only six governance/documentation files. Neither run was Neon-specific, and neither applied any migration to Neon.
 
 ## Publication record
 
@@ -59,4 +59,4 @@ Parsing handled string, tuple, and list `down_revision` forms, all merge parents
 - **Correction commit:** the commit that introduced this revision of these five files, on `docs/neon-staging-readiness-artifacts`. A Git commit cannot embed its own SHA, so that SHA is recorded in the commit itself and in `git log -1` rather than in a file it contains; it is also reported in the publication report for this pass.
 - **Byte and line counts** above are measured on the published UTF-8 files of this revision (logical lines = newline-separated content lines, ignoring the single trailing newline).
 
-**Status:** RESIDUAL DOCUMENTATION DEFECTS CORRECTED — MIGRATION GRAPH AND APPLICATION APPROVAL CONSISTENT — POSTGRESQL ROLE-MEMBERSHIP LIMITATIONS DOCUMENTED — NO DATABASE OR INFRASTRUCTURE ACTIONS TAKEN
+**Status:** FINAL FOUR RESIDUAL DEFECTS CORRECTED — CI EVIDENCE ACCURATE — POSTGRESQL 16 INHERIT/SET SEMANTICS CORRECT — READ-ONLY PLAN VERIFIED — FIVE REMOTE FILES VERIFIED — NO DATABASE OR INFRASTRUCTURE ACTIONS TAKEN
