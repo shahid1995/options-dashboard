@@ -12,7 +12,7 @@
 |---|---:|---:|---|
 | `README.md` | 6071 | 62 | This index: publication metadata, migration graph, authorization gates |
 | `AUDIT_REPORT_CORRECTED.md` | 34291 | 405 | Corrective audit: Render provider, migration graph at both pinned trees, Founder approval, Neon role observation, accepted architecture, findings |
-| `NEON_STAGING_PRIVILEGE_PROPOSAL.md` | 22889 | 263 | Proposed staging identity pair with full PostgreSQL 16 role-membership semantics and review-only SQL |
+| `NEON_STAGING_PRIVILEGE_PROPOSAL.md` | 22889 | 286 | Proposed staging identity pair with full PostgreSQL 16 role-membership semantics and review-only SQL |
 | `NEON_STAGING_MIGRATION_PREFLIGHT.md` | 8674 | 117 | Preflight: inventories, head results, PG16 compatibility, qualified CI evidence, prerequisites |
 | `NEON_STAGING_EXECUTION_PLAN.md` | 9412 | 117 | Numbered plan for gates 2–5 (privilege, migration, Render integration, post-deploy) |
 
