@@ -2,7 +2,7 @@
 
 **Purpose:** Propose a staging-scoped least-privilege identity pair for the Neon `strikenova_staging` database, consistent with the *accepted* ADR-016 / ADR-017 / ADR-018, and document the PostgreSQL 16 role-membership conditions that make the proposal correct.
 
-**Scope:** Documentation only. No role created, altered, granted, or dropped. No database contacted. **All SQL below is review-only, unexecuted, and untested.** No role-membership rehearsal of any kind has been performed.
+**Scope:** Documentation only. No role created, altered, granted, or dropped. No database contacted. **All SQL below is review-only and unexecuted.** A disposable PostgreSQL 16.15 rehearsal ([run `41813028902`](https://github.com/shahid1995/options-dashboard/actions/runs/41813028902)) executed the *earlier* revision of §6 — table and sequence defaults only — and validated arrangements A/B/C, 206 assertions, 0 failures. It did **not** execute the corrected statements below, and it did not contact Neon. Evidence: [`POSTGRESQL_16_PRIVILEGE_REHEARSAL.md`](POSTGRESQL_16_PRIVILEGE_REHEARSAL.md) §17–§41.
 
 **Founder-approved application target** (application version approval: **COMPLETE**):
 - Repository: `shahid1995/options-dashboard`
@@ -34,6 +34,8 @@ These are **Accepted** decisions in [`DECISIONS.md`](../../../DECISIONS.md), not
 
 **Accepted production contract:** [`DATA.md` §5](../../../DATA.md) — "Production privilege model (database `strikenova`)" — is the accepted database-role contract. It documents `strikenova_production_app` (DML only), `strikenova_prod_migrator` (DDL + migration lock), `strikenova_prod_runtime` (NOLOGIN, owns the application tables), `strikenova_prod_admin` (break-glass), the two `pg_default_acl` rows bound to `strikenova_prod_migrator`, and the warning that **defaults do not follow a creator-role change**.
 
+The production contract has **two** rows because it covers tables and sequences only. The staging design in §6.1 adds a **third**, global function-scoped row; that is a staging-scoped extension of ADR-018's accepted scope, not a restatement of the production contract, and it requires the Founder decision in §10 (item F).
+
 It is *not* paper-trading data and it is not a staging document. This proposal mirrors its shape for staging; it does not create a second governance system (see `AGENTS.md` §5).
 
 **Application support already exists (no source change required):** `app/config.py` defines `STRIKENOVA_MIGRATION_DATABASE_URL`; `app/db.py` resolves the migration URL via `resolve_migration_database_url()` (precedence: explicit/CLI → `STRIKENOVA_MIGRATION_DATABASE_URL` → `DATABASE_URL`) and uses it for the migration engine, the lease, and `_run_alembic_migrations()`; `alembic/env.py` delegates to the same resolver; `app/_migration_lock.py` implements ADR-017.
@@ -64,7 +66,7 @@ It is *not* paper-trading data and it is not a staging document. This proposal m
 | Identity | Type | Proposed role |
 |---|---|---|
 | `strikenova_staging_migrator` | Migration / creator | Owns and creates schema objects; runs Alembic and the ADR-017 lease bootstrap; is the role that `ALTER DEFAULT PRIVILEGES` must be bound to (ADR-018) |
-| `strikenova_staging_app` | Runtime DML | `CONNECT`, schema `USAGE`, `SELECT/INSERT/UPDATE/DELETE` on tables, `USAGE` on sequences. No DDL, no ownership, no role management, no cluster attributes |
+| `strikenova_staging_app` | Runtime DML | `CONNECT`, schema `USAGE`, `SELECT/INSERT/UPDATE/DELETE` on tables, `USAGE` on sequences. No DDL, no ownership, no role management, no cluster attributes. **Not yet specified:** database `TEMPORARY` (held today through `PUBLIC`) and the fact that `CONNECT` is also a `PUBLIC` default, so an explicit `GRANT` is not connection control — both are open decisions, §10 |
 | `strikenova_staging_owner` | Provider/setup | Neon-created. Left as-is unless a documented technical requirement justifies altering it |
 
 Staging names are staging-scoped on purpose. Do **not** reuse `strikenova_prod_*` names for staging, and do not import production identities into `strikenova_staging`.
@@ -123,8 +125,9 @@ Objects are normally owned by the role that executed the creation statement (i.e
 
 `ALTER DEFAULT PRIVILEGES` *"allows you to set the privileges that will be applied to objects created in the future"* and *"does not affect privileges assigned to already-existing objects."*
 
-- **Future objects:** handled by the two `ALTER DEFAULT PRIVILEGES` statements in §6.
+- **Future objects:** handled by the three `ALTER DEFAULT PRIVILEGES` statements in §6 — two schema-scoped grants (tables, sequences) and one global function revoke (§6.1).
 - **Existing objects:** require explicit `GRANT … ON ALL TABLES IN SCHEMA` / `ON ALL SEQUENCES IN SCHEMA` at the moment they exist. On a brand-new empty database this set is empty, so the explicit grants are a no-op — but they must be re-run if any object is ever created before the defaults are installed.
+- **Existing functions:** the function default in §6.1 is future-only as well. Any function that already exists keeps its own `proacl`; a default `REVOKE` never changes it. Gate 2 must therefore start with an inventory (`SELECT p.oid::regprocedure, p.proacl FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema');`) and an explicit privilege review for anything it finds. The application tree contains no `CREATE FUNCTION` or `CREATE TRIGGER`, so the expected inventory is empty — but that is a property of the pinned tree, not a guarantee.
 
 ### 4.6 Who should run the default-privilege statements
 
@@ -160,7 +163,7 @@ From PostgreSQL 15 onward, `CREATE` on schema `public` is **no longer granted to
 3. `strikenova_staging_migrator` holds `USAGE, CREATE` on schema `public`.
 4. `strikenova_staging_app` holds `USAGE` on schema `public` and `CONNECT` on the database.
 5. The default privileges in §6 are installed **for** `strikenova_staging_migrator` **before** the first migration creates tables.
-6. `pg_default_acl` shows exactly the two intended rows for the migrator (inspect with `\ddp`).
+6. `pg_default_acl` shows the intended rows for the migrator **and only** the migrator — **three** rows under the corrected design, with the scopes in §8: two schema-scoped (`public`, object types `r` and `S`) and one global (namespace `-`, object type `f`).
 7. Runtime identity holds no `CREATE`, no ownership, no `CREATEROLE`/`CREATEDB`/`SUPERUSER`/`REPLICATION`/`BYPASSRLS`.
 
 ---
@@ -173,13 +176,17 @@ From PostgreSQL 15 onward, `CREATE` on schema `public` is **no longer granted to
 - Default privileges must be bound to the **actual creating role** via `FOR ROLE`, in the schema where objects are created.
 - Cover both future **tables** and future **sequences**. ADR-018's accepted grant is `SELECT, INSERT, UPDATE, DELETE` on tables and `USAGE` on sequences; `USAGE` already permits `nextval` and `currval`. Add sequence `SELECT`/`UPDATE` only if a concrete need for `setval` is demonstrated.
 - Per-schema defaults are **added to** global defaults; a per-schema `REVOKE` cannot remove a global grant.
+- **Functions:** PostgreSQL grants `EXECUTE` on every new function to `PUBLIC` by default. `ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC` is a **no-op** — it stores no row when none exists, and can only undo a matching per-schema `GRANT` — so removing the `PUBLIC` grant requires the **global** form, with no `IN SCHEMA` clause (§6.1). Measured on PostgreSQL 16.15; see the rehearsal report §33 and the [PostgreSQL 16 `ALTER DEFAULT PRIVILEGES`](https://www.postgresql.org/docs/16/sql-alterdefaultprivileges.html) reference, which states the case explicitly.
+- **`TEMPORARY` and `CONNECT` are database-level and both belong to `PUBLIC` by default** ([§5.7](https://www.postgresql.org/docs/16/ddl-priv.html), Table 5.2: default `PUBLIC` privileges on a database are `Tc`). An explicit `GRANT CONNECT` therefore restricts nothing, and revoking either from `PUBLIC` affects every non-superuser identity that uses the database — provider-managed roles included. Both are open decisions (§10), not settled parts of this proposal.
 - Treat existing objects and future objects separately (§4.5).
 
 ---
 
-## 6. Review-Only Proposed SQL — NOT EXECUTED, NOT TESTED
+## 6. Review-Only Proposed SQL — CORRECTED, NOT EXECUTED
 
-> Templates for review. Role names, ownership, and grants must be validated against the target database before use. Executing any of this requires **separate Founder authorization** (gate 2). Nothing here has been run against Neon, CockroachDB, or any PostgreSQL instance.
+> Templates for review. Role names, ownership, and grants must be validated against the target database before use. Executing any of this requires **separate Founder authorization** (gate 2). Nothing in this revision has been run against Neon, CockroachDB, or any PostgreSQL instance.
+>
+> **Revision note (2026-11-04).** The table and sequence default statements below are the ones a disposable PostgreSQL 16.15 rehearsal executed in arrangements A, B and C. The **function** statement (§6.1) is new in this revision: it exists because the rehearsal measured that the earlier SQL left new functions `PUBLIC`-executable, and that the schema-scoped remedy is inert. The function statement was rehearsed **in isolation** (the global form, in a separate disposable database); these three parts as a whole have never been executed.
 
 ```sql
 -- ------------------------------------------------------------------
@@ -225,6 +232,12 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
   GRANT USAGE ON SEQUENCES TO strikenova_staging_app;
 
+-- Part 6.1 — Function default privileges (§6.1 below). GLOBAL scope: no
+-- IN SCHEMA clause. A schema-scoped REVOKE cannot remove the built-in
+-- PUBLIC EXECUTE grant; it stores nothing and changes nothing.
+ALTER DEFAULT PRIVILEGES
+  REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+
 -- ------------------------------------------------------------------
 -- Part 7 — ARRANGEMENT B: administrator with INHERIT TRUE, FOR ROLE form.
 -- Requires part 5 with INHERIT TRUE. Do NOT also run parts 6 or 8.
@@ -235,6 +248,11 @@ ALTER DEFAULT PRIVILEGES FOR ROLE strikenova_staging_migrator IN SCHEMA public
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO strikenova_staging_app;
 ALTER DEFAULT PRIVILEGES FOR ROLE strikenova_staging_migrator IN SCHEMA public
   GRANT USAGE ON SEQUENCES TO strikenova_staging_app;
+
+-- Part 7.1 — the same global function default, named FOR ROLE. The IN SCHEMA
+-- form does not work here either; the scope of the revocation must be global.
+ALTER DEFAULT PRIVILEGES FOR ROLE strikenova_staging_migrator
+  REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 
 -- ------------------------------------------------------------------
 -- Part 8 — ARRANGEMENT C: administrator with SET TRUE, SET ROLE first.
@@ -248,6 +266,12 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO strikenova_staging_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
   GRANT USAGE ON SEQUENCES TO strikenova_staging_app;
+
+-- Part 8.1 — the function default, executed while current_user is the migrator.
+-- No FOR ROLE, no IN SCHEMA: the global default of the current role.
+ALTER DEFAULT PRIVILEGES
+  REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+
 RESET ROLE;
 ```
 
@@ -258,10 +282,37 @@ RESET ROLE;
 - Part 6 (arrangement A) binds to the creator role directly, with no `FOR ROLE`; effective when migrations create objects as the migrator (§4.2).
 - Part 7 (arrangement B) uses `FOR ROLE` with the administrator as executor; the administrator must already hold an `INHERIT TRUE` membership path (§4.6).
 - Part 8 (arrangement C) changes `current_user` with `SET ROLE`, then installs the defaults as the migrator; it requires `SET TRUE` on every membership edge (§4.6). `RESET ROLE` restores the session's original identity.
-- Parts 6, 7, and 8 are **alternatives**: each installs the same two default-ACL rows for the same creator role. Running more than one is redundant, not additive.
+- Parts 6, 7, and 8 are **alternatives**: each installs the same **three** default-ACL rows for the same creator role (two schema-scoped, one global). Running more than one is redundant, not additive.
 - Part 4 cannot substitute for parts 6-8: it covers objects that already exist; defaults only affect future objects.
 - No `REPLICATION`, no `BYPASSRLS`, no `CREATEDB`, no `CREATEROLE`, no ownership, and no schema `CREATE` is granted to `strikenova_staging_app`.
 - Schema ownership (`public` belongs to `pg_database_owner`) is deliberately left alone.
+
+### 6.1 Function default privileges — why the scope must be global
+
+PostgreSQL grants `EXECUTE` on a newly created function to `PUBLIC` by default. That grant comes from the **global** default privileges, and per-schema default privileges can only *add* to the global setting — the PostgreSQL 16 reference gives this counter-example verbatim:
+
+> "That's because per-schema default privileges can only add privileges to the global setting, not remove privileges granted by it."
+> — [`ALTER DEFAULT PRIVILEGES`](https://www.postgresql.org/docs/16/sql-alterdefaultprivileges.html), Notes
+
+Measured consequence on PostgreSQL 16.15 (rehearsal §33): with no function default installed, `proacl` is `NULL` and the runtime role executes the function; `ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC` stores **no row at all** and changes nothing; the global form stores a row with no `PUBLIC` entry, and the runtime role is then refused with `42501`.
+
+**Expected `pg_default_acl` state after exactly one arrangement** (the corrected design — three rows, all bound to the migrator):
+
+| Row | `defaclrole` | `defaclnamespace` | `defaclobjtype` | Expected `defaclacl` shape |
+|---|---|---|---|---|
+| Table defaults | `strikenova_staging_migrator` | `public` | `r` (table) | contains `strikenova_staging_app=` with `arwd`; no `PUBLIC` entry |
+| Sequence defaults | `strikenova_staging_migrator` | `public` | `S` (sequence) | contains `strikenova_staging_app=U`; no `PUBLIC` entry |
+| Function defaults | `strikenova_staging_migrator` | *none* (rendered `-`; catalog `0`) | `f` (function) | `{strikenova_staging_migrator=X/strikenova_staging_migrator}` — **no** leading `=X`, i.e. no `PUBLIC` |
+
+What the rehearsal actually observed, for comparison: two schema-scoped rows (`public`, `r` and `S`) and, after the global revoke, one global row `[rehearsal_f_migrator, "-", "f", "{rehearsal_f_migrator=X/rehearsal_f_migrator}"]`. The **function row's** exact catalog text above is therefore measured; the table and sequence `defaclacl` text is described by shape only, because the rehearsal recorded those rows' role/namespace/object type and the runtime's effective privileges, not the literal ACL string. **Verification must read the value, not assume it.**
+
+Consequences that belong to the design, not to the SQL:
+
+- The revoke is **future-only**. Existing functions keep their ACLs (§4.5).
+- The revoke applies to **every** function the migrator creates, in **every** schema of that database — this is the point, not a side effect.
+- Because the statement is global, `IN SCHEMA` must not be added; doing so silently disables it.
+- `PUBLIC` losing `EXECUTE` means a function intended for general use needs an explicit `GRANT EXECUTE … TO <role>` — including to the app role.
+- ADR-018's accepted text covers tables and sequences only. This statement therefore extends the accepted scope and requires explicit Founder acknowledgment (§10).
 
 ---
 
@@ -277,14 +328,22 @@ Login roles are inert until credentials exist, and credentials are not part of t
 
 ---
 
-## 8. Verification Plan (read-only, NOT PERFORMED)
+## 8. Verification Plan (read-only, with two disposable probes — NOT PERFORMED)
 
-To be executed only after gate 2 authorization and only with read-only statements:
+To be executed only after gate 2 authorization. Everything below is read-only except the two rows marked **probe**, which create a disposable object and drop it in the same session.
 
 | Check | Statement | Expected |
 |---|---|---|
 | Roles exist with intended attributes | `SELECT rolname, rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls FROM pg_roles WHERE rolname LIKE 'strikenova_staging_%' ORDER BY 1;` | migrator/app `LOGIN`, all elevated attributes `false` |
-| Defaults installed for the migrator only | `\ddp` (or `SELECT defaclrole::regrole, defaclnamespace::regnamespace, defaclobjtype, defaclacl FROM pg_default_acl;`) | Exactly two rows, both `defaclrole = strikenova_staging_migrator` |
+| Defaults installed for the migrator only | `\ddp`, or `SELECT defaclrole::regrole::text, CASE WHEN defaclnamespace = 0 THEN '<global>' ELSE defaclnamespace::regnamespace::text END, defaclobjtype, defaclacl::text FROM pg_default_acl ORDER BY 3, 2;` (the `CASE` matters: a global row has `defaclnamespace = 0`, which casts to `regnamespace` as `-`, not `NULL`) | Exactly **three** rows, all `defaclrole = strikenova_staging_migrator`: `public`/`r`, `public`/`S`, and a global row (`<global>`) with object type `f` whose ACL has **no** `PUBLIC` entry (§6.1) |
+| No unexpected default-ACL rows | the same query | Nothing bound to another role, no global table/sequence row, no `PUBLIC` grant in any row |
+| **probe** — Function `EXECUTE` is not public | as the migrator: `CREATE FUNCTION public._probe_acl() RETURNS integer LANGUAGE sql AS 'SELECT 1';` then `SELECT proacl::text FROM pg_proc WHERE proname = '_probe_acl';` then `DROP FUNCTION public._probe_acl();` | `proacl` is `{strikenova_staging_migrator=X/strikenova_staging_migrator}` — a `NULL` value or any `=X/` entry means the global revoke is missing or was scoped |
+| **probe** — Runtime cannot execute a probe function | with the probe function still present, as the app role: `SELECT public._probe_acl();` | refused, `42501: permission denied for function _probe_acl` |
+| Runtime cannot execute functions in another schema either | repeat the probe in a second schema as the migrator, then call it as the app | refused, `42501` — the revoke is global, so a second schema must not leak |
+| `TEMPORARY` — catalog | `SELECT has_database_privilege('strikenova_staging_app', current_database(), 'TEMPORARY'), has_database_privilege('strikenova_staging_migrator', current_database(), 'TEMPORARY');` | depends on the §10 decision; record the values rather than assume them. Under the untouched `PUBLIC` default both are expected to be `true` |
+| **probe** — `TEMPORARY` behaviour | as the app role: `CREATE TEMP TABLE _probe_temp (id integer);` then `DROP TABLE _probe_temp;` | must match the §10 decision: succeeds if `PUBLIC` `TEMPORARY` is retained, `42501` if it is revoked. A catalog check alone is not sufficient |
+| `CONNECT` — catalog | `SELECT has_database_privilege('strikenova_staging_app', current_database(), 'CONNECT'), has_database_privilege('strikenova_staging_migrator', current_database(), 'CONNECT'), has_database_privilege('<unrelated-ordinary-role>', current_database(), 'CONNECT');` | under posture A all three are `true`; under posture B only the authorized identities are `true`. Record the third value explicitly — it is the one that shows whether `PUBLIC` still confers connection |
+| `CONNECT` — limitation | an actual connection attempt by an unrelated role | a catalog check is **not** equivalent to a provider access test; `pg_hba.conf`, provider proxies and superuser status all sit in front of it. Record the attempt and its result, and do not present it as a Neon-level guarantee |
 | Schema privileges | `SELECT has_schema_privilege('strikenova_staging_migrator','public','CREATE'), has_schema_privilege('strikenova_staging_app','public','CREATE');` | `true, false` |
 | Runtime cannot create in schema | `SELECT has_schema_privilege('strikenova_staging_app','public','CREATE');` | `false` |
 | Membership setup | `SELECT r.rolname AS member, g.rolname AS granted, m.inherit_option, m.set_option FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.member JOIN pg_roles g ON g.oid=m.roleid;` | Matches the chosen arrangement (§4.6) |
@@ -295,11 +354,15 @@ These are **plans**, not results. No query in this section has been run.
 
 ## 9. Explicit Gaps
 
-1. **No execution.** No role exists that this document proposes. No `GRANT`, `ALTER DEFAULT PRIVILEGES`, or `SET ROLE` has been run.
-2. **No rehearsal.** No disposable PostgreSQL 16 instance was used to validate §4 or §6. The membership behaviour described is documentation-derived, including the PG16 `SET`-option caution in §4.6.
+1. **No execution against any target.** No role exists that this document proposes, and no statement here has been run against Neon or any persistent database.
+2. **Rehearsal status, corrected.** A disposable PostgreSQL 16.15 rehearsal *was* run ([run `41813028902`](https://github.com/shahid1995/options-dashboard/actions/runs/41813028902), 206 assertions, 0 failures) and it validated the membership, default-privilege and ownership behaviour in §4, including the PG16 `INHERIT`/`SET` distinction: `INHERIT TRUE, SET FALSE` permits the `FOR ROLE` form but not `SET ROLE`; `INHERIT FALSE, SET TRUE` permits `SET ROLE` but not the `FOR ROLE` form. That rehearsal executed the **table and sequence** statements only. The **function** statement in §6.1, and the three arrangements as complete units, remain unexecuted. The rehearsal did not contact Neon and says nothing about its current state.
 3. **No fresh catalog read.** §2 is an earlier observation; the current `pg_roles`/`pg_default_acl` state of `strikenova_staging` has not been re-verified.
 4. **No migration.** No migration has been applied to `strikenova_staging`; the database is assumed to be the existing empty Neon database.
 5. **Provider role untouched.** `strikenova_staging_owner` retains `replication`, `bypass_rls`, `createdb`, `createrole`. Removing those attributes is a separate decision with its own risk (it may be the only path to administer the database).
+6. **`TEMPORARY` unresolved.** The runtime role inherits `TEMPORARY` from `PUBLIC`. Nothing in the application evidence requires it, and nothing in the application evidence proves it is safe to remove. Open decision (§10).
+7. **`CONNECT` unresolved.** `PUBLIC` holds `CONNECT`, so the explicit grants in §6 Part 2 guarantee access but do not restrict it. Open decision (§10).
+8. **Existing functions not inventoried.** The default in §6.1 is future-only. Whether any function already exists in `strikenova_staging` is unknown (no catalog read since the earlier inspection), and the app tree creates none.
+9. **Function-gap evidence lives outside this proposal.** The measurement, the artifact id and its retrieval limitation are recorded in the rehearsal report §31 and §33; this document summarises them and does not restate the raw log.
 
 ---
 
@@ -311,6 +374,16 @@ These are **plans**, not results. No query in this section has been run.
 | **B** | Defer implementation and run staging single-identity under `strikenova_staging_owner` | Simpler, but the application keeps `replication`, `bypass_rls`, `createrole`, and DDL capability; ADR-016 stays unused in staging |
 | **C** | Option A, plus a documented justification to alter the provider role's attributes | Narrowest staging posture; requires a separate technical justification and its own authorization |
 
+Three further decisions are separable from the implementation option and are **not** made by this document:
+
+| Decision | Options | What it changes |
+|---|---|---|
+| **D — `TEMPORARY`** | keep the `PUBLIC` default (current text), or `REVOKE TEMPORARY ON DATABASE strikenova_staging FROM PUBLIC` and grant it only where demonstrated | the runtime role's ability to create temporary tables; provider/service roles that rely on `PUBLIC` would each need their own grant |
+| **E — `CONNECT`** | posture A: `PUBLIC` `CONNECT` retained, explicit grants are additive; posture B: `REVOKE CONNECT ON DATABASE … FROM PUBLIC` and grant explicitly | whether connection is actually restricted; superusers are unaffected either way, and posture B requires the authoritative identity list |
+| **F — function defaults** | accept §6.1's global `REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC` as a staging control, or leave functions on PostgreSQL's `PUBLIC` default | whether a future migrator-created function is executable by any role that can reach the schema. ADR-018's accepted text covers tables and sequences only, so accepting §6.1 extends the accepted scope |
+
+Whichever option is chosen, the verification in §8 must be run read-only afterwards and its **actual** values recorded — not the expected ones.
+
 Authorization for this gate is **not** authorization to apply migrations (gate 3) or to change Render (gate 4).
 
-**Status of this document:** `PROPOSAL — REVIEW ONLY — UNEXECUTED — UNTESTED — AWAITING SEPARATE FOUNDER AUTHORIZATION`
+**Status of this document:** `PROPOSAL — REVIEW ONLY — UNEXECUTED — PARTIALLY REHEARSED (A/B/C MEMBERSHIP AND TABLE/SEQUENCE DEFAULTS) — FUNCTION DEFAULT CORRECTED, UNEXECUTED — TEMP AND CONNECT AWAITING FOUNDER DECISION — AWAITING SEPARATE FOUNDER AUTHORIZATION FOR GATE 2`

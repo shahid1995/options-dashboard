@@ -10,18 +10,32 @@
 
 | File | Bytes (UTF-8) | Logical lines | Purpose |
 |---|---:|---:|---|
-| `README.md` | 6796 | 62 | This index: publication metadata, migration graph, authorization gates |
+| `README.md` | 9224 | 77 | This index: publication metadata, rehearsal evidence, migration graph, authorization gates |
 | `AUDIT_REPORT_CORRECTED.md` | 34291 | 405 | Corrective audit: Render provider, migration graph at both pinned trees, Founder approval, Neon role observation, accepted architecture, findings |
-| `NEON_STAGING_PRIVILEGE_PROPOSAL.md` | 25580 | 316 | Proposed staging identity pair with full PostgreSQL 16 role-membership semantics and review-only SQL |
-| `NEON_STAGING_MIGRATION_PREFLIGHT.md` | 10978 | 125 | Preflight: inventories, head results, PG16 compatibility, qualified CI evidence, prerequisites |
-| `NEON_STAGING_EXECUTION_PLAN.md` | 10921 | 124 | Numbered plan for gates 2–5 (privilege, migration, Render integration, post-deploy) |
+| `NEON_STAGING_PRIVILEGE_PROPOSAL.md` | 38545 | 389 | Proposed staging identity pair with full PostgreSQL 16 role-membership semantics, corrected function default privileges, and review-only SQL |
+| `NEON_STAGING_MIGRATION_PREFLIGHT.md` | 12027 | 128 | Preflight: inventories, head results, PG16 compatibility, qualified CI evidence, prerequisites |
+| `NEON_STAGING_EXECUTION_PLAN.md` | 13150 | 131 | Numbered plan for gates 2–5 (privilege, migration, Render integration, post-deploy) |
+| `POSTGRESQL_16_PRIVILEGE_REHEARSAL.md` | 73582 | 745 | PostgreSQL 16 privilege rehearsal evidence report: the blocked local attempt (Part I), the executed GitHub-hosted run (Part II), and the 2026-11-04 corrective pass (Part III) |
+
+## Rehearsal evidence (Gate 2 preparation)
+
+`POSTGRESQL_16_PRIVILEGE_REHEARSAL.md` is the evidence report for the privilege rehearsal that the proposal's §4 and §6 needed. It records two attempts: a **blocked** local attempt (no PostgreSQL 16 runtime was available; zero SQL executed) and an **executed** GitHub-hosted run against disposable `postgres:16` containers.
+
+| Item | Value |
+|---|---|
+| Workflow run | [`41813028902`](https://github.com/shahid1995/options-dashboard/actions/runs/41813028902) — conclusion `success` |
+| Run commit | `165f70e92b71b4b1bf5f00aa0ae6694ee08542fe` (a temporary branch, since deleted; the commit remains fetchable from `origin`) |
+| Result | 206 assertions passed, 12 recorded observations, **0 failed**, on PostgreSQL 16.15 |
+| Artifact | `pg16-privilege-rehearsal-evidence`, id `13313880536`, 13 970 bytes, digest `sha256:b17f2667…`, expires **2026-11-11T10:16:36Z** (available at publication) |
+
+**This is documentation evidence, not a staging gate approval.** It establishes behaviour on disposable PostgreSQL 16 instances only. It does not describe the live `strikenova_staging` catalog, Neon's `pg_hba.conf`, or any deployed state, and it authorizes nothing — gates 2, 3 and 4 remain pending separate Founder authorization. The report's limitations section (§26, §39) states what the rehearsal does not prove; its §40 lists the decisions it deliberately leaves open (`TEMPORARY`, `CONNECT`, and whether to accept the global function default).
 
 ## Authorization state
 
 | # | Gate | Status |
 |---|---|---|
 | 1 | Application version | **COMPLETE** — `feat/strikenova-day35-portfolio-intelligence` @ `9dc6e15c7b7c112ccb81b3be9c1609be66c92414`, expected head `d49aa0000001` |
-| 2 | Staging privilege implementation | **PENDING** — separate Founder authorization |
+| 2 | Staging privilege implementation | **PENDING** — separate Founder authorization. Prerequisites now measured (rehearsal report); `TEMPORARY`/`CONNECT` and the function default remain open Founder decisions |
 | 3 | Neon migration execution | **PENDING** — separate Founder authorization |
 | 4 | Render–Neon integration & deployment | **PENDING** — separate Founder authorization (Render currently uses CockroachDB; auto-deploy disabled) |
 
@@ -55,8 +69,9 @@ Parsing handled string, tuple, and list `down_revision` forms, all merge parents
 
 ## Publication record
 
-- **Baseline for this correction pass:** `cc00e87d4bcf13d190e3ca9025aa6c01d4b357e1` (parent `059c1c752d0fe82089831002838b6bdd4b0e8c68`).
-- **Correction commit:** the commit that introduced this revision of these five files, on `docs/neon-staging-readiness-artifacts`. A Git commit cannot embed its own SHA, so that SHA is recorded in the commit itself and in `git log -1` rather than in a file it contains; it is also reported in the publication report for this pass.
-- **Byte and line counts** above are measured on the published UTF-8 files of this revision (logical lines = newline-separated content lines, ignoring the single trailing newline).
+- **Baseline for this correction pass:** `f56d9922d89a465ad94343f51fcc60f0f41d74bf`.
+- **Correction commit:** the commit that introduced this revision of these six files, on `docs/neon-staging-readiness-artifacts`. A Git commit cannot embed its own SHA, so that SHA is recorded in the commit itself and in `git log -1` rather than in a file it contains; it is also reported in the publication report for this pass.
+- **Byte and line counts** above are measured on the published UTF-8 files of this revision (logical lines = newline-separated content lines, ignoring the single trailing newline). They were re-measured mechanically after the 2026-11-04 corrections, not carried over.
+- **Changed in this pass:** the privilege proposal (global function default, three-row `pg_default_acl` expectation, `TEMP`/`CONNECT` findings), the execution plan (function step, `TEMP`/`CONNECT` gate, exit criteria), the migration preflight (no functions/triggers/temporary tables in the chain), this index, and the rehearsal report (new Part III plus the two object-name corrections). `AUDIT_REPORT_CORRECTED.md` is unchanged.
 
-**Status:** INDEPENDENT AUDIT CORRECTIONS APPLIED — CI CHAIN EVIDENCE ACCURATE — POSTGRESQL 16 INHERIT/SET DISTINCTIONS CORRECT — SQL ORDERING AND EXECUTION PLAN ALIGNED — READ-ONLY PLAN VERIFIED — FIVE REMOTE FILES VERIFIED — NO DATABASE OR INFRASTRUCTURE ACTIONS TAKEN
+**Status:** POSTGRESQL 16 REHEARSAL EVIDENCE PUBLISHED — FUNCTION `EXECUTE` GAP CORRECTED IN THE PROPOSAL (REVIEW-ONLY, UNEXECUTED) — `TEMPORARY` AND `CONNECT` REPORTED AS OPEN FOUNDER DECISIONS — ASSERTION-ID COLLISIONS DECLARED — SIX FILES, NO DATABASE OR INFRASTRUCTURE ACTIONS TAKEN — GATES 2, 3 AND 4 STILL PENDING

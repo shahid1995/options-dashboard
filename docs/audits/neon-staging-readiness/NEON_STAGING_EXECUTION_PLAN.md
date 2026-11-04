@@ -46,18 +46,24 @@
 2. **Provision credentials out of band.** Obtain passwords for `strikenova_staging_migrator` and `strikenova_staging_app` from the approved Neon/provider process or the platform secret store. Never write a password, connection string, or token into a file, SQL script, log, or chat.
 3. **Create the two login roles** (review-only SQL in the proposal, §6). Do not grant `REPLICATION`, `BYPASSRLS`, `CREATEDB`, `CREATEROLE`, `SUPERUSER`, or object ownership to the runtime role.
 4. **Grant schema access.** `USAGE, CREATE` on schema `public` to the migrator; `USAGE` on `public` and `CONNECT` on the database to the app. In PostgreSQL 16, `public` no longer grants `CREATE` to `PUBLIC`, so this is explicit.
-5. **Install default privileges for the migrator** (ADR-018): `ALTER DEFAULT PRIVILEGES FOR ROLE strikenova_staging_migrator IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO strikenova_staging_app;` and `… GRANT USAGE ON SEQUENCES TO strikenova_staging_app;`
+   - **`CONNECT` and `TEMPORARY` are database-level, and both are `PUBLIC` defaults.** The grants above guarantee the two identities access; they restrict nothing. Apply the Founder's decisions on proposal §10 items D (`TEMPORARY`) and E (`CONNECT`) before running anything. If those decisions do not exist, leave both at their defaults **and record in the gate-2 evidence that the posture is not exclusive** — do not describe it as connection control.
+5. **Install default privileges for the migrator** (ADR-018 plus the function default in proposal §6.1): `ALTER DEFAULT PRIVILEGES FOR ROLE strikenova_staging_migrator IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO strikenova_staging_app;`, `… GRANT USAGE ON SEQUENCES TO strikenova_staging_app;`, and the **global** function statement in the next bullet. Three rows total, all bound to the migrator.
    - Choose exactly one arrangement (proposal §4.6 / §4.8). They are alternatives, not sequential steps:
      - **A (recommended):** connect directly as `strikenova_staging_migrator` and run the statements **without** `FOR ROLE`.
      - **B:** run as an administrative role with an `INHERIT TRUE` membership path to the migrator, using the `FOR ROLE` form. This sets the migrator's defaults for future objects but does **not** make objects created in that session count as the migrator's.
      - **C:** run as an administrative role with `SET TRUE` on every membership edge, execute `SET ROLE strikenova_staging_migrator;`, then run the statements as the migrator. `INHERIT TRUE` alone does not permit `SET ROLE`.
    - `INHERIT TRUE` and `SET TRUE` are independent: the `FOR ROLE` inherited-privilege check needs `INHERIT TRUE`; `SET ROLE` needs `SET TRUE`. `WITH INHERIT TRUE, SET TRUE` satisfies both. A membership grant requires the grantor to hold `ADMIN` on it (or be a superuser).
-   - Defaults affect **future** objects only. Existing objects need explicit `GRANT … ON ALL TABLES/SEQUENCES IN SCHEMA`.
+   - Defaults affect **future** objects only. Existing objects need explicit `GRANT … ON ALL TABLES/SEQUENCES IN SCHEMA`; existing functions need their own inventory and review.
+   - **Install the global function default in the same arrangement** (does **not** need `IN SCHEMA`, and must not use it):
+     - **A:** `ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;` as the migrator.
+     - **B:** `ALTER DEFAULT PRIVILEGES FOR ROLE strikenova_staging_migrator REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;` — same `INHERIT TRUE` requirement as the table statements.
+     - **C:** after `SET ROLE strikenova_staging_migrator;`, `ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;` before `RESET ROLE;`.
+     - The schema-scoped form is inert on PostgreSQL 16 (it stores no row and removes no built-in grant); a change that adds `IN SCHEMA public` here silently disables the control.
 6. **Configure environment variables** (only if two-identity is authorized): `STRIKENOVA_MIGRATION_DATABASE_URL` → migrator connection; `DATABASE_URL` → runtime app connection.
-7. **Verify read-only** using the checks in the proposal §8 (`pg_roles`, `pg_default_acl` / `\ddp`, `has_schema_privilege`, membership options). Confirm the app identity cannot create in `public`.
+7. **Verify read-only** using the checks in the proposal §8: `pg_roles`, `pg_default_acl` / `\ddp` (**three** rows: `public`/`r`, `public`/`S`, global/`f` with no `PUBLIC`), `has_schema_privilege`, membership options, a function probe (`proacl` must show no `PUBLIC` entry; the app role must be refused with `42501`), and the recorded `TEMPORARY`/`CONNECT` values for the app role and for an unrelated ordinary role. Confirm the app identity cannot create in `public`.
 8. **Do not alter `strikenova_staging_owner`** unless a documented technical requirement and its own authorization exist. It currently holds `replication`, `bypass_rls`, `createdb`, `createrole`.
 
-**Gate 2 exit criteria:** migrator and app roles exist with the intended attributes; two `pg_default_acl` rows bound to the migrator; the app identity is DML-only; credentials live only in the secret store.
+**Gate 2 exit criteria:** migrator and app roles exist with the intended attributes; **three** `pg_default_acl` rows bound to the migrator, including the global function row with no `PUBLIC` entry; the app identity holds only the privileges the Founder approved — DML on tables, `USAGE` on sequences, and whatever the `TEMPORARY`/`CONNECT` decisions allow; credentials live only in the secret store. "DML-only" is not a valid exit statement until those two decisions exist.
 
 ---
 
@@ -101,7 +107,8 @@
 - **Target is the existing empty Neon database.** Distinguish it from any disposable PostgreSQL 16 rehearsal.
 - **Correct env var names only:** `DATABASE_URL`, `STRIKENOVA_MIGRATION_DATABASE_URL`. No `NEON_DATABASE_URL`.
 - **Platform is Render.** No Railway restart or logging instructions apply.
-- **PostgreSQL 16 semantics only.** `TEMPORARY` is a database privilege, not a schema privilege; there is no standalone `CREATE INDEX` grant; defaults never apply retroactively.
+- **PostgreSQL 16 semantics only.** `TEMPORARY` and `CONNECT` are database privileges, not schema privileges, and both are `PUBLIC` defaults; there is no standalone `CREATE INDEX` grant; defaults never apply retroactively.
+- **The function default must be global.** `ALTER DEFAULT PRIVILEGES … REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC` with `IN SCHEMA` is a no-op on PostgreSQL 16 — per-schema defaults only add to global defaults. Measured, see the rehearsal report §33.
 - **Creation role matters.** Defaults bound to the migrator are inert unless objects are actually created by the migrator.
 - **No unverified table counts.** Report only what is observed.
 - **Never commit or log credentials.** Passwords come from the secret store.

@@ -62,6 +62,9 @@
 - `d9e0f1a2b3c4` creates a global UNIQUE index on `(broker, broker_account_id)`: succeeds on a fresh empty database; would abort if duplicates exist.
 - `e5f6a7b8c9d0` drops the legacy `uq_users_broker_identity` constraint. Between the two pinned trees this file gained a CockroachDB branch; the PostgreSQL 16 branch is unchanged (`ALTER TABLE users DROP CONSTRAINT IF EXISTS …`).
 - Schema `public` in PostgreSQL 15+ no longer grants `CREATE` to `PUBLIC`; the migration identity needs explicit `USAGE, CREATE` (see `NEON_STAGING_PRIVILEGE_PROPOSAL.md` §4.7).
+- **No functions, procedures, or triggers.** Searched the approved tree for `create (or replace )?function` and `CREATE TRIGGER` across `alembic/` and `app/`: no match. The open function-default decision (proposal §6.1) therefore does not change this chain's outcome; it governs what a *future* revision may create.
+- **No temporary tables.** `batch_alter_table` appears only with `create_index`, `add_column`, `drop_column`, `create_foreign_key` and `drop_constraint`, and never with `recreate=True`. On PostgreSQL, batch mode emits ordinary `ALTER TABLE`/`CREATE INDEX` DDL and builds no temporary table, so the open `TEMPORARY` decision (proposal §10 item D) does not block the chain.
+- **Privilege posture is not yet final.** The open `TEMPORARY` and `CONNECT` decisions change what the runtime identity may do, not whether the chain applies. They must be settled before gate 2 evidence is written, not before gate 3.
 
 **Compatibility conclusion:** the chain is PostgreSQL 16-compatible for a fresh empty database, by static inspection only. No migration was executed.
 
@@ -98,7 +101,7 @@ The PostgreSQL *compatibility* workflow also includes this test file in its suit
 | 2 | Alembic head determined | ✅ Static reconstruction | `d49aa0000001`, single head at this tree; CLI not executed |
 | 3 | Target database identified | ✅ Identified | Existing empty Neon `strikenova_staging`, project `gentle-field-42671929` |
 | 4 | Connection configuration | ⚠️ Pending | Use `DATABASE_URL` (runtime) and, if two-identity is authorized, `STRIKENOVA_MIGRATION_DATABASE_URL` (migrator). Do **not** invent `NEON_DATABASE_URL`. |
-| 5 | Role privileges | ⚠️ Pending gate 2 | See `NEON_STAGING_PRIVILEGE_PROPOSAL.md` |
+| 5 | Role privileges | ⚠️ Pending gate 2 | See `NEON_STAGING_PRIVILEGE_PROPOSAL.md` — now three default-ACL rows including the global function row, plus the open `TEMPORARY`/`CONNECT` decisions (§10 there) |
 | 6 | Migration lock / ownership understood | ✅ Documented | ADR-017 lease uses the migration identity; ADR-018 binds defaults to the migrator/creator |
 | 7 | Render–Neon integration | ⚠️ Pending gate 4 | Render currently uses CockroachDB; no integration change authorized |
 | 8 | Migration execution authorization | ⚠️ Pending gate 3 | No migration applied to Neon |
