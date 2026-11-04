@@ -10,7 +10,7 @@
 
 | File | Bytes (UTF-8) | Logical lines | Purpose |
 |---|---:|---:|---|
-| `README.md` | 6528 | 62 | This index: publication metadata, migration graph, authorization gates |
+| `README.md` | 6559 | 62 | This index: publication metadata, migration graph, authorization gates |
 | `AUDIT_REPORT_CORRECTED.md` | 34291 | 405 | Corrective audit: Render provider, migration graph at both pinned trees, Founder approval, Neon role observation, accepted architecture, findings |
 | `NEON_STAGING_PRIVILEGE_PROPOSAL.md` | 25580 | 316 | Proposed staging identity pair with full PostgreSQL 16 role-membership semantics and review-only SQL |
 | `NEON_STAGING_MIGRATION_PREFLIGHT.md` | 10360 | 123 | Preflight: inventories, head results, PG16 compatibility, qualified CI evidence, prerequisites |
@@ -59,4 +59,4 @@ Parsing handled string, tuple, and list `down_revision` forms, all merge parents
 - **Correction commit:** the commit that introduced this revision of these five files, on `docs/neon-staging-readiness-artifacts`. A Git commit cannot embed its own SHA, so that SHA is recorded in the commit itself and in `git log -1` rather than in a file it contains; it is also reported in the publication report for this pass.
 - **Byte and line counts** above are measured on the published UTF-8 files of this revision (logical lines = newline-separated content lines, ignoring the single trailing newline).
 
-**Status:** INDEPENDENT AUDIT CORRECTIONS APPLIED — CI CHAIN EVIDENCE ACCURATE — POSTGRESQL 16 INHERIT/SET DISTINCTIONS CORRECT — SQL ORDERING AND EXECUTION PLAN ALIGNED — READ-ONLY PLAN VERIFIED — NO DATABASE OR INFRASTRUCTURE ACTIONS TAKEN
+**Status:** INDEPENDENT AUDIT CORRECTIONS APPLIED — CI CHAIN EVIDENCE ACCURATE — POSTGRESQL 16 INHERIT/SET DISTINCTIONS CORRECT — SQL ORDERING AND EXECUTION PLAN ALIGNED — READ-ONLY PLAN VERIFIED — FIVE REMOTE FILES VERIFIED — NO DATABASE OR INFRASTRUCTURE ACTIONS TAKEN
