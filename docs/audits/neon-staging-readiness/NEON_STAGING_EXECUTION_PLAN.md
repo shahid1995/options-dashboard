@@ -35,7 +35,7 @@
 - [x] **Alembic CLI / `ScriptDirectory.get_heads()` not executed** — all head results are static reconstruction.
 - [x] Application already supports `STRIKENOVA_MIGRATION_DATABASE_URL`; no application source change needed.
 - [x] ADR-016/017/018 read and confirmed *Accepted*; `DATA.md` §5 is the accepted production privilege model.
-- [x] CI evidence qualified (runs at `a016887`, not at the exact `9dc6e15` SHA. The migration trees are identical at both commits: all 31 migration files have the same blob SHAs; the two intervening commits changed only six governance/documentation files. Neither run was Neon-specific, and neither applied any migration to Neon.)
+- [x] CI evidence qualified: the PostgreSQL job of the migration-rehearsal workflow runs `tests/test_migration_rehearsal_postgres.py`, which invokes `command.upgrade(cfg, "head")` against a real `postgres:16` container and therefore applied the full 31-revision chain to the single head `d49aa0000001`. Runs were at `a016887`, not at the exact `9dc6e15` SHA; the migration trees are byte-identical at both commits (31 files, same blob SHAs; the two intervening commits changed only six governance/documentation files). The 27-revision figure belongs to the historical deployment `b960ca2`. Neither run was Neon-specific, and neither applied any migration to Neon (the container is ephemeral).
 - [x] No Neon, CockroachDB, or Render change made.
 
 ---
@@ -47,7 +47,11 @@
 3. **Create the two login roles** (review-only SQL in the proposal, §6). Do not grant `REPLICATION`, `BYPASSRLS`, `CREATEDB`, `CREATEROLE`, `SUPERUSER`, or object ownership to the runtime role.
 4. **Grant schema access.** `USAGE, CREATE` on schema `public` to the migrator; `USAGE` on `public` and `CONNECT` on the database to the app. In PostgreSQL 16, `public` no longer grants `CREATE` to `PUBLIC`, so this is explicit.
 5. **Install default privileges for the migrator** (ADR-018): `ALTER DEFAULT PRIVILEGES FOR ROLE strikenova_staging_migrator IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO strikenova_staging_app;` and `… GRANT USAGE ON SEQUENCES TO strikenova_staging_app;`
-   - Run this as the migrator, or as a role that is a member of it. Membership is the documented precondition for the `FOR ROLE` form; `WITH INHERIT TRUE, SET TRUE` also enables the `SET ROLE` path.
+   - Choose exactly one arrangement (proposal §4.6 / §4.8). They are alternatives, not sequential steps:
+     - **A (recommended):** connect directly as `strikenova_staging_migrator` and run the statements **without** `FOR ROLE`.
+     - **B:** run as an administrative role with an `INHERIT TRUE` membership path to the migrator, using the `FOR ROLE` form. This sets the migrator's defaults for future objects but does **not** make objects created in that session count as the migrator's.
+     - **C:** run as an administrative role with `SET TRUE` on every membership edge, execute `SET ROLE strikenova_staging_migrator;`, then run the statements as the migrator. `INHERIT TRUE` alone does not permit `SET ROLE`.
+   - `INHERIT TRUE` and `SET TRUE` are independent: the `FOR ROLE` inherited-privilege check needs `INHERIT TRUE`; `SET ROLE` needs `SET TRUE`. `WITH INHERIT TRUE, SET TRUE` satisfies both. A membership grant requires the grantor to hold `ADMIN` on it (or be a superuser).
    - Defaults affect **future** objects only. Existing objects need explicit `GRANT … ON ALL TABLES/SEQUENCES IN SCHEMA`.
 6. **Configure environment variables** (only if two-identity is authorized): `STRIKENOVA_MIGRATION_DATABASE_URL` → migrator connection; `DATABASE_URL` → runtime app connection.
 7. **Verify read-only** using the checks in the proposal §8 (`pg_roles`, `pg_default_acl` / `\ddp`, `has_schema_privilege`, membership options). Confirm the app identity cannot create in `public`.
@@ -61,7 +65,10 @@
 
 9. **Confirm the target.** Confirm the connection resolves to the existing empty Neon `strikenova_staging` database — not a scratch or rehearsal instance. Record the database name and project, never the credential.
 10. **Confirm emptiness.** Verify no `alembic_version` table and no application tables exist. If the database is not empty, stop and obtain explicit instruction; do not stamp, force, or downgrade on assumption.
-11. **Choose the executing identity.** Either connect as `strikenova_staging_migrator`, or connect as an authorized administrative role and `SET ROLE strikenova_staging_migrator` for the session. **Objects must be created by the migrator** — membership alone does not apply the migrator's default privileges at creation time.
+11. **Choose the executing identity.** Either connect directly as `strikenova_staging_migrator`, or connect as an authorized administrative role and `SET ROLE strikenova_staging_migrator` for the session.
+    - `SET ROLE` requires a membership path with `SET TRUE` on **every** edge; `INHERIT TRUE` alone is insufficient.
+    - After `SET ROLE`, `current_user` is the migrator, so object creation and the ADR-018 default privileges apply as the migrator.
+    - **Objects must be created by the migrator:** membership alone — without a direct migrator connection or a prior `SET ROLE` — does not make the migrator's defaults apply to objects created under a different current role.
 12. **Run the migration.** From `options-dashboard-project/backend/`, run `alembic upgrade head`. The single head at this tree is `d49aa0000001`, so the target is unambiguous. With the two-identity model the ADR-017 lease serializes execution and bootstraps on an empty database.
 13. **Verify.** Confirm `alembic_version` reports `d49aa0000001`, that the key tables exist, and that a table created by the migrator carries the runtime grants from the defaults. Do **not** assert an unverified table count.
 

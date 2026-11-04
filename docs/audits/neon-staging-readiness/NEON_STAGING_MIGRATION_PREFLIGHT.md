@@ -73,12 +73,18 @@ Successful GitHub Actions runs exist at commit `a016887f61289bc9c64edaabed45d3e1
 - PostgreSQL compatibility — [run 37575586698](https://github.com/shahid1995/options-dashboard/actions/runs/37575586698)
 - PostgreSQL and CockroachDB migration rehearsal — [run 37575586664](https://github.com/shahid1995/options-dashboard/actions/runs/37575586664)
 
-**Qualifications — read these before citing the runs:**
-- The application and migration files are identical between `a016887` and `9dc6e15`: all 31 migration files have identical blob SHAs, and the two intervening commits changed only six governance/documentation files. *(This was re-derived from the exact tree comparison.)*
-- **Not** executed at the exact `9dc6e15` SHA.
-- **Not** a Neon-specific run, and **not** a Neon role-privilege rehearsal.
-- The CI runs covered the 27-revision chain that existed at `a016887`; the four revisions added by `9dc6e15` were present in the tree (`d47aa0000001` through `d49aa0000001`) but were **not** part of any migration execution in those runs.
-- No migration has been applied to Neon.
+**What the runs actually executed.** The PostgreSQL job of the migration-rehearsal workflow runs `tests/test_migration_rehearsal_postgres.py` against a real `postgres:16` service container. That test invokes `command.upgrade(cfg, "head")` through the application's own migration-URL resolver, so the job applies the **entire chain** from an empty database to the single head of the tree it checked out. The PostgreSQL rehearsal job completed successfully.
+
+**What tree that checkout contained.** The checked-out commit `a016887` and the approved target `9dc6e15` have **byte-identical migration trees**: both contain the same 31 migration files with the same blob SHAs (the tree object at `options-dashboard-project/backend/alembic/versions` is identical), and both have the single head `d49aa0000001`. The two intervening commits changed only six governance/documentation files. The rehearsal therefore exercised the same 31-revision chain — `d3eb45a2e046` → … → `d46aa0000001` → `d47aa0000001` → `d48aa0000001` → `d48aa0000002` → `d49aa0000001` — that the approved target contains.
+
+**Where the 27-versus-31 distinction belongs.** The 27-revision figure belongs to the historical Render deployment `b960ca2` (27 files, single head `d46aa0000001`), **not** to `a016887`. `a016887` already held all 31 files, so the four later revisions (`d47aa0000001`, `d48aa0000001`, `d48aa0000002`, `d49aa0000001`) were present in the CI tree and were part of the PostgreSQL chain the rehearsal applied.
+
+**Qualifications that still apply:**
+- **Not** executed at the exact `9dc6e15` SHA — the run's checkout is `a016887`. The migration trees are identical, so the executed chain is the same, but the run is not a run *at* `9dc6e15`.
+- **Not** a Neon-specific run, and **not** a Neon role/privilege rehearsal. The container is a stock `postgres:16` service reached with a superuser connection; no staging roles, `pg_default_acl` entries, or `INHERIT`/`SET` membership behaviour were exercised.
+- **No migration has been applied to Neon.** The rehearsal ran against an ephemeral CI container that is destroyed with the job.
+
+The PostgreSQL *compatibility* workflow also includes this test file in its suite, so it likewise applied the chain to its own ephemeral `postgres:16` container; the full-chain statement is attributed to the verified migration-rehearsal test, not to the compatibility suite as a whole.
 
 ---
 
