@@ -10,10 +10,10 @@
 
 | File | Bytes (UTF-8) | Logical lines | Purpose |
 |---|---:|---:|---|
-| `README.md` | 6559 | 62 | This index: publication metadata, migration graph, authorization gates |
+| `README.md` | 6796 | 62 | This index: publication metadata, migration graph, authorization gates |
 | `AUDIT_REPORT_CORRECTED.md` | 34291 | 405 | Corrective audit: Render provider, migration graph at both pinned trees, Founder approval, Neon role observation, accepted architecture, findings |
 | `NEON_STAGING_PRIVILEGE_PROPOSAL.md` | 25580 | 316 | Proposed staging identity pair with full PostgreSQL 16 role-membership semantics and review-only SQL |
-| `NEON_STAGING_MIGRATION_PREFLIGHT.md` | 10360 | 123 | Preflight: inventories, head results, PG16 compatibility, qualified CI evidence, prerequisites |
+| `NEON_STAGING_MIGRATION_PREFLIGHT.md` | 10978 | 125 | Preflight: inventories, head results, PG16 compatibility, qualified CI evidence, prerequisites |
 | `NEON_STAGING_EXECUTION_PLAN.md` | 10921 | 124 | Numbered plan for gates 2–5 (privilege, migration, Render integration, post-deploy) |
 
 ## Authorization state
@@ -31,7 +31,7 @@ Gate 1 approves *which application version*. It does not authorize creating role
 
 | Commit | Migration files | Heads | Notes |
 |---|---:|---|---|
-| `b960ca2f20f0c15bf2e59f3d894ccb66d8b0f3ba` (historical Render deployment, 2026-09-24) | **27** | `d46aa0000001` — exactly 1 | Does **not** contain `d47aa0000001`, `d48aa0000001`, `d48aa0000002`, `d49aa0000001`. |
+| `b960ca2f20f0c15bf2e59f3d894ccb66d8b0f3ba` (historical Render deployment — commit date 2026-09-24, deployed 2026-09-25) | **27** | `d46aa0000001` — exactly 1 | Does **not** contain `d47aa0000001`, `d48aa0000001`, `d48aa0000002`, `d49aa0000001`. |
 | `9dc6e15c7b7c112ccb81b3be9c1609be66c92414` (approved target, 2026-10-19) | **31** | `d49aa0000001` — exactly 1 | Adds four revisions extending the chain: `d46aa0000001` → `d47aa0000001` → `d48aa0000001` → `d48aa0000002` → `d49aa0000001`. |
 
 **Merge relationships that decide the head count:**
@@ -47,7 +47,7 @@ Parsing handled string, tuple, and list `down_revision` forms, all merge parents
 
 ## Key facts
 
-- **Render** runs on CockroachDB (`sqlalchemy_cockroachdb`); Neon is not connected to it. Historical deployment `b960ca2` on 2026-09-25 (`dep-dar4go17lnhs73a0mfm0`). Auto-deploy disabled.
+- **Render** runs on CockroachDB (`sqlalchemy_cockroachdb`); Neon is not connected to it. Historical deployment `b960ca2` — commit dated **2026-09-24**, actually deployed **2026-09-25** (`dep-dar4go17lnhs73a0mfm0`). The two dates differ: the commit date is the Git authoring/commit timestamp, the deployment date is when Render released `dep-dar4go17lnhs73a0mfm0`. Auto-deploy disabled.
 - **Neon:** project `gentle-field-42671929`, database `strikenova_staging` (PostgreSQL 16). The earlier read-only catalog inspection found only the Neon-created `strikenova_staging_owner` as an application-present role, with `replication`, `bypass_rls`, `createdb`, and `createrole` set. The catalog was **not** re-read during this documentation pass.
 - **Architecture:** ADR-016 (identity separation via `STRIKENOVA_MIGRATION_DATABASE_URL`), ADR-017 (`_migration_lock` lease), and ADR-018 (default privileges bound to the migrator/creator) are **Accepted** in `DECISIONS.md`. `DATA.md` §5 is the accepted production privilege model for database `strikenova`. Application support already exists; no source change is required.
 - **Proposed staging identities** (`strikenova_staging_migrator`, `strikenova_staging_app`) are distinct from the accepted production identities (`strikenova_production_app`, `strikenova_prod_migrator`, `strikenova_prod_runtime`, `strikenova_prod_admin`) and from the provider-created `strikenova_staging_owner`.
