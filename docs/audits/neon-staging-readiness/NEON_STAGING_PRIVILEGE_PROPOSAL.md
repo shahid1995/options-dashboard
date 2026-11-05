@@ -352,7 +352,7 @@ Creation, ACL inspection, app-role invocation and cleanup are steps of **one** t
 | No unintended migrator rows | the same query | No fourth row, no global table/sequence row, no `PUBLIC` entry in the function row, no grant to a role other than the app |
 | Schema privileges | `SELECT has_schema_privilege('strikenova_staging_migrator','public','CREATE'), has_schema_privilege('strikenova_staging_app','public','CREATE'), has_schema_privilege('strikenova_staging_app','public','USAGE');` | `true, false, true` |
 | Membership setup | `SELECT r.rolname AS member, g.rolname AS granted, m.inherit_option, m.set_option FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.member JOIN pg_roles g ON g.oid=m.roleid;` | Matches the chosen arrangement (§4.6) |
-| `CONNECT` — catalog | `SELECT has_database_privilege('strikenova_staging_app', current_database(), 'CONNECT'), has_database_privilege('strikenova_staging_migrator', current_database(), 'CONNECT'), has_database_privilege('<unrelated-ordinary-role>', current_database(), 'CONNECT');` | under posture A all three are `true`; under posture B only the authorized identities are `true`. Record the third value explicitly — it is the one that shows whether `PUBLIC` still confers connection |
+| `CONNECT` — catalog | `SELECT has_database_privilege('strikenova_staging_app', current_database(), 'CONNECT'), has_database_privilege('strikenova_staging_migrator', current_database(), 'CONNECT'), has_database_privilege('<unrelated-ordinary-role>', current_database(), 'CONNECT');` | under posture A all three are `true`; under posture B only the authorized identities are `true`. Record the third value explicitly — it is the one that shows whether `PUBLIC` still confers connection. §8.4 lists the ACL rows (`CONNECT`, `TEMPORARY`) behind these effective values |
 | `CONNECT` — limitation | an actual connection attempt by an unrelated role | a catalog check is **not** equivalent to a provider access test; `pg_hba.conf`, provider proxies and superuser status all sit in front of it. Record the attempt and its result, and do not present it as a Neon-level guarantee |
 
 **Check 2 — database-wide inventory (assessment, not a gate).** Separately inventory every default-ACL entry in the database:
@@ -368,20 +368,33 @@ Rows bound to other roles are **recorded and assessed, not automatically failed*
 
 ### 8.2 Function `EXECUTE` probe — one ordered lifecycle
 
-Run the steps in this order. Steps 3–4 must precede step 9, and step 9 must not run before step 7 has been attempted.
+The probe measures the **migrator's** default function privileges, so the function must be created *by the migrator identity*. The three arrangements in §4.6 are not interchangeable for this step: arrangement B's `INHERIT TRUE` path authorizes the `FOR ROLE` form of `ALTER DEFAULT PRIVILEGES`, but it does **not** authorize `SET ROLE`, and an object created while `current_user` is the administrator is owned by the administrator, not by the migrator. An administrator-owned function does not test the migrator's defaults and must not be reported as if it did.
+
+| Selected arrangement | Permitted way to establish the creating identity |
+|---|---|
+| **A — direct migrator** | Connect directly as `strikenova_staging_migrator`. No `SET ROLE` is involved. |
+| **B — administrator with `INHERIT TRUE` / `FOR ROLE`** | For this probe, connect **directly** as `strikenova_staging_migrator`. `INHERIT TRUE` does not permit `SET ROLE` and does not transfer ownership of objects created in the administrator's session, so the administrator path must not be used to create the probe object. |
+| **C — administrator with `SET TRUE`** | The administrator may `SET ROLE strikenova_staging_migrator;` before creating the probe, but only when `SET TRUE` holds on **every** membership edge in the path. Never infer `SET` from `INHERIT`. |
+
+If the migrator identity cannot be established by the path the selected arrangement permits, stop and record the probe as **`NOT EXECUTABLE — MIGRATOR IDENTITY NOT ESTABLISHED`**. Do not substitute an administrator-owned function, and do not invent, derive or reuse credentials outside the approved secret-store process (§7).
+
+Run the steps in this order. Step 3 gates creation, and the drop (step 10) must not run before step 9 has been attempted.
 
 | Step | Identity | Action | Pass condition |
 |---:|---|---|---|
-| 1 | administrator (or migrator directly, arrangement A) | establish the migrator identity: connect as `strikenova_staging_migrator`, or `SET ROLE strikenova_staging_migrator;` in a session whose membership allows it | `SELECT current_user;` returns `strikenova_staging_migrator` |
-| 2 | migrator (`current_user`) | `CREATE FUNCTION public._probe_fn_exec_<suffix>() RETURNS integer LANGUAGE sql AS 'SELECT 1';` — `<suffix>` unique to this run and recorded | function created |
-| 3 | migrator | `SELECT p.proacl::text FROM pg_proc p WHERE p.oid = 'public._probe_fn_exec_<suffix>()'::regprocedure;` — schema-qualified, resolved by OID, never by `proname` alone | one row returned (the function exists) |
-| 4 | migrator | interpret the ACL | **no** `=X/` entry anywhere in it. `NULL` means the built-in default still applies (the global revoke is missing or was scoped) → fail. An `=X/` entry means `PUBLIC` still holds `EXECUTE` → fail |
-| 5 | **separate session**, app | connect as `strikenova_staging_app` (credentials from the secret store) | `SELECT current_user;` returns `strikenova_staging_app` |
-| 6 | app | `SELECT has_schema_privilege(current_user,'public','USAGE');` | `true`. If `false`, **stop**: a schema-access failure cannot be reported as an `EXECUTE` denial |
-| 7 | app | `SELECT public._probe_fn_exec_<suffix>();` | refused with SQLSTATE **`42501`** and a message naming the *function* |
-| 8 | app | classify the refusal | `42501` naming the function = the control worked. `42883` (`undefined function`) = wrong name/schema or the function is gone → **not** a pass. `42501` naming the *schema* = `USAGE` failure → **not** a pass. Successful execution = control absent → fail |
-| 9 | migrator | `DROP FUNCTION public._probe_fn_exec_<suffix>();` — only now, after step 7 | drop succeeds |
-| 10 | recorder | record the outcome of every step, including the drop | if the drop failed, record it and leave the object named in the gate-2 evidence for follow-up; do not report a clean rehearsal |
+| 1 | operator | select the already-authorized arrangement (§4.6) and record it; it determines the only permitted identity path in step 2 | one arrangement recorded — A, B or C, not a mixture |
+| 2 | operator | establish the migrator identity by the path that arrangement permits (table above) | a session whose `current_user` is the migrator |
+| 3 | migrator | `SELECT current_user;` | returns `strikenova_staging_migrator`. If it returns the administrator, stop: `NOT EXECUTABLE — MIGRATOR IDENTITY NOT ESTABLISHED` |
+| 4 | migrator (`current_user`) | `CREATE FUNCTION public._probe_fn_exec_<suffix>() RETURNS integer LANGUAGE sql AS 'SELECT 1';` — `<suffix>` unique to this run and recorded | function created, owned by the migrator |
+| 5 | migrator | `SELECT p.proacl::text FROM pg_proc p WHERE p.oid = 'public._probe_fn_exec_<suffix>()'::regprocedure;` — schema-qualified, resolved by OID, never by `proname` alone | one row returned (the function exists) |
+| 6 | migrator | interpret the ACL | **no** `=X/` entry anywhere in it. `NULL` means the built-in default still applies (the global revoke is missing or was scoped) → fail. An `=X/` entry means `PUBLIC` still holds `EXECUTE` → fail |
+| 7 | **separate session**, app | connect as `strikenova_staging_app` (credentials from the secret store) | `SELECT current_user;` returns `strikenova_staging_app` |
+| 8 | app | `SELECT has_schema_privilege(current_user,'public','USAGE');` | `true`. If `false`, **stop**: a schema-access failure cannot be reported as an `EXECUTE` denial |
+| 9 | app | `SELECT public._probe_fn_exec_<suffix>();` — the function must still exist | refused with SQLSTATE **`42501`** and a message naming the *function* |
+| 10 | migrator | `DROP FUNCTION public._probe_fn_exec_<suffix>();` — only now, after step 9, and as the migrator | drop succeeds |
+| 11 | recorder | record the outcome of every step, including the drop | if the drop failed, record it and leave the object named in the gate-2 evidence for follow-up; do not report a clean rehearsal |
+
+Classifying the step-9 result: `42501` naming the function = the control worked (only if step 8 already confirmed schema `USAGE`). `42883` (`undefined function`) = wrong name/schema or the function is gone → **not** a pass. `42501` naming the *schema* = `USAGE` failure → **not** a pass. Successful execution = control absent → fail.
 
 A generic permission error is not evidence of the specific function `EXECUTE` control: the SQLSTATE and the object named in the message are what distinguish them.
 
@@ -402,7 +415,7 @@ If no existing schema satisfies (1) and (2), the second-schema runtime probe is 
 
 Neither substitutes for the other, and neither is a target-database result.
 
-When the preconditions do hold, repeat §8.2 steps 2–9 with the schema substituted, and record which schema was used.
+When the preconditions do hold, repeat §8.2 steps 2–10 with the schema substituted, creating and dropping the object as the same migrator identity, and record which schema was used.
 
 ### 8.4 `TEMPORARY` probe — expectation follows effective privilege
 
@@ -414,8 +427,37 @@ Record, before asserting anything:
 |---|---|
 | Effective privilege, app | `SELECT has_database_privilege('strikenova_staging_app', current_database(), 'TEMPORARY');` |
 | Effective privilege, migrator | `SELECT has_database_privilege('strikenova_staging_migrator', current_database(), 'TEMPORARY');` |
-| Source of the app's privilege | `SELECT (aclexplode(datacl)).grantee::regrole::text, (aclexplode(datacl)).privilege_type FROM pg_database WHERE datname = current_database();` plus `pg_auth_members` for any membership path that confers it |
+| Database ACL rows (`CONNECT`, `TEMPORARY`) | the query below — expands `datacl`, or the built-in default when `datacl` is `NULL` |
+| Membership path (diagnostic only) | `SELECT r.rolname AS member, g.rolname AS granted, m.inherit_option, m.set_option FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.member JOIN pg_roles g ON g.oid = m.roleid;` — for any path that could confer either privilege on the app identity |
 | Approved policy | §10 decision D — recorded verbatim, or "undecided" |
+
+```sql
+SELECT
+    CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+         ELSE acl.grantee::regrole::text
+    END AS grantee,
+    acl.grantor::regrole::text AS grantor,
+    acl.privilege_type,
+    acl.is_grantable
+FROM pg_database AS d
+CROSS JOIN LATERAL aclexplode(
+    COALESCE(d.datacl, acldefault('d', d.datdba))
+) AS acl
+WHERE d.datname = current_database()
+  AND acl.privilege_type IN ('CONNECT', 'TEMPORARY')
+ORDER BY 1, 3;
+```
+
+**Why the query is written this way.** Each point is a documented PostgreSQL 16 behaviour, not a preference:
+
+- **`datacl` can be `NULL`.** An object whose ACL column is null has never had a `GRANT`/`REVOKE` applied; PostgreSQL then uses its hard-wired default privileges for that object ([5.7 Privileges](https://www.postgresql.org/docs/16/ddl-priv.html): "If the 'Access privileges' column is empty … its privileges entry in the relevant system catalog is null"). Passing a `NULL` ACL straight to `aclexplode()` yields **zero rows**, which is indistinguishable from "nobody holds `CONNECT` or `TEMPORARY`" — the opposite of the truth for a fresh database.
+- **`acldefault('d', d.datdba)` is that default.** `acldefault` "constructs an `aclitem` array holding the default access privileges for an object of type `type` belonging to the role with OID `ownerId`", and `'d'` is `DATABASE` ([9.27 System Information Functions](https://www.postgresql.org/docs/16/functions-info.html)). Its result therefore reproduces the privileges a null ACL stands for, owned by the database's owner (`datdba`). Note the scope precisely: it is the **hard-wired** default, not whatever `pg_default_acl` holds — `pg_default_acl` is consulted only at object creation ([53.17 `pg_default_acl`](https://www.postgresql.org/docs/16/catalog-pg-default-acl.html)).
+- **Grantee OID `0` is `PUBLIC`.** `aclexplode` documents that "If the grantee is the pseudo-role PUBLIC, it is represented by zero in the `grantee` column". `0` is not a role OID, so the `CASE` renders it as the literal `PUBLIC` instead of casting it to `regrole`; casting it would produce some unrelated rendering rather than a role name.
+- **Default database privileges are `Tc`.** The default privileges granted to `PUBLIC` on a new database are `CONNECT` and `TEMPORARY` ([5.7](https://www.postgresql.org/docs/16/ddl-priv.html), Table 5.2). So on an untouched database this query returns two `PUBLIC` rows — from the `COALESCE` branch — not an empty result.
+- **ACL rows are not effective privilege.** Enumeration shows what the stored (or default) ACL grants to whom. It does not evaluate role membership, `SUPERUSER`, `CREATEROLE`, or provider-level restrictions. `has_database_privilege()` remains the authoritative statement of an identity's effective privilege and is not replaced by this inventory; the two are recorded side by side and a disagreement between them is itself a finding.
+- **Membership can grant what the ACL does not name.** Because PostgreSQL 16 evaluates inherited privileges along `INHERIT TRUE` edges, the app identity may hold `TEMPORARY` (or `CONNECT`) through membership even though no ACL row names `strikenova_staging_app`. That is why `pg_auth_members` is recorded as a *diagnostic*: it explains where an effective privilege comes from, rather than being counted as an ACL grant.
+
+These are **proposed inspection statements**. Neither this query nor any other statement in §8 has been executed — not against Neon, not against any persistent database — and this section is not evidence of a measured target state.
 
 Then the behavioural step, as the app identity in its own session: `CREATE TEMP TABLE _probe_temp_<suffix> (id integer);` followed by `DROP TABLE _probe_temp_<suffix>;`.
 

@@ -13,6 +13,8 @@ Attempt 2 does not overwrite attempt 1's history. §1–§16 are the original bl
 
 **Post-publication review pass, 2026-11-05:** §42–§43 record corrections to the *verification plan and reporting wording* raised by an independent review of the published set. No rehearsal result, count, or limitation changes; Part IV governs where it and an earlier part disagree about a procedure.
 
+**Second post-publication review pass, 2026-11-05:** §44–§46 record two further documentation corrections raised by independent review — how the database ACL must be inspected when `datacl` is `NULL`, and which identity may create the function probe under each of the three arrangements. Still documentation only; Part V governs on those two points.
+
 ---
 
 ## Part I — Initial local attempt (BLOCKED, zero SQL executed)
@@ -781,3 +783,97 @@ A review of the published set (commit `5e084ce836ad1c2746de2eae2e82fcb3021ed1a9`
 This is a review of wording and procedure. It is not a new rehearsal, not a re-run, and not evidence about the live `strikenova_staging` database.
 
 **Part IV status: `PROCEDURE CORRECTED — FUNCTION PROBE SEQUENCED — SECOND-SCHEMA AND TEMPORARY PROBES MADE CONDITIONAL — DEFAULT-ACL ASSERTIONS SCOPED TO THE MIGRATOR — CLEANUP CLAIMS DOWNGRADED TO ATTEMPTS — README COUNTS CORRECTED TO FIVE FILES / SIX ARTIFACTS — REHEARSAL VALUES UNCHANGED`**
+
+---
+
+# Part V — PostgreSQL ACL and probe-identity clarification (2026-11-05)
+
+An independent review of the Revision 2.1 published set found two further defects in the proposal's verification plan, neither of which was raised by Part IV. Both are documentation defects in a *plan*: no procedure described here has been executed, and nothing in this part is evidence about `strikenova_staging`.
+
+## 44. Correction R9 — `aclexplode(datacl)` misreads a `NULL` ACL as "no privileges"
+
+| Item | Detail |
+|---|---|
+| Where | Proposal §8.4, the "source of the app's privilege" row |
+| Published form | `SELECT (aclexplode(datacl)).grantee::regrole::text, (aclexplode(datacl)).privilege_type FROM pg_database WHERE datname = current_database();` |
+| Defect 1 — `NULL` reads as empty | `datacl` is `NULL` for any database that has never had a `GRANT`/`REVOKE` applied, and PostgreSQL 16 then applies the object's hard-wired default privileges (["If the 'Access privileges' column is empty … its privileges entry in the relevant system catalog is null"](https://www.postgresql.org/docs/16/ddl-priv.html), §5.7). `aclexplode(NULL)` returns **zero rows**, so the published query reports *no* `CONNECT` and *no* `TEMPORARY` for exactly the state in which `PUBLIC` holds both — the inverse of the truth, and the state a fresh staging database is most likely to be in |
+| Defect 2 — grantee `0` | `aclexplode` represents the pseudo-role `PUBLIC` as grantee OID `0`. Casting `0` to `regrole` does not yield a role name, so the row for the `PUBLIC` grant would not be attributable |
+| Defect 3 — unfiltered | The published form did not restrict the result to the two database privileges under discussion, so the row set mixed in privileges that are not `CONNECT`/`TEMPORARY` |
+| Correction | The proposal's §8.4 now uses one statement that expands `datacl`, or the built-in default when it is `NULL`, and renders `PUBLIC` explicitly (reproduced below) |
+
+```sql
+SELECT
+    CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+         ELSE acl.grantee::regrole::text
+    END AS grantee,
+    acl.grantor::regrole::text AS grantor,
+    acl.privilege_type,
+    acl.is_grantable
+FROM pg_database AS d
+CROSS JOIN LATERAL aclexplode(
+    COALESCE(d.datacl, acldefault('d', d.datdba))
+) AS acl
+WHERE d.datname = current_database()
+  AND acl.privilege_type IN ('CONNECT', 'TEMPORARY')
+ORDER BY 1, 3;
+```
+
+| Semantics the correction preserves | How |
+|---|---|
+| `NULL` built-in ACL is handled | `COALESCE(d.datacl, acldefault('d', d.datdba))` |
+| The fallback is the *database* default ACL | `acldefault`'s first argument is the object-type code; `'d'` is `DATABASE` |
+| The owner is the database's owner | `d.datdba`, read from the same `pg_database` row |
+| `PUBLIC` is labelled, not cast | `CASE WHEN acl.grantee = 0 THEN 'PUBLIC'` — the cast runs only on real role OIDs |
+| `CONNECT`/`TEMPORARY` are database, not schema privileges | both appear in `pg_database`'s ACL and in `acldefault('d', …)`; none of this is read from `pg_namespace` |
+| ACL rows are not effective privilege | the query enumerates stored or default ACL entries only; it does not evaluate membership, `SUPERUSER` or provider restrictions |
+| The effective checks stay authoritative | `has_database_privilege(...)` for the app and migrator identities is retained unchanged in §8.4 and is **not** replaced by the enumeration |
+| Membership stays a separate diagnostic | `pg_auth_members` (`inherit_option`, `set_option`) is recorded to explain an inherited privilege path, never counted as an ACL grant |
+
+**PostgreSQL 16 documentation checked.** Three references, each used for the specific claim it supports:
+
+| Reference | Supports |
+|---|---|
+| [9.27 System Information Functions — `acldefault`, `aclexplode`](https://www.postgresql.org/docs/16/functions-info.html) | `acldefault(type "char", ownerId oid)` "constructs an `aclitem` array holding the default access privileges for an object of type `type` belonging to the role with OID `ownerId`" and "represents the access privileges that will be assumed when an object's ACL entry is null"; `'d'` is `DATABASE`; `aclexplode` returns `(grantor, grantee, privilege_type, is_grantable)` and "If the grantee is the pseudo-role PUBLIC, it is represented by zero in the `grantee` column" |
+| [5.7 Privileges](https://www.postgresql.org/docs/16/ddl-priv.html) | default `PUBLIC` privileges on a `DATABASE` are `Tc` (`TEMPORARY`, `CONNECT`), and a null ACL column means the hard-wired default applies |
+| [53.17 `pg_default_acl`](https://www.postgresql.org/docs/16/catalog-pg-default-acl.html) | `acldefault` yields the **hard-wired** default, not `pg_default_acl` contents — "when an ACL entry in another catalog is null, it is taken to represent the hard-wired default privileges for its object, not whatever might be in `pg_default_acl` at the moment" |
+
+The corrected statement has not been executed — not against Neon, CockroachDB, Render, or any other persistent database — and this report does not claim a result for it.
+
+## 45. Correction R10 — the function probe must be created *by* the migrator, and the arrangement decides how
+
+| Item | Detail |
+|---|---|
+| Where | Proposal §8.2, step 1 (identity establishment) |
+| Published form | "administrator (or migrator directly, arrangement A) … connect as `strikenova_staging_migrator`, or `SET ROLE strikenova_staging_migrator;` in a session whose membership allows it" |
+| Defect | "whose membership allows it" conflated the two PG16 membership options §4.6 already distinguishes. Arrangement B is authorized by an `INHERIT TRUE` path, which satisfies the `FOR ROLE` precondition for `ALTER DEFAULT PRIVILEGES` but does **not** permit `SET ROLE`; and an object created in the administrator's session is owned by the administrator (§4.4), so its privileges say nothing about the migrator's defaults |
+| Consequence if uncorrected | The probe could be created as the administrator, inspected, and reported as a test of the migrator's default function privileges when it tested a different role's defaults — a false pass in exactly the control this rehearsal exists to check |
+
+The proposal's §8.2 now states the permitted identity per arrangement before the step table:
+
+| Selected arrangement | Permitted way to establish the creating identity |
+|---|---|
+| **A — direct migrator** | Connect directly as `strikenova_staging_migrator`; no `SET ROLE` involved |
+| **B — administrator with `INHERIT TRUE` / `FOR ROLE`** | For this probe, connect **directly** as `strikenova_staging_migrator`. `INHERIT TRUE` does not permit `SET ROLE` and does not transfer ownership of objects created in the administrator's session, so the administrator path must not be used to create the probe object |
+| **C — administrator with `SET TRUE`** | The administrator may `SET ROLE strikenova_staging_migrator;` before creation, but only when `SET TRUE` holds on **every** membership edge in the path. `SET` is never inferred from `INHERIT` |
+
+Rules now stated with it: `current_user` is verified immediately before creation and must be the migrator; if the required identity cannot be established the probe is recorded **`NOT EXECUTABLE — MIGRATOR IDENTITY NOT ESTABLISHED`**; an administrator-owned function is never substituted; no credential is invented or reused outside the approved secret-store process (§7); the separate app-role session, the requirement that the function still exist at invocation, and cleanup *after* the invocation are unchanged.
+
+The sequence is now eleven numbered steps — select the authorized arrangement, establish the identity, verify `current_user`, create, inspect the ACL, open the separate app session, verify the app's `current_user`, verify schema `USAGE`, invoke and classify, drop as the migrator, record every outcome — so step 3 gates creation and the drop cannot precede the invocation. The second-schema check references the same range (steps 2–10) with the schema substituted.
+
+Classification is unchanged: `42501` naming the *function* is the expected denial only once step 8 has confirmed schema `USAGE`; `42501` naming the *schema* is not proof of function `EXECUTE` protection; `42883` is not a pass; successful execution means the control is absent.
+
+## 46. What this pass did not change
+
+| Item | State |
+|---|---|
+| Parts I–IV | **preserved**; §44–§46 are appended, and the only edit inside the existing text is the one-paragraph Part V note in the header. No finding, table, correction entry, or status line in Parts I–IV was rewritten |
+| Rehearsal results | **unchanged** — 206 passing assertions (A 43, B 61, C 62, D1 35, D2 5), 12 observations, **0 failures**, 219 result records; 204 distinct assertion IDs, 15 used twice, 30 ambiguous records |
+| Evidence metadata | **unchanged** — run `41813028902`, harness `165f70e`, artifact `13313880536`, digest `sha256:b17f2667…08e6`, retrieval limitation L10 |
+| Proposal sections touched | §8.1 (one cross-reference clause), §8.2 (identity table plus the eleven-step sequence), §8.4 (ACL statement and its rationale). No other section, and no SQL statement in §6, changed |
+| Arrangement architecture | **unchanged** — A/B/C, the global function default in §6.1, and the "review-only, unexecuted" status all stand |
+| Founder decisions | **unchanged and still open** — `TEMPORARY` policy, `CONNECT` policy, the global function `EXECUTE` default, existing-function inventory, provider-role attributes |
+| Execution | **none** — no database contacted, no SQL executed, no role or privilege created, altered, granted or revoked, no migration run, no deployment or provider setting touched |
+
+This is a clarification of how a future verification *would* be performed, if it were ever authorized. It is not a rehearsal, not a re-run, and not evidence about the live `strikenova_staging` database.
+
+**Part V status: `NULL-ACL INSPECTION CORRECTED — PUBLIC RENDERED FROM GRANTEE 0 — EFFECTIVE CHECKS RETAINED — FUNCTION PROBE RESTRICTED TO THE MIGRATOR IDENTITY PER ARRANGEMENT — INHERIT ≠ SET STATED — NO SQL EXECUTED — REHEARSAL VALUES AND FOUNDER DECISIONS UNCHANGED`**
