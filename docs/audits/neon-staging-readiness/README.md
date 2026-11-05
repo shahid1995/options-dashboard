@@ -10,12 +10,12 @@
 
 | File | Bytes (UTF-8) | Logical lines | Purpose |
 |---|---:|---:|---|
-| `README.md` | 9224 | 77 | This index: publication metadata, rehearsal evidence, migration graph, authorization gates |
+| `README.md` | 10449 | 79 | This index: publication metadata, rehearsal evidence, migration graph, authorization gates |
 | `AUDIT_REPORT_CORRECTED.md` | 34291 | 405 | Corrective audit: Render provider, migration graph at both pinned trees, Founder approval, Neon role observation, accepted architecture, findings |
-| `NEON_STAGING_PRIVILEGE_PROPOSAL.md` | 38545 | 389 | Proposed staging identity pair with full PostgreSQL 16 role-membership semantics, corrected function default privileges, and review-only SQL |
+| `NEON_STAGING_PRIVILEGE_PROPOSAL.md` | 45264 | 469 | Proposed staging identity pair with full PostgreSQL 16 role-membership semantics, corrected function default privileges, and review-only SQL |
 | `NEON_STAGING_MIGRATION_PREFLIGHT.md` | 12027 | 128 | Preflight: inventories, head results, PG16 compatibility, qualified CI evidence, prerequisites |
 | `NEON_STAGING_EXECUTION_PLAN.md` | 13150 | 131 | Numbered plan for gates 2–5 (privilege, migration, Render integration, post-deploy) |
-| `POSTGRESQL_16_PRIVILEGE_REHEARSAL.md` | 73582 | 745 | PostgreSQL 16 privilege rehearsal evidence report: the blocked local attempt (Part I), the executed GitHub-hosted run (Part II), and the 2026-11-04 corrective pass (Part III) |
+| `POSTGRESQL_16_PRIVILEGE_REHEARSAL.md` | 79765 | 783 | PostgreSQL 16 privilege rehearsal evidence report: the blocked local attempt (Part I), the executed GitHub-hosted run (Part II), the 2026-11-04 corrective pass (Part III), and the 2026-11-05 post-publication review corrections (Part IV) |
 
 ## Rehearsal evidence (Gate 2 preparation)
 
@@ -69,9 +69,11 @@ Parsing handled string, tuple, and list `down_revision` forms, all merge parents
 
 ## Publication record
 
-- **Baseline for this correction pass:** `f56d9922d89a465ad94343f51fcc60f0f41d74bf`.
-- **Correction commit:** the commit that introduced this revision of these six files, on `docs/neon-staging-readiness-artifacts`. A Git commit cannot embed its own SHA, so that SHA is recorded in the commit itself and in `git log -1` rather than in a file it contains; it is also reported in the publication report for this pass.
-- **Byte and line counts** above are measured on the published UTF-8 files of this revision (logical lines = newline-separated content lines, ignoring the single trailing newline). They were re-measured mechanically after the 2026-11-04 corrections, not carried over.
-- **Changed in this pass:** the privilege proposal (global function default, three-row `pg_default_acl` expectation, `TEMP`/`CONNECT` findings), the execution plan (function step, `TEMP`/`CONNECT` gate, exit criteria), the migration preflight (no functions/triggers/temporary tables in the chain), this index, and the rehearsal report (new Part III plus the two object-name corrections). `AUDIT_REPORT_CORRECTED.md` is unchanged.
+- **Baseline for the 2026-11-04 correction pass:** `f56d9922d89a465ad94343f51fcc60f0f41d74bf`.
+- **2026-11-04 correction commit:** `5e084ce836ad1c2746de2eae2e82fcb3021ed1a9` — **five files in that commit**: four modified (this index, the privilege proposal, the execution plan, the migration preflight) and one added (`POSTGRESQL_16_PRIVILEGE_REHEARSAL.md`). **Six artifacts are catalogued** in the table above; `AUDIT_REPORT_CORRECTED.md` is catalogued and was **not** modified.
+- **2026-11-05 post-publication review commit:** the commit carrying this revision, on `docs/neon-staging-readiness-artifacts` — **three files changed**: `NEON_STAGING_PRIVILEGE_PROPOSAL.md`, `POSTGRESQL_16_PRIVILEGE_REHEARSAL.md` (new Part IV) and this index. A Git commit cannot embed its own SHA, so that SHA is recorded in `git log -1` and in the publication report for this pass rather than in a file it contains.
+- **Byte and line counts** above are measured on the UTF-8 files of this revision (logical lines = newline-separated content lines, ignoring the single trailing newline). They were re-measured mechanically after the 2026-11-05 corrections, not carried over; this index's own row is recalculated until it is stable.
+- **Changed in the 2026-11-04 pass:** the privilege proposal (global function default, three-row `pg_default_acl` expectation, `TEMP`/`CONNECT` findings), the execution plan (function step, `TEMP`/`CONNECT` gate, exit criteria), the migration preflight (no functions/triggers/temporary tables in the chain), this index, and the rehearsal report (new Part III plus the two object-name corrections).
+- **Changed in the 2026-11-05 pass:** the verification plan (the function probe sequenced as one lifecycle with cleanup last, second-schema preconditions, an expectation that follows the *effective* `TEMPORARY` privilege, default-ACL assertions scoped to the migrator role, and two consistently described probe categories), the report's cleanup wording (§36) and its new Part IV, and this index's counts. **Not changed:** the rehearsal results (206 assertions / 12 observations / 0 failures), the run, the artifact metadata, the migration documents, and `AUDIT_REPORT_CORRECTED.md`.
 
-**Status:** POSTGRESQL 16 REHEARSAL EVIDENCE PUBLISHED — FUNCTION `EXECUTE` GAP CORRECTED IN THE PROPOSAL (REVIEW-ONLY, UNEXECUTED) — `TEMPORARY` AND `CONNECT` REPORTED AS OPEN FOUNDER DECISIONS — ASSERTION-ID COLLISIONS DECLARED — SIX FILES, NO DATABASE OR INFRASTRUCTURE ACTIONS TAKEN — GATES 2, 3 AND 4 STILL PENDING
+**Status:** POSTGRESQL 16 REHEARSAL EVIDENCE PUBLISHED — FUNCTION `EXECUTE` GAP CORRECTED IN THE PROPOSAL (REVIEW-ONLY, UNEXECUTED) — `TEMPORARY` AND `CONNECT` REPORTED AS OPEN FOUNDER DECISIONS — ASSERTION-ID COLLISIONS DECLARED — FIVE FILES IN THE 2026-11-04 COMMIT, THREE IN THIS PASS, SIX ARTIFACTS CATALOGUED — NO DATABASE OR INFRASTRUCTURE ACTIONS TAKEN — GATES 2, 3 AND 4 STILL PENDING

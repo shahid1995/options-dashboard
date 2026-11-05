@@ -304,6 +304,8 @@ Measured consequence on PostgreSQL 16.15 (rehearsal §33): with no function defa
 | Sequence defaults | `strikenova_staging_migrator` | `public` | `S` (sequence) | contains `strikenova_staging_app=U`; no `PUBLIC` entry |
 | Function defaults | `strikenova_staging_migrator` | *none* (rendered `-`; catalog `0`) | `f` (function) | `{strikenova_staging_migrator=X/strikenova_staging_migrator}` — **no** leading `=X`, i.e. no `PUBLIC` |
 
+The three-row requirement applies **to this role's rows only**. Other roles in the database may hold unrelated default-ACL entries; those are inventoried and assessed separately (§8.1 Check 2) and their presence is not evidence that the migrator's defaults are wrong.
+
 What the rehearsal actually observed, for comparison: two schema-scoped rows (`public`, `r` and `S`) and, after the global revoke, one global row `[rehearsal_f_migrator, "-", "f", "{rehearsal_f_migrator=X/rehearsal_f_migrator}"]`. The **function row's** exact catalog text above is therefore measured; the table and sequence `defaclacl` text is described by shape only, because the rehearsal recorded those rows' role/namespace/object type and the runtime's effective privileges, not the literal ACL string. **Verification must read the value, not assume it.**
 
 Consequences that belong to the design, not to the SQL:
@@ -328,25 +330,103 @@ Login roles are inert until credentials exist, and credentials are not part of t
 
 ---
 
-## 8. Verification Plan (read-only, with two disposable probes — NOT PERFORMED)
+## 8. Verification Plan (read-only, with two probe categories — NOT PERFORMED)
 
-To be executed only after gate 2 authorization. Everything below is read-only except the two rows marked **probe**, which create a disposable object and drop it in the same session.
+To be executed only after gate 2 authorization. Every check in §8.1 is read-only. The two **probe categories** below create a disposable object, exercise it, and remove it; nothing in this section has been run.
+
+| # | Probe category | Object(s) | Created by | Exercised as | Removed by | Conditional on |
+|---|---|---|---|---|---|---|
+| 1 | **Function `EXECUTE` probe** — one multi-step lifecycle (§8.2), not separate probes | `public._probe_fn_exec_<suffix>()`; plus a second-schema instance only if §8.3's prerequisites hold | the migrator identity | catalog read as the migrator; **invocation as the app role** | the migrator identity, **after** the app-role invocation | gate 2 authorization; §8.3 prerequisites for the second schema only |
+| 2 | **`TEMPORARY` probe** (§8.4) | one uniquely named temporary table, session-local | the app identity | creation attempt as the app identity | the same session | the §10 decision D; without it no acceptance expectation can be asserted |
+
+Creation, ACL inspection, app-role invocation and cleanup are steps of **one** test object. They are not independent probes, and the function must still exist when the app role calls it.
+
+### 8.1 Catalog and privilege checks (read-only)
+
+**Check 1 — target-role assertions.** Inspect only rows belonging to `strikenova_staging_migrator`.
 
 | Check | Statement | Expected |
 |---|---|---|
 | Roles exist with intended attributes | `SELECT rolname, rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls FROM pg_roles WHERE rolname LIKE 'strikenova_staging_%' ORDER BY 1;` | migrator/app `LOGIN`, all elevated attributes `false` |
-| Defaults installed for the migrator only | `\ddp`, or `SELECT defaclrole::regrole::text, CASE WHEN defaclnamespace = 0 THEN '<global>' ELSE defaclnamespace::regnamespace::text END, defaclobjtype, defaclacl::text FROM pg_default_acl ORDER BY 3, 2;` (the `CASE` matters: a global row has `defaclnamespace = 0`, which casts to `regnamespace` as `-`, not `NULL`) | Exactly **three** rows, all `defaclrole = strikenova_staging_migrator`: `public`/`r`, `public`/`S`, and a global row (`<global>`) with object type `f` whose ACL has **no** `PUBLIC` entry (§6.1) |
-| No unexpected default-ACL rows | the same query | Nothing bound to another role, no global table/sequence row, no `PUBLIC` grant in any row |
-| **probe** — Function `EXECUTE` is not public | as the migrator: `CREATE FUNCTION public._probe_acl() RETURNS integer LANGUAGE sql AS 'SELECT 1';` then `SELECT proacl::text FROM pg_proc WHERE proname = '_probe_acl';` then `DROP FUNCTION public._probe_acl();` | `proacl` is `{strikenova_staging_migrator=X/strikenova_staging_migrator}` — a `NULL` value or any `=X/` entry means the global revoke is missing or was scoped |
-| **probe** — Runtime cannot execute a probe function | with the probe function still present, as the app role: `SELECT public._probe_acl();` | refused, `42501: permission denied for function _probe_acl` |
-| Runtime cannot execute functions in another schema either | repeat the probe in a second schema as the migrator, then call it as the app | refused, `42501` — the revoke is global, so a second schema must not leak |
-| `TEMPORARY` — catalog | `SELECT has_database_privilege('strikenova_staging_app', current_database(), 'TEMPORARY'), has_database_privilege('strikenova_staging_migrator', current_database(), 'TEMPORARY');` | depends on the §10 decision; record the values rather than assume them. Under the untouched `PUBLIC` default both are expected to be `true` |
-| **probe** — `TEMPORARY` behaviour | as the app role: `CREATE TEMP TABLE _probe_temp (id integer);` then `DROP TABLE _probe_temp;` | must match the §10 decision: succeeds if `PUBLIC` `TEMPORARY` is retained, `42501` if it is revoked. A catalog check alone is not sufficient |
+| Migrator's default ACLs | `SELECT defaclrole::regrole::text, CASE WHEN defaclnamespace = 0 THEN '<global>' ELSE defaclnamespace::regnamespace::text END AS ns, defaclobjtype, defaclacl::text FROM pg_default_acl WHERE defaclrole = 'strikenova_staging_migrator'::regrole ORDER BY 3, 2;` (the `CASE` matters: a global row has `defaclnamespace = 0`, which casts to `regnamespace` as `-`, not `NULL`) | Exactly **three** rows for this role: `public`/`r`, `public`/`S`, and `<global>`/`f` (§6.1). Table/sequence ACLs contain `strikenova_staging_app=`; the function ACL has **no** `PUBLIC` entry (`=X/`) |
+| No unintended migrator rows | the same query | No fourth row, no global table/sequence row, no `PUBLIC` entry in the function row, no grant to a role other than the app |
+| Schema privileges | `SELECT has_schema_privilege('strikenova_staging_migrator','public','CREATE'), has_schema_privilege('strikenova_staging_app','public','CREATE'), has_schema_privilege('strikenova_staging_app','public','USAGE');` | `true, false, true` |
+| Membership setup | `SELECT r.rolname AS member, g.rolname AS granted, m.inherit_option, m.set_option FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.member JOIN pg_roles g ON g.oid=m.roleid;` | Matches the chosen arrangement (§4.6) |
 | `CONNECT` — catalog | `SELECT has_database_privilege('strikenova_staging_app', current_database(), 'CONNECT'), has_database_privilege('strikenova_staging_migrator', current_database(), 'CONNECT'), has_database_privilege('<unrelated-ordinary-role>', current_database(), 'CONNECT');` | under posture A all three are `true`; under posture B only the authorized identities are `true`. Record the third value explicitly — it is the one that shows whether `PUBLIC` still confers connection |
 | `CONNECT` — limitation | an actual connection attempt by an unrelated role | a catalog check is **not** equivalent to a provider access test; `pg_hba.conf`, provider proxies and superuser status all sit in front of it. Record the attempt and its result, and do not present it as a Neon-level guarantee |
-| Schema privileges | `SELECT has_schema_privilege('strikenova_staging_migrator','public','CREATE'), has_schema_privilege('strikenova_staging_app','public','CREATE');` | `true, false` |
-| Runtime cannot create in schema | `SELECT has_schema_privilege('strikenova_staging_app','public','CREATE');` | `false` |
-| Membership setup | `SELECT r.rolname AS member, g.rolname AS granted, m.inherit_option, m.set_option FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.member JOIN pg_roles g ON g.oid=m.roleid;` | Matches the chosen arrangement (§4.6) |
+
+**Check 2 — database-wide inventory (assessment, not a gate).** Separately inventory every default-ACL entry in the database:
+
+```sql
+SELECT defaclrole::regrole::text,
+       CASE WHEN defaclnamespace = 0 THEN '<global>' ELSE defaclnamespace::regnamespace::text END AS ns,
+       defaclobjtype, defaclacl::text
+FROM pg_default_acl ORDER BY 1, 3, 2;
+```
+
+Rows bound to other roles are **recorded and assessed, not automatically failed**: other roles may legitimately hold unrelated default privileges, and their existence says nothing about whether the migrator's three rows are correct. Only Check 1 asserts a three-row requirement. A database-wide "exactly three rows" claim is valid only if the proposal has an independent reason to forbid every other role's defaults, which it does not claim.
+
+### 8.2 Function `EXECUTE` probe — one ordered lifecycle
+
+Run the steps in this order. Steps 3–4 must precede step 9, and step 9 must not run before step 7 has been attempted.
+
+| Step | Identity | Action | Pass condition |
+|---:|---|---|---|
+| 1 | administrator (or migrator directly, arrangement A) | establish the migrator identity: connect as `strikenova_staging_migrator`, or `SET ROLE strikenova_staging_migrator;` in a session whose membership allows it | `SELECT current_user;` returns `strikenova_staging_migrator` |
+| 2 | migrator (`current_user`) | `CREATE FUNCTION public._probe_fn_exec_<suffix>() RETURNS integer LANGUAGE sql AS 'SELECT 1';` — `<suffix>` unique to this run and recorded | function created |
+| 3 | migrator | `SELECT p.proacl::text FROM pg_proc p WHERE p.oid = 'public._probe_fn_exec_<suffix>()'::regprocedure;` — schema-qualified, resolved by OID, never by `proname` alone | one row returned (the function exists) |
+| 4 | migrator | interpret the ACL | **no** `=X/` entry anywhere in it. `NULL` means the built-in default still applies (the global revoke is missing or was scoped) → fail. An `=X/` entry means `PUBLIC` still holds `EXECUTE` → fail |
+| 5 | **separate session**, app | connect as `strikenova_staging_app` (credentials from the secret store) | `SELECT current_user;` returns `strikenova_staging_app` |
+| 6 | app | `SELECT has_schema_privilege(current_user,'public','USAGE');` | `true`. If `false`, **stop**: a schema-access failure cannot be reported as an `EXECUTE` denial |
+| 7 | app | `SELECT public._probe_fn_exec_<suffix>();` | refused with SQLSTATE **`42501`** and a message naming the *function* |
+| 8 | app | classify the refusal | `42501` naming the function = the control worked. `42883` (`undefined function`) = wrong name/schema or the function is gone → **not** a pass. `42501` naming the *schema* = `USAGE` failure → **not** a pass. Successful execution = control absent → fail |
+| 9 | migrator | `DROP FUNCTION public._probe_fn_exec_<suffix>();` — only now, after step 7 | drop succeeds |
+| 10 | recorder | record the outcome of every step, including the drop | if the drop failed, record it and leave the object named in the gate-2 evidence for follow-up; do not report a clean rehearsal |
+
+A generic permission error is not evidence of the specific function `EXECUTE` control: the SQLSTATE and the object named in the message are what distinguish them.
+
+### 8.3 Second-schema check — conditional, never assumed
+
+The second-schema probe tests the **global scope** of the function default. It must not be used to widen the app role's permanent schema permissions.
+
+Preconditions, checked before anything is created:
+
+1. `SELECT has_schema_privilege('strikenova_staging_app', '<test_schema>', 'USAGE');` must return `true`.
+2. `<test_schema>` must already exist in the target and must not be `public`. **`jobs` is a name used by the disposable rehearsal; it is not assumed to exist in `strikenova_staging`.**
+3. Do not create a schema in the target to make this test possible, and do not grant the app role permanent `USAGE` on a schema it does not already have. A temporary test-only grant is acceptable only if it is issued and revoked within the window and both actions are recorded.
+
+If no existing schema satisfies (1) and (2), the second-schema runtime probe is **not executable** under the current target prerequisites. Record that explicitly and keep these two things separate instead:
+
+- the **catalog** evidence that the migrator's function default has global scope (`defaclnamespace = 0` in Check 1);
+- the **disposable PostgreSQL 16 rehearsal**, which measured behaviour in two schemas in a throwaway database.
+
+Neither substitutes for the other, and neither is a target-database result.
+
+When the preconditions do hold, repeat §8.2 steps 2–9 with the schema substituted, and record which schema was used.
+
+### 8.4 `TEMPORARY` probe — expectation follows effective privilege
+
+The expectation is driven by the **effective** privilege for the app identity under the Founder-approved policy, not by whether a `PUBLIC` grant is present.
+
+Record, before asserting anything:
+
+| Item | Statement |
+|---|---|
+| Effective privilege, app | `SELECT has_database_privilege('strikenova_staging_app', current_database(), 'TEMPORARY');` |
+| Effective privilege, migrator | `SELECT has_database_privilege('strikenova_staging_migrator', current_database(), 'TEMPORARY');` |
+| Source of the app's privilege | `SELECT (aclexplode(datacl)).grantee::regrole::text, (aclexplode(datacl)).privilege_type FROM pg_database WHERE datname = current_database();` plus `pg_auth_members` for any membership path that confers it |
+| Approved policy | §10 decision D — recorded verbatim, or "undecided" |
+
+Then the behavioural step, as the app identity in its own session: `CREATE TEMP TABLE _probe_temp_<suffix> (id integer);` followed by `DROP TABLE _probe_temp_<suffix>;`.
+
+| Effective privilege under the approved policy | Expected outcome |
+|---|---|
+| `true` | creation **succeeds**, then the drop succeeds. Success here is the pass condition, even if the privilege arrives through a direct grant or a membership path rather than through `PUBLIC` |
+| `false` | creation is refused with SQLSTATE `42501` (`permission denied to create temporary tables in database …`) |
+
+Revoking `TEMPORARY` from `PUBLIC` does **not** by itself deny the app role: a direct `GRANT … TO strikenova_staging_app` or an inherited membership keeps the effective privilege `true`, and a successful creation in that state is correct behaviour, not a failure. Conversely, a denial is only explainable once the effective privilege is known to be `false`.
+
+If decision D is still open, no acceptance expectation can be assigned. A catalog read may record the current effective privileges; it does not authorize altering them, and the probe is recorded as `NOT EXECUTABLE — POLICY UNDECIDED` rather than pass or fail.
 
 These are **plans**, not results. No query in this section has been run.
 

@@ -11,6 +11,8 @@ Attempt 2 does not overwrite attempt 1's history. §1–§16 are the original bl
 
 **Corrective pass, 2026-11-04:** §30–§41 re-verify the run of record from GitHub, correct statements in Part II that the evidence does not support, and add the `TEMP` and `CONNECT` investigations. §41 lists every correction. Where Part II and Part III disagree, Part III governs.
 
+**Post-publication review pass, 2026-11-05:** §42–§43 record corrections to the *verification plan and reporting wording* raised by an independent review of the published set. No rehearsal result, count, or limitation changes; Part IV governs where it and an earlier part disagree about a procedure.
+
 ---
 
 ## Part I — Initial local attempt (BLOCKED, zero SQL executed)
@@ -606,7 +608,7 @@ Repository evidence does not settle the question: `DATA.md` §5 records the acce
 
 The earlier Part II text said the trust service meant "no credential exists in the repository at all", which is true but incomplete, and Part I's blanket "no credential … was written" describes attempt 1 only. The accurate statement for attempt 2 is:
 
-> A random disposable test password was generated in memory for the optional SCRAM authentication container and passed to it through a temporary environment file with `0600` permissions. The harness did not print or archive it and deleted the file during cleanup. No Neon, Render, CockroachDB, or production credential was accessed or used.
+> A random disposable test password was generated in memory for the optional SCRAM authentication container and passed to it through a temporary environment file with `0600` permissions. The harness did not print or archive it. The harness attempted to unlink the temporary environment file and remove the SCRAM container in its `finally` block. The cleanup command's successful completion is not independently established by the run log. The hosted runner was ephemeral and was removed by the workflow environment after the job. No Neon, Render, CockroachDB, or production credential was accessed or used.
 
 Supporting harness lines at `165f70e` (read, not assumed):
 
@@ -620,7 +622,7 @@ Supporting harness lines at `165f70e` (read, not assumed):
 
 The password does not appear in the run log; the log shows it neither in the step environment nor in any command echo.
 
-**Cleanup verification, stated precisely.** The environment file's deletion and the second container's removal both run in `finally` blocks whose stdout/stderr are captured, so the log does **not** show them succeeding. What the log does show is the hosted runner's own teardown for the service container (`docker rm --force 39da39ab…`, network removed) and the fact that the job ran on an ephemeral runner that is destroyed afterwards. The honest claim is: **removal was executed by a `finally` block; success is not independently evidenced in the log; the container and file cannot outlive the ephemeral runner.** §27's earlier phrasing ("were destroyed when the job finished") is true of the runner but overstated what the log proves about the harness's own `docker rm`.
+**Cleanup verification, stated precisely.** The environment file's deletion and the second container's removal both run in `finally` blocks whose stdout/stderr are captured, so the log does **not** show them succeeding. What the log does show is the hosted runner's own teardown for the service container (`docker rm --force 39da39ab…`, network removed) and the fact that the job ran on an ephemeral runner that is destroyed afterwards. The honest claim is: **the `finally` block issued the removal commands; their success is not independently evidenced in the log; the container and file cannot outlive the ephemeral runner.** §27's earlier phrasing ("were destroyed when the job finished") is true of the runner but overstated what the log proves about the harness's own `docker rm`. Three states must stay distinct: a cleanup command being issued, that command returning success, and the hosting platform destroying the ephemeral runner. Only the first and third are evidenced here; the second is not upgraded by inference (§42, R6).
 
 ## 37. Finding 5 — assertion-ID collisions in the historical run
 
@@ -742,4 +744,40 @@ None of these decisions is made, implied, or recommended here.
 | C10 | README | report absent from the index | report listed with byte/line counts, run link, artifact metadata, and "not a gate approval"; all six counts re-measured |
 | C11 | This report §3 (Part I) | one Part I table cell contained a literal pipe character inside a code span, so the row rendered with a spurious extra column | the pipe is escaped as a GFM table escape; the rendered text and every recorded value are unchanged — a rendering fix only, logged here because Part I is otherwise preserved verbatim |
 
+Corrections raised by the post-publication review of 2026-11-05 are indexed separately in §42 (R1–R8); they change procedure and wording, not the measurements above.
+
 **Part III status: `CORRECTED — 206 ASSERTIONS / 12 OBSERVATIONS / 0 FAILURES RE-VERIFIED — FUNCTION-EXECUTE FINDING CONFIRMED AGAINST PostgreSQL 16 DOCUMENTATION — TEMP AND CONNECT REPORTED AS OPEN FOUNDER DECISIONS — 15 ID COLLISIONS DECLARED — CORRECTED SQL REMAINS REVIEW-ONLY AND UNEXECUTED`**
+
+---
+
+# Part IV — Post-publication independent review corrections (2026-11-05)
+
+A review of the published set (commit `5e084ce836ad1c2746de2eae2e82fcb3021ed1a9`) found sequence and wording defects in the **verification plan** and in the **publication metadata**. They are corrected here. No SQL was executed, no database or provider was contacted, no rehearsal result changed, and no Founder decision is made or implied. Where Part IV and an earlier part disagree about a *procedure* or a *count*, Part IV governs; Parts I–III remain the historical record of the 2026-11-04 pass and are otherwise untouched.
+
+## 42. Corrections applied in this pass
+
+| # | Where | Was | Now |
+|---|---|---|---|
+| R1 | Proposal §8, function `EXECUTE` rows | the first row created the function, read `proacl` and **dropped it**; the next row required calling "the same function … with the probe function still present" — an order that cannot execute | a single ordered lifecycle (§8.2, steps 1–10): create as the migrator, read `proacl` by `regprocedure` OID, verify no `PUBLIC` entry, then invoke as the app role in a **separate session**, and drop only afterwards |
+| R2 | Proposal §8, second-schema row | "repeat the probe in a second schema" — with no statement of the app role's `USAGE` requirement and an implicit assumption that a second schema exists | preconditions checked first (`has_schema_privilege` for the app; schema must already exist; `jobs` is a rehearsal name, not a target assumption); no permanent grant, no schema created for the test; if no schema qualifies, the runtime probe is recorded **not executable** and the catalog check plus the disposable rehearsal stand in separately |
+| R3 | Proposal §8, `TEMPORARY` probe row | "succeeds if `PUBLIC` `TEMPORARY` is retained, `42501` if it is revoked" — treated a `PUBLIC` revocation as an automatic denial | expectation follows the **effective** privilege for the app identity under the approved policy: `true` → creation must succeed (including when it arrives by direct grant or membership); `false` → `42501`; policy undecided → recorded `NOT EXECUTABLE — POLICY UNDECIDED` |
+| R4 | Proposal §8, default-ACL rows | "Exactly **three** rows" plus "Nothing bound to another role" — readable as a database-wide prohibition on any other role's default privileges | **Check 1** asserts exactly three rows for `strikenova_staging_migrator` only (namespace, object type, app ACL entries, no `PUBLIC` entry, no fourth row); **Check 2** inventories the database and *assesses* other roles' rows instead of failing them |
+| R5 | Proposal §8 heading and probe rows | "two disposable probes" while three rows were marked `probe` and a second-schema test was described separately | two **probe categories**: the function probe is one multi-step lifecycle, the `TEMPORARY` probe is conditional; a table names, for each, the object, the creating identity, the invoking identity and the cleaning identity |
+| R6 | This report §36 | "deleted the file during cleanup" and "removal was executed by a `finally` block" | the harness **attempted** the unlink and the `docker rm` in `finally`; success is not independently established by the log; the three states — command issued, command returned success, runner destroyed — are kept distinct |
+| R7 | `README.md` publication record | "this revision of these six files" and a status line ending `SIX FILES` | **five files in the commit** (four modified, one added), **six artifacts catalogued**; `AUDIT_REPORT_CORRECTED.md` was not modified |
+| R8 | This report, header | "Where Part II and Part III disagree, Part III governs" | Part IV noted as governing on procedural conflicts; Parts I–III preserved unchanged |
+
+## 43. What this pass did not change
+
+| Item | State |
+|---|---|
+| Rehearsal results | **unchanged** — 206 passing assertions (A 43, B 61, C 62, D1 35, D2 5), 12 observations, **0 failures**, 219 result records |
+| Assertion-ID audit | **unchanged** — 15 IDs used twice, 30 ambiguous records, 204 distinct IDs |
+| Evidence classes and limitations | unchanged; L1–L13 stand, and R6 sharpens L13's wording rather than relaxing it |
+| Corrected SQL status | **still review-only and unexecuted** as a complete A/B/C arrangement; only the global function statement was ever executed, in isolation, in a disposable database |
+| `TEMPORARY` / `CONNECT` | **still untested and still open Founder decisions.** §8.4 now states that no acceptance expectation can be assigned while the `TEMPORARY` policy is undecided |
+| Scope of this pass | documentation only: no database contacted, no SQL executed, no role or privilege changed, no migration, deployment or provider setting touched |
+
+This is a review of wording and procedure. It is not a new rehearsal, not a re-run, and not evidence about the live `strikenova_staging` database.
+
+**Part IV status: `PROCEDURE CORRECTED — FUNCTION PROBE SEQUENCED — SECOND-SCHEMA AND TEMPORARY PROBES MADE CONDITIONAL — DEFAULT-ACL ASSERTIONS SCOPED TO THE MIGRATOR — CLEANUP CLAIMS DOWNGRADED TO ATTEMPTS — README COUNTS CORRECTED TO FIVE FILES / SIX ARTIFACTS — REHEARSAL VALUES UNCHANGED`**
