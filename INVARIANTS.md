@@ -280,7 +280,7 @@ Schema changes must consider:
 - indexes and constraints;
 - rollback/forward-compatibility;
 - SQLite development/test behavior;
-- CockroachDB production behavior.
+- the target PostgreSQL production behavior (Neon, ADR-013)—as an intended contract, not as an already-verified one (see INV-023a).
 
 A migration is incomplete until the affected existing-data path has been verified.
 
@@ -295,6 +295,30 @@ A developer must not introduce a second independent write path that can leave au
 Where the current code uses row locking, idempotency constraints, transactional checks, or serialized state transitions to prevent races, those mechanisms are correctness requirements.
 
 They must not be removed or weakened as an optimization or refactor without proving the concurrent behavior remains safe.
+
+### INV-023a — Engine requirements are technology-independent, and their evidence status is explicit
+
+Database-engine requirements in this document are stated in terms that do not depend on a particular engine, because the invariants that matter are engine-independent properties:
+
+- transaction atomicity — a state transition commits completely or not at all (INV-022);
+- authorization and ownership checks — user-scoped records stay user-scoped (INV-004, INV-005, INV-024);
+- concurrency safety — row locking, uniqueness constraints and serialized transitions are not removed or weakened (INV-023);
+- data integrity — constraints, foreign keys and indexes remain present and enforced (INV-017, INV-021);
+- safe retry and idempotency — retries are idempotent and idempotency keys remain honoured (INV-012, INV-014);
+- no duplicate provider dispatch — a provider call is never issued twice for one logical attempt;
+- ambiguous-commit handling — a commit whose outcome cannot be observed is resolved by re-reading durable state, never by assuming success or by blind retry.
+
+The last two are specified for the email delivery pipeline only, and that specification is **proposed, not certified**: ADR-012 remains NOT READY and its Founder decisions F-1 to F-12 are open. They are therefore requirements on any implementation, not descriptions of shipped behaviour.
+
+Evidence status must always be stated explicitly, and these three tiers must not be merged:
+
+| Tier | Scope | Status |
+|---|---|---|
+| **Supported by existing tests** | SQLite; local PostgreSQL 16 | Verified behaviour. Covers the retry transition, its rollback stages and the delivery indexes; not the application as a whole |
+| **Intended, awaiting integration verification** | Neon PostgreSQL (target engine, ADR-013) | Unverified. No Neon branch has been provisioned or exercised, and no Neon result exists. Local PostgreSQL 16 results do not transfer automatically |
+| **Historical** | CockroachDB | Evaluated and rejected as a target (ADR-012 historical evidence, ADR-013). Preserved as history; never a compatibility, certification or release requirement |
+
+Unverified behaviour must not be written as a certified invariant. An invariant derived from PostgreSQL 16 evidence states its scope; an invariant that requires Neon states that Neon verification is outstanding.
 
 ---
 

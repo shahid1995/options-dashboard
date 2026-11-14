@@ -62,9 +62,9 @@ If the apparent conflict cannot be resolved from these sources, stop and surface
 - **Tests:** evidence of verified behavior; passing tests do not authorize violating an invariant.
 - **Historical documents/commits:** evidence of what existed previously, not automatically the current specification.
 
-## 5. Current Deployment Facts
+## 5. Deployment Facts
 
-The current production topology is:
+The **target** production topology — not yet a measured deployment fact, see Cutover status below — is:
 
     User Browser
          |
@@ -75,11 +75,17 @@ The current production topology is:
        Render
          |
          v
-    CockroachDB
+     Neon PostgreSQL
 
-Do not reintroduce stale assumptions that the current backend is hosted on Railway or that the production database is PostgreSQL.
+**Target database: Neon PostgreSQL.** It is the engine the application is designed against, using the ordinary PostgreSQL SQLAlchemy dialect (`postgresql+psycopg2`). It has **not** been tested or certified against Neon — no Neon run has been performed. The existing certification covers the SQLite and PostgreSQL 16 paths only, and covers one transition, not the application (see `DECISIONS.md`, ADR-012). Application traffic is *intended* to use Neon's pooled connection and schema migrations the direct (unpooled) connection; neither has been exercised.
 
-For authoritative details, consult ARCHITECTURE.md.
+**CockroachDB is historical.** It was evaluated and rejected as a target and is no longer a compatibility requirement. Its results are recorded in `DECISIONS.md` (ADR-012, "Historical engine evidence") as evidence only. Do not add, preserve or reintroduce CockroachDB-specific behaviour, dialect branches, test fixtures or release gates. The single `"cockroachdb"` entry in `email_delivery_retry._lock_clause()` is a historical leftover and is deliberately not treated as a supported target.
+
+**Cutover status:** not performed. Neon is the target, not a measured deployment fact. The database the application currently runs against in production is not established by any document in this repository: CockroachDB is recorded as the previous production engine, and the Alembic history shows the current head cannot have been reached there. Do not claim Neon is verified, certified or live, and do not assert a current production engine, until that evidence exists.
+
+Do not reintroduce stale assumptions that the current backend is hosted on Railway, that the database is self-hosted PostgreSQL, or that CockroachDB is the production engine.
+
+For the component-level detail behind these facts, consult `ARCHITECTURE.md` §7 (database architecture) and §13 (runtime and deployment architecture). Those sections now carry the same Neon target and the same CockroachDB historical status; this section remains the summary of record for deployment facts, and the rationale is recorded in `DECISIONS.md` ADR-013.
 
 ## 6. Core Non-Negotiable Areas
 

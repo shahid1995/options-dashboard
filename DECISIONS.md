@@ -61,6 +61,8 @@ Do not rewrite historical decisions to make the history look cleaner. When direc
 | ADR-009 | Keep historical market-data collection disabled by default and operationally bounded | Active |
 | ADR-010 | Keep the public website and authenticated application as separate application/deployment concerns | Active |
 | ADR-011 | Preserve GitHub as implementation/project authority and keep durable knowledge outside implementation state | Active |
+| ADR-012 | Define the email delivery worker/reaper recovery contract | Proposed — NOT READY |
+| ADR-013 | Target PostgreSQL on Neon as the production database engine; retire CockroachDB as historical | Active (target engine only) |
 
 The entries below capture the decision intent and implementation consequences.
 
@@ -572,6 +574,178 @@ A change to an accepted architectural decision requires an explicit decision tra
 - `PROJECT-CONTROL.md`
 - `options-dashboard-project/docs/PROJECT_STATUS_CURRENT.md`
 - current AI workspace control documents.
+
+---
+
+## ADR-012 — Email Delivery Worker/Reaper Recovery Contract
+
+**Status:** Proposed — NOT READY for implementation. No worker, reaper, finalizer, abandon transition, reconciler or provider integration exists. This ADR records the contract shape and the evidence behind it; it does not authorize implementation.
+**Target engine:** Neon PostgreSQL (`postgresql` SQLAlchemy dialect, PostgreSQL 16/17). CockroachDB is retired as a target; its results are historical only (see "Historical engine evidence").
+**Date:** 2026-11  
+**Category:** Data / Reliability / Email Delivery  
+**Related:** ADR-013 — the target engine is Neon PostgreSQL; CockroachDB results in this ADR are historical only.
+
+### Context
+
+`backend/app/services/email_delivery_retry.py` implements exactly one state transition: retry a delivery after a conclusive retryable provider outcome, inside a four-attempt budget, and finalize it as `retry_budget_exhausted` on the next request. Nothing in the application calls it.
+
+The delivery contract is defined against Neon PostgreSQL. Every rule, measurement and test result below must be read in that light: the application is a PostgreSQL application, and the one migration revision that blocked CockroachDB (`125e1807df8d`) takes its PostgreSQL branch on Neon by construction. Nothing in this ADR is a Neon measurement; Neon certification is outstanding.
+
+The worker is expected to commit an attempt outcome in one transaction and then call the retry writer in a second. A crash between the two commits strands a committed outcome. A reaper that selects only expired `sending` claims with no outcome does not recover that case, and recovers neither an accepted nor a permanently rejected outcome.
+
+### Proposed contract (awaiting approval)
+
+Nothing below is approved for implementation. Every rule is a **proposal** subject to the open Founder decisions at the end of this ADR; "proposed" is the default reading of every sentence in this section.
+
+1. **Transaction ownership.** The reaper never holds a lock across a writer call. It performs a read-only candidate scan for ids, then invokes a transition that opens its own transaction, re-reads the delivery under lock and **reclassifies from durable state**. Correctness comes from reclassification under the lock, not from the scan; no lock is claimed to be held across transactions.
+2. **Lease closure on a conclusive outcome.** The transaction that records `accepted`, `rejected_retryable` or `rejected_permanent` also sets `lease_expires_at` to the observation time in the same commit. Without it the writer's `abort_live_lease` guard makes inline retry impossible and every retry waits a full lease.
+3. **Reaper selection.** Two disjoint queries: expired claims (`status IN ('sending','dispatched') AND lease_expires_at <= now`), and blocked deliveries whose payload expired (`status IN ('awaiting_reconciliation','review_required') AND payload_expires_at <= now`). The second has no lease predicate: `ck_delivery_blocked_no_lease` guarantees no lease exists. One delivery per transaction, ordered by the expiry column then `id`.
+4. **Evidence identity (proposed, unapproved).** One provider observation is *proposed* to be identified by `(source, evidence_source)`, enforced by unique index `uq_evidence_provider_event` (revision `c1d2e3f4a5b6`). The index exists; **the identity choice is not approved** (F-6). Uniqueness, not a read-then-write check, is what would make duplicate webhook delivery idempotent across independent writers.
+5. **Evidence authority.** Only the attempt on `delivery.active_generation_id` may drive finalization. A **decisive** outcome (`accepted`, `rejected_permanent`) recorded on a superseded generation is a contradiction and parks the delivery in `review_required`; it never proves delivery. Contradictory outcomes on one attempt likewise park. Late webhooks attach to their own attempt and never mutate a newer one.
+   An ordinary historical `rejected_retryable` recorded on a superseded generation is **not** a contradiction. It is the expected predecessor of the next generation: it is what the retry writer consumed to create that generation, and it must be preserved as history rather than treated as a conflict. Only an outcome that claims a *final* result can contradict the active generation.
+6. **Uncertainty is not an outcome.** A dispatch marker written without a recorded outcome (`dispatch_marker_at IS NOT NULL`, no `execution_completed`) parks the delivery as `awaiting_reconciliation` with `execution_disposition='execution_unknown'`, no `provider_outcome` and no decisive evidence row. The schema cannot store an "unknown" outcome (`ck_evidence_outcome_enum`); uncertainty is carried by the disposition and the absence of evidence. Never resend automatically.
+7. **Ambiguous commit.** A commit error is resolved by re-reading whether the caller's `new_generation_id`/`new_attempt_id` landed and became active, never by treating a retry refusal as success. If the result cannot be attributed to this operation, return an explicit ambiguous result and park for reconciliation.
+8. **Clock authority.** Lease validity is judged only inside the transaction holding the delivery lock, using a timestamp read after the lock. A caller-supplied timestamp is provisional: a measured PostgreSQL lock wait of 0.603 s left `now()` frozen at transaction start.
+9. **Budget (unresolved — F-3).** Current behaviour: the writer counts reservations (`len(attempts)` / `attempt_index`), so pre-dispatch crashes consume budget. Alternatives (dispatch-authorized count, conclusive rejections) are derivable without a schema change but are a policy change requiring approval. Which count is correct is **not decided** here.
+
+### Clock contract (measured, not assumed)
+
+| Source | Representation | Granularity | Evidence |
+|---|---|---|---|
+| SQLite `CURRENT_TIMESTAMP` | `YYYY-MM-DD HH:MM:SS`, naive UTC | 1 s | measured 2026-11-13: 7 844 samples / 2.2 s, 3 distinct, min step 1.000 s |
+| SQLite `strftime('%Y-%m-%dT%H:%M:%fZ','now')` | ISO UTC | 1 ms | measured: 4 179 samples / 1.2 s, 1 200 distinct, min step 0.001 s |
+| `_bind_dt(aware datetime)` | ISO with `+00:00` | supplied precision, µs preserved | measured: instants 1 µs apart survive the round trip |
+| PostgreSQL `now()` | transaction start | µs | measured: 0.000 s drift across a 250 ms transaction |
+| PostgreSQL `clock_timestamp()` | wall clock | µs | measured: 0.251 s drift in 250 ms |
+| CockroachDB | — | — | out of scope: retired as a target. The 24.1.0 experiment (end of support 2026-10-21) produced no clock measurement |
+
+Mixed storage formats are **unsafe**, not merely untidy: with `'2026-01-01 00:00:30'` and `'2026-01-01T00:00:20.5+00:00'` in one column, both `ORDER BY ts` and `WHERE ts <= …` return the wrong rows because byte 10 (`' '` = 0x20 vs `'T'` = 0x54) dominates the comparison. One canonical representation (ISO `T` plus offset everywhere) restores correct ordering. Timestamps read through a typed column are **aware for writer-bound values and naive for SQL-written values**; every typed read must be normalized to aware UTC.
+
+The current writer compares timestamps in Python after `_as_dt` and contains no SQL timestamp predicate, so it is not exposed. The hazard is the unwritten reaper and any future SQL filter.
+
+### Certification status
+
+- Certified on SQLite and PostgreSQL 16: the retry transition, rollback after each of its five stages, two-connection single-successor behaviour, argument validation, the four-attempt progression, and the three indexes of revision `c1d2e3f4a5b6`.
+- Scope of that certification: the retry transition only. It certifies no lifecycle, no worker or reaper, and no engine other than the two named above.
+- **Neon PostgreSQL: not certified.** Local PostgreSQL 16 results do not transfer automatically to a managed Neon branch. No statement in this ADR is a Neon measurement; the target engine's certification is outstanding.
+- Not certified: every other transition, and the worker and reaper lifecycle.
+- CockroachDB certification is neither claimed nor required. It is not part of the forward acceptance criteria.
+
+### NOT READY
+
+- No claim path, outcome writer, finalizer, abandon/redispatch transition, reconciler, reaper loop, provider adapter, ambiguous-commit verification read, or Neon certification run exists.
+- The lifecycle questions below are open and are not closed by choosing the engine: expected historical retryable predecessors (rule 5), conclusive-outcome versus payload-expiry precedence (rule 2 against the reaper's second query), provider-event identity and deduplication (F-6), dispatch ownership and stale-worker fencing, ambiguous-commit resolution (rule 7), and unknown/unmatched evidence reconciliation (F-8).
+- Advisory only: nothing in this ADR is approved for implementation.
+
+### Historical engine evidence (CockroachDB — historical, not a target)
+
+CockroachDB was evaluated and rejected as a target. The record is kept so the same ground is not re-covered, and it is **not** a release gate.
+
+- Run on CockroachDB 24.1.0 (CCL, end of support 2026-10-21), dialect `cockroachdb`, driver `cockroachdb+psycopg2`.
+- The full migration chain cannot complete there: revision `125e1807df8d` takes its non-PostgreSQL branch and emits `CREATE UNIQUE INDEX … WHERE is_default = 1` against a boolean column, which fails with `unsupported comparison operator: <bool> = <int>`. `DROP DATABASE … WITH (FORCE)` is also a syntax error there.
+- The delivery revisions were reached only by stamping `b2c3d4e5f6a7` onto an empty database, so eight earlier revisions never ran. On that stamped schema one retry transition succeeded and a two-thread race produced one successor and one `abort_live_lease` refusal. No `40001` was observed and none was instrumented for.
+- Therefore: two of ten revisions, one process, one stamped schema, one run. That is not certification of CockroachDB, and it is not evidence about Neon.
+- The Neon target requires none of this: `125e1807df8d` selects its PostgreSQL branch (`WHERE is_default = true`) on any `postgresql` dialect, and no serialization-retry wrapper is planned for a READ COMMITTED target.
+
+### Open Founder decisions
+
+| # | Decision | Recommendation |
+|---|---|---|
+| F-1 | Close the lease in the conclusive-outcome transaction | approve |
+| F-2 | Abandon is a distinct transition that consumes an attempt | approve |
+| F-3 | What the four-attempt budget counts | reservations now, dispatch-authorized later |
+| F-4 | Accept the dispatch-marker false-positive park rate | accept |
+| F-5 | Reconciliation ownership: manual queue or provider status API | manual first |
+| F-6 | Unique `(source, evidence_source)` index, and the identity it implies | index exists in `c1d2e3f4a5b6`; both the identity and its **retention** are unapproved |
+| F-7 | Reaper indexes | exist in `c1d2e3f4a5b6`; **retention** is unapproved |
+| F-8 | Quarantine for unmatched provider events, or drop plus counter | counter first |
+| F-9 | Late `accepted` for a delivery already `failed`: correct or park | park for review |
+| F-10 | Metrics backend (none exists) | structured logs first |
+| F-11 | Lease TTL, reaper interval, whether SQLite runs a reaper | 60 s / 15 s / yes |
+| F-12 | Move the clock read inside the writer's transaction | approve before multi-instance |
+
+### Evidence
+
+- `options-dashboard-project/backend/app/services/email_delivery_retry.py`
+- `options-dashboard-project/backend/alembic/versions/f2a7c9d1e4b8_delivery_pipeline_tables.py`
+- `options-dashboard-project/backend/alembic/versions/a8b3d5e7c902_delivery_referential_integrity.py`
+- `options-dashboard-project/backend/alembic/versions/c1d2e3f4a5b6_delivery_reaper_indexes.py`
+- `options-dashboard-project/backend/tests/test_email_delivery_retry.py`
+- `options-dashboard-project/backend/tests/test_email_delivery_retry_certification.py`
+- `options-dashboard-project/backend/tests/test_delivery_indexes.py`
+- CockroachDB 24.1.0 experiment (historical): migrations reached only by stamping `b2c3d4e5f6a7` on an empty database; `f2a7c9d1e4b8`, `a8b3d5e7c902`, `c1d2e3f4a5b6` applied; one retry transition and one two-thread race observed.
+- Neon PostgreSQL audit (source and documentation only): dialect inventory, complete migration graph, pooled versus direct connection architecture, branch-based test strategy. No Neon execution occurred.
+
+### Revisit when
+
+A provider integration is chosen, the worker/reaper host is agreed, F-1 to F-12 are decided, or a Neon staging branch is provisioned for certification.
+
+---
+
+## ADR-013 — PostgreSQL on Neon as the Target Database Engine
+
+**Status:** Active — Founder-directed, and limited to the target engine. This ADR selects an engine; it does not approve any delivery-lifecycle rule, any ADR-012 Founder decision, or any schema-execution change.
+**Date:** 2026-11  
+**Category:** Data / Infrastructure / Deployment  
+**Supersedes:** none — no prior ADR selected a database engine, and this record corrects a deployment fact that was documented inconsistently across the control documents.  
+**Related:** ADR-007 (Alembic remains the authoritative schema mechanism; unaffected), ADR-012 (email delivery contract — remains **NOT READY**). The proposed move of migration execution out of application startup is described in this ADR's consequences only; it has no ADR of its own and is unapproved.
+
+### Context
+
+Every control document named CockroachDB as the production database, and none of them could show the schema being reached there. Two independent findings made that untenable:
+
+- The full Alembic chain cannot complete on CockroachDB. Revision `125e1807df8d` branches on `dialect == "postgresql"` and falls through to a SQLite-shaped predicate for every other dialect, emitting `CREATE UNIQUE INDEX … WHERE is_default = 1` against a `BOOLEAN` column. CockroachDB rejects it (`unsupported comparison operator: <bool> = <int>`), so revision 2 of 10 blocks revisions 3 to 10. `DROP DATABASE … WITH (FORCE)` is also a syntax error there.
+- The evaluation itself was run on CockroachDB 24.1.0, whose support ended 2026-10-21. Even a clean run would have certified an out-of-support engine.
+
+The application, meanwhile, is already a PostgreSQL application: the `postgresql` SQLAlchemy dialect, `postgresql.insert(...).on_conflict_do_update()` through `dialect_insert()`, `FOR UPDATE` row locking, `timestamptz` columns, `bytea` payloads, `Text`-encoded JSON (no `JSONB`), UUID/string identifiers with no sequences and no autoincrement, and no extension, trigger or search-path dependence. Nothing in the schema requires CockroachDB, and nothing in it is rewritten by moving to PostgreSQL.
+
+### Decision
+
+1. **Target engine.** Neon PostgreSQL, reached through the ordinary PostgreSQL dialect (`postgresql+psycopg2`). A Neon project on PostgreSQL 16 or 17 — 16 keeps the engine line already certified on a local server.
+2. **CockroachDB is historical.** It was evaluated and rejected as a target and is no longer a compatibility requirement. No CockroachDB-specific schema, dialect branch, test fixture, acceptance criterion or release gate may be added. Evidence gathered there is retained in ADR-012 as historical evidence only.
+3. **Connection split (intent, not yet exercised).** Application traffic uses the pooled endpoint; schema migrations use the direct (unpooled) endpoint.
+4. **Schema authority is unchanged.** Alembic remains authoritative (ADR-007). Selecting an engine does not change who owns the schema.
+5. **`125e1807df8d` is not modified.** On any `postgresql` dialect it takes its existing PostgreSQL branch. Editing it for CockroachDB's sake is now explicitly out of scope.
+6. **Existing CockroachDB remnants stay as remnants.** The `"cockroachdb"` member of `_lock_clause()`'s tuple is a historical leftover; it is not a supported target and must not become one by accretion.
+7. **Control documents follow this decision.** `AI.md`, `CONTEXT.md`, `DATA.md`, `ARCHITECTURE.md`, `INVARIANTS.md` and `TESTING.md` name Neon PostgreSQL as the target and mark CockroachDB historical.
+
+### Consequences
+
+**Positive.** The blocked migration path disappears without touching a migration; no application rewrite is required; the dependency set (`SQLAlchemy 2.0.57`, `alembic 1.15.2`, `psycopg2-binary 2.9.13`) needs no change or upgrade; the PostgreSQL behaviour already tested locally becomes the behaviour that ships.
+
+**Costs and risks.**
+
+- **Zero Neon certification exists.** No statement about Neon in this repository is a measurement. Local PostgreSQL 16 results do not transfer automatically to a managed branch.
+- **Migrations still execute at application startup** (`init_db()` → `alembic upgrade head`) on the application engine, which under this decision is the pooled endpoint, on every process boot. That is the one architectural change this pivot forces; it is proposed and unapproved, not implemented.
+- **Neon suspends idle compute and drops idle connections, pooled ones included.** `pool_pre_ping=True` already covers the dead-socket case; recycling intervals and cold-start latency are tuning decisions, not code rewrites.
+- **Transaction pooling forbids session-level state** (`SET`, `LISTEN/NOTIFY`, advisory locks, held cursors). The application uses none of them today; startup migrations would, if they ever took an advisory lock, and that is one more reason they belong on a direct connection.
+- **The source of any data migration is unknown.** No document establishes what the current production database holds. This ADR does not assume it is empty, and it does not authorise a move.
+
+### Not decided here
+
+- Any Neon result, certification or performance claim. None exists.
+- ADR-012 remains **NOT READY**; its rules remain **proposed**; the evidence identity `(source, evidence_source)` remains unapproved; F-1 to F-12 all remain open.
+- Moving Alembic out of `init_db()` onto a direct-URL release step — design exists, implementation does not.
+- Whether existing records must be preserved, and how they would move.
+- Promoting the four SQLite-only `init_db()` indexes into Alembic.
+- Neon plan, region, compute size, and the staging/production project separation.
+
+### Affected boundaries
+
+Schema and migrations; database connection configuration; deployment topology and hosting responsibilities; verification environments; backup and recovery planning.
+
+### Evidence
+
+- `DECISIONS.md` ADR-012 — "Historical engine evidence (CockroachDB — historical, not a target)" and the delivery contract that remains NOT READY.
+- `options-dashboard-project/backend/alembic/versions/125e1807df8d_add_broker_connection_foundation.py` — the dialect branch.
+- `options-dashboard-project/backend/app/db.py` — engine construction, pooling, `init_db()`.
+- `options-dashboard-project/backend/app/utils/db_dialect.py` — the `postgresql`/`sqlite` upsert split.
+- `options-dashboard-project/backend/app/services/email_delivery_retry.py` — `_lock_clause()`.
+- Neon documentation: connection pooling (pooled versus direct), compute lifecycle and scale to zero, supported PostgreSQL versions.
+
+### Revisit when
+
+A Neon staging branch is provisioned and certified; the source-data question is answered by the Founder; migration execution moves out of application startup; or Neon's pooled/direct guidance changes.
 
 ---
 
