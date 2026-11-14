@@ -39,11 +39,27 @@ def _engine():
     if url.startswith("sqlite"):
         connect_args = {"check_same_thread": False}
         eng = create_engine(url, connect_args=connect_args)
-        # Phase 7.23B: Switch SQLite to WAL journal mode for crash safety.
+
+        # Exactly one connect listener. The previous code registered the same
+        # WAL pragma pair twice (once inside this branch, once again after it),
+        # which ran both statements twice on every new connection.
+        #
+        # foreign_keys=ON is what makes the schema's foreign keys actually
+        # apply: SQLite defaults to OFF, so without this every FK in the
+        # database is inert. Migrations are the one exception -- Alembic's
+        # batch rebuilds must drop and recreate tables, which SQLite refuses
+        # while enforcement is on. alembic/env.py therefore turns enforcement
+        # off on the raw DBAPI connection for the duration of a migration and
+        # restores it in a finally block (a transaction-scoped pragma cannot
+        # work: the check on DROP TABLE is immediate, not deferrable), so this
+        # listener can leave enforcement on for the life of the application.
         @event.listens_for(eng, "connect")
-        def _set_wal(dbapi_conn, _rec):
-            dbapi_conn.execute("PRAGMA journal_mode=WAL")
-            dbapi_conn.execute("PRAGMA synchronous=NORMAL")
+        def _set_sqlite_pragmas(dbapi_conn, _rec):
+            cur = dbapi_conn.cursor()
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA synchronous=NORMAL")
+            cur.execute("PRAGMA foreign_keys=ON")
+            cur.close()
     else:
         # Phase 9E: Production PostgreSQL configuration
         eng = create_engine(
@@ -54,12 +70,6 @@ def _engine():
             pool_recycle=1800,
             pool_pre_ping=True,
         )
-
-    if url.startswith("sqlite"):
-        @event.listens_for(eng, "connect")
-        def _set_wal(dbapi_conn, _rec):
-            dbapi_conn.execute("PRAGMA journal_mode=WAL")
-            dbapi_conn.execute("PRAGMA synchronous=NORMAL")
 
     return eng
 
