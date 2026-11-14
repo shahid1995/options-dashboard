@@ -164,7 +164,7 @@ ADR-013 (target engine; also cross-references ADR-007 and ADR-012); ADR-012 rema
 
 **Commit/PR**
 
-`73ba2b7` — `docs: target Neon PostgreSQL and retire CockroachDB in the control documents`. That entry was added by amending this same commit, so the hash recorded here is its pre-amend value; the commit subject is the stable reference.
+`docs: target Neon PostgreSQL and retire CockroachDB in the control documents`. The subject is recorded instead of a hash because this entry is part of that same commit, and a commit cannot contain its own final SHA.
 
 ---
 
