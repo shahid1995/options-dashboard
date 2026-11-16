@@ -1,0 +1,24 @@
+{
+  "artifact": "sqlite-fk-preflight-f1-f3-corrections.diff",
+  "description": "Complete git diff dd1d06e..worktree for the SQLite foreign-key preflight F1-F3 corrections. Review artifact only.",
+  "base_commit": "dd1d06ec34985e471ed05a21f38afe3d83090e54",
+  "sha256": "e317b3c85631425c279428ca530010430df6d9831ccf6a9100fdc762c3590283",
+  "bytes": 90692,
+  "lines": 1850,
+  "reassemble": "cat sqlite-fk-preflight-f1-f3-corrections.diff.part{1,2,3,4,5,6} in order, then verify sha256 and byte count above",
+  "part1": {"blob": "31d8fa7b67c2d1eb5a4e38e3675955f239abb739", "lines": "1-129", "bytes": 15075},
+  "part2": {"blob": "c37f1cf4cf0ca908d7b7873686a5c3afe5580064", "lines": "130-379", "bytes": 15065},
+  "part3": {"blob": "9874b98c02d04e2ba4666b3d3e01abc2d3b122e5", "lines": "380-738", "bytes": 15042},
+  "part4": {"blob": "f5bd37f19db240ba4f66f774e41e3725efcc0699", "lines": "739-1081", "bytes": 15042},
+  "part5": {"blob": "e3c6557f027bda89f1122a1255e19a042775202a", "lines": "1082-1465", "bytes": 15008},
+  "part6": {"blob": "30f6cb5c864658569c5634576692b75f33cd2351", "lines": "1466-1850", "bytes": 15460},
+  "files_changed": [
+    "CHANGELOG.md",
+    "INVARIANTS.md",
+    "TESTING.md",
+    "options-dashboard-project/backend/app/config.py",
+    "options-dashboard-project/backend/app/db.py",
+    "options-dashboard-project/backend/tests/test_db_sqlite_pragmas.py"
+  ],
+  "scope": "Review artifact only. The six implementation files are NOT committed on this branch; only these sliced parts and this manifest are."
+}

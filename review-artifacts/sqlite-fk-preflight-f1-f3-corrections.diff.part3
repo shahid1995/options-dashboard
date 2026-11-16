@@ -1,0 +1,359 @@
++            "cannot prove it would inspect the same database."
++        )
++
++
++def _uri_semantics(query: Mapping[str, str]) -> bool:
++    """True when the URL asks SQLAlchemy for SQLite URI semantics.
+ 
+-    conn = sqlite3.connect(database)
++    SQLAlchemy coerces the ``uri`` option with ``asbool`` and then passes
++    ``uri=True`` to ``sqlite3.connect()``. Reading it with the same coercion
++    keeps the preflight's understanding of the URL identical to the engine's.
++    """
++    raw = query.get("uri")
++    if raw is None:
++        return False
+     try:
+-        rows = conn.execute("PRAGMA foreign_key_check").fetchall()
+-    finally:
+-        conn.close()
++        return asbool(raw)
++    except ValueError:
++        raise UnsafeSQLiteConfiguration(
++            f"SQLite URL option uri={raw!r} is not a boolean; SQLAlchemy would "
++            "reject it."
++        ) from None
++
++
++def _uri_filename(parts) -> str:
++    """Absolute filename for a ``file:`` URI, resolved the way SQLite does.
++
++    SQLite percent-decodes the path, and on Windows maps the
++    ``file:///C:/dir/db`` form to ``C:/dir/db``; a relative name is resolved
++    against the process working directory. Resolving identically keeps the
++    ``os.stat`` check on the file the engine will actually open.
++    """
++    raw = unquote(parts.path)
++    if os.name == "nt" and raw.startswith("/"):
++        raw = url2pathname(raw)
++    return os.path.abspath(raw)
++
++
++def _classify_target(
++    database: str | None,
++    query: Mapping[str, str] | None = None,
++) -> tuple[str, str | None]:
++    """Classify what SQLite would open for ``database``.
++
++    Returns ``(kind, path)``: ``"file"`` with an absolute path, or ``"memory"``
++    or ``"named-memory"`` with ``None``. A named in-memory database is its own
++    kind because it has no image to inspect and is refused by the caller.
++
++    The URL's query decides whether ``file:`` is a URI: SQLAlchemy only enables
++    SQLite URI semantics for ``uri=true``, and otherwise passes
++    ``os.path.abspath(database)`` as a literal filename. A ``file:``-prefixed
++    database without ``uri=true`` is therefore refused instead of being read as
++    a URI the engine would never open.
++    """
++    query = dict(query or {})
++    if not database or database == ":memory:":
++        return "memory", None
++    if _uri_semantics(query):
++        if database.startswith("file:"):
++            return _classify_uri(database, query)
++        # SQLite only treats ``file:`` strings as URIs. Anything else stays a
++        # literal filename even when ``uri=true`` is set.
++        return "file", os.path.abspath(database)
++    if database.startswith("file:"):
++        raise UnsafeSQLiteConfiguration(
++            f"{database!r} is a 'file:' URI but the URL does not set uri=true, "
++            "so SQLAlchemy would open a literal file with that name instead. "
++            "Add '?uri=true' for URI semantics, or use a plain path."
++        )
++    return "file", os.path.abspath(database)
++
+ 
+-    tables = sorted({row[0] for row in rows})
+-    return (not rows), len(rows), tables
++def _classify_uri(
++    database: str,
++    query: Mapping[str, str],
++) -> tuple[str, str | None]:
++    """Classify a ``file:`` URI that SQLAlchemy will pass through verbatim.
++
++    Pathless URIs, memory variants and shared-cache file databases are refused:
++    each one either names no file to inspect or changes connection semantics
++    the snapshot cannot reproduce.
++    """
++    parts = urlsplit(database)
++    if parts.netloc and parts.netloc != "localhost":
++        raise UnsafeSQLiteConfiguration(
++            f"URI {database!r} names host {parts.netloc!r}; SQLite has no "
++            "authority component, so the file it would open is ambiguous and "
++            "cannot be inspected read-only."
++        )
++    path = unquote(parts.path)
++    mode = query.get("mode")
++    cache = query.get("cache")
++    if not path:
++        # ``file:``, ``file:?mode=ro``, ``file://localhost``: no database file.
++        # That is not the same thing as the supported ``:memory:`` target.
++        raise UnsafeSQLiteConfiguration(
++            f"URI {database!r} names no database file; a pathless SQLite URI is "
++            "not equivalent to ':memory:' and cannot be inspected."
++        )
++    if path == ":memory:":
++        if mode == "memory" or cache == "shared":
++            return "named-memory", None
++        raise UnsafeSQLiteConfiguration(
++            f"URI {database!r} is an in-memory database URI. Only the plain "
++            "':memory:' target is supported: URI memory variants differ in "
++            "pooling, isolation and connection lifetime."
++        )
++    if mode == "memory":
++        return "named-memory", None
++    if cache == "shared":
++        raise UnsafeSQLiteConfiguration(
++            f"URI {database!r} requests cache=shared. A shared-cache file "
++            "database changes locking and connection semantics that the "
++            "read-only preflight cannot reproduce."
++        )
++    return "file", _uri_filename(parts)
++
++
++def _read_only_uri(path: str) -> str:
++    """Read-only URI for a literal filesystem path."""
++    return f"file:{quote(path)}?mode=ro"
++
++
++def _inspection_uri(
++    database: str | None,
++    query: Mapping[str, str],
++    path: str,
++) -> str:
++    """Read-only URI naming the same file SQLite opens for the target.
++
++    A URI target keeps its original path text — percent-encoding, drive-letter
++    form and all — and only the query is replaced with ``mode=ro``, so SQLite
++    resolves the file exactly as it will for the application connection. The
++    options that survive validation cannot change which file is read, so
++    replacing them with ``mode=ro`` preserves identity.
++    """
++    if database and database.startswith("file:") and _uri_semantics(query):
++        return f"{database.split('?', 1)[0]}?mode=ro"
++    return _read_only_uri(path)
++
++
++def _file_presence(path: str) -> bool:
++    """True when ``path`` exists; False only when it is genuinely absent.
++
++    ``os.path.exists()`` reports ``False`` for a path the process may not
++    inspect, which would let an inaccessible database masquerade as a missing
++    one and start unenforced. ``os.stat`` separates the two cases: only
++    ``FileNotFoundError`` means "no database yet". Permission errors, a
++    non-directory in the path and every other ``OSError`` fail closed.
++    """
++    try:
++        _stat(path)
++    except FileNotFoundError:
++        return False
++    except OSError as exc:
++        raise UnsafeSQLiteConfiguration(
++            f"could not inspect {path} for the foreign-key preflight: {exc}"
++        ) from exc
++    return True
++
++
++def _deadline_guard(
++    path: str,
++    budget: float,
++    *,
++    clock: Callable[[], float] = time.monotonic,
++) -> Callable[[], None]:
++    """Return a guard that raises ``SQLitePreflightTimeout`` once ``budget`` is spent.
++
++    One guard means one deadline: snapshot creation and the scan share it, and
++    it is never reset between phases. The deadline is cooperative: expiry is
++    noticed at the next phase boundary, backup batch or progress-hook interval,
++    so a phase can overshoot the budget by a small interval rather than
++    stopping at an exact wall-clock instant.
++
++    ``clock`` exists so tests can drive the deadline deterministically;
++    production always uses ``time.monotonic``.
++    """
++    deadline = clock() + budget
++
++    def _raise_if_expired() -> None:
++        if clock() >= deadline:
++            raise SQLitePreflightTimeout(
++                f"inspecting {path} for the foreign-key preflight exceeded "
++                f"{budget:g}s"
++            )
++
++    return _raise_if_expired
++
++
++def _violation_summary(
++    snapshot: str,
++    check_deadline: Callable[[], None],
++) -> tuple[int, list[str], bool]:
++    """Count violations under a deadline, retaining only a bounded sample.
++
++    ``PRAGMA foreign_key_check`` emits one row per violating row, so the cursor
++    is streamed instead of collected: ``fetchall()`` would grow with the damage.
++    Every row is counted; only distinct offending table names are retained, and
++    at most ``_VIOLATION_TABLE_SAMPLE_LIMIT`` of them.
++
++    Returns ``(violations, tables, sample_truncated)``. ``sample_truncated``
++    means further distinct table names were seen but not retained, so the
++    sample is diagnostic rather than exhaustive while the count stays exact.
++
++    The scan is a single statement, so the copy's progress callback cannot bind
++    it. SQLite's progress hook can: on expiry the handler marks the interruption
++    as its own and returns non-zero to abort the statement. CPython then raises
++    ``OperationalError("interrupted")``, which becomes the typed timeout only
++    because of that marker — an unrelated SQLite error is left to the caller's
++    inspection-failure handling. The deadline is also checked immediately before
++    the statement and after a completed scan, so a scan too short to reach the
++    hook still cannot outlive the budget.
++    """
++    check = sqlite3.connect(snapshot)
++    interrupted: SQLitePreflightTimeout | None = None
++
++    def _on_progress() -> int:
++        nonlocal interrupted
++        try:
++            check_deadline()
++        except SQLitePreflightTimeout as exc:
++            interrupted = exc
++            return 1
++        return 0
++
++    violations = 0
++    tables: list[str] = []
++    seen: set[str] = set()
++    truncated = False
++    try:
++        check.set_progress_handler(_on_progress, _CHECK_PROGRESS_STEPS)
++        check_deadline()  # before the statement starts
++        try:
++            for row in check.execute("PRAGMA foreign_key_check"):
++                violations += 1
++                table = row[0]
++                if table in seen:
++                    continue
++                if len(tables) < _VIOLATION_TABLE_SAMPLE_LIMIT:
++                    seen.add(table)
++                    tables.append(table)
++                else:
++                    truncated = True
++        except sqlite3.Error as exc:
++            if interrupted is not None:
++                raise interrupted from exc
++            raise
++        check_deadline()  # after a completed scan
++        return violations, tables, truncated
++    finally:
++        check.set_progress_handler(None, 0)
++        check.close()
++
++
++def _snapshot_violation_rows(
++    path: str,
++    *,
++    source_uri: str | None = None,
++    clock: Callable[[], float] = time.monotonic,
++) -> tuple[int, list[str], bool]:
++    """Count foreign-key violations from a private snapshot of ``path``.
++
++    Returns ``(violations, tables, sample_truncated)``; see
++    ``_violation_summary`` for the bounded sample. ``clock`` exists for tests.
++    ``source_uri`` lets a URI target be opened with the original path text so
++    SQLite resolves the same file; it is always read-only.
++
++    The source is opened read-only and copied with SQLite's Online Backup API,
++    so the check runs against a consistent image that includes committed WAL
++    frames without writing to the database.
++
++    Side effects, stated precisely: the main database and any existing ``-wal``
++    file are left byte-identical, but reading a WAL database still causes
++    SQLite to create or update the ``-shm`` WAL index, and a zero-length
++    ``-wal`` may appear for a database whose journal mode is WAL. Both are
++    SQLite's own sidecars, not database content.
++
++    The copy and the scan share one budget,
++    ``settings.SQLITE_FK_PREFLIGHT_TIMEOUT_SECONDS`` (default 5s), and it is
++    never reset between them: it is checked before the snapshot is created,
++    after the copy finishes, before the scan and after it. Exceeding it from
++    any of those phases raises ``SQLitePreflightTimeout``, so a huge, slow or
++    locked database fails closed instead of stalling startup.
++    """
++    budget = settings.SQLITE_FK_PREFLIGHT_TIMEOUT_SECONDS
++    check_deadline = _deadline_guard(path, budget, clock=clock)
++
++    def _backup_progress(_status: int, _remaining: int, _total: int) -> None:
++        # ``sqlite3`` ignores this callback's return value and retries
++        # SQLITE_BUSY internally, so returning non-zero cannot abort anything.
++        # Raising is the only reliable interrupt: the callback runs once per
++        # copied batch and on every retry, including the retries against a
++        # locked source, which wait _SNAPSHOT_RETRY_SECONDS between attempts.
++        check_deadline()
++
++    check_deadline()  # before the snapshot exists
++    try:
++        with tempfile.TemporaryDirectory(prefix="fk-preflight-") as workdir:
++            snapshot = os.path.join(workdir, "snapshot.db")
++            # One lock attempt must not consume the whole budget, or the
++            # deadline cannot be checked before the first step returns.
++            lock_wait = min(_SNAPSHOT_LOCK_WAIT_SECONDS, budget)
++            source = sqlite3.connect(
++                source_uri or _read_only_uri(path),
++                uri=True,
++                timeout=lock_wait,
++            )
++            try:
++                destination = sqlite3.connect(snapshot)
++                try:
++                    source.backup(
++                        destination,
++                        pages=_BACKUP_PAGE_BATCH,
++                        progress=_backup_progress,
++                        sleep=_SNAPSHOT_RETRY_SECONDS,
++                    )
++                finally:
++                    destination.close()
++            finally:
++                source.close()
++
++            check_deadline()  # copy finished; the scan gets what is left
++            return _violation_summary(snapshot, check_deadline)
++    except (sqlite3.Error, OSError) as exc:
++        raise UnsafeSQLiteConfiguration(
++            f"could not inspect {path} read-only for the foreign-key "
++            f"preflight: {exc}"
++        ) from exc
++
++
++def _sqlite_fk_preflight(
++    database: str | None,
++    query: Mapping[str, str] | None = None,
++) -> None:
++    """Refuse to start against an unsafe SQLite database.
++
++    Returns only when enforcement is safe: the target is an ordinary in-memory
++    database, a database file that does not exist yet, or a persistent file
++    whose snapshot shows no foreign-key violations.
++
++    Raises ``SQLiteForeignKeyViolation`` when existing rows already violate a
++    foreign key, and ``UnsafeSQLiteConfiguration`` (including
++    ``SQLitePreflightTimeout``) when the target cannot be inspected at all:
++    unresolvable or ambiguous URIs, named shared-memory databases, malformed
++    files, inaccessible paths, snapshot failures, lock failures and timeouts are
++    never treated as clean.
++
++    The check never writes to the database: it reads through
++    ``_snapshot_violation_rows``, which opens the source read-only and inspects
++    a private backup copy.
++    """
++    query = dict(query or {})
++    kind, path = _classify_target(database, query)
