@@ -1,0 +1,338 @@
++    inspection-failure handling. The deadline is also checked immediately before
++    the statement and after a completed scan, so a scan too short to reach the
++    hook still cannot outlive the budget.
++    """
++    check = sqlite3.connect(snapshot)
++    interrupted: SQLitePreflightTimeout | None = None
++
++    def _on_progress() -> int:
++        nonlocal interrupted
++        try:
++            check_deadline()
++        except SQLitePreflightTimeout as exc:
++            interrupted = exc
++            return 1
++        return 0
++
++    violations = 0
++    tables: list[str] = []
++    seen: set[str] = set()
++    truncated = False
+     try:
+-        rows = conn.execute("PRAGMA foreign_key_check").fetchall()
++        check.set_progress_handler(_on_progress, _CHECK_PROGRESS_STEPS)
++        check_deadline()  # before the statement starts
++        try:
++            for row in check.execute("PRAGMA foreign_key_check"):
++                violations += 1
++                table = row[0]
++                if table in seen:
++                    continue
++                if len(tables) < _VIOLATION_TABLE_SAMPLE_LIMIT:
++                    seen.add(table)
++                    tables.append(table)
++                else:
++                    truncated = True
++        except sqlite3.Error as exc:
++            if interrupted is not None:
++                raise interrupted from exc
++            raise
++        check_deadline()  # after a completed scan
++        return violations, tables, truncated
+     finally:
+-        conn.close()
+-
+-    tables = sorted({row[0] for row in rows})
+-    return (not rows), len(rows), tables
++        check.set_progress_handler(None, 0)
++        check.close()
++
++
++def _snapshot_violation_rows(
++    path: str,
++    *,
++    clock: Callable[[], float] = time.monotonic,
++) -> tuple[int, list[str], bool]:
++    """Count foreign-key violations from a private snapshot of ``path``.
++
++    Returns ``(violations, tables, sample_truncated)``; see
++    ``_violation_summary`` for the bounded sample. ``clock`` exists for tests.
++
++    The source is opened read-only and copied with SQLite's Online Backup API,
++    so the check runs against a consistent image that includes committed WAL
++    frames without writing to the database.
++
++    Side effects, stated precisely: the main database and any existing ``-wal``
++    file are left byte-identical, but reading a WAL database still causes
++    SQLite to create or update the ``-shm`` WAL index, and a zero-length
++    ``-wal`` may appear for a database whose journal mode is WAL. Both are
++    SQLite's own sidecars, not database content.
++
++    The copy and the scan share one budget,
++    ``settings.SQLITE_FK_PREFLIGHT_TIMEOUT_SECONDS`` (default 5s), and it is
++    never reset between them: it is checked before the snapshot is created,
++    after the copy finishes, before the scan and after it. Exceeding it from
++    any of those phases raises ``SQLitePreflightTimeout``, so a huge, slow or
++    locked database fails closed instead of stalling startup.
++    """
++    budget = settings.SQLITE_FK_PREFLIGHT_TIMEOUT_SECONDS
++    check_deadline = _deadline_guard(path, budget, clock=clock)
++
++    def _backup_progress(_status: int, _remaining: int, _total: int) -> None:
++        # ``sqlite3`` ignores this callback's return value and retries
++        # SQLITE_BUSY internally, so returning non-zero cannot abort anything.
++        # Raising is the only reliable interrupt: the callback runs once per
++        # copied batch and on every busy retry, which is exactly the loop that
++        # would otherwise spin forever against a locked source.
++        check_deadline()
++
++    check_deadline()  # before the snapshot exists
++    try:
++        with tempfile.TemporaryDirectory(prefix="fk-preflight-") as workdir:
++            snapshot = os.path.join(workdir, "snapshot.db")
++            # One lock attempt must not consume the whole budget, or the
++            # deadline cannot be checked before the first step returns.
++            lock_wait = min(_SNAPSHOT_LOCK_WAIT_SECONDS, budget)
++            source = sqlite3.connect(
++                f"file:{quote(path)}?mode=ro",
++                uri=True,
++                timeout=lock_wait,
++            )
++            try:
++                destination = sqlite3.connect(snapshot)
++                try:
++                    source.backup(
++                        destination,
++                        pages=_BACKUP_PAGE_BATCH,
++                        progress=_backup_progress,
++                        sleep=_SNAPSHOT_RETRY_SECONDS,
++                    )
++                finally:
++                    destination.close()
++            finally:
++                source.close()
++
++            check_deadline()  # copy finished; the scan gets what is left
++            return _violation_summary(snapshot, check_deadline)
++    except (sqlite3.Error, OSError) as exc:
++        raise UnsafeSQLiteConfiguration(
++            f"could not inspect {path} read-only for the foreign-key "
++            f"preflight: {exc}"
++        ) from exc
++
++
++def _sqlite_fk_preflight(database: str | None) -> None:
++    """Refuse to start against an unsafe SQLite database.
++
++    Returns only when enforcement is safe: the target is an ordinary in-memory
++    database, a database file that does not exist yet, or a persistent file
++    whose snapshot shows no foreign-key violations.
++
++    Raises ``SQLiteForeignKeyViolation`` when existing rows already violate a
++    foreign key, and ``UnsafeSQLiteConfiguration`` (including
++    ``SQLitePreflightTimeout``) when the target cannot be inspected at all:
++    unresolvable URIs, named shared-memory databases, malformed files, snapshot
++    failures, lock failures and timeouts are never treated as clean.
++
++    The check never writes to the database: it reads through
++    ``_snapshot_violation_rows``, which opens the source read-only and inspects
++    a private backup copy.
++    """
++    kind, path = _classify_target(database)
++    if kind == "named-memory":
++        raise UnsafeSQLiteConfiguration(
++            f"{database!r} is a named in-memory SQLite database. Shared-memory "
++            "databases cannot be inspected or shared safely across processes; "
++            "use ':memory:' or a file-backed database for the application."
++        )
++    if path is None:
++        return
++    if not os.path.exists(path):
++        # No rows to violate anything, and the file is not created here.
++        return
++
++    violations, tables, sample_truncated = _snapshot_violation_rows(path)
++    if violations:
++        raise SQLiteForeignKeyViolation(
++            path=path,
++            violations=violations,
++            tables=tables,
++            sample_truncated=sample_truncated,
++        )
+ 
+ 
+ def _engine():
+@@ -72,7 +366,30 @@ def _engine():
+         url = f"sqlite:///{_DEFAULT_DB_PATH}"
+     if url.startswith("sqlite"):
+         connect_args = {"check_same_thread": False}
++        sqlite_url = make_url(url)
++        database = sqlite_url.database
++        # A ``file:`` target carries meaning in its query (``?mode=memory``),
++        # which SQLAlchemy splits off; put it back so the target is classified
++        # the same way SQLite will open it.
++        if database and database.startswith("file:") and sqlite_url.query:
++            database = f"{database}?{urlencode(dict(sqlite_url.query))}"
++
++        state_key = database or ":memory:"
++        # A new attempt invalidates any earlier verdict for this target, so a
++        # failure below cannot leave a stale success behind.
++        _SQLITE_FK_STATE.pop(state_key, None)
++
++        # Fail closed before an engine exists. A dirty database, or one that
++        # cannot be inspected (or cannot be inspected in time), raises here, so
++        # startup is refused instead of handing out an unenforced engine.
++        _sqlite_fk_preflight(database)
+         eng = create_engine(url, connect_args=connect_args)
++        # "preflight_passed" is all this proves: the snapshot inspection
++        # succeeded and an engine was constructed. create_engine() is lazy, so
++        # no physical connection exists yet; the listener below enables and
++        # verifies enforcement on every connection, and this verdict is never
++        # used to skip it.
++        _SQLITE_FK_STATE[state_key] = "preflight_passed"
+ 
+         # Exactly one connect listener. The previous code registered the same
+         # WAL pragma pair twice (once inside this branch, once again after it),
+@@ -88,34 +405,24 @@ def _engine():
+         # work: the check on DROP TABLE is immediate, not deferrable), so this
+         # listener can leave enforcement on for the life of the application.
+         #
+-        # One precondition: an existing database may already contain orphan
+-        # rows from the era when nothing was enforced. Turning enforcement on
+-        # there would reject writes that used to succeed, so the rows are
+-        # checked first and enforcement is skipped (loudly) if they are dirty.
+-        database = make_url(url).database
+-        fk_safe, fk_violations, fk_tables = _sqlite_fk_preflight(database)
+-        _SQLITE_FK_STATE[database or ":memory:"] = (
+-            "enforced" if fk_safe else "violations"
+-        )
+-        if not fk_safe:
+-            logging.getLogger(__name__).error(
+-                "SQLite foreign-key enforcement is OFF for %s: %d existing "
+-                "violation(s) in %s. Enforcing now would reject writes that "
+-                "previously succeeded. Repair these rows and restart to turn "
+-                "enforcement on.",
+-                database,
+-                fk_violations,
+-                ", ".join(fk_tables) or "unknown tables",
+-            )
+-
++        # Enforcement is set on every physical connection and then read back.
++        # It is never skipped because of a cached preflight verdict: the
++        # verdict only decides whether startup is allowed at all.
+         @event.listens_for(eng, "connect")
+         def _set_sqlite_pragmas(dbapi_conn, _rec):
+             cur = dbapi_conn.cursor()
+-            cur.execute("PRAGMA journal_mode=WAL")
+-            cur.execute("PRAGMA synchronous=NORMAL")
+-            if fk_safe:
++            try:
++                cur.execute("PRAGMA journal_mode=WAL")
++                cur.execute("PRAGMA synchronous=NORMAL")
+                 cur.execute("PRAGMA foreign_keys=ON")
+-            cur.close()
++                enabled = cur.execute("PRAGMA foreign_keys").fetchone()[0]
++            finally:
++                cur.close()
++            if enabled != 1:
++                raise UnsafeSQLiteConfiguration(
++                    "SQLite did not accept PRAGMA foreign_keys=ON on a new "
++                    "connection; refusing to use an unenforced connection."
++                )
+     else:
+         # Phase 9E: Production PostgreSQL configuration
+         eng = create_engine(
+diff --git a/options-dashboard-project/backend/tests/test_db_sqlite_pragmas.py b/options-dashboard-project/backend/tests/test_db_sqlite_pragmas.py
+index e470d99..cc2b3dc 100644
+--- a/options-dashboard-project/backend/tests/test_db_sqlite_pragmas.py
++++ b/options-dashboard-project/backend/tests/test_db_sqlite_pragmas.py
+@@ -10,8 +10,16 @@ pragmas its own connection would pass even if the application listener were
+ missing, which is exactly the gap this covers.
+ """
+ 
+-import logging
++import hashlib
++import os
+ import sqlite3
++import subprocess
++import sys
++import tempfile
++import threading
++import time
++import tracemalloc
++from urllib.parse import quote
+ 
+ import pytest
+ from sqlalchemy.exc import IntegrityError
+@@ -102,27 +110,21 @@ def _legacy_db(path, *, orphan: bool) -> str:
+     return str(path)
+ 
+ 
+-def test_legacy_database_with_violations_is_not_enforced(monkeypatch, tmp_path, caplog):
+-    """A dirty legacy file keeps working: enforcement is skipped, not applied."""
++def test_legacy_database_with_violations_refuses_an_engine(monkeypatch, tmp_path):
++    """A dirty legacy file fails closed instead of starting unenforced."""
+     path = _legacy_db(tmp_path / "legacy_dirty.db", orphan=True)
+     monkeypatch.setattr(db.settings, "DATABASE_URL", f"sqlite:///{path}")
+ 
+-    with caplog.at_level(logging.ERROR, logger="app.db"):
+-        eng = db._engine()
+-    try:
+-        with eng.connect() as conn:
+-            assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar() == 0
+-        # The write that used to succeed must still succeed.
+-        with eng.begin() as conn:
+-            conn.exec_driver_sql(
+-                "INSERT INTO legacy_child (id, parent_id) VALUES (2, 998)"
+-            )
+-            assert conn.exec_driver_sql("SELECT COUNT(*) FROM legacy_child").scalar() == 2
+-    finally:
+-        eng.dispose()
++    with pytest.raises(db.SQLiteForeignKeyViolation) as excinfo:
++        db._engine()
+ 
+-    assert db._SQLITE_FK_STATE[path] == "violations"
+-    assert any("foreign-key enforcement is OFF" in r.message for r in caplog.records)
++    # The error names the rows to repair, so startup failure is actionable.
++    assert excinfo.value.violations == 1
++    assert excinfo.value.tables == ["legacy_child"]
++    assert excinfo.value.path == path
++    assert excinfo.value.sample_truncated is False
++    assert "foreign-key" in str(excinfo.value)
++    assert path not in db._SQLITE_FK_STATE, "a refused database was recorded as inspected"
+ 
+ 
+ def test_legacy_database_without_violations_is_enforced(monkeypatch, tmp_path):
+@@ -143,23 +145,698 @@ def test_legacy_database_without_violations_is_enforced(monkeypatch, tmp_path):
+     finally:
+         eng.dispose()
+ 
+-    assert db._SQLITE_FK_STATE[path] == "enforced"
++    assert db._SQLITE_FK_STATE[path] == "preflight_passed"
+ 
+ 
+-def test_preflight_reports_violation_counts(monkeypatch, tmp_path):
++def test_preflight_error_reports_violation_counts(tmp_path):
+     """The guard reports what it found, so the error is actionable."""
+     path = _legacy_db(tmp_path / "legacy_report.db", orphan=True)
+ 
+-    safe, count, tables = db._sqlite_fk_preflight(path)
++    with pytest.raises(db.SQLiteForeignKeyViolation) as excinfo:
++        db._sqlite_fk_preflight(path)
+ 
+-    assert safe is False
+-    assert count == 1
+-    assert tables == ["legacy_child"]
++    assert excinfo.value.violations == 1
++    assert excinfo.value.tables == ["legacy_child"]
+ 
+ 
+ def test_preflight_treats_a_missing_file_as_clean(tmp_path):
+     """A database that does not exist yet cannot contain violations."""
+-    safe, count, tables = db._sqlite_fk_preflight(str(tmp_path / "absent.db"))
+-
+-    assert (safe, count, tables) == (True, 0, [])
++    assert db._sqlite_fk_preflight(str(tmp_path / "absent.db")) is None
+     assert not (tmp_path / "absent.db").exists()
++
++

@@ -1,0 +1,338 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ef34ecd..e471782 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -134,6 +134,50 @@ SECURITY.md §12.1; INV-007 (credential ownership) and INV-024 (server-boundary
+ 
+ See the `security/auth-register-no-password-linking` pull request.
+ 
++### 2026-11-14 — SQLite foreign-key preflight reads a read-only snapshot
++
++**Category:** Data
++
++**Change**
++
++`app/db.py` decided whether `PRAGMA foreign_keys=ON` was safe by opening the application database read-write and running `PRAGMA foreign_key_check` directly. Because that ran at import, before any pooled connection existed, its connection was normally the last one on the file: closing it checkpointed the database and deleted the WAL. A crashed database was rewritten, and its WAL destroyed, by the check that was only meant to read it.
++
++The preflight now opens the source read-only (`file:<path>?mode=ro`), copies it with SQLite's Online Backup API in bounded page batches, and runs `PRAGMA foreign_key_check` against that private snapshot. `file:` URIs are classified — percent-decoded, with `mode=memory` and `cache=shared` recognised as named shared memory — instead of being skipped, and a persistent target that cannot be resolved to one file raises rather than being assumed clean. `_engine()` also keeps a URI's query string, which SQLAlchemy splits off, so a named in-memory target is classified as shared memory and refused rather than mistaken for a relative file path.
++
++**Why**
++
++An inspection must not change what it inspects. The previous read rewrote the main database and removed the WAL before migrations ran, which is a durability and forensic-integrity problem in precisely the crash-recovery case where the check matters most.
++
++**Fail-closed startup**
++
++Startup now refuses to continue when enforcement cannot be guaranteed. `_sqlite_fk_preflight()` returns only for an ordinary in-memory database, a database file that does not exist yet, or a persistent file whose snapshot shows no violations. A database with existing violations raises `SQLiteForeignKeyViolation` (carrying the violation count and offending tables, so the message names what to repair), and an uninspectable target — an unresolvable or unsupported URL, a named in-memory database (`mode=memory`, with or without `cache=shared`), a malformed file, a snapshot or lock failure, or an expired budget (`SQLitePreflightTimeout`) — raises `UnsafeSQLiteConfiguration`. In both cases no engine is created. The previous behaviour — log an error and continue with `foreign_keys` OFF — is gone.
++
++`_SQLITE_FK_STATE` now records `preflight_passed`, and only after inspection and engine construction both succeed: a refused or failed attempt leaves no entry, and a failed retry clears an earlier one. The label is deliberately narrow. `create_engine()` is lazy, so no physical connection exists when it is written, and the diagnostic state never substitutes for verification. Every physical application connection still sets `PRAGMA foreign_keys=ON` and reads the pragma back, raising if it did not take; enforcement is never skipped from the cached verdict. `:memory:` remains supported.
++
++**Bounded diagnostics**
++
++`PRAGMA foreign_key_check` emits one row per violating row, and the preflight used to collect them all with `fetchall()`, so its memory grew with the damage. The cursor is now streamed: every violation is counted exactly (`violations`), while only distinct offending table names are retained, at most 20 (`tables`), together with `sample_truncated` when further distinct tables exist. The error message says when the sample is partial. An interrupted scan is neither clean nor a violation: it fails closed with `SQLitePreflightTimeout`.
++
++**Side effects**
++
++The main database and any existing `-wal` file are left byte-identical. SQLite may still create or update the `-shm` WAL index, and a zero-length `-wal` may appear for a database in WAL mode; a rollback-journal database gains no sidecar files. The private snapshot copy is removed on success and on failure.
++
++**Time budget**
++
++The snapshot is bounded by `SQLITE_FK_PREFLIGHT_TIMEOUT_SECONDS` (a setting, default 5s), so an operator with a large but healthy database can raise the budget instead of failing startup. The deadline is enforced from inside the Backup API's progress callback because `sqlite3` ignores a callback's return value and retries `SQLITE_BUSY` internally: raising is the only reliable interrupt, and the callback runs on every retry, including the spin against a locked source. A single Backup API step waits at most `_SNAPSHOT_LOCK_WAIT_SECONDS` (0.5s) for the source lock, so one lock attempt cannot outlast the whole budget. Exceeding the deadline raises `SQLitePreflightTimeout`, which stops startup (fail closed) instead of waiting indefinitely; the partial snapshot and both connections are cleaned up first. The same deadline covers `PRAGMA foreign_key_check`, which the copy callback cannot bound because it is one statement: the scan runs under SQLite's progress hook, which aborts it. The handler owns that classification — it marks the interruption it caused and only that marker turns CPython's `OperationalError("interrupted")` into `SQLitePreflightTimeout`, while an unrelated SQLite error remains an inspection failure even when the clock has already passed the budget. The deadline is also checked at every phase boundary — before the snapshot is created, after the copy, before the scan and after it — because a short or empty scan can finish without ever invoking the hook, and it is never reset between phases.
++
++**Limitations**
++
++The deadline is cooperative rather than an exact wall-clock cutoff: expiry is noticed at the next phase boundary, backup batch or progress-hook interval, so a phase can overshoot by a small interval. The table sample in a violation error is diagnostic, not exhaustive — beyond 20 distinct offending tables it is truncated and `sample_truncated` reports that, while the violation count stays exact. The verdict is computed once at import and cached for diagnostics only, so a database dirtied after startup is not re-evaluated until the process restarts (enforcement itself remains on for every connection). No PostgreSQL behavior is claimed or verified.
++
++**Related decision/invariant**
++
++INV-035; TESTING.md "SQLite foreign-key preflight".
++
++**Commit/PR**
++
++See INV-035 and TESTING.md "SQLite foreign-key preflight".
++
+ ---
+ 
+ ## Change-entry template
+diff --git a/INVARIANTS.md b/INVARIANTS.md
+index 0ae36dd..556c3da 100644
+--- a/INVARIANTS.md
++++ b/INVARIANTS.md
+@@ -296,6 +296,26 @@ Where the current code uses row locking, idempotency constraints, transactional
+ 
+ They must not be removed or weakened as an optimization or refactor without proving the concurrent behavior remains safe.
+ 
++### INV-035 — The SQLite foreign-key preflight must not mutate the database it inspects, and must fail closed
++
++The startup preflight decides whether `PRAGMA foreign_keys=ON` is safe against the rows that already exist. That decision must be made from a read-only snapshot, never by opening the application database for writing, and the application must never receive an engine whose enforcement cannot be guaranteed.
++
++Required properties:
++
++- the source is opened read-only (`mode=ro`) and copied with SQLite's Online Backup API before `PRAGMA foreign_key_check` runs, so the check sees a consistent image that includes committed WAL frames;
++- the main database file and any existing `-wal` file are left byte-identical;
++- the private snapshot copy is removed on success and on failure;
++- a missing database file is reported clean and is not created;
++- `file:` URIs are classified — percent-decoded, with `mode=memory` and `cache=shared` recognised as named in-memory databases — instead of being skipped; a persistent target that cannot be resolved to one file raises instead of being assumed clean;
++- a database containing foreign-key violations raises `SQLiteForeignKeyViolation`, and engine creation is refused: startup never continues with enforcement disabled. The error carries the exact violation count, a bounded, de-duplicated sample of at most 20 offending table names, and whether that sample is truncated; violation rows are streamed, never materialised, so the report's memory does not grow with the damage;
++- any inspection failure — unresolvable or unsupported URL, named in-memory database, malformed file, snapshot or lock failure — raises `UnsafeSQLiteConfiguration`, so an uninspectable database cannot start the application;
++- `_SQLITE_FK_STATE` records `"preflight_passed"` only after inspection and engine construction succeed, and never for a refused or failed attempt, which also clears any earlier verdict for that target. The label means exactly that much: `create_engine()` is lazy, so it does not imply a physical connection, let alone a verified one, and it never bypasses the connection listener;
++- every physical application connection sets `PRAGMA foreign_keys=ON` and reads it back, raising if the pragma did not take; enforcement is never skipped from the cached verdict;
++- the snapshot copy and the `PRAGMA foreign_key_check` scan share one configurable deadline (`SQLITE_FK_PREFLIGHT_TIMEOUT_SECONDS`, default 5s), checked before the snapshot is created, after the copy, before the scan and after it, and never reset between phases; exceeding it raises `SQLitePreflightTimeout` rather than returning, so a large, slow or locked database fails closed instead of blocking startup indefinitely; raising the budget is a deliberate operator decision, not a silent fallback;
++- the scan is a single statement, so the deadline reaches it through SQLite's progress hook, which aborts the statement, rather than through the backup callback. The handler marks the interruption it caused, and only that marker turns SQLite's `interrupted` error into `SQLitePreflightTimeout`; any other SQLite error remains an inspection failure. An interrupted scan is never reported as clean and never as a violation. Expiry is cooperative: it is noticed at the next phase boundary, backup batch or progress interval, so a phase may overshoot the budget by a small interval rather than stopping at an exact wall-clock instant.
++
++SQLite may create or update the `-shm` WAL index, and a zero-length `-wal` may appear for a database in WAL mode. Those are SQLite's shared-memory sidecars, not database content, and they are the only permitted filesystem side effects of the preflight.
++
+ ---
+ 
+ ## 7. API and application-boundary invariants
+diff --git a/TESTING.md b/TESTING.md
+index 3d2e929..af635fd 100644
+--- a/TESTING.md
++++ b/TESTING.md
+@@ -180,6 +180,35 @@ Verify:
+ 
+ Relevant areas include test_alembic_migrations.py and test_db_migration.py.
+ 
++#### SQLite foreign-key preflight
++
++`app/db.py` decides whether `PRAGMA foreign_keys=ON` is safe before any connection is handed out, and that decision must come from a read-only snapshot (INV-035).
++
++Verify:
++
++- the source is opened read-only and copied with the Online Backup API, and `PRAGMA foreign_key_check` runs against the private snapshot;
++- committed WAL frames are visible — a violation written only to WAL is still detected;
++- the main database file and any existing `-wal` file are byte-identical before and after the preflight (sha256 comparison), and the `-wal` is not deleted;
++- a rollback-journal database gains no sidecar files at all; for a WAL database only `-shm` (and possibly a zero-length `-wal`) may appear;
++- the temporary snapshot directory is removed on success and on failure;
++- `file:` URIs are classified rather than skipped: a percent-encoded path reaches the real file, `mode=memory` (with or without `cache=shared`) raises `UnsafeSQLiteConfiguration`, and an unresolvable `file://host/...` target raises instead of being reported as clean;
++- a missing database file is still reported clean and is not created;
++- `_engine()` forwards a URI's query string, so a `mode=memory` target is classified as named in-memory and rejected rather than mistaken for a relative file path;
++- a persistent database with a real violation makes `_engine()` raise `SQLiteForeignKeyViolation`, no engine is returned, and its main file and existing `-wal` are still byte-identical;
++- violations are counted exactly beyond the sample limit (25 tables report 25 violations with 20 retained names and `sample_truncated` true), duplicate table names do not consume slots, and 100k violations are streamed under a small measured memory peak that a `fetchall()` would exceed;
++- an ordinary `:memory:` target remains supported and reports `foreign_keys=1`;
++- a malformed database file raises rather than being treated as clean;
++- `_SQLITE_FK_STATE` records `preflight_passed` only after inspection and engine construction succeed; a refused database records nothing, and a failed retry clears an earlier verdict. The label never claims a physical connection — `create_engine()` is lazy, so none exists at that point;
++- two simultaneous physical connections from a clean engine each report `foreign_keys=1`, so enforcement comes from the connect listener and not from a cached verdict;
++- the snapshot deadline is enforced *during* the copy: a multi-batch database aborts once the budget expires, and a source held under an exclusive lock returns `SQLitePreflightTimeout` in roughly one lock wait plus the budget (a single Backup API step waits at most `_SNAPSHOT_LOCK_WAIT_SECONDS`) instead of spinning;
++- a timeout fails closed — the exception propagates out of the preflight rather than being reported as clean or as a dirty database — and the temporary snapshot is still removed;
++- the budget is configurable: `SQLITE_FK_PREFLIGHT_TIMEOUT_SECONDS` (default 5s) reaches the settings model from the environment, a raised budget lets a large healthy database through (returning normally, not as a violation), and the same database fails closed under a zero budget;
++- the same deadline covers the `PRAGMA foreign_key_check` scan, which a single statement cannot interrupt through the copy callback: an expired budget aborts the scan through SQLite's progress hook and raises `SQLitePreflightTimeout` instead of running to completion, and a scan that fits the budget still returns clean;
++- the deadline is checked at each phase boundary with a controlled clock: an expired budget is refused before the snapshot opens a connection, a copy that finishes over budget is refused before the scan starts, a scan that never reaches the progress hook is refused by the pre-statement check, a scan that completes over budget is refused after the loop, and the deadline is not reset between phases;
++- a deliberate progress-hook interruption becomes `SQLitePreflightTimeout`, while an unrelated SQLite error (a foreign-key mismatch) stays an inspection failure even when the clock is already past the budget.
++
++Covered by `tests/test_db_sqlite_pragmas.py`. The deadline bounds the copy loop and the scan, not an individual SQLite I/O call, so expiry is observed at the next progress callback rather than at an exact wall-clock instant. The locked-source test runs the preflight in a worker thread with a join timeout, so a regression fails the test instead of hanging the suite.
++
+ ### GEX and quant calculations
+ 
+ The current GEX contract is:
+diff --git a/options-dashboard-project/backend/app/config.py b/options-dashboard-project/backend/app/config.py
+index a8a71e8..ce68e96 100644
+--- a/options-dashboard-project/backend/app/config.py
++++ b/options-dashboard-project/backend/app/config.py
+@@ -63,6 +63,11 @@ class Settings(BaseSettings):
+     # Phase 10.2B-6: Optional backend URL for auto-deriving UPSTOX_REDIRECT_URI
+     BACKEND_URL: str = ""
+ 
++    # SQLite foreign-key preflight (INV-035): how long the read-only snapshot may
++    # run before startup fails closed. Raise it for a large but healthy database;
++    # 0 or less aborts at the first backup step.
++    SQLITE_FK_PREFLIGHT_TIMEOUT_SECONDS: float = 5.0
++
+     @property
+     def FRONTEND_ORIGIN(self) -> str:
+         """Primary frontend URL for OAuth redirects.
+diff --git a/options-dashboard-project/backend/app/db.py b/options-dashboard-project/backend/app/db.py
+index 1eda744..c8952f2 100644
+--- a/options-dashboard-project/backend/app/db.py
++++ b/options-dashboard-project/backend/app/db.py
+@@ -1,6 +1,9 @@
+-import logging
+ import os
+ import sqlite3
++import tempfile
++import time
++from collections.abc import Callable
++from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
+ 
+ from sqlalchemy import create_engine, text, event
+ from sqlalchemy.engine import make_url
+@@ -34,34 +37,325 @@ _DEFAULT_DB_PATH = os.path.join(_BACKEND_DIR, "paper_journal.db")
+ 
+ 
+ #: Result of the one-time SQLite foreign-key preflight, keyed by database path.
+-#: Exposed for diagnostics: "enforced", "violations" or "clean" (fresh file).
++#: Diagnostics only: nothing reads it to decide enforcement.
++#:
++#: "preflight_passed" means the snapshot inspection succeeded and an engine
++#: was constructed for the target. It says nothing about physical
++#: connections: ``create_engine()`` is lazy, and every connection is enabled
++#: and verified separately by the connect listener. A refused or failed
++#: attempt leaves no entry.
+ _SQLITE_FK_STATE: dict[str, str] = {}
+ 
++#: Pages copied per Online Backup step. Positive on purpose: the ``sqlite3``
++#: default is ``-1``, which copies the whole database in a single unbounded
++#: step, so the snapshot could not advance incrementally.
++_BACKUP_PAGE_BATCH = 512
+ 
+-def _sqlite_fk_preflight(database: str | None) -> tuple[bool, int, list[str]]:
+-    """Check an existing SQLite file for foreign-key violations before enforcing.
++#: Seconds a single Backup API step may wait for the source lock. Kept short
++#: because the step loop retries until the configured budget
++#: (``settings.SQLITE_FK_PREFLIGHT_TIMEOUT_SECONDS``); a long per-attempt wait
++#: would let one lock attempt outlast the whole budget.
++_SNAPSHOT_LOCK_WAIT_SECONDS = 0.5
+ 
+-    Enforcing ``foreign_keys=ON`` on a database that already contains orphan
+-    rows would make writes that previously succeeded start failing -- a deploy
+-    would turn a latent inconsistency into an outage. So the decision is made
+-    once, from the existing rows, before any connection is handed out.
++#: Seconds to sleep between Backup API retries while the source is locked.
++_SNAPSHOT_RETRY_SECONDS = 0.05
+ 
+-    Returns ``(safe_to_enforce, violation_count, offending_tables)``. A missing
+-    file is trivially safe: it has no rows to violate anything.
++#: VM instructions between deadline checks while ``PRAGMA foreign_key_check``
++#: scans the snapshot. Small enough to bound how far the scan can overshoot
++#: the budget, large enough that the hook costs nothing measurable.
++_CHECK_PROGRESS_STEPS = 1000
++
++#: Distinct offending table names retained in a violation error's diagnostic
++#: sample. The sample exists for humans; the total count is always exact, so
++#: this limit bounds memory rather than knowledge of how much is broken.
++_VIOLATION_TABLE_SAMPLE_LIMIT = 20
++
++
++class SQLitePreflightError(RuntimeError):
++    """Base class for failures that must stop SQLite startup."""
++
++
++class SQLiteForeignKeyViolation(SQLitePreflightError):
++    """The database already contains foreign-key violations.
++
++    Enforcing ``foreign_keys=ON`` here would reject writes that previously
++    succeeded, and starting with enforcement off would leave every foreign key
++    inert, so engine creation is refused instead.
++    """
++
++    def __init__(self, path, violations, tables, sample_truncated):
++        self.path = path
++        #: Exact number of violating rows found; never bounded.
++        self.violations = violations
++        #: At most ``_VIOLATION_TABLE_SAMPLE_LIMIT`` distinct table names.
++        self.tables = tables
++        #: True when more distinct tables exist than ``tables`` retains.
++        self.sample_truncated = sample_truncated
++        sample = ", ".join(tables) or "unknown tables"
++        if sample_truncated:
++            sample += f", plus more beyond a {len(tables)}-table sample"
++        super().__init__(
++            f"SQLite database {path} has {violations} foreign-key violation(s) "
++            f"in {sample}. Repair these rows, then restart: startup is "
++            "refused while enforcement cannot be guaranteed."
++        )
++
++
++class UnsafeSQLiteConfiguration(SQLitePreflightError):
++    """The SQLite target cannot be inspected or enforced safely.
++
++    Raised for unresolvable URLs, named shared-memory databases, malformed
++    files, snapshot failures and failed pragma verification.
+     """
+-    if not database or database == ":memory:" or database.startswith("file:"):
+-        return True, 0, []
+-    if not os.path.exists(database):
+-        return True, 0, []
+ 
+-    conn = sqlite3.connect(database)
++
++class SQLitePreflightTimeout(UnsafeSQLiteConfiguration):
++    """The SQLite foreign-key preflight exceeded its time budget."""
++
++
++def _classify_target(database: str | None) -> tuple[str, str | None]:
++    """Classify what SQLite would open for ``database``.
++
++    Returns ``(kind, path)``: ``"file"`` with an absolute path, or ``"memory"``
++    or ``"named-memory"`` with ``None``. A named in-memory database is its own
++    kind because it has no image to inspect and is refused by the caller.
++
++    ``file:`` URIs are classified rather than skipped. SQLAlchemy passes such a
++    database string through verbatim when ``uri=true``, and it can name a real
++    database file or a shared-memory database, so neither may be assumed clean.
++    A ``file:`` target whose host makes the file ambiguous raises here: there is
++    no single file to inspect, so it cannot be judged safe.
++    """
++    if not database or database == ":memory:":
++        return "memory", None
++    if not database.startswith("file:"):
++        return "file", os.path.abspath(database)
++
++    parts = urlsplit(database)
++    params = parse_qs(parts.query)
++    if params.get("mode", [""])[0] == "memory":
++        return "named-memory", None
++    if parts.netloc and parts.netloc != "localhost":
++        raise UnsafeSQLiteConfiguration(
++            f"URI {database!r} names host {parts.netloc!r}; SQLite has no "
++            "authority component, so the file it would open is ambiguous and "
++            "cannot be inspected read-only."
++        )
++    path = unquote(parts.path)
++    if path == ":memory:":
++        if params.get("cache", [""])[0] == "shared":
++            return "named-memory", None
++        return "memory", None
++    if not path:
++        return "memory", None
++    return "file", os.path.abspath(path)
++
++
++def _deadline_guard(
++    path: str,
++    budget: float,
++    *,
++    clock: Callable[[], float] = time.monotonic,
++) -> Callable[[], None]:
++    """Return a guard that raises ``SQLitePreflightTimeout`` once ``budget`` is spent.
++
++    One guard means one deadline: snapshot creation and the scan share it, and
++    it is never reset between phases. The deadline is cooperative: expiry is
++    noticed at the next phase boundary, backup batch or progress-hook interval,
++    so a phase can overshoot the budget by a small interval rather than
++    stopping at an exact wall-clock instant.
++
++    ``clock`` exists so tests can drive the deadline deterministically;
++    production always uses ``time.monotonic``.
++    """
++    deadline = clock() + budget
++
++    def _raise_if_expired() -> None:
++        if clock() >= deadline:
++            raise SQLitePreflightTimeout(
++                f"inspecting {path} for the foreign-key preflight exceeded "
++                f"{budget:g}s"
++            )
++
++    return _raise_if_expired
++
++
++def _violation_summary(
++    snapshot: str,
++    check_deadline: Callable[[], None],
++) -> tuple[int, list[str], bool]:
++    """Count violations under a deadline, retaining only a bounded sample.
++
++    ``PRAGMA foreign_key_check`` emits one row per violating row, so the cursor
++    is streamed instead of collected: ``fetchall()`` would grow with the damage.
++    Every row is counted; only distinct offending table names are retained, and
++    at most ``_VIOLATION_TABLE_SAMPLE_LIMIT`` of them.
++
++    Returns ``(violations, tables, sample_truncated)``. ``sample_truncated``
++    means further distinct table names were seen but not retained, so the
++    sample is diagnostic rather than exhaustive while the count stays exact.
++
++    The scan is a single statement, so the copy's progress callback cannot bind
++    it. SQLite's progress hook can: on expiry the handler marks the interruption
++    as its own and returns non-zero to abort the statement. CPython then raises
++    ``OperationalError("interrupted")``, which becomes the typed timeout only
++    because of that marker — an unrelated SQLite error is left to the caller's
