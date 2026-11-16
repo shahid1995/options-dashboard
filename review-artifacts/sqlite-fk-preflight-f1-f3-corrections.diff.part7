@@ -1,0 +1,314 @@
++    assert not os.path.exists("fk_memdb")
++
++
++def test_engine_fails_closed_when_the_snapshot_budget_expires(tmp_path, monkeypatch):
++    """The factory raises instead of returning an engine it could not inspect."""
++    path = _large_database(tmp_path / "engine_slow.db", orphan=True)
++    main_before = _digest(path)
++    monkeypatch.setattr(db.settings, "DATABASE_URL", f"sqlite:///{path}")
++    monkeypatch.setattr(db.settings, "SQLITE_FK_PREFLIGHT_TIMEOUT_SECONDS", 0.0)
++
++    with pytest.raises(db.SQLitePreflightTimeout):
++        db._engine()
++
++    assert _digest(path) == main_before, "a failed engine build wrote to the database"
++    assert path not in db._SQLITE_FK_STATE, "an uninspected database was recorded"
++
++
++def test_preflight_budget_is_configurable_from_the_environment(tmp_path, monkeypatch):
++    """A large but healthy database can raise the budget instead of failing startup."""
++    from app.config import Settings
++
++    path = _large_database(tmp_path / "healthy.db", orphan=False)
++
++    # The environment override reaches the settings model with the documented name.
++    monkeypatch.setenv("SQLITE_FK_PREFLIGHT_TIMEOUT_SECONDS", "30")
++    assert Settings().SQLITE_FK_PREFLIGHT_TIMEOUT_SECONDS == 30.0
++
++    # The preflight reads that setting rather than a module constant: the same
++    # large database passes under the raised budget and fails closed under zero.
++    monkeypatch.setattr(db.settings, "SQLITE_FK_PREFLIGHT_TIMEOUT_SECONDS", 30.0)
++    assert db._sqlite_fk_preflight(str(path)) is None
++
++    monkeypatch.setattr(db.settings, "SQLITE_FK_PREFLIGHT_TIMEOUT_SECONDS", 0.0)
++    with pytest.raises(db.SQLitePreflightTimeout):
++        db._sqlite_fk_preflight(str(path))
++
++
++def test_preflight_refuses_an_unresolvable_uri():
++    """An ambiguous target refuses startup instead of being declared clean."""
++    with pytest.raises(db.UnsafeSQLiteConfiguration, match="names host"):
++        db._sqlite_fk_preflight("file://somehost/srv/app.db", {"uri": "true"})
++
++
++# ---------------------------------------------------------------------------
++# Engine creation fails closed
++# ---------------------------------------------------------------------------
++
++
++def test_engine_refuses_a_dirty_wal_database_and_leaves_it_untouched(
++    tmp_path, monkeypatch
++):
++    """Refusing startup must not rewrite the database it refused."""
++    path = _make_wal_database(tmp_path / "engine_wal_dirty.db", orphan=True, unclean=True)
++    wal = f"{path}-wal"
++    main_before = _digest(path)
++    wal_before = _digest(wal)
++    monkeypatch.setattr(db.settings, "DATABASE_URL", f"sqlite:///{path}")
++
++    with pytest.raises(db.SQLiteForeignKeyViolation):
++        db._engine()
++
++    assert _digest(path) == main_before, "the refused database was written to"
++    assert _digest(wal) == wal_before, "the refused database's WAL was written to"
++    assert path not in db._SQLITE_FK_STATE
++
++
++def test_each_physical_connection_enables_and_verifies_enforcement(
++    monkeypatch, tmp_path
++):
++    """Enforcement is set and read back per connection, not trusted from a cache."""
++    path = _legacy_db(tmp_path / "clean_pool.db", orphan=False)
++    monkeypatch.setattr(db.settings, "DATABASE_URL", f"sqlite:///{path}")
++
++    eng = db._engine()
++    try:
++        first = eng.connect()
++        second = eng.connect()
++        try:
++            assert first.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
++            assert second.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
++            assert (
++                first.connection.dbapi_connection
++                is not second.connection.dbapi_connection
++            ), "the two checks must run on separate physical connections"
++        finally:
++            first.close()
++            second.close()
++    finally:
++        eng.dispose()
++
++    assert db._SQLITE_FK_STATE[path] == "preflight_passed"
++
++
++@pytest.mark.parametrize(
++    "url",
++    [
++        "sqlite:///file:fk_mem_only?mode=memory&uri=true",
++        "sqlite:///file:fk_mem_shared?mode=memory&cache=shared&uri=true",
++    ],
++)
++def test_engine_rejects_named_memory_urls(monkeypatch, url):
++    """Named shared-memory databases cannot be inspected, so they are refused."""
++    monkeypatch.setattr(db.settings, "DATABASE_URL", url)
++
++    with pytest.raises(db.UnsafeSQLiteConfiguration, match="named in-memory"):
++        db._engine()
++
++
++def test_engine_still_supports_an_ordinary_memory_database(monkeypatch):
++    """``:memory:`` has no rows to inspect and remains supported."""
++    monkeypatch.setattr(db.settings, "DATABASE_URL", "sqlite:///:memory:")
++
++    eng = db._engine()
++    try:
++        with eng.connect() as conn:
++            assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
++    finally:
++        eng.dispose()
++
++    assert db._SQLITE_FK_STATE[":memory:"] == "preflight_passed"
++
++
++def test_engine_refuses_a_malformed_database(tmp_path, monkeypatch):
++    """An unreadable file fails closed instead of being treated as clean."""
++    path = tmp_path / "malformed.db"
++    path.write_bytes(b"this is not a SQLite database" * 64)
++    monkeypatch.setattr(db.settings, "DATABASE_URL", f"sqlite:///{path}")
++
++    with pytest.raises(db.UnsafeSQLiteConfiguration):
++        db._engine()
++
++    assert str(path) not in db._SQLITE_FK_STATE
++
++
++# ---------------------------------------------------------------------------
++# Bounded violation diagnostics
++# ---------------------------------------------------------------------------
++
++
++def _many_violations(path, *, rows, tables=1):
++    """``rows`` orphan rows spread evenly over ``tables`` child tables."""
++    per_table = rows // tables
++    conn = sqlite3.connect(path)
++    try:
++        conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
++        for index in range(tables):
++            conn.execute(
++                f"CREATE TABLE child_{index} ("
++                "id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))"
++            )
++            conn.executemany(
++                f"INSERT INTO child_{index} (id, pid) VALUES (?, 999)",
++                ((value,) for value in range(per_table)),
++            )
++        conn.commit()
++    finally:
++        conn.close()
++    return str(path)
++
++
++def test_violation_count_is_exact_beyond_the_table_sample(tmp_path):
++    """The total stays exact even when the table sample is capped."""
++    path = _many_violations(tmp_path / "many_tables.db", rows=25, tables=25)
++
++    with pytest.raises(db.SQLiteForeignKeyViolation) as excinfo:
++        db._sqlite_fk_preflight(path)
++
++    error = excinfo.value
++    assert error.violations == 25, "the total count must not be bounded"
++    assert len(error.tables) == db._VIOLATION_TABLE_SAMPLE_LIMIT
++    assert len(set(error.tables)) == len(error.tables), "sample must be de-duplicated"
++    assert error.sample_truncated is True
++    assert "plus more beyond" in str(error)
++
++
++def test_duplicate_tables_do_not_consume_sample_slots(tmp_path):
++    """Many violations in one table keep one sample slot and stay exact."""
++    path = _many_violations(tmp_path / "one_table.db", rows=40, tables=1)
++
++    with pytest.raises(db.SQLiteForeignKeyViolation) as excinfo:
++        db._sqlite_fk_preflight(path)
++
++    assert excinfo.value.violations == 40
++    assert excinfo.value.tables == ["child_0"]
++    assert excinfo.value.sample_truncated is False
++
++
++def test_violations_are_streamed_not_materialised(tmp_path):
++    """100k result rows must not be retained: fetchall() would dwarf this bound."""
++    path = _many_violations(tmp_path / "huge_violations.db", rows=100_000)
++    guard = db._deadline_guard(path, 60.0)
++
++    tracemalloc.start()
++    try:
++        violations, tables, truncated = db._violation_summary(path, guard)
++        _current, peak = tracemalloc.get_traced_memory()
++    finally:
++        tracemalloc.stop()
++
++    assert violations == 100_000
++    assert (tables, truncated) == (["child_0"], False)
++    # Materialising the rows costs tens of MB; streaming keeps the peak small.
++    assert peak < 4 * 1024 * 1024, f"violations were materialised (peak {peak} bytes)"
++
++
++# ---------------------------------------------------------------------------
++# Deadline phase boundaries and interruption classification
++# ---------------------------------------------------------------------------
++
++
++def _scripted_clock(values):
++    """A clock that walks ``values`` and then repeats the last one."""
++    remaining = list(values)
++
++    def clock():
++        if len(remaining) > 1:
++            return remaining.pop(0)
++        return remaining[0]
++
++    return clock
++
++
++def test_deadline_is_checked_before_the_snapshot_starts(tmp_path, monkeypatch):
++    """An expired budget is refused before any connection or temp file exists."""
++    path = _legacy_db(tmp_path / "expired_before.db", orphan=False)
++    monkeypatch.setattr(db.settings, "SQLITE_FK_PREFLIGHT_TIMEOUT_SECONDS", 0.0)
++    opened = []
++    real_connect = sqlite3.connect
++
++    def record_connect(*args, **kwargs):
++        opened.append(args[0] if args else kwargs.get("database"))
++        return real_connect(*args, **kwargs)
++
++    monkeypatch.setattr(sqlite3, "connect", record_connect)
++    before = _snapshot_directories()
++
++    with pytest.raises(db.SQLitePreflightTimeout):
++        db._snapshot_violation_rows(str(path))
++
++    assert opened == [], "a connection was opened before the deadline check"
++    assert _snapshot_directories() - before == set()
++
++
++def test_deadline_expiring_after_the_copy_is_rejected(tmp_path, monkeypatch):
++    """A copy that finishes over budget is refused before the scan starts."""
++    path = _legacy_db(tmp_path / "copy_expiry.db", orphan=False)
++    copied = {"done": False}
++    opened = []
++    real_connect = sqlite3.connect
++
++    class _Source:
++        """Proxy for the read-only source, to observe when the copy returns."""
++
++        def __init__(self, connection):
++            self._connection = connection
++
++        def backup(self, target, **kwargs):
++            self._connection.backup(target, **kwargs)
++            copied["done"] = True
++
++        def __getattr__(self, name):
++            return getattr(self._connection, name)
++
++    def record_connect(*args, **kwargs):
++        opened.append(1)
++        connection = real_connect(*args, **kwargs)
++        return _Source(connection) if kwargs.get("uri") else connection
++
++    monkeypatch.setattr(sqlite3, "connect", record_connect)
++    clock = lambda: 100.0 if copied["done"] else 0.0  # noqa: E731
++
++    with pytest.raises(db.SQLitePreflightTimeout):
++        db._snapshot_violation_rows(str(path), clock=clock)
++
++    assert len(opened) == 2, "the scan opened a connection after the deadline passed"
++
++
++def _foreign_key_mismatch_db(path):
++    """A database whose ``foreign_key_check`` fails immediately.
++
++    ``child`` references ``parent(id)``, which is not unique, so SQLite raises
++    ``OperationalError("foreign key mismatch")`` as soon as the pragma runs.
++    """
++    conn = sqlite3.connect(path)
++    try:
++        conn.execute("CREATE TABLE parent(id INTEGER)")
++        conn.execute(
++            "CREATE TABLE child(id INTEGER PRIMARY KEY, "
++            "pid INTEGER REFERENCES parent(id))"
++        )
++        conn.commit()
++    finally:
++        conn.close()
++    return str(path)
++
++
++def test_deadline_is_checked_before_the_scan_starts(tmp_path, monkeypatch):
++    """The statement never runs once the budget is spent.
++
++    The scan would fail immediately with an unrelated SQLite error, so a typed
++    timeout proves the explicit pre-scan check refused the work. That matters
++    because a short scan may never reach the progress hook, and the post-scan
++    check alone would let the statement run first.
++    """
++    path = _foreign_key_mismatch_db(tmp_path / "expired_scan.db")
++    monkeypatch.setattr(db, "_CHECK_PROGRESS_STEPS", 10**9)
++    expired = db._deadline_guard(path, 0.0)
++
++    with pytest.raises(db.SQLitePreflightTimeout):
++        db._violation_summary(path, expired)
++
++
++def test_deadline_is_checked_after_a_completed_scan(tmp_path, monkeypatch):
++    """A scan that completes after the budget is a timeout, not a clean result."""

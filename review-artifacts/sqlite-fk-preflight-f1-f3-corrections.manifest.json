@@ -1,0 +1,47 @@
+{
+  "artifact": "sqlite-fk-preflight-f1-f3-corrections.diff",
+  "description": "Complete unified diff of the SQLite foreign-key preflight F1-F3 work. Review artifact only: no application source is committed on this branch.",
+  "base_commit": "dd1d06ec34985e471ed05a21f38afe3d83090e54",
+  "diff_sha256": "e317b3c85631425c279428ca530010430df6d9831ccf6a9100fdc762c3590283",
+  "diff_bytes": 90692,
+  "diff_lines": 1850,
+  "parts_count": 8,
+  "files_changed": [
+    "CHANGELOG.md",
+    "INVARIANTS.md",
+    "TESTING.md",
+    "options-dashboard-project/backend/app/config.py",
+    "options-dashboard-project/backend/app/db.py",
+    "options-dashboard-project/backend/tests/test_db_sqlite_pragmas.py"
+  ],
+  "hunks_total": 11,
+  "hunks_per_file": {
+    "CHANGELOG.md": 1,
+    "INVARIANTS.md": 1,
+    "TESTING.md": 1,
+    "options-dashboard-project/backend/app/config.py": 1,
+    "options-dashboard-project/backend/app/db.py": 4,
+    "options-dashboard-project/backend/tests/test_db_sqlite_pragmas.py": 3
+  },
+  "reassemble": "cat part1 part2 part3 part4 part5 part6 part7 part8 (no separators, numeric order, exactly as stored) then verify diff_bytes and diff_sha256 above",
+  "slice_policy": "Boundaries fall on file-diff boundaries and hunk boundaries. A file's diff header is never separated from its first hunk. Three hunks are larger than the 17,500-byte slice limit; those are the only places a part starts mid-hunk, and each such part records continues_hunk below so a continuation cannot be mistaken for an omission.",
+  "previous_artifact_note": "This supersedes review/sqlite-fk-preflight-f1-f3-corrections (commit 5fef59a4) only in slicing: the diff bytes are identical (sha256 e317b3c8...). Parts here are aligned to file/hunk boundaries so no part ends mid-function.",
+  "parts": [
+    {"part": 1, "blob": "4bad6acb000db262e306a09bbcae9a01be698894", "bytes": 14511, "sha256": "fa9045596c49e50bf3d3660fe6028fb7466e03167849f1294c418a2399c69cb2", "diff_lines": [1, 114], "starts_at_file_header": ["CHANGELOG.md", "INVARIANTS.md"], "continues_hunk": null},
+    {"part": 2, "blob": "e403c7965f76f48377b066ac9791ce4d296d2716", "bytes": 7264, "sha256": "a982c7ff55050dd54fdb542bda0828ab6554d14b8fc067954380b1e50513927f", "diff_lines": [115, 197], "starts_at_file_header": ["TESTING.md"], "starts_at_hunk": "@@ -180,6 +180,41 @@ Verify:", "continues_hunk": null},
+    {"part": 3, "blob": "e9b91a6dd7f077be4c351af260c3f607a06d4cdc", "bytes": 12666, "sha256": "8f7eba5cd852fe68dfa4f128730cacd89188b3ec9f0e8904ef6bd83d2aeb6ec1", "diff_lines": [198, 482], "starts_at_hunk": "@@ -34,34 +39,549 @@", "continues_hunk": null},
+    {"part": 4, "blob": "73e15ff99b7811f061b1fd5c01ae063b1b80eb5c", "bytes": 11742, "sha256": "1fc1615cbf4bbc32e525ab94567c5be290dc67bd0c68b2e25ed8b7c68e4fb9b2", "diff_lines": [483, 766], "continues_hunk": "@@ -34,34 +39,549 @@ (options-dashboard-project/backend/app/db.py) - this part is the remainder of the same hunk declared in part 3"},
+    {"part": 5, "blob": "5ed63a41aa41fafeef91790a726877403b35b6af", "bytes": 6911, "sha256": "df11abe6b21526bb6800ecb2d47592d4a1c413fabf3316294145227849a14ffc", "diff_lines": [767, 910], "starts_at_hunk": "@@ -72,7 +592,33 @@", "continues_hunk": null},
+    {"part": 6, "blob": "1ff9b05e6081faa7991711f1db182788c8af9b10", "bytes": 12603, "sha256": "bf72b2f5f7b7ec9f966a200003672b865f0106a3426c759a06111ea52b457291", "diff_lines": [911, 1224], "starts_at_hunk": "@@ -143,23 +145,930 @@", "continues_hunk": null},
+    {"part": 7, "blob": "c53d8fadcf9dc22ad21ce4ff478eec7187a135fb", "bytes": 12274, "sha256": "680ab7ee81dbd61fb31cbb0a6ccdda0abd45644d4e2658a0367c6c6cc3339e37", "diff_lines": [1225, 1538], "continues_hunk": "@@ -143,23 +145,930 @@ (options-dashboard-project/backend/tests/test_db_sqlite_pragmas.py) - remainder of the hunk declared in part 6"},
+    {"part": 8, "blob": "d8767e1c3ceebf8e5a4da7a6064a740d8c6d94e9", "bytes": 12721, "sha256": "09c79f4a93b28ff52d7cd64eee55f70bab6f9dd7f65225ab0902abc807c0fcaf", "diff_lines": [1539, 1850], "continues_hunk": "@@ -143,23 +145,930 @@ (options-dashboard-project/backend/tests/test_db_sqlite_pragmas.py) - remainder of the hunk declared in part 6"}
+  ],
+  "validation": {
+    "git_diff_check": "exit 0",
+    "hunk_line_counts": "all 11 hunks match their declared old/new counts",
+    "git_apply_check": "exit 0 against a clean worktree at dd1d06e (git worktree add --detach), using both the generated diff and the reassembled parts",
+    "apply_reproduces_worktree": "applying the diff to the pristine tree yields files whose sha256 matches the local worktree for all six files",
+    "reassembly": "concatenation of the eight published parts is byte-identical to the generated diff (90692 bytes, sha256 e317b3c8...)"
+  },
+  "scope": "Review artifact only. Application source remains uncommitted and unpublished; this branch adds no source file, opens no PR and merges nothing."
+}

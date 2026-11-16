@@ -1,0 +1,314 @@
+@@ -143,23 +145,930 @@ def test_legacy_database_without_violations_is_enforced(monkeypatch, tmp_path):
+     finally:
+         eng.dispose()
+ 
+-    assert db._SQLITE_FK_STATE[path] == "enforced"
++    assert db._SQLITE_FK_STATE[path] == "preflight_passed"
+ 
+ 
+-def test_preflight_reports_violation_counts(monkeypatch, tmp_path):
++def test_preflight_error_reports_violation_counts(tmp_path):
+     """The guard reports what it found, so the error is actionable."""
+     path = _legacy_db(tmp_path / "legacy_report.db", orphan=True)
+ 
+-    safe, count, tables = db._sqlite_fk_preflight(path)
++    with pytest.raises(db.SQLiteForeignKeyViolation) as excinfo:
++        db._sqlite_fk_preflight(path)
+ 
+-    assert safe is False
+-    assert count == 1
+-    assert tables == ["legacy_child"]
++    assert excinfo.value.violations == 1
++    assert excinfo.value.tables == ["legacy_child"]
+ 
+ 
+ def test_preflight_treats_a_missing_file_as_clean(tmp_path):
+     """A database that does not exist yet cannot contain violations."""
+-    safe, count, tables = db._sqlite_fk_preflight(str(tmp_path / "absent.db"))
+-
+-    assert (safe, count, tables) == (True, 0, [])
++    assert db._sqlite_fk_preflight(str(tmp_path / "absent.db")) is None
+     assert not (tmp_path / "absent.db").exists()
++
++
++# ---------------------------------------------------------------------------
++# Preflight reads are non-mutating: read-only source + Online Backup snapshot
++# ---------------------------------------------------------------------------
++
++
++def _make_wal_database(path, *, orphan=False, unclean=True):
++    """Create a WAL database, optionally leaving committed frames uncheckpointed.
++
++    With ``unclean=True`` the writer exits without closing its connection, so the
++    ``-wal`` file survives and the rows -- including any orphan -- exist only in
++    WAL frames until something checkpoints the database.
++    """
++    statements = [
++        "import os, sqlite3",
++        f"conn = sqlite3.connect({str(path)!r})",
++        "conn.execute('PRAGMA journal_mode=WAL')",
++        "conn.execute('CREATE TABLE parent(id INTEGER PRIMARY KEY)')",
++        "conn.execute('CREATE TABLE child(id INTEGER PRIMARY KEY, "
++        "pid INTEGER REFERENCES parent(id))')",
++        "conn.execute('INSERT INTO parent VALUES (1)')",
++        "conn.execute('INSERT INTO child VALUES (1, 1)')",
++    ]
++    if orphan:
++        statements.append("conn.execute('INSERT INTO child VALUES (2, 999)')")
++    statements.append("conn.commit()")
++    statements.append("os._exit(0)" if unclean else "conn.close()")
++    subprocess.run([sys.executable, "-c", "\n".join(statements)], check=True)
++    return path
++
++
++def _digest(path):
++    with open(path, "rb") as handle:
++        return hashlib.sha256(handle.read()).hexdigest()
++
++
++def test_preflight_snapshot_leaves_the_database_and_wal_byte_identical(tmp_path):
++    """Inspecting a crashed WAL database neither rewrites it nor loses the WAL."""
++    path = _make_wal_database(tmp_path / "wal_dirty.db", orphan=True, unclean=True)
++    wal = f"{path}-wal"
++    assert os.path.getsize(wal) > 0, "fixture must leave committed frames in the WAL"
++
++    main_before = _digest(path)
++    wal_before = _digest(wal)
++
++    # The orphan only ever reached WAL frames, so seeing it proves the snapshot
++    # includes committed WAL state instead of reading a pre-WAL image.
++    with pytest.raises(db.SQLiteForeignKeyViolation) as excinfo:
++        db._sqlite_fk_preflight(str(path))
++    assert excinfo.value.violations == 1
++    assert excinfo.value.tables == ["child"]
++    assert os.path.exists(wal), "the preflight deleted the WAL file"
++    assert _digest(path) == main_before, "the preflight wrote to the main database"
++    assert _digest(wal) == wal_before, "the preflight wrote to the WAL file"
++
++
++def test_preflight_leaves_a_checkpointed_database_byte_identical(tmp_path):
++    """A cleanly closed WAL database is also inspected without being touched."""
++    path = _make_wal_database(tmp_path / "wal_clean.db", orphan=False, unclean=False)
++    main_before = _digest(path)
++
++    assert db._sqlite_fk_preflight(str(path)) is None
++
++    assert _digest(path) == main_before
++
++
++def test_preflight_creates_no_sidecars_for_a_rollback_journal_database(tmp_path):
++    """Without a WAL, the read-only snapshot leaves no files behind at all."""
++    path = tmp_path / "rollback.db"
++    conn = sqlite3.connect(path)
++    try:
++        conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
++        conn.execute(
++            "CREATE TABLE child(id INTEGER PRIMARY KEY, "
++            "pid INTEGER REFERENCES parent(id))"
++        )
++        conn.execute("INSERT INTO parent VALUES (1)")
++        conn.execute("INSERT INTO child VALUES (1, 1)")
++        conn.execute("INSERT INTO child VALUES (2, 999)")
++        conn.commit()
++    finally:
++        conn.close()
++
++    with pytest.raises(db.SQLiteForeignKeyViolation):
++        db._sqlite_fk_preflight(str(path))
++    assert [p.name for p in tmp_path.iterdir()] == ["rollback.db"]
++
++
++def test_preflight_removes_its_temporary_snapshot(tmp_path):
++    """The private copy is cleaned up, so repeated preflights do not accumulate files."""
++    path = _make_wal_database(tmp_path / "wal_cleanup.db", orphan=False)
++    before = _snapshot_directories()
++
++    db._sqlite_fk_preflight(str(path))
++
++    assert _snapshot_directories() - before == set()
++
++
++def test_preflight_inspects_a_file_uri_instead_of_skipping_it(tmp_path):
++    """A ``file:`` target names a real database and must be checked like one."""
++    path = _make_wal_database(tmp_path / "uri_dirty.db", orphan=True)
++
++    with pytest.raises(db.SQLiteForeignKeyViolation) as excinfo:
++        db._sqlite_fk_preflight(f"file:{path}", {"uri": "true"})
++
++    assert (excinfo.value.violations, excinfo.value.tables) == (1, ["child"])
++
++
++def test_preflight_resolves_a_percent_encoded_uri_path(tmp_path):
++    """Percent-encoded URI paths resolve to the file SQLite would open."""
++    directory = tmp_path / "dir with space"
++    directory.mkdir()
++    path = _make_wal_database(directory / "fk.db", orphan=True)
++
++    with pytest.raises(db.SQLiteForeignKeyViolation) as excinfo:
++        db._sqlite_fk_preflight(f"file:{quote(str(path))}", {"uri": "true"})
++
++    assert excinfo.value.violations == 1
++
++
++def test_preflight_rejects_a_mode_memory_uri():
++    """A named in-memory database cannot be inspected, so it is not assumed clean."""
++    with pytest.raises(db.UnsafeSQLiteConfiguration, match="named in-memory"):
++        db._sqlite_fk_preflight(
++            "file:memdb1", {"uri": "true", "mode": "memory", "cache": "shared"}
++        )
++
++
++def _snapshot_directories():
++    return {n for n in os.listdir(tempfile.gettempdir()) if n.startswith("fk-preflight-")}
++
++
++def _large_database(path, *, orphan=False):
++    """A database big enough that the Online Backup API needs several batches."""
++    conn = sqlite3.connect(path)
++    try:
++        conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
++        conn.execute(
++            "CREATE TABLE child(id INTEGER PRIMARY KEY, "
++            "pid INTEGER REFERENCES parent(id), pad BLOB)"
++        )
++        conn.execute("INSERT INTO parent VALUES (0)")
++        conn.executemany(
++            "INSERT INTO child VALUES (?,?,?)",
++            ((i, 0, b"x" * 2000) for i in range(3000)),
++        )
++        if orphan:
++            conn.execute("INSERT INTO child VALUES (99999, 12345, x'00')")
++        conn.commit()
++    finally:
++        conn.close()
++    return path
++
++
++def test_snapshot_copies_a_multi_batch_database(tmp_path):
++    """The snapshot works across several backup iterations, not one giant step."""
++    path = _large_database(tmp_path / "multi.db", orphan=True)
++    assert os.path.getsize(path) > db._BACKUP_PAGE_BATCH * 4096
++
++    with pytest.raises(db.SQLiteForeignKeyViolation) as excinfo:
++        db._sqlite_fk_preflight(str(path))
++    assert excinfo.value.violations == 1
++
++
++def test_snapshot_deadline_fails_closed_on_a_large_database(tmp_path, monkeypatch):
++    """An expired budget raises instead of returning, and touches nothing."""
++    path = _large_database(tmp_path / "slow.db", orphan=True)
++    main_before = _digest(path)
++    snapshots_before = _snapshot_directories()
++    monkeypatch.setattr(db.settings, "SQLITE_FK_PREFLIGHT_TIMEOUT_SECONDS", 0.0)
++
++    with pytest.raises(db.SQLitePreflightTimeout):
++        db._sqlite_fk_preflight(str(path))
++
++    assert _digest(path) == main_before, "an aborted snapshot wrote to the database"
++    assert _snapshot_directories() - snapshots_before == set(), (
++        "an aborted snapshot left its copy behind"
++    )
++
++
++def test_fk_check_scan_honours_the_same_deadline(tmp_path):
++    """The scan aborts at the shared deadline instead of running to completion.
++
++    The copy's progress callback cannot bound a single statement, so the scan
++    installs the same guard as SQLite's progress hook. With an expired budget
++    the statement is interrupted, and the interruption is reported as the typed
++    timeout instead of a generic SQLite error.
++    """
++    path = _large_database(tmp_path / "scan_budget.db", orphan=False)
++    expired = db._deadline_guard(str(path), 0.0)
++
++    started = time.monotonic()
++    with pytest.raises(db.SQLitePreflightTimeout):
++        db._violation_summary(str(path), expired)
++    elapsed = time.monotonic() - started
++
++    assert elapsed < 1.0, "the scan was not interrupted; it can stall startup"
++
++
++def test_fk_check_scan_completes_under_the_budget(tmp_path):
++    """The scan guard does not disturb a check that fits in the budget."""
++    path = _large_database(tmp_path / "scan_ok.db", orphan=False)
++
++    assert db._sqlite_fk_preflight(str(path)) is None
++
++
++def test_snapshot_deadline_fails_closed_on_a_locked_source(tmp_path, monkeypatch):
++    """A locked database returns within the budget instead of spinning forever.
++
++    Python's ``backup()`` retries ``SQLITE_BUSY`` internally and never returns
++    on its own, so the preflight runs in a worker thread with a join timeout:
++    a regression fails this test instead of hanging the suite.
++    """
++    path = tmp_path / "locked.db"
++    conn = sqlite3.connect(path)
++    try:
++        conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
++        conn.execute("INSERT INTO parent VALUES (1)")
++        conn.commit()
++    finally:
++        conn.close()
++
++    monkeypatch.setattr(db.settings, "SQLITE_FK_PREFLIGHT_TIMEOUT_SECONDS", 0.3)
++    before = _snapshot_directories()
++
++    holder = sqlite3.connect(path, isolation_level=None)
++    holder.execute("BEGIN EXCLUSIVE")
++    holder.execute("INSERT INTO parent VALUES (2)")
++    outcome = {}
++
++    def run():
++        try:
++            outcome["result"] = db._sqlite_fk_preflight(str(path))
++        except BaseException as exc:  # noqa: BLE001 - recorded for the assertion
++            outcome["error"] = exc
++
++    try:
++        worker = threading.Thread(target=run, daemon=True)
++        started = time.monotonic()
++        worker.start()
++        worker.join(10)
++        elapsed = time.monotonic() - started
++    finally:
++        holder.rollback()
++        holder.close()
++
++    assert not worker.is_alive(), (
++        "the preflight never returned: the deadline does not bound a locked source"
++    )
++    assert isinstance(outcome.get("error"), db.SQLitePreflightTimeout)
++    assert elapsed < 5.0
++    assert _snapshot_directories() - before == set(), "a timed-out snapshot left its copy behind"
++
++
++def test_engine_passes_the_parsed_query_to_the_preflight(monkeypatch):
++    """``_engine()`` forwards the URL query, so URI semantics are honoured.
++
++    SQLAlchemy splits ``?mode=memory&cache=shared&uri=true`` off into
++    ``url.query``; the classifier needs that query to tell a named in-memory
++    database from a file path, and to require uri=true before reading a
++    ``file:`` string as a URI at all.
++    """
++    monkeypatch.setattr(
++        db.settings,
++        "DATABASE_URL",
++        "sqlite:///file:fk_memdb?mode=memory&cache=shared&uri=true",
++    )
++    seen = []
++    real = db._sqlite_fk_preflight
++
++    def spy(database, query=None):
++        seen.append((database, dict(query or {})))
++        return real(database, query)
++
++    monkeypatch.setattr(db, "_sqlite_fk_preflight", spy)
++
++    with pytest.raises(db.UnsafeSQLiteConfiguration, match="named in-memory"):
++        db._engine()
++
++    assert seen == [
++        ("file:fk_memdb", {"mode": "memory", "cache": "shared", "uri": "true"})
++    ]

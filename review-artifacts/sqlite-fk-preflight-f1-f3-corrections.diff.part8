@@ -1,0 +1,312 @@
++    path = _legacy_db(tmp_path / "post_scan.db", orphan=False)
++    monkeypatch.setattr(db, "_CHECK_PROGRESS_STEPS", 10**9)
++    # guard creation, pre-scan check, post-scan check
++    guard = db._deadline_guard(path, 5.0, clock=_scripted_clock([0.0, 0.0, 100.0]))
++
++    with pytest.raises(db.SQLitePreflightTimeout):
++        db._violation_summary(path, guard)
++
++
++def test_deliberate_interrupt_is_a_timeout(tmp_path):
++    """The handler's own abort is reported as the typed timeout."""
++    path = _many_violations(tmp_path / "interrupt.db", rows=5_000)
++    # guard creation and pre-scan are inside budget; the first hook call is not.
++    guard = db._deadline_guard(path, 5.0, clock=_scripted_clock([0.0, 0.0, 100.0]))
++
++    with pytest.raises(db.SQLitePreflightTimeout) as excinfo:
++        db._violation_summary(path, guard)
++
++    assert "exceeded" in str(excinfo.value)
++
++
++def test_progress_hook_aborts_a_scan_that_outlives_the_budget(tmp_path):
++    """The hook, not a boundary check, is what stops a long scan.
++
++    Only the hook can abort from inside the single statement, and that abort
++    is re-raised with the interrupted SQLite error as its cause. A boundary
++    check would raise the same type with no cause, so this assertion fails if
++    the progress handler is removed.
++    """
++    path = _many_violations(tmp_path / "hook_only.db", rows=5_000)
++    guard = db._deadline_guard(path, 5.0, clock=_scripted_clock([0.0, 0.0, 100.0, 0.0]))
++
++    with pytest.raises(db.SQLitePreflightTimeout) as excinfo:
++        db._violation_summary(path, guard)
++
++    assert isinstance(excinfo.value.__cause__, sqlite3.OperationalError)
++    assert "interrupt" in str(excinfo.value.__cause__).lower()
++
++
++def test_unrelated_operational_error_is_not_a_timeout(tmp_path, monkeypatch):
++    """A SQLite failure after the deadline stays an inspection failure."""
++    path = _foreign_key_mismatch_db(tmp_path / "mismatch.db")
++
++    monkeypatch.setattr(db, "_CHECK_PROGRESS_STEPS", 10**9)
++    # Pre-scan check passes, then the clock is far past the budget while SQLite
++    # reports a foreign-key mismatch (the parent column is not unique).
++    guard = db._deadline_guard(str(path), 5.0, clock=_scripted_clock([0.0, 0.0, 1e9]))
++
++    with pytest.raises(sqlite3.Error) as excinfo:
++        db._violation_summary(str(path), guard)
++
++    assert not isinstance(excinfo.value, db.SQLitePreflightTimeout)
++    assert "foreign key mismatch" in str(excinfo.value).lower()
++
++    # The same failure refuses engine creation as an inspection failure.
++    with pytest.raises(db.UnsafeSQLiteConfiguration) as wrapped:
++        db._sqlite_fk_preflight(str(path))
++    assert not isinstance(wrapped.value, db.SQLitePreflightTimeout)
++
++
++# ---------------------------------------------------------------------------
++# Diagnostic state semantics
++# ---------------------------------------------------------------------------
++
++
++def test_engine_construction_records_only_preflight_passed(monkeypatch, tmp_path):
++    """create_engine() is lazy, so construction must not claim enforcement."""
++    path = _legacy_db(tmp_path / "lazy.db", orphan=False)
++    monkeypatch.setattr(db.settings, "DATABASE_URL", f"sqlite:///{path}")
++
++    eng = db._engine()
++    try:
++        assert db._SQLITE_FK_STATE[path] == "preflight_passed"
++        assert "enforced" not in db._SQLITE_FK_STATE.values()
++        assert eng.pool.checkedout() == 0, "construction opened a physical connection"
++    finally:
++        eng.dispose()
++
++
++def test_failed_construction_leaves_no_stale_verdict(monkeypatch, tmp_path):
++    """A later failed attempt must not inherit an earlier success verdict."""
++    path = _legacy_db(tmp_path / "rerun.db", orphan=False)
++    monkeypatch.setattr(db.settings, "DATABASE_URL", f"sqlite:///{path}")
++
++    first = db._engine()
++    first.dispose()
++    assert db._SQLITE_FK_STATE[path] == "preflight_passed"
++
++    def explode(*_args, **_kwargs):
++        raise RuntimeError("engine construction failed")
++
++    monkeypatch.setattr(db, "create_engine", explode)
++
++    with pytest.raises(RuntimeError):
++        db._engine()
++
++    assert path not in db._SQLITE_FK_STATE, (
++        "a failed attempt kept an earlier success verdict"
++    )
++
++# ---------------------------------------------------------------------------
++# F1: the preflight and the engine must resolve the same database
++# ---------------------------------------------------------------------------
++
++
++def _resolved(url):
++    """Resolve a DATABASE_URL the way ``_engine()`` does."""
++    from sqlalchemy.engine import make_url
++
++    query = db._parse_sqlite_query(url)
++    db._validate_sqlite_options(query)
++    return db._classify_target(make_url(url).database, query)
++
++
++def test_file_prefix_without_uri_semantics_is_refused(monkeypatch):
++    """A ``file:`` database without uri=true is a literal name, so it is refused.
++
++    SQLAlchemy passes ``os.path.abspath(database)`` as a filename in that case,
++    so reading the string as a URI would inspect a different file than the
++    engine opens.
++    """
++    monkeypatch.setattr(db.settings, "DATABASE_URL", "sqlite:///file:not-a-uri.db")
++
++    with pytest.raises(db.UnsafeSQLiteConfiguration, match="uri=true"):
++        db._engine()
++
++
++def test_engine_and_preflight_agree_on_a_file_uri_target(monkeypatch, tmp_path):
++    """The file the engine opens is the file the preflight resolved."""
++    path = _legacy_db(tmp_path / "same_target.db", orphan=False)
++    url = f"sqlite:///file:{path}?uri=true"
++    monkeypatch.setattr(db.settings, "DATABASE_URL", url)
++
++    assert _resolved(url) == ("file", os.path.abspath(path))
++
++    eng = db._engine()
++    try:
++        with eng.connect() as conn:
++            opened = conn.exec_driver_sql("PRAGMA database_list").fetchone()[2]
++    finally:
++        eng.dispose()
++
++    assert os.path.normcase(os.path.abspath(opened)) == os.path.normcase(
++        os.path.abspath(path)
++    ), "the engine opened a different file than the preflight resolved"
++
++
++def test_dirty_file_uri_target_is_inspected(monkeypatch, tmp_path):
++    """A dirty database named by a valid file URI refuses an engine."""
++    path = _legacy_db(tmp_path / "uri_dirty_engine.db", orphan=True)
++    monkeypatch.setattr(db.settings, "DATABASE_URL", f"sqlite:///file:{path}?uri=true")
++
++    with pytest.raises(db.SQLiteForeignKeyViolation) as excinfo:
++        db._engine()
++
++    assert excinfo.value.path == os.path.abspath(path)
++    assert (excinfo.value.violations, excinfo.value.tables) == (1, ["legacy_child"])
++
++
++def test_percent_encoded_file_uri_inspects_the_real_file(monkeypatch, tmp_path):
++    """A percent-encoded URI path resolves to the database SQLite opens."""
++    directory = tmp_path / "encoded dir"
++    directory.mkdir()
++    path = _legacy_db(directory / "encoded.db", orphan=True)
++    url = f"sqlite:///file:{quote(str(path))}?uri=true"
++    monkeypatch.setattr(db.settings, "DATABASE_URL", url)
++
++    assert _resolved(url) == ("file", os.path.abspath(path))
++
++    with pytest.raises(db.SQLiteForeignKeyViolation) as excinfo:
++        db._engine()
++
++    assert excinfo.value.path == os.path.abspath(path)
++
++
++@pytest.mark.parametrize(
++    "query, match",
++    [
++        ("uri=true&uri=true", "repeated"),
++        ("uri=true&mode=", "blank value"),
++        ("uri=true&=rw", "blank name"),
++        ("uri=true&vfs=unix-none", "cannot reproduce"),
++        ("uri=true&immutable=1", "cannot reproduce"),
++        ("uri=true&nolock=1", "cannot reproduce"),
++        ("uri=true&cache=shared", "cache=shared"),
++        ("uri=true&journal_mode=off", "not supported"),
++        ("uri=perhaps", "not a boolean"),
++        ("uri=true&mode=delete", "mode='delete'"),
++    ],
++)
++def test_unsafe_uri_options_fail_closed(monkeypatch, tmp_path, query, match):
++    """Ambiguous or unsupported URI options refuse startup instead of guessing."""
++    monkeypatch.setattr(
++        db.settings, "DATABASE_URL", f"sqlite:///file:{tmp_path / 'opts.db'}?{query}"
++    )
++
++    with pytest.raises(db.UnsafeSQLiteConfiguration, match=match):
++        db._engine()
++
++
++def test_supported_persistent_file_uri_is_accepted(monkeypatch, tmp_path):
++    """mode=rw and the default cache name the same file, so they are accepted."""
++    path = _legacy_db(tmp_path / "uri_ok.db", orphan=False)
++    url = f"sqlite:///file:{path}?mode=rw&cache=private&uri=true"
++    monkeypatch.setattr(db.settings, "DATABASE_URL", url)
++
++    eng = db._engine()
++    try:
++        with eng.connect() as conn:
++            assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
++    finally:
++        eng.dispose()
++
++    assert db._SQLITE_FK_STATE[os.path.abspath(path)] == "preflight_passed"
++
++
++# ---------------------------------------------------------------------------
++# F2: pathless and memory-variant URIs are not ordinary memory
++# ---------------------------------------------------------------------------
++
++
++def test_pathless_file_uri_is_refused_not_memory():
++    """``file:`` names no database, so it can never be read as ``:memory:``."""
++    with pytest.raises(db.UnsafeSQLiteConfiguration, match="names no database file"):
++        db._sqlite_fk_preflight("file:", {"uri": "true"})
++
++
++def test_localhost_pathless_uri_is_refused_not_memory():
++    """``file://localhost`` has an authority but no path: still not memory."""
++    with pytest.raises(db.UnsafeSQLiteConfiguration, match="names no database file"):
++        db._sqlite_fk_preflight("file://localhost", {"uri": "true"})
++
++    # The supported in-memory target is unchanged and still classified as memory.
++    assert db._classify_target(":memory:", {}) == ("memory", None)
++
++
++@pytest.mark.parametrize("extra", [{}, {"cache": "private"}, {"mode": "rw"}])
++def test_memory_uri_variants_are_refused(extra):
++    """Only the plain ``:memory:`` target is supported."""
++    with pytest.raises(db.UnsafeSQLiteConfiguration, match="in-memory database URI"):
++        db._sqlite_fk_preflight("file::memory:", {"uri": "true", **extra})
++
++
++def test_shared_memory_uri_remains_rejected():
++    """A named shared-memory database is still refused as uninspectable."""
++    with pytest.raises(db.UnsafeSQLiteConfiguration, match="named in-memory"):
++        db._sqlite_fk_preflight("file::memory:", {"uri": "true", "cache": "shared"})
++
++
++# ---------------------------------------------------------------------------
++# F3: a missing file is clean, an unreadable path fails closed
++# ---------------------------------------------------------------------------
++
++
++def test_absent_database_is_clean_and_not_created(tmp_path):
++    """A database that does not exist yet is clean, and the check creates none."""
++    path = tmp_path / "absent_f3.db"
++
++    assert db._sqlite_fk_preflight(str(path)) is None
++    assert not path.exists()
++    assert sorted(p.name for p in tmp_path.iterdir()) == []
++
++
++def test_permission_error_is_not_a_missing_file(monkeypatch, tmp_path):
++    """An unreadable existing database must not be treated as absent."""
++    path = tmp_path / "inaccessible.db"
++    path.write_bytes(b"")
++
++    def denied(_path):
++        raise PermissionError(13, "Permission denied", str(_path))
++
++    monkeypatch.setattr(db, "_stat", denied)
++
++    with pytest.raises(db.UnsafeSQLiteConfiguration, match="could not inspect"):
++        db._sqlite_fk_preflight(str(path))
++
++
++def test_not_a_directory_error_fails_closed(monkeypatch, tmp_path):
++    def not_a_dir(_path):
++        raise NotADirectoryError(20, "Not a directory", str(_path))
++
++    monkeypatch.setattr(db, "_stat", not_a_dir)
++
++    with pytest.raises(db.UnsafeSQLiteConfiguration, match="could not inspect"):
++        db._sqlite_fk_preflight(str(tmp_path / "file" / "db.sqlite"))
++
++
++def test_other_oserror_fails_closed(monkeypatch, tmp_path):
++    def failing(_path):
++        raise OSError(5, "Input/output error")
++
++    monkeypatch.setattr(db, "_stat", failing)
++
++    with pytest.raises(db.UnsafeSQLiteConfiguration, match="could not inspect"):
++        db._sqlite_fk_preflight(str(tmp_path / "io_error.db"))
++
++
++def test_engine_fails_closed_on_an_uninspectable_path(monkeypatch, tmp_path):
++    """Engine creation inherits the fail-closed filesystem inspection."""
++    path = tmp_path / "engine_inaccessible.db"
++    path.write_bytes(b"")
++    monkeypatch.setattr(db.settings, "DATABASE_URL", f"sqlite:///{path}")
++
++    def denied(_path):
++        raise PermissionError(13, "Permission denied", str(_path))
++
++    monkeypatch.setattr(db, "_stat", denied)
++
++    with pytest.raises(db.UnsafeSQLiteConfiguration):
++        db._engine()
++
++    assert str(path) not in db._SQLITE_FK_STATE

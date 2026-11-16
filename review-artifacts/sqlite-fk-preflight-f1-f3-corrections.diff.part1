@@ -1,0 +1,114 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ef34ecd..40f2d3a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -134,6 +134,76 @@ SECURITY.md §12.1; INV-007 (credential ownership) and INV-024 (server-boundary
+ 
+ See the `security/auth-register-no-password-linking` pull request.
+ 
++### 2026-11-14 — SQLite foreign-key preflight reads a read-only snapshot
++
++**Category:** Data
++
++**Change**
++
++`app/db.py` decided whether `PRAGMA foreign_keys=ON` was safe by opening the application database read-write and running `PRAGMA foreign_key_check` directly. Because that ran at import, before any pooled connection existed, its connection was normally the last one on the file: closing it checkpointed the database and deleted the WAL. A crashed database was rewritten, and its WAL destroyed, by the check that was only meant to read it.
++
++The preflight now opens the source read-only (`file:<path>?mode=ro`), copies it with SQLite's Online Backup API in bounded page batches, and runs `PRAGMA foreign_key_check` against that private snapshot. `file:` URIs are classified — percent-decoded, with `mode=memory` and `cache=shared` recognised as named shared memory — instead of being skipped, and a persistent target that cannot be resolved to one file raises rather than being assumed clean. `_engine()` also keeps a URI's query string, which SQLAlchemy splits off, so a named in-memory target is classified as shared memory and refused rather than mistaken for a relative file path.
++
++**Why**
++
++An inspection must not change what it inspects. The previous read rewrote the main database and removed the WAL before migrations ran, which is a durability and forensic-integrity problem in precisely the crash-recovery case where the check matters most.
++
++**Fail-closed startup**
++
++Startup now refuses to continue when enforcement cannot be guaranteed. `_sqlite_fk_preflight()` returns only for an ordinary in-memory database, a database file that does not exist yet, or a persistent file whose snapshot shows no violations. A database with existing violations raises `SQLiteForeignKeyViolation` (carrying the violation count and offending tables, so the message names what to repair), and an uninspectable target — an unresolvable or unsupported URL, a named in-memory database (`mode=memory`, with or without `cache=shared`), a malformed file, a snapshot or lock failure, or an expired budget (`SQLitePreflightTimeout`) — raises `UnsafeSQLiteConfiguration`. In both cases no engine is created. The previous behaviour — log an error and continue with `foreign_keys` OFF — is gone.
++
++`_SQLITE_FK_STATE` now records `preflight_passed`, and only after inspection and engine construction both succeed: a refused or failed attempt leaves no entry, and a failed retry clears an earlier one. The label is deliberately narrow. `create_engine()` is lazy, so no physical connection exists when it is written, and the diagnostic state never substitutes for verification. Every physical application connection still sets `PRAGMA foreign_keys=ON` and reads the pragma back, raising if it did not take; enforcement is never skipped from the cached verdict. `:memory:` remains supported.
++
++**Bounded diagnostics**
++
++`PRAGMA foreign_key_check` emits one row per violating row, and the preflight used to collect them all with `fetchall()`, so its memory grew with the damage. The cursor is now streamed: every violation is counted exactly (`violations`), while only distinct offending table names are retained, at most 20 (`tables`), together with `sample_truncated` when further distinct tables exist. The error message says when the sample is partial. An interrupted scan is neither clean nor a violation: it fails closed with `SQLitePreflightTimeout`.
++
++**Side effects**
++
++The main database and any existing `-wal` file are left byte-identical. SQLite may still create or update the `-shm` WAL index, and a zero-length `-wal` may appear for a database in WAL mode; a rollback-journal database gains no sidecar files. The private snapshot copy is removed on success and on failure.
++
++**Time budget**
++
++The snapshot is bounded by `SQLITE_FK_PREFLIGHT_TIMEOUT_SECONDS` (a setting, default 5s), so an operator with a large but healthy database can raise the budget instead of failing startup. The deadline is enforced from inside the Backup API's progress callback because `sqlite3` ignores a callback's return value and retries `SQLITE_BUSY` internally: raising is the only reliable interrupt, and the callback runs on every retry, including the retries against a locked source, which are paced by the configured `_SNAPSHOT_RETRY_SECONDS` (0.05s) sleep between attempts rather than by a tight busy loop. A single Backup API step waits at most `_SNAPSHOT_LOCK_WAIT_SECONDS` (0.5s) for the source lock, so one lock attempt cannot outlast the whole budget. Exceeding the deadline raises `SQLitePreflightTimeout`, which stops startup (fail closed) instead of waiting indefinitely; the partial snapshot and both connections are cleaned up first. The same deadline covers `PRAGMA foreign_key_check`, which the copy callback cannot bound because it is one statement: the scan runs under SQLite's progress hook, which aborts it. The handler owns that classification — it marks the interruption it caused and only that marker turns CPython's `OperationalError("interrupted")` into `SQLitePreflightTimeout`, while an unrelated SQLite error remains an inspection failure even when the clock has already passed the budget. The deadline is also checked at every phase boundary — before the snapshot is created, after the copy, before the scan and after it — because a short or empty scan can finish without ever invoking the hook, and it is never reset between phases.
++
++**Limitations**
++
++The deadline is cooperative rather than an exact wall-clock cutoff: expiry is noticed at the next phase boundary, backup batch or progress-hook interval, so a phase can overshoot by a small interval. The table sample in a violation error is diagnostic, not exhaustive — beyond 20 distinct offending tables it is truncated and `sample_truncated` reports that, while the violation count stays exact. The verdict is computed once at import and cached for diagnostics only, so a database dirtied after startup is not re-evaluated until the process restarts (enforcement itself remains on for every connection). No PostgreSQL behavior is claimed or verified.
++
++**Related decision/invariant**
++
++INV-035; TESTING.md "SQLite foreign-key preflight".
++
++**Commit/PR**
++
++See INV-035 and TESTING.md "SQLite foreign-key preflight".
++
++### 2026-11-16 — Preflight target identity, URI refusal and inaccessible paths
++
++**Category:** Data
++
++**Change**
++
++The preflight now resolves its target from the SQLAlchemy URL instead of from a `file:` prefix. `uri=true` is required before a `file:` database string is read as a SQLite URI: without it SQLAlchemy passes `os.path.abspath(database)` as a literal filename, so a `file:`-prefixed target that lacks the flag is refused rather than inspected as a URI the engine would never open. Query parameters are parsed from the raw URL, because `make_url()` collapses a repeated parameter to its last value; repeated names, blank names, blank values, `vfs`, `immutable`, `nolock`, `cache=shared` and unrecognised options all fail closed, while `mode` (`rw`, `rwc`, `ro`) and `cache=private` are accepted because they select the same file. A URI target is inspected through its original path text — percent-encoding and drive-letter form preserved — with only the query replaced by `mode=ro`, so SQLite resolves exactly the file the engine will open.
++
++Pathless `file:` URIs (`file:`, `file://localhost`) and `file::memory:` variants are now refused: they name no inspectable file and are not equivalent to the supported `:memory:` target. Missing databases are detected with `os.stat` instead of `os.path.exists`, so only `FileNotFoundError` counts as clean; `PermissionError`, `NotADirectoryError` and every other `OSError` raise `UnsafeSQLiteConfiguration` instead of letting an inaccessible database start unenforced.
++
++**Why**
++
++A preflight that inspects a different file than the application opens is worse than no preflight: it issues a clean verdict for a database nothing verified. The same reasoning applies to an unreadable path — `os.path.exists()` answers "no" for a path the process may not inspect, which would have promoted an inaccessible database to "missing database, nothing to check".
++
++**Limitations**
++
++URI paths are resolved with `urllib.parse.unquote` plus `url2pathname` on Windows, which matches SQLite's own mapping for the supported forms and is covered by tests; a form that cannot be mapped confidently is refused rather than guessed. Everything else in the entry above still holds: the main database and any existing `-wal` remain byte-identical, the snapshot and the scan share one deadline, the diagnostic state remains an import-time verdict, and no PostgreSQL behaviour is claimed or verified.
++
++**Related decision/invariant**
++
++INV-035; TESTING.md "SQLite foreign-key preflight".
++
++**Commit/PR**
++
++See INV-035 and TESTING.md "SQLite foreign-key preflight".
++
+ ---
+ 
+ ## Change-entry template
+diff --git a/INVARIANTS.md b/INVARIANTS.md
+index 0ae36dd..60deb04 100644
+--- a/INVARIANTS.md
++++ b/INVARIANTS.md
+@@ -296,6 +296,28 @@ Where the current code uses row locking, idempotency constraints, transactional
+ 
+ They must not be removed or weakened as an optimization or refactor without proving the concurrent behavior remains safe.
+ 
++### INV-035 — The SQLite foreign-key preflight must not mutate the database it inspects, and must fail closed
++
++The startup preflight decides whether `PRAGMA foreign_keys=ON` is safe against the rows that already exist. That decision must be made from a read-only snapshot, never by opening the application database for writing, and the application must never receive an engine whose enforcement cannot be guaranteed.
++
++Required properties:
++
++- the source is opened read-only (`mode=ro`) and copied with SQLite's Online Backup API before `PRAGMA foreign_key_check` runs, so the check sees a consistent image that includes committed WAL frames;
++- the main database file and any existing `-wal` file are left byte-identical;
++- the private snapshot copy is removed on success and on failure;
++- a missing database file is reported clean and is not created;
++- `file:` URIs are classified — percent-decoded, with `mode=memory` and `cache=shared` recognised as named in-memory databases — instead of being skipped; a persistent target that cannot be resolved to one file raises instead of being assumed clean;
++- a database containing foreign-key violations raises `SQLiteForeignKeyViolation`, and engine creation is refused: startup never continues with enforcement disabled. The error carries the exact violation count, a bounded, de-duplicated sample of at most 20 offending table names, and whether that sample is truncated; violation rows are streamed, never materialised, so the report's memory does not grow with the damage;
++- any inspection failure — unresolvable or unsupported URL, named in-memory database, malformed file, snapshot or lock failure — raises `UnsafeSQLiteConfiguration`, so an uninspectable database cannot start the application;
++- `_SQLITE_FK_STATE` records `"preflight_passed"` only after inspection and engine construction succeed, and never for a refused or failed attempt, which also clears any earlier verdict for that target. The label means exactly that much: `create_engine()` is lazy, so it does not imply a physical connection, let alone a verified one, and it never bypasses the connection listener;
++- every physical application connection sets `PRAGMA foreign_keys=ON` and reads it back, raising if the pragma did not take; enforcement is never skipped from the cached verdict;
++- the snapshot copy and the `PRAGMA foreign_key_check` scan share one configurable deadline (`SQLITE_FK_PREFLIGHT_TIMEOUT_SECONDS`, default 5s), checked before the snapshot is created, after the copy, before the scan and after it, and never reset between phases; exceeding it raises `SQLitePreflightTimeout` rather than returning, so a large, slow or locked database fails closed instead of blocking startup indefinitely; raising the budget is a deliberate operator decision, not a silent fallback;
++- the scan is a single statement, so the deadline reaches it through SQLite's progress hook, which aborts the statement, rather than through the backup callback. The handler marks the interruption it caused, and only that marker turns SQLite's `interrupted` error into `SQLitePreflightTimeout`; any other SQLite error remains an inspection failure. An interrupted scan is never reported as clean and never as a violation. Expiry is cooperative: it is noticed at the next phase boundary, backup batch or progress interval, so a phase may overshoot the budget by a small interval rather than stopping at an exact wall-clock instant.
++
++Target identity is part of the invariant: the preflight must inspect the database the application engine opens, and must not infer URI semantics from a `file:` prefix. `uri=true` is required before a `file:` database string is read as a SQLite URI; without it the string is a literal filename and is refused. Query parameters are parsed strictly from the raw URL, so a repeated name cannot silently select a different target: repeated names, blank names, blank values, `vfs`, `immutable`, `nolock`, `cache=shared` and unrecognised options fail closed, while `mode` (`rw`, `rwc`, `ro`) and `cache=private` are accepted because they select the same file. A URI target is inspected through its original path text with only the query replaced by `mode=ro`, so percent-encoded and drive-letter forms resolve to the same file. Pathless `file:` URIs and `file::memory:` variants are refused; only the plain `:memory:` target is supported. A database file counts as missing only on `FileNotFoundError` — `PermissionError`, `NotADirectoryError` and every other `OSError` raise `UnsafeSQLiteConfiguration` instead of being reported clean.
++
++SQLite may create or update the `-shm` WAL index, and a zero-length `-wal` may appear for a database in WAL mode. Those are SQLite's shared-memory sidecars, not database content, and they are the only permitted filesystem side effects of the preflight.
++
+ ---
+ 
+ ## 7. API and application-boundary invariants

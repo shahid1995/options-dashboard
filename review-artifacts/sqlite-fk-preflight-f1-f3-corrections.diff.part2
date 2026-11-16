@@ -1,0 +1,83 @@
+diff --git a/TESTING.md b/TESTING.md
+index 3d2e929..af2b180 100644
+--- a/TESTING.md
++++ b/TESTING.md
+@@ -180,6 +180,41 @@ Verify:
+ 
+ Relevant areas include test_alembic_migrations.py and test_db_migration.py.
+ 
++#### SQLite foreign-key preflight
++
++`app/db.py` decides whether `PRAGMA foreign_keys=ON` is safe before any connection is handed out, and that decision must come from a read-only snapshot (INV-035).
++
++Verify:
++
++- the source is opened read-only and copied with the Online Backup API, and `PRAGMA foreign_key_check` runs against the private snapshot;
++- committed WAL frames are visible — a violation written only to WAL is still detected;
++- the main database file and any existing `-wal` file are byte-identical before and after the preflight (sha256 comparison), and the `-wal` is not deleted;
++- a rollback-journal database gains no sidecar files at all; for a WAL database only `-shm` (and possibly a zero-length `-wal`) may appear;
++- the temporary snapshot directory is removed on success and on failure;
++- `file:` URIs are classified rather than skipped: a percent-encoded path reaches the real file, `mode=memory` (with or without `cache=shared`) raises `UnsafeSQLiteConfiguration`, and an unresolvable `file://host/...` target raises instead of being reported as clean;
++- a missing database file is still reported clean and is not created;
++- `_engine()` forwards a URI's query string, so a `mode=memory` target is classified as named in-memory and rejected rather than mistaken for a relative file path;
++- a persistent database with a real violation makes `_engine()` raise `SQLiteForeignKeyViolation`, no engine is returned, and its main file and existing `-wal` are still byte-identical;
++- violations are counted exactly beyond the sample limit (25 tables report 25 violations with 20 retained names and `sample_truncated` true), duplicate table names do not consume slots, and 100k violations are streamed under a small measured memory peak that a `fetchall()` would exceed;
++- an ordinary `:memory:` target remains supported and reports `foreign_keys=1`;
++- a malformed database file raises rather than being treated as clean;
++- `_SQLITE_FK_STATE` records `preflight_passed` only after inspection and engine construction succeed; a refused database records nothing, and a failed retry clears an earlier verdict. The label never claims a physical connection — `create_engine()` is lazy, so none exists at that point;
++- two simultaneous physical connections from a clean engine each report `foreign_keys=1`, so enforcement comes from the connect listener and not from a cached verdict;
++- the snapshot deadline is enforced *during* the copy: a multi-batch database aborts once the budget expires, and a source held under an exclusive lock returns `SQLitePreflightTimeout` in roughly one lock wait plus the budget (a single Backup API step waits at most `_SNAPSHOT_LOCK_WAIT_SECONDS`) instead of retrying indefinitely;
++- a timeout fails closed — the exception propagates out of the preflight rather than being reported as clean or as a dirty database — and the temporary snapshot is still removed;
++- the budget is configurable: `SQLITE_FK_PREFLIGHT_TIMEOUT_SECONDS` (default 5s) reaches the settings model from the environment, a raised budget lets a large healthy database through (returning normally, not as a violation), and the same database fails closed under a zero budget;
++- the same deadline covers the `PRAGMA foreign_key_check` scan, which a single statement cannot interrupt through the copy callback: an expired budget aborts the scan through SQLite's progress hook and raises `SQLitePreflightTimeout` instead of running to completion, and a scan that fits the budget still returns clean;
++- the deadline is checked at each phase boundary with a controlled clock: an expired budget is refused before the snapshot opens a connection, a copy that finishes over budget is refused before the scan starts, a scan that never reaches the progress hook is refused by the pre-statement check, a scan that completes over budget is refused after the loop, and the deadline is not reset between phases;
++- a deliberate progress-hook interruption becomes `SQLitePreflightTimeout`, while an unrelated SQLite error (a foreign-key mismatch) stays an inspection failure even when the clock is already past the budget.
++
++- the preflight inspects the same database the engine opens: `uri=true` is required for a `file:` URI, a `file:`-prefixed database without it is refused, and the engine's own `PRAGMA database_list` reports the path the preflight resolved;
++- a percent-encoded URI path resolves to the database SQLite opens;
++- strict query parsing fails closed on repeated names, blank names, blank values, `vfs`, `immutable`, `nolock`, `cache=shared`, a non-boolean `uri` and unrecognised options, while `mode=rw`/`rwc`/`ro` and `cache=private` are accepted;
++- pathless `file:` URIs (`file:`, `file://localhost`) and `file::memory:` variants are refused, and only the plain `:memory:` target remains supported;
++- a missing database is clean and is not created, while an injected `PermissionError`, `NotADirectoryError` or other `OSError` from the filesystem check raises `UnsafeSQLiteConfiguration` (the tests inject the failure, so they do not depend on host permissions or on running as root);
++
++Covered by `tests/test_db_sqlite_pragmas.py`. The deadline bounds the copy loop and the scan, not an individual SQLite I/O call, so expiry is observed at the next progress callback rather than at an exact wall-clock instant. The locked-source test runs the preflight in a worker thread with a join timeout, so a regression fails the test instead of hanging the suite.
++
+ ### GEX and quant calculations
+ 
+ The current GEX contract is:
+diff --git a/options-dashboard-project/backend/app/config.py b/options-dashboard-project/backend/app/config.py
+index a8a71e8..ce68e96 100644
+--- a/options-dashboard-project/backend/app/config.py
++++ b/options-dashboard-project/backend/app/config.py
+@@ -63,6 +63,11 @@ class Settings(BaseSettings):
+     # Phase 10.2B-6: Optional backend URL for auto-deriving UPSTOX_REDIRECT_URI
+     BACKEND_URL: str = ""
+ 
++    # SQLite foreign-key preflight (INV-035): how long the read-only snapshot may
++    # run before startup fails closed. Raise it for a large but healthy database;
++    # 0 or less aborts at the first backup step.
++    SQLITE_FK_PREFLIGHT_TIMEOUT_SECONDS: float = 5.0
++
+     @property
+     def FRONTEND_ORIGIN(self) -> str:
+         """Primary frontend URL for OAuth redirects.
+diff --git a/options-dashboard-project/backend/app/db.py b/options-dashboard-project/backend/app/db.py
+index 1eda744..b5b05e0 100644
+--- a/options-dashboard-project/backend/app/db.py
++++ b/options-dashboard-project/backend/app/db.py
+@@ -1,10 +1,15 @@
+-import logging
+ import os
+ import sqlite3
++import tempfile
++import time
++from collections.abc import Callable, Mapping
++from urllib.parse import parse_qsl, quote, unquote, urlsplit
++from urllib.request import url2pathname
+ 
+ from sqlalchemy import create_engine, text, event
+ from sqlalchemy.engine import make_url
+ from sqlalchemy.orm import DeclarativeBase, sessionmaker
++from sqlalchemy.util import asbool
+ 
+ from app.config import settings
+ 

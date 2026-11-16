@@ -1,0 +1,285 @@
+@@ -34,34 +39,549 @@ _DEFAULT_DB_PATH = os.path.join(_BACKEND_DIR, "paper_journal.db")
+ 
+ 
+ #: Result of the one-time SQLite foreign-key preflight, keyed by database path.
+-#: Exposed for diagnostics: "enforced", "violations" or "clean" (fresh file).
++#: Diagnostics only: nothing reads it to decide enforcement.
++#:
++#: "preflight_passed" means the snapshot inspection succeeded and an engine
++#: was constructed for the target. It says nothing about physical
++#: connections: ``create_engine()`` is lazy, and every connection is enabled
++#: and verified separately by the connect listener. A refused or failed
++#: attempt leaves no entry.
+ _SQLITE_FK_STATE: dict[str, str] = {}
+ 
++#: Pages copied per Online Backup step. Positive on purpose: the ``sqlite3``
++#: default is ``-1``, which copies the whole database in a single unbounded
++#: step, so the snapshot could not advance incrementally.
++_BACKUP_PAGE_BATCH = 512
++
++#: Seconds a single Backup API step may wait for the source lock. Kept short
++#: because the step loop retries until the configured budget
++#: (``settings.SQLITE_FK_PREFLIGHT_TIMEOUT_SECONDS``); a long per-attempt wait
++#: would let one lock attempt outlast the whole budget.
++_SNAPSHOT_LOCK_WAIT_SECONDS = 0.5
++
++#: Seconds to sleep between Backup API retries while the source is locked.
++#: ``sqlite3`` retries ``SQLITE_BUSY`` internally, so this is a paced retry
++#: interval, not a busy spin.
++_SNAPSHOT_RETRY_SECONDS = 0.05
++
++#: VM instructions between deadline checks while ``PRAGMA foreign_key_check``
++#: scans the snapshot. Small enough to bound how far the scan can overshoot
++#: the budget, large enough that the hook costs nothing measurable.
++_CHECK_PROGRESS_STEPS = 1000
++
++#: Distinct offending table names retained in a violation error's diagnostic
++#: sample. The sample exists for humans; the total count is always exact, so
++#: this limit bounds memory rather than knowledge of how much is broken.
++_VIOLATION_TABLE_SAMPLE_LIMIT = 20
++
++#: URL query options the pysqlite driver consumes itself. They reach
++#: ``sqlite3.connect()`` as keyword arguments and never change which file opens.
++_SQLITE_DRIVER_OPTIONS = frozenset(
++    {
++        "timeout",
++        "isolation_level",
++        "detect_types",
++        "check_same_thread",
++        "cached_statements",
++    }
++)
++
++#: SQLite URI ``mode`` values that still name the same database file. The
++#: inspection always opens ``mode=ro`` itself; the application's value only has
++#: to select the same file.
++_SQLITE_URI_MODES = frozenset({"rw", "rwc", "ro"})
++
++#: URI options whose effect the read-only snapshot cannot reproduce, so a URL
++#: that requests them is refused rather than inspected under other semantics.
++_SQLITE_UNSUPPORTED_URI_OPTIONS = frozenset({"vfs", "immutable", "nolock"})
++
++#: ``os.stat`` by name so tests can inject filesystem failures deterministically
++#: instead of depending on host permissions (or on running as root).
++_stat = os.stat
++
++
++class SQLitePreflightError(RuntimeError):
++    """Base class for failures that must stop SQLite startup."""
++
++
++class SQLiteForeignKeyViolation(SQLitePreflightError):
++    """The database already contains foreign-key violations.
++
++    Enforcing ``foreign_keys=ON`` here would reject writes that previously
++    succeeded, and starting with enforcement off would leave every foreign key
++    inert, so engine creation is refused instead.
++    """
++
++    def __init__(self, path, violations, tables, sample_truncated):
++        self.path = path
++        #: Exact number of violating rows found; never bounded.
++        self.violations = violations
++        #: At most ``_VIOLATION_TABLE_SAMPLE_LIMIT`` distinct table names.
++        self.tables = tables
++        #: True when more distinct tables exist than ``tables`` retains.
++        self.sample_truncated = sample_truncated
++        sample = ", ".join(tables) or "unknown tables"
++        if sample_truncated:
++            sample += f", plus more beyond a {len(tables)}-table sample"
++        super().__init__(
++            f"SQLite database {path} has {violations} foreign-key violation(s) "
++            f"in {sample}. Repair these rows, then restart: startup is "
++            "refused while enforcement cannot be guaranteed."
++        )
++
++
++class UnsafeSQLiteConfiguration(SQLitePreflightError):
++    """The SQLite target cannot be inspected or enforced safely.
++
++    Raised for unresolvable URLs, named shared-memory databases, malformed
++    files, snapshot failures and failed pragma verification.
++    """
++
++
++class SQLitePreflightTimeout(UnsafeSQLiteConfiguration):
++    """The SQLite foreign-key preflight exceeded its time budget."""
++
+ 
+-def _sqlite_fk_preflight(database: str | None) -> tuple[bool, int, list[str]]:
+-    """Check an existing SQLite file for foreign-key violations before enforcing.
++def _parse_sqlite_query(url_text: str) -> dict[str, str]:
++    """Parse a SQLite URL's query string strictly.
++
++    ``make_url()`` collapses a repeated parameter to its last value, which could
++    silently change the file SQLite opens, so the raw query is parsed here.
++    Duplicate names, blank names and blank values are refused rather than
++    resolved by guesswork.
++    """
++    _, _, query = url_text.partition("?")
++    parsed: dict[str, str] = {}
++    for name, value in parse_qsl(query, keep_blank_values=True):
++        if not name.strip():
++            raise UnsafeSQLiteConfiguration(
++                f"SQLite URL query {query!r} has a parameter with a blank name."
++            )
++        if value == "":
++            raise UnsafeSQLiteConfiguration(
++                f"SQLite URL parameter {name!r} has a blank value."
++            )
++        if name in parsed:
++            raise UnsafeSQLiteConfiguration(
++                f"SQLite URL parameter {name!r} is repeated, so the target is "
++                "ambiguous."
++            )
++        parsed[name] = value
++    return parsed
+ 
+-    Enforcing ``foreign_keys=ON`` on a database that already contains orphan
+-    rows would make writes that previously succeeded start failing -- a deploy
+-    would turn a latent inconsistency into an outage. So the decision is made
+-    once, from the existing rows, before any connection is handed out.
+ 
+-    Returns ``(safe_to_enforce, violation_count, offending_tables)``. A missing
+-    file is trivially safe: it has no rows to violate anything.
++def _validate_sqlite_options(query: Mapping[str, str]) -> None:
++    """Refuse URL options the preflight cannot reproduce faithfully.
++
++    The driver options are passed to ``sqlite3.connect()`` and do not select a
++    file. ``mode`` and ``cache`` are assessed explicitly: a mode that names the
++    same file is accepted, ``cache=shared`` is not, and options that change
++    resolution or locking (``vfs``, ``immutable``, ``nolock``) or that the
++    preflight has never been taught are refused instead of dropped.
+     """
+-    if not database or database == ":memory:" or database.startswith("file:"):
+-        return True, 0, []
+-    if not os.path.exists(database):
+-        return True, 0, []
++    for name, value in query.items():
++        if name == "uri" or name in _SQLITE_DRIVER_OPTIONS:
++            continue
++        if name == "mode":
++            if value not in _SQLITE_URI_MODES and value != "memory":
++                raise UnsafeSQLiteConfiguration(
++                    f"SQLite URL option mode={value!r} is not supported; expected "
++                    f"one of {sorted(_SQLITE_URI_MODES)} or 'memory'."
++                )
++            continue
++        if name == "cache":
++            if value not in ("private", "shared"):
++                raise UnsafeSQLiteConfiguration(
++                    f"SQLite URL option cache={value!r} is not supported; "
++                    "expected 'private' or 'shared'."
++                )
++            continue
++        if name in _SQLITE_UNSUPPORTED_URI_OPTIONS:
++            raise UnsafeSQLiteConfiguration(
++                f"SQLite URL option {name}={value!r} is refused: the read-only "
++                "preflight cannot reproduce its effect, so it could inspect a "
++                "different database or locking regime than the application opens."
++            )
++        raise UnsafeSQLiteConfiguration(
++            f"SQLite URL option {name}={value!r} is not supported; the preflight "
++            "cannot prove it would inspect the same database."
++        )
++
++
++def _uri_semantics(query: Mapping[str, str]) -> bool:
++    """True when the URL asks SQLAlchemy for SQLite URI semantics.
+ 
+-    conn = sqlite3.connect(database)
++    SQLAlchemy coerces the ``uri`` option with ``asbool`` and then passes
++    ``uri=True`` to ``sqlite3.connect()``. Reading it with the same coercion
++    keeps the preflight's understanding of the URL identical to the engine's.
++    """
++    raw = query.get("uri")
++    if raw is None:
++        return False
+     try:
+-        rows = conn.execute("PRAGMA foreign_key_check").fetchall()
+-    finally:
+-        conn.close()
++        return asbool(raw)
++    except ValueError:
++        raise UnsafeSQLiteConfiguration(
++            f"SQLite URL option uri={raw!r} is not a boolean; SQLAlchemy would "
++            "reject it."
++        ) from None
++
++
++def _uri_filename(parts) -> str:
++    """Absolute filename for a ``file:`` URI, resolved the way SQLite does.
++
++    SQLite percent-decodes the path, and on Windows maps the
++    ``file:///C:/dir/db`` form to ``C:/dir/db``; a relative name is resolved
++    against the process working directory. Resolving identically keeps the
++    ``os.stat`` check on the file the engine will actually open.
++    """
++    raw = unquote(parts.path)
++    if os.name == "nt" and raw.startswith("/"):
++        raw = url2pathname(raw)
++    return os.path.abspath(raw)
++
++
++def _classify_target(
++    database: str | None,
++    query: Mapping[str, str] | None = None,
++) -> tuple[str, str | None]:
++    """Classify what SQLite would open for ``database``.
++
++    Returns ``(kind, path)``: ``"file"`` with an absolute path, or ``"memory"``
++    or ``"named-memory"`` with ``None``. A named in-memory database is its own
++    kind because it has no image to inspect and is refused by the caller.
++
++    The URL's query decides whether ``file:`` is a URI: SQLAlchemy only enables
++    SQLite URI semantics for ``uri=true``, and otherwise passes
++    ``os.path.abspath(database)`` as a literal filename. A ``file:``-prefixed
++    database without ``uri=true`` is therefore refused instead of being read as
++    a URI the engine would never open.
++    """
++    query = dict(query or {})
++    if not database or database == ":memory:":
++        return "memory", None
++    if _uri_semantics(query):
++        if database.startswith("file:"):
++            return _classify_uri(database, query)
++        # SQLite only treats ``file:`` strings as URIs. Anything else stays a
++        # literal filename even when ``uri=true`` is set.
++        return "file", os.path.abspath(database)
++    if database.startswith("file:"):
++        raise UnsafeSQLiteConfiguration(
++            f"{database!r} is a 'file:' URI but the URL does not set uri=true, "
++            "so SQLAlchemy would open a literal file with that name instead. "
++            "Add '?uri=true' for URI semantics, or use a plain path."
++        )
++    return "file", os.path.abspath(database)
++
+ 
+-    tables = sorted({row[0] for row in rows})
+-    return (not rows), len(rows), tables
++def _classify_uri(
++    database: str,
++    query: Mapping[str, str],
++) -> tuple[str, str | None]:
++    """Classify a ``file:`` URI that SQLAlchemy will pass through verbatim.
++
++    Pathless URIs, memory variants and shared-cache file databases are refused:
++    each one either names no file to inspect or changes connection semantics
++    the snapshot cannot reproduce.
++    """
++    parts = urlsplit(database)
++    if parts.netloc and parts.netloc != "localhost":
++        raise UnsafeSQLiteConfiguration(
++            f"URI {database!r} names host {parts.netloc!r}; SQLite has no "
++            "authority component, so the file it would open is ambiguous and "
++            "cannot be inspected read-only."
++        )
++    path = unquote(parts.path)
++    mode = query.get("mode")
++    cache = query.get("cache")
++    if not path:
++        # ``file:``, ``file:?mode=ro``, ``file://localhost``: no database file.
++        # That is not the same thing as the supported ``:memory:`` target.
++        raise UnsafeSQLiteConfiguration(
++            f"URI {database!r} names no database file; a pathless SQLite URI is "
++            "not equivalent to ':memory:' and cannot be inspected."

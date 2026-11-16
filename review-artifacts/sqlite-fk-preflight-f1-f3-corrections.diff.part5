@@ -1,0 +1,144 @@
+@@ -72,7 +592,33 @@ def _engine():
+         url = f"sqlite:///{_DEFAULT_DB_PATH}"
+     if url.startswith("sqlite"):
+         connect_args = {"check_same_thread": False}
++        sqlite_url = make_url(url)
++        database = sqlite_url.database
++        # The URL is the single authority for the target. Its query decides
++        # whether ``file:`` means a URI (``uri=true``) or a literal filename,
++        # and _classify_target resolves the file SQLite will actually open.
++        # The raw query is parsed because make_url() collapses repeated
++        # parameters, which could silently select a different target.
++        query = _parse_sqlite_query(url)
++        _validate_sqlite_options(query)
++        _, path = _classify_target(database, query)
++
++        state_key = path if path is not None else (database or ":memory:")
++        # A new attempt invalidates any earlier verdict for this target, so a
++        # failure below cannot leave a stale success behind.
++        _SQLITE_FK_STATE.pop(state_key, None)
++
++        # Fail closed before an engine exists. A dirty database, or one that
++        # cannot be inspected (or cannot be inspected in time), raises here, so
++        # startup is refused instead of handing out an unenforced engine.
++        _sqlite_fk_preflight(database, query)
+         eng = create_engine(url, connect_args=connect_args)
++        # "preflight_passed" is all this proves: the snapshot inspection
++        # succeeded and an engine was constructed. create_engine() is lazy, so
++        # no physical connection exists yet; the listener below enables and
++        # verifies enforcement on every connection, and this verdict is never
++        # used to skip it.
++        _SQLITE_FK_STATE[state_key] = "preflight_passed"
+ 
+         # Exactly one connect listener. The previous code registered the same
+         # WAL pragma pair twice (once inside this branch, once again after it),
+@@ -88,34 +634,24 @@ def _engine():
+         # work: the check on DROP TABLE is immediate, not deferrable), so this
+         # listener can leave enforcement on for the life of the application.
+         #
+-        # One precondition: an existing database may already contain orphan
+-        # rows from the era when nothing was enforced. Turning enforcement on
+-        # there would reject writes that used to succeed, so the rows are
+-        # checked first and enforcement is skipped (loudly) if they are dirty.
+-        database = make_url(url).database
+-        fk_safe, fk_violations, fk_tables = _sqlite_fk_preflight(database)
+-        _SQLITE_FK_STATE[database or ":memory:"] = (
+-            "enforced" if fk_safe else "violations"
+-        )
+-        if not fk_safe:
+-            logging.getLogger(__name__).error(
+-                "SQLite foreign-key enforcement is OFF for %s: %d existing "
+-                "violation(s) in %s. Enforcing now would reject writes that "
+-                "previously succeeded. Repair these rows and restart to turn "
+-                "enforcement on.",
+-                database,
+-                fk_violations,
+-                ", ".join(fk_tables) or "unknown tables",
+-            )
+-
++        # Enforcement is set on every physical connection and then read back.
++        # It is never skipped because of a cached preflight verdict: the
++        # verdict only decides whether startup is allowed at all.
+         @event.listens_for(eng, "connect")
+         def _set_sqlite_pragmas(dbapi_conn, _rec):
+             cur = dbapi_conn.cursor()
+-            cur.execute("PRAGMA journal_mode=WAL")
+-            cur.execute("PRAGMA synchronous=NORMAL")
+-            if fk_safe:
++            try:
++                cur.execute("PRAGMA journal_mode=WAL")
++                cur.execute("PRAGMA synchronous=NORMAL")
+                 cur.execute("PRAGMA foreign_keys=ON")
+-            cur.close()
++                enabled = cur.execute("PRAGMA foreign_keys").fetchone()[0]
++            finally:
++                cur.close()
++            if enabled != 1:
++                raise UnsafeSQLiteConfiguration(
++                    "SQLite did not accept PRAGMA foreign_keys=ON on a new "
++                    "connection; refusing to use an unenforced connection."
++                )
+     else:
+         # Phase 9E: Production PostgreSQL configuration
+         eng = create_engine(
+diff --git a/options-dashboard-project/backend/tests/test_db_sqlite_pragmas.py b/options-dashboard-project/backend/tests/test_db_sqlite_pragmas.py
+index e470d99..acfbe71 100644
+--- a/options-dashboard-project/backend/tests/test_db_sqlite_pragmas.py
++++ b/options-dashboard-project/backend/tests/test_db_sqlite_pragmas.py
+@@ -10,8 +10,16 @@ pragmas its own connection would pass even if the application listener were
+ missing, which is exactly the gap this covers.
+ """
+ 
+-import logging
++import hashlib
++import os
+ import sqlite3
++import subprocess
++import sys
++import tempfile
++import threading
++import time
++import tracemalloc
++from urllib.parse import quote
+ 
+ import pytest
+ from sqlalchemy.exc import IntegrityError
+@@ -102,27 +110,21 @@ def _legacy_db(path, *, orphan: bool) -> str:
+     return str(path)
+ 
+ 
+-def test_legacy_database_with_violations_is_not_enforced(monkeypatch, tmp_path, caplog):
+-    """A dirty legacy file keeps working: enforcement is skipped, not applied."""
++def test_legacy_database_with_violations_refuses_an_engine(monkeypatch, tmp_path):
++    """A dirty legacy file fails closed instead of starting unenforced."""
+     path = _legacy_db(tmp_path / "legacy_dirty.db", orphan=True)
+     monkeypatch.setattr(db.settings, "DATABASE_URL", f"sqlite:///{path}")
+ 
+-    with caplog.at_level(logging.ERROR, logger="app.db"):
+-        eng = db._engine()
+-    try:
+-        with eng.connect() as conn:
+-            assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar() == 0
+-        # The write that used to succeed must still succeed.
+-        with eng.begin() as conn:
+-            conn.exec_driver_sql(
+-                "INSERT INTO legacy_child (id, parent_id) VALUES (2, 998)"
+-            )
+-            assert conn.exec_driver_sql("SELECT COUNT(*) FROM legacy_child").scalar() == 2
+-    finally:
+-        eng.dispose()
++    with pytest.raises(db.SQLiteForeignKeyViolation) as excinfo:
++        db._engine()
+ 
+-    assert db._SQLITE_FK_STATE[path] == "violations"
+-    assert any("foreign-key enforcement is OFF" in r.message for r in caplog.records)
++    # The error names the rows to repair, so startup failure is actionable.
++    assert excinfo.value.violations == 1
++    assert excinfo.value.tables == ["legacy_child"]
++    assert excinfo.value.path == path
++    assert excinfo.value.sample_truncated is False
++    assert "foreign-key" in str(excinfo.value)
++    assert path not in db._SQLITE_FK_STATE, "a refused database was recorded as inspected"
+ 
+ 
+ def test_legacy_database_without_violations_is_enforced(monkeypatch, tmp_path):
