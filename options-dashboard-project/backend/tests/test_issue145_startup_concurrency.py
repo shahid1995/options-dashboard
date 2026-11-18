@@ -1134,7 +1134,9 @@ class TestScenarioBLeaseRenewalDuringBackfill:
             )
             if current_expiry != expiries[-1]:
                 expiries.append(current_expiry)
-            elapsed = time.monotonic() - entered
+            # Marker timestamps are wall-clock (time.time()); monotonic() is
+            # a different clock domain and would make this difference negative.
+            elapsed = time.time() - entered
             if elapsed > REHEARSAL_TTL * 1.5 and len(expiries) >= 3:
                 break
             time.sleep(0.2)
@@ -1153,7 +1155,7 @@ class TestScenarioBLeaseRenewalDuringBackfill:
             "the lease expiry never advanced beyond the value issued at acquisition",
         )
         _check(
-            time.monotonic() - entered > REHEARSAL_TTL,
+            time.time() - entered > REHEARSAL_TTL,
             "the backfill was not held longer than the lease TTL",
         )
 
