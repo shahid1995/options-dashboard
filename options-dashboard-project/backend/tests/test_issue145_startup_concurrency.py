@@ -44,6 +44,7 @@ rehearsal environment is not configured at all; a half-configured environment
 """
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import secrets
@@ -347,6 +348,24 @@ def _check(condition: bool, message: str) -> None:
         raise AssertionError(_redact(message))
 
 
+def _is_local_server_address(address: str) -> bool:
+    """Accept loopback and private (container bridge) server addresses.
+
+    ``inet_server_addr()`` renders an ``inet`` value including its netmask
+    (``172.18.0.2/32``), and a GitHub Actions service container publishes its
+    port on the runner's loopback interface while the postmaster itself
+    reports the container's private bridge address. Loopback and private
+    addresses are therefore accepted here; disposability is still decided by
+    the official-image markers and cluster freshness checked alongside this,
+    and a routable address is refused outright.
+    """
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return parsed.is_loopback or parsed.is_private
+
+
 def _validate_job_local_server(observation: dict, bootstrap_url: str) -> None:
     """Reject any PostgreSQL that is not this job's disposable container.
 
@@ -364,9 +383,10 @@ def _validate_job_local_server(observation: dict, bootstrap_url: str) -> None:
             f"rehearsal requires PostgreSQL 16.x, server reports "
             f"{observation['banner']!r} ({version_num})"
         )
-    if observation["server_addr"] not in ("127.0.0.1", "::1"):
+    server_addr = str(observation["server_addr"] or "").split("/", 1)[0].strip()
+    if not _is_local_server_address(server_addr):
         pytest.fail(
-            "the server reports a non-loopback address "
+            "the server reports a routable address "
             f"({observation['server_addr']!r}): refusing a remote server"
         )
     if int(observation["server_port"]) != expected_port:

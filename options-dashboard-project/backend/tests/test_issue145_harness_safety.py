@@ -441,7 +441,10 @@ def test_server_identity_tolerates_this_harness_only_leftovers():
     "overrides, expected",
     [
         ({"version_num": 150000, "banner": "15.8"}, "PostgreSQL 16"),
-        ({"server_addr": "10.1.2.3"}, "non-loopback"),
+        ({"server_addr": "8.8.8.8"}, "routable"),
+        ({"server_addr": "8.8.8.8/32"}, "routable"),
+        ({"server_addr": ""}, "routable"),
+        ({"server_addr": "not-an-address"}, "routable"),
         ({"server_port": 6432}, "listens on port"),
         ({"container_marker": None}, "/.dockerenv"),
         ({"data_directory": "/var/lib/postgresql/16/main"}, "data directory"),
@@ -458,6 +461,15 @@ def test_server_identity_rejects_anything_not_job_local(overrides, expected):
     with pytest.raises(pytest.fail.Exception) as excinfo:
         harness._validate_job_local_server(_observation(**overrides), BOOTSTRAP)
     assert expected in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "server_addr",
+    ["127.0.0.1", "127.0.0.1/32", "::1", "172.18.0.2/32", "10.1.0.5"],
+)
+def test_server_identity_accepts_loopback_and_container_bridge_addresses(server_addr):
+    """Service containers publish on loopback but report their bridge address."""
+    harness._validate_job_local_server(_observation(server_addr=server_addr), BOOTSTRAP)
 
 
 def test_server_identity_honours_the_bootstrap_port():
