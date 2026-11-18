@@ -882,6 +882,11 @@ class _Rehearsal:
                 "STRIKENOVA_ENV": "",
             }
         )
+        # The bootstrap URL is the superuser credential this harness uses to
+        # create and drop the disposable database. Workers authenticate as the
+        # application or migrator identity, so the inherited bootstrap URL is
+        # removed instead of being carried into a child environment.
+        env.pop(BOOTSTRAP_ENV, None)
         stdout_path = _log_path(markers, worker_id, "stdout")
         stderr_path = _log_path(markers, worker_id, "stderr")
         stdout_handle = open(stdout_path, "wb")

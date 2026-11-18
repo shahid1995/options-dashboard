@@ -11,6 +11,7 @@ import io
 import os
 import pathlib
 import re
+import types
 
 import pytest
 import yaml
@@ -390,6 +391,12 @@ def test_workflow_verifies_three_scenarios_and_fails_on_skips():
     assert "sys.exit(1)" in script
 
 
+def test_workflow_runs_the_harness_safety_module_in_the_regression_suite():
+    steps = _steps(_workflow())
+    regression = next(s for s in steps if "Existing migration/exposure regression" in s.get("name", ""))
+    assert "tests/test_issue145_harness_safety.py" in regression["run"]
+
+
 def test_workflow_preserves_the_six_module_regression_suite():
     steps = _steps(_workflow())
     regression = next(s for s in steps if "Existing migration/exposure regression" in s.get("name", ""))
@@ -554,3 +561,108 @@ def test_worker_script_wires_redaction_before_logging():
         "logging.basicConfig"
     )
     compile(script, "<worker>", "exec")
+
+
+# ---------------------------------------------------------------------------
+# Worker process environment isolation
+# ---------------------------------------------------------------------------
+def _assert(condition, message):
+    """Assert without letting pytest render the compared credential values."""
+    if not condition:
+        raise AssertionError(message)
+
+
+class _RecordedPopen:
+    """Stand-in for ``subprocess.Popen`` that records the launched arguments."""
+
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        self.returncode = 0
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def communicate(self, timeout=None):
+        return "", ""
+
+
+def _spawn_worker_with_recorded_popen(monkeypatch, tmp_path):
+    launched = []
+
+    class _Popen(_RecordedPopen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            launched.append(self)
+
+    # Patch the harness module's reference only: the real subprocess module is
+    # never replaced for the rest of the suite.
+    monkeypatch.setattr(harness, "subprocess", types.SimpleNamespace(Popen=_Popen))
+    rehearsal = harness._Rehearsal(NORMALIZED_BOOTSTRAP)
+    rehearsal.spawn_worker(str(tmp_path), "isolation")
+    _assert(len(launched) == 1, "spawn_worker did not launch exactly one worker")
+    return launched[0], rehearsal
+
+
+def test_spawn_worker_removes_the_bootstrap_credential_from_the_child(monkeypatch, tmp_path):
+    monkeypatch.setenv(harness.BOOTSTRAP_ENV, NORMALIZED_BOOTSTRAP)
+    proc, _ = _spawn_worker_with_recorded_popen(monkeypatch, tmp_path)
+
+    # The parent keeps the bootstrap URL; only the child environment loses it.
+    _assert(
+        os.environ.get(harness.BOOTSTRAP_ENV) == NORMALIZED_BOOTSTRAP,
+        "the parent harness environment lost the bootstrap URL",
+    )
+    child_env = proc.kwargs["env"]
+    _assert(
+        harness.BOOTSTRAP_ENV not in child_env,
+        "the worker child environment still carries the bootstrap credential",
+    )
+
+
+def test_spawn_worker_keeps_the_environment_the_worker_needs(monkeypatch, tmp_path):
+    monkeypatch.setenv(harness.BOOTSTRAP_ENV, NORMALIZED_BOOTSTRAP)
+    proc, rehearsal = _spawn_worker_with_recorded_popen(monkeypatch, tmp_path)
+    child_env = proc.kwargs["env"]
+
+    _assert(child_env["ISSUE145_WORKER_BACKEND"] == harness.BACKEND_ROOT,
+            "the worker lost its backend path")
+    _assert(child_env["ISSUE145_WORKER_APP_ROLE"] == rehearsal.app_role,
+            "the worker lost the application role")
+    _assert(child_env["ISSUE145_WORKER_MIGRATOR_ROLE"] == rehearsal.migrator_role,
+            "the worker lost the migrator role")
+    _assert(child_env["ISSUE145_REDACT_PATTERN"] == harness.REDACT_PATTERN,
+            "the worker lost the redaction pattern")
+
+
+def test_spawn_worker_hands_the_worker_the_two_distinct_runtime_identities(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv(harness.BOOTSTRAP_ENV, NORMALIZED_BOOTSTRAP)
+    proc, rehearsal = _spawn_worker_with_recorded_popen(monkeypatch, tmp_path)
+    child_env = proc.kwargs["env"]
+
+    app_url = make_url(child_env["DATABASE_URL"])
+    migrator_url = make_url(child_env["STRIKENOVA_MIGRATION_DATABASE_URL"])
+
+    _assert(app_url.username == rehearsal.app_role,
+            "DATABASE_URL does not carry the application identity")
+    _assert(app_url.password == rehearsal.app_password,
+            "DATABASE_URL does not carry the application credential")
+    _assert(migrator_url.username == rehearsal.migrator_role,
+            "STRIKENOVA_MIGRATION_DATABASE_URL does not carry the migrator identity")
+    _assert(migrator_url.password == rehearsal.migrator_password,
+            "STRIKENOVA_MIGRATION_DATABASE_URL does not carry the migrator credential")
+    _assert(app_url.database == rehearsal.database,
+            "the application URL points at the wrong database")
+    _assert(migrator_url.database == rehearsal.database,
+            "the migrator URL points at the wrong database")
+    _assert(app_url.username != migrator_url.username,
+            "the two runtime identities are not distinct")
+    _assert(app_url.password != migrator_url.password,
+            "the two runtime identities share a credential")
+    _assert(child_env["DATABASE_URL"] != child_env["STRIKENOVA_MIGRATION_DATABASE_URL"],
+            "the application and migrator URLs are identical")

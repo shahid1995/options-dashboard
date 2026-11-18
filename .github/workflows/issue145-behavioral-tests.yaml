@@ -110,13 +110,16 @@ jobs:
         env:
           STRIKENOVA_ENV: ""
         run: |
+          # The six migration/exposure modules plus the DB-free harness safety
+          # module, which guards the rehearsal's own gate and credential controls.
           if python -m pytest -q \
               tests/test_db_migration.py \
               tests/test_migration_serialization.py \
               tests/test_migration_identity_separation.py \
               tests/test_alembic_migrations.py \
               tests/test_day5_alembic_authority.py \
-              tests/test_leg_exposure.py > issue145-regression.raw.log 2>&1; then
+              tests/test_leg_exposure.py \
+              tests/test_issue145_harness_safety.py > issue145-regression.raw.log 2>&1; then
             echo "0" > issue145-regression.rc
           else
             echo "$?" > issue145-regression.rc
