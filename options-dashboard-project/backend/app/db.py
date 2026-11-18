@@ -1,4 +1,5 @@
 import os
+from typing import Callable
 
 from sqlalchemy import create_engine, text, event
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
@@ -358,7 +359,9 @@ def _migration_lock_url() -> str:
     return resolve_migration_database_url()
 
 
-def _run_alembic_migrations() -> None:
+def _run_alembic_migrations(
+    post_migration_callback: Callable[[], None] | None = None,
+) -> None:
     """Run Alembic migrations against the migration identity.
 
     Alembic is the authoritative schema-management path. By default the
@@ -401,12 +404,22 @@ def _run_alembic_migrations() -> None:
         logger.info("SQLite target: migration lease lock skipped (single-process)")
         command.upgrade(alembic_cfg, "head")
         logger.info("Alembic migrations applied successfully")
+        # The startup backfill must run for every dialect, including SQLite.
+        # There is no distributed lease to extend here, so the callback is
+        # invoked directly; any failure propagates to the caller.
+        if post_migration_callback is not None:
+            post_migration_callback()
         return
 
-    _execute_serialized(alembic_cfg, command, logger)
+    _execute_serialized(alembic_cfg, command, logger, post_migration_callback)
 
 
-def _execute_serialized(alembic_cfg, command, logger) -> None:
+def _execute_serialized(
+    alembic_cfg,
+    command,
+    logger,
+    post_migration_callback: Callable[[], None] | None = None,
+) -> None:
     """Run ``command.upgrade`` guarded by the ADR-017 transactional lease.
 
     Exactly one process may execute the migration chain at a time. Waiters
@@ -457,6 +470,10 @@ def _execute_serialized(alembic_cfg, command, logger) -> None:
             pass
         command.upgrade(alembic_cfg, "head")
         logger.info("Alembic migrations applied successfully")
+        # Post-migration work (the startup exposure backfill) runs while the
+        # lease is still held, so concurrent starts cannot race it.
+        if post_migration_callback is not None:
+            post_migration_callback()
     finally:
         renewer.stop()
         released = mlock.release(lock_url, owner)
@@ -498,17 +515,21 @@ def init_db():
     from app import models  # noqa: F401  (registers tables on Base.metadata)
 
     logger = logging.getLogger(__name__)
-    _run_alembic_migrations()
 
     # Conservative one-time backfill for pre-existing, provably unambiguous
-    # executions. Rows already present are never duplicated.
+    # executions. Rows already present are never duplicated. It runs as the
+    # migration's post-step (inside the ADR-017 lease on server databases) so
+    # two instances starting at once cannot interleave their backfills.
     from app.services.leg_exposure import backfill_all_exposures
 
-    session = sessionmaker(bind=engine)()
-    try:
-        backfill_all_exposures(session)
-    finally:
-        session.close()
+    def _backfill_after_migrations() -> None:
+        session = sessionmaker(bind=engine)()
+        try:
+            backfill_all_exposures(session)
+        finally:
+            session.close()
+
+    _run_alembic_migrations(post_migration_callback=_backfill_after_migrations)
 
     # These indexes are intentionally SQLite-only and are not part of the
     # cross-dialect Alembic schema.

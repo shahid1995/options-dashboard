@@ -1,0 +1,214 @@
+name: Issue #145 - PostgreSQL 16 startup lease rehearsal
+
+# Executes tests/test_issue145_startup_concurrency.py, which drives three real
+# behavioral scenarios against a disposable PostgreSQL 16 server:
+#   A: two concurrent app.db.init_db() processes serialize migrations AND the
+#      startup exposure backfill (no duplicate exposures, no SQLSTATE 23505).
+#   B: a backfill held longer than the lease TTL is renewed by the holder while
+#      a competing startup stays blocked, then proceeds after the release.
+#   C: cleanup/consistency - lease released, exposure ledger exact, application
+#      identity still DML-only.
+# The rehearsal refuses to run anywhere except a GitHub-hosted runner
+# (GITHUB_ACTIONS=true and RUNNER_ENVIRONMENT=github-hosted).
+# This workflow does not claim any behavior the module does not execute.
+
+on:
+  push:
+    branches: [issue-145-fix]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  startup-lease-rehearsal:
+    name: PostgreSQL 16 startup lease + backfill rehearsal
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:16
+        # Password authentication with a credential that is unique per workflow
+        # run/attempt. It is derived from the run identifiers, so no static
+        # password is stored in the repository, and it is never printed or
+        # uploaded. The rehearsal additionally creates its own per-run
+        # migrator/application roles with generated passwords.
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+          POSTGRES_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}-issue145
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    defaults:
+      run:
+        working-directory: options-dashboard-project/backend
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Configure disposable PostgreSQL connection
+        env:
+          PG_SERVICE_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}-issue145
+        run: |
+          # Mask the credential and hand the bootstrap URL to later steps
+          # without ever echoing either value to the job log.
+          echo "::add-mask::$PG_SERVICE_PASSWORD"
+          printf 'ISSUE145_BOOTSTRAP_DATABASE_URL=postgresql://postgres:%s@127.0.0.1:5432/postgres\n' "$PG_SERVICE_PASSWORD" >> "$GITHUB_ENV"
+
+      - name: Report PostgreSQL server version
+        run: |
+          python - <<'PY'
+          import os
+
+          import psycopg
+
+          url = os.environ["ISSUE145_BOOTSTRAP_DATABASE_URL"]
+          with psycopg.connect(url) as conn:
+              banner = conn.execute("SHOW server_version").fetchone()[0]
+              num = conn.execute("SHOW server_version_num").fetchone()[0]
+          print("server_version:", banner)
+          if not str(num).startswith("16"):
+              raise SystemExit(f"expected PostgreSQL 16.x, got {num}")
+          PY
+
+      - name: Issue #145 behavioral rehearsal (scenarios A, B, C)
+        env:
+          ISSUE145_REHEARSAL: "1"
+          ISSUE145_DISPOSABLE_CONFIRM: issue145-disposable
+          STRIKENOVA_ENV: ""
+        run: |
+          # Keep the raw output out of the job log: capture it, record the exit
+          # status, and let the sanitizing step below decide the job outcome.
+          if python -m pytest -q tests/test_issue145_startup_concurrency.py \
+              --junitxml=issue145-rehearsal.xml > issue145-rehearsal.raw.log 2>&1; then
+            echo "0" > issue145-rehearsal.rc
+          else
+            echo "$?" > issue145-rehearsal.rc
+          fi
+          exit 0
+
+      - name: Existing migration/exposure regression suite
+        env:
+          STRIKENOVA_ENV: ""
+        run: |
+          if python -m pytest -q \
+              tests/test_db_migration.py \
+              tests/test_migration_serialization.py \
+              tests/test_migration_identity_separation.py \
+              tests/test_alembic_migrations.py \
+              tests/test_day5_alembic_authority.py \
+              tests/test_leg_exposure.py > issue145-regression.raw.log 2>&1; then
+            echo "0" > issue145-regression.rc
+          else
+            echo "$?" > issue145-regression.rc
+          fi
+          exit 0
+
+      - name: Redact, print, and verify rehearsal results
+        if: always()
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import importlib.util
+          import pathlib
+          import sys
+          import xml.etree.ElementTree as ET
+
+          HARNESS = pathlib.Path("tests/test_issue145_startup_concurrency.py")
+          EXPECTED = {
+              "test_two_concurrent_startups_serialize_migrations_and_backfill",
+              "test_lease_is_renewed_while_backfill_outlasts_ttl",
+              "test_workers_leave_a_clean_leased_database",
+          }
+
+          spec = importlib.util.spec_from_file_location("issue145_harness", HARNESS)
+          harness = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(harness)
+
+          problems = []
+          for stem in ("issue145-rehearsal", "issue145-regression"):
+              raw = pathlib.Path(stem + ".raw.log")
+              sanitized = pathlib.Path(stem + ".log")
+              if not raw.exists():
+                  problems.append(f"{raw.name} was not produced")
+                  continue
+              try:
+                  cleaned = harness._redact(
+                      raw.read_text(encoding="utf-8", errors="replace")
+                  )
+                  sanitized.write_text(cleaned, encoding="utf-8")
+              except Exception as exc:  # noqa: BLE001 - never print the raw file
+                  problems.append(f"redaction of {raw.name} failed: {type(exc).__name__}")
+                  continue
+              print(f"===== {sanitized.name} (redacted) =====")
+              print(cleaned)
+
+          xml_path = pathlib.Path("issue145-rehearsal.xml")
+          if not xml_path.exists():
+              problems.append("issue145-rehearsal.xml missing: the rehearsal did not run")
+          else:
+              root = ET.parse(xml_path).getroot()
+              if root.tag == "testsuites":
+                  suite = root.find("testsuite")
+                  if suite is not None:
+                      root = suite
+              cases = root.findall(".//testcase")
+              names = {case.get("name", "") for case in cases}
+              if len(cases) != 3:
+                  problems.append(f"expected 3 collected scenarios, got {len(cases)}")
+              missing = EXPECTED - names
+              if missing:
+                  problems.append(f"missing scenarios: {sorted(missing)}")
+              skipped = len(root.findall(".//skipped"))
+              if skipped:
+                  problems.append(f"{skipped} scenario(s) were skipped")
+              for attr in ("failures", "errors"):
+                  value = int(root.get(attr, "0") or 0)
+                  if value:
+                      problems.append(f"{value} {attr} reported by JUnit")
+
+          for stem in ("issue145-rehearsal", "issue145-regression"):
+              rc_path = pathlib.Path(stem + ".rc")
+              rc = int(rc_path.read_text().strip()) if rc_path.exists() else 1
+              if rc != 0:
+                  problems.append(f"{stem} exited with status {rc}")
+
+          if problems:
+              for problem in problems:
+                  print(f"FAIL: {problem}", file=sys.stderr)
+              sys.exit(1)
+          print("rehearsal verification passed: 3 scenarios executed, none skipped, none failed")
+          PY
+
+      - name: Upload sanitized rehearsal logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue145-postgres16-rehearsal-logs
+          path: |
+            options-dashboard-project/backend/issue145-rehearsal.log
+            options-dashboard-project/backend/issue145-regression.log
+          if-no-files-found: warn
+
+      - name: Remove raw logs and scratch files
+        if: always()
+        run: rm -f issue145-rehearsal.raw.log issue145-regression.raw.log issue145-rehearsal.xml issue145-rehearsal.rc issue145-regression.rc

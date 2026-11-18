@@ -740,6 +740,202 @@ class TestSqliteSkip:
         serialized.assert_not_called()
 
 
+# ---------------------------- SQLite post-migration callback (Issue #145)
+class TestSqlitePostMigrationCallback:
+    """The startup backfill must run after SQLite migrations too.
+
+    SQLite is single-process, so there is no distributed lease to extend --
+    but startup must still perform the post-migration work that ran for every
+    dialect before the lease was introduced (Issue #145).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _sqlite_target(self):
+        import sqlalchemy
+
+        with patch.object(
+            db_module,
+            "settings",
+            Settings(DATABASE_URL="sqlite://", STRIKENOVA_MIGRATION_DATABASE_URL=""),
+        ), patch.object(
+            db_module, "engine", sqlalchemy.create_engine("sqlite://")
+        ):
+            yield
+
+    def test_sqlite_upgrade_invokes_callback_exactly_once(self):
+        calls = []
+        with patch("alembic.config.Config"), patch(
+            "alembic.command.upgrade"
+        ) as upgrade:
+            db_module._run_alembic_migrations(
+                post_migration_callback=lambda: calls.append("backfill")
+            )
+        upgrade.assert_called_once()
+        assert calls == ["backfill"]
+
+    def test_sqlite_upgrade_failure_skips_callback(self):
+        calls = []
+        with patch("alembic.config.Config"), patch(
+            "alembic.command.upgrade", side_effect=RuntimeError("boom")
+        ):
+            with pytest.raises(RuntimeError):
+                db_module._run_alembic_migrations(
+                    post_migration_callback=lambda: calls.append("backfill")
+                )
+        assert calls == []
+
+    def test_callback_exception_propagates(self):
+        class BackfillFailed(RuntimeError):
+            pass
+
+        def _failing_callback():
+            raise BackfillFailed("backfill failed")
+
+        with patch("alembic.config.Config"), patch("alembic.command.upgrade"):
+            with pytest.raises(BackfillFailed):
+                db_module._run_alembic_migrations(
+                    post_migration_callback=_failing_callback
+                )
+
+    def test_sqlite_path_never_touches_the_postgres_lease(self):
+        with patch("alembic.config.Config"), patch(
+            "alembic.command.upgrade"
+        ), patch.object(mlock, "try_acquire") as try_acquire, patch.object(
+            mlock, "wait_for_release"
+        ) as wait_for_release, patch.object(
+            mlock, "release"
+        ) as release, patch.object(
+            mlock, "LeaseRenewer"
+        ) as renewer, patch.object(
+            mlock, "read_alembic_version"
+        ) as read_version:
+            db_module._run_alembic_migrations(post_migration_callback=lambda: None)
+        try_acquire.assert_not_called()
+        wait_for_release.assert_not_called()
+        release.assert_not_called()
+        renewer.assert_not_called()
+        read_version.assert_not_called()
+
+
+# ---------------------- PostgreSQL post-migration callback (Issue #145)
+class TestPostgresPostMigrationCallback:
+    """The startup backfill runs inside the ADR-017 lease on the PostgreSQL path.
+
+    Every lease function is mocked here: this is a unit test of the ordering
+    contract in ``_execute_serialized`` (upgrade -> callback while the lease is
+    still held -> renewer.stop -> release), not a concurrency test. No database
+    connection is opened (``_migration_lock._connect`` is asserted unused).
+    """
+
+    @staticmethod
+    def _cfg():
+        cfg = MagicMock()
+        cfg.get_main_option.return_value = "postgresql://x/db"
+        return cfg
+
+    @pytest.fixture(autouse=True)
+    def _mocked_lease(self):
+        with patch.object(
+            mlock, "try_acquire", return_value=(True, False)
+        ) as try_acquire, patch.object(
+            mlock, "wait_for_release"
+        ) as wait_for_release, patch.object(
+            mlock, "release", return_value=True
+        ) as release, patch.object(
+            mlock, "LeaseRenewer"
+        ) as renewer_cls, patch.object(
+            mlock, "read_alembic_version", return_value=None
+        ), patch.object(
+            mlock, "_connect"
+        ) as connect, patch(
+            "alembic.script.ScriptDirectory.from_config"
+        ) as script_dir:
+            script_dir.return_value.get_current_head.return_value = None
+            renewer_cls.return_value.stop = MagicMock()
+            yield {
+                "try_acquire": try_acquire,
+                "wait_for_release": wait_for_release,
+                "release": release,
+                "renewer_cls": renewer_cls,
+                "connect": connect,
+            }
+
+    def test_callback_runs_after_upgrade_while_lease_is_held(self, _mocked_lease):
+        lease = _mocked_lease
+        events = []
+        command = MagicMock()
+        command.upgrade.side_effect = lambda *_a, **_k: events.append("upgrade")
+
+        def _backfill():
+            # The lease must still be held when the backfill runs: neither
+            # renewal nor release may have happened yet.
+            assert lease["renewer_cls"].return_value.stop.call_count == 0
+            assert lease["release"].call_count == 0
+            events.append("backfill")
+
+        lease["renewer_cls"].return_value.stop.side_effect = lambda: events.append(
+            "renewer_stop"
+        )
+        lease["release"].side_effect = lambda *_a, **_k: events.append("release") or True
+
+        db_module._execute_serialized(self._cfg(), command, MagicMock(), _backfill)
+
+        assert command.upgrade.call_count == 1
+        assert events == ["upgrade", "backfill", "renewer_stop", "release"]
+        # Same lease is released that was acquired.
+        lock_url, owner = lease["try_acquire"].call_args.args[0:2]
+        lease["release"].assert_called_once_with(lock_url, owner)
+        lease["connect"].assert_not_called()
+
+    def test_upgrade_failure_skips_callback_but_still_releases(self, _mocked_lease):
+        lease = _mocked_lease
+        command = MagicMock()
+        command.upgrade.side_effect = RuntimeError("boom")
+        calls = []
+
+        def _backfill():
+            calls.append("backfill")
+
+        with pytest.raises(RuntimeError):
+            db_module._execute_serialized(
+                self._cfg(), command, MagicMock(), _backfill
+            )
+
+        assert calls == []
+        lease["renewer_cls"].return_value.stop.assert_called_once()
+        lease["release"].assert_called_once()
+        lease["connect"].assert_not_called()
+
+    def test_callback_exception_stops_renewal_and_releases_lease(self, _mocked_lease):
+        lease = _mocked_lease
+        events = []
+
+        class BackfillFailed(RuntimeError):
+            pass
+
+        def _backfill():
+            events.append("backfill")
+            raise BackfillFailed("duplicate key value violates unique constraint")
+
+        command = MagicMock()
+        command.upgrade.side_effect = lambda *_a, **_k: events.append("upgrade")
+        lease["renewer_cls"].return_value.stop.side_effect = lambda: events.append(
+            "renewer_stop"
+        )
+        lease["release"].side_effect = lambda *_a, **_k: events.append("release") or True
+
+        with pytest.raises(BackfillFailed):
+            db_module._execute_serialized(
+                self._cfg(), command, MagicMock(), _backfill
+            )
+
+        # Renewal stops and the lease is released before the error propagates.
+        assert events == ["upgrade", "backfill", "renewer_stop", "release"]
+        lock_url, owner = lease["try_acquire"].call_args.args[0:2]
+        lease["release"].assert_called_once_with(lock_url, owner)
+        lease["connect"].assert_not_called()
+
+
 class TestNoCrossTestPollution:
     def test_module_engine_is_a_real_engine(self):
         import sqlalchemy
