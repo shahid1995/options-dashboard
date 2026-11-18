@@ -14,6 +14,7 @@ import re
 
 import pytest
 import yaml
+from sqlalchemy.engine import make_url
 
 HERE = pathlib.Path(__file__).resolve().parent
 HARNESS_PATH = HERE / "test_issue145_startup_concurrency.py"
@@ -22,6 +23,7 @@ WORKFLOW_PATH = (
 )
 
 BOOTSTRAP = "postgresql://postgres:per-run-secret@127.0.0.1:5432/postgres"
+NORMALIZED_BOOTSTRAP = "postgresql+psycopg://postgres:per-run-secret@127.0.0.1:5432/postgres"
 
 spec = importlib.util.spec_from_file_location("issue145_rehearsal_harness", HARNESS_PATH)
 harness = importlib.util.module_from_spec(spec)
@@ -53,7 +55,58 @@ def _env(monkeypatch, **overrides):
 
 def test_gate_accepts_a_complete_hosted_runner_environment(monkeypatch):
     _env(monkeypatch)
-    assert harness._require_rehearsal_env() == BOOTSTRAP
+    assert harness._require_rehearsal_env() == NORMALIZED_BOOTSTRAP
+
+
+def test_gate_normalizes_the_bootstrap_url_to_the_psycopg3_driver(monkeypatch):
+    _env(monkeypatch)
+    url = harness._require_rehearsal_env()
+    parsed = make_url(url)
+    # psycopg2 is deliberately absent: SQLAlchemy must select the psycopg 3
+    # dialect that the application and requirements install.
+    assert parsed.drivername == "postgresql+psycopg"
+    assert parsed.get_backend_name() == "postgresql"
+    assert parsed.username == "postgres"
+    assert parsed.password == "per-run-secret"
+    assert parsed.host == "127.0.0.1"
+    assert parsed.port == 5432
+    assert parsed.database == "postgres"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        BOOTSTRAP,
+        "postgres://postgres:per-run-secret@127.0.0.1:5432/postgres",
+        NORMALIZED_BOOTSTRAP,
+    ],
+)
+def test_gate_normalizes_every_supported_postgres_scheme(monkeypatch, raw):
+    _env(monkeypatch, ISSUE145_BOOTSTRAP_DATABASE_URL=raw)
+    assert harness._require_rehearsal_env() == NORMALIZED_BOOTSTRAP
+
+
+def test_gate_still_rejects_non_postgres_bootstrap_urls(monkeypatch):
+    _env(monkeypatch, ISSUE145_BOOTSTRAP_DATABASE_URL="sqlite:///./paper_journal.db")
+    with pytest.raises(pytest.fail.Exception) as excinfo:
+        harness._require_rehearsal_env()
+    assert "must be a PostgreSQL URL" in str(excinfo.value)
+
+
+def test_harness_connection_urls_keep_the_real_passwords():
+    rehearsal = harness._Rehearsal(NORMALIZED_BOOTSTRAP)
+    admin = make_url(rehearsal.admin_db_url)
+    app = make_url(rehearsal.app_url)
+    migrator = make_url(rehearsal.migrator_url)
+    for url in (admin, app, migrator):
+        assert url.drivername == "postgresql+psycopg"
+        assert url.database == rehearsal.database
+        assert "***" not in url.password
+    assert admin.password == "per-run-secret"
+    assert app.username == rehearsal.app_role
+    assert app.password == rehearsal.app_password
+    assert migrator.username == rehearsal.migrator_role
+    assert migrator.password == rehearsal.migrator_password
 
 
 def test_gate_skips_only_when_the_rehearsal_is_not_requested(monkeypatch):

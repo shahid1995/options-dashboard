@@ -17,6 +17,11 @@ These tests are inert unless ALL of the following hold:
 * ``ISSUE145_BOOTSTRAP_DATABASE_URL`` is a PASSWORD-authenticated PostgreSQL
   URL on loopback using the ``postgres``/``template1`` maintenance database
 
+The bootstrap URL is normalized exactly like the application does
+(``app.db.normalize_database_url``): bare ``postgres://``/``postgresql://``
+become ``postgresql+psycopg://``, so every engine this harness builds uses
+the installed psycopg 3 driver instead of SQLAlchemy's psycopg2 default.
+
 Once the gate passes, the test asks the server itself before creating
 anything: PostgreSQL 16.x, loopback address and expected port, the
 ``/.dockerenv`` marker from the official image, the image's data directory, a
@@ -296,8 +301,14 @@ def _require_rehearsal_env() -> str:
         pytest.fail(f"{REHEARSAL_FLAG}=1 but {BOOTSTRAP_ENV} is not set")
     if "production" in (os.getenv("STRIKENOVA_ENV", "") or "").lower():
         pytest.fail("refusing to rehearse against STRIKENOVA_ENV=production")
+    # Reuse the application's own mapping so the harness connects exactly like
+    # production does: SQLAlchemy's bare ``postgresql://`` dialect targets
+    # psycopg2, which this project does not install.
+    from app.db import normalize_database_url
+
+    normalized = normalize_database_url(raw)
     try:
-        url = make_url(raw)
+        url = make_url(normalized)
     except Exception as exc:  # noqa: BLE001 - malformed configuration
         pytest.fail(f"{BOOTSTRAP_ENV} is not a valid SQLAlchemy URL: {exc}")
     if url.get_backend_name() != "postgresql":
@@ -318,7 +329,7 @@ def _require_rehearsal_env() -> str:
             f"{BOOTSTRAP_ENV} must use one of the maintenance databases "
             f"{MAINTENANCE_DATABASES} (got {maintenance_db!r})"
         )
-    return raw
+    return normalized
 
 
 def _redact(message: str) -> str:
@@ -440,7 +451,9 @@ class _Rehearsal:
         url = make_url(self._bootstrap_url)
         if user is not None:
             url = url.set(username=user, password=password)
-        return str(url.set(database=database))
+        # ``str(URL)`` masks the password as ``***``; these URLs are used to
+        # connect, so render the real credential explicitly.
+        return url.set(database=database).render_as_string(hide_password=False)
 
     @property
     def admin_db_url(self) -> str:
