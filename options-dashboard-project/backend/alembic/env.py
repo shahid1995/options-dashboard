@@ -93,6 +93,83 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+def _sqlite_disable_fk(connection):
+    """Turn off SQLite foreign-key enforcement for the duration of a migration.
+
+    SQLite refuses to ``DROP TABLE`` a table that child rows still reference,
+    and an Alembic batch migration does exactly that (create tmp, copy, drop,
+    rename). ``PRAGMA defer_foreign_keys`` does **not** help: the check on DROP
+    is immediate, not deferrable. Only ``foreign_keys=OFF`` does.
+
+    Two constraints on when it can be set:
+
+    * It is a no-op inside a transaction, so it must run before the migration
+      emits any DDL.
+    * It must be executed on the **raw DBAPI connection**. Running any
+      statement through the SQLAlchemy ``Connection`` first triggers autobegin,
+      which makes Alembic's ``begin_transaction()`` a no-op and silently loses
+      the version bump (DDL survives because pysqlite defers BEGIN until DML,
+      while the version insert rolls back).
+
+    Returns the raw connection so the caller can restore enforcement.
+    """
+    if connection.dialect.name != "sqlite":
+        return None
+    raw = connection.connection.dbapi_connection
+    cur = raw.cursor()
+    cur.execute("PRAGMA foreign_keys=OFF")
+    cur.execute("PRAGMA foreign_keys")
+    value = cur.fetchone()[0]
+    cur.close()
+    if value != 0:
+        raise RuntimeError(
+            "could not disable SQLite foreign-key enforcement for this "
+            "migration; a transaction is already open on the connection"
+        )
+    return raw
+
+
+def _sqlite_restore_fk(raw) -> None:
+    """Re-enable enforcement once the migration transaction has ended."""
+    if raw is None:
+        return
+    cur = raw.cursor()
+    cur.execute("PRAGMA foreign_keys=ON")
+    cur.execute("PRAGMA foreign_keys")
+    value = cur.fetchone()[0]
+    cur.close()
+    if value != 1:
+        # A transaction was still open, so the pragma was a no-op. Never hand a
+        # connection back to the pool with enforcement silently off.
+        raise RuntimeError(
+            "could not re-enable SQLite foreign-key enforcement after the migration"
+        )
+
+
+def _sqlite_fk_check(connection) -> None:
+    """Fail the migration if it left a referential inconsistency behind."""
+    if connection.dialect.name != "sqlite":
+        return
+    violations = connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise RuntimeError(
+            f"migration left {len(violations)} foreign-key violation(s); "
+            f"first: {violations[0]}"
+        )
+
+
+def _run_migrations_with_connection(connection) -> None:
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        render_as_batch=True,
+    )
+
+    with context.begin_transaction():
+        context.run_migrations()
+        _sqlite_fk_check(connection)
+
+
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode.
 
@@ -127,14 +204,19 @@ def run_migrations_online() -> None:
             )
 
     with connectable.connect() as connection:
-        context.configure(
-            connection=connection,
-            target_metadata=target_metadata,
-            render_as_batch=True,
-        )
-
-        with context.begin_transaction():
-            context.run_migrations()
+        # FK enforcement is disabled only for the migration transaction and is
+        # restored in `finally`, so a pooled application connection is never
+        # handed back with foreign keys off.
+        raw = _sqlite_disable_fk(connection)
+        try:
+            _run_migrations_with_connection(connection)
+        except Exception:
+            # Close the aborted transaction first: the pragma cannot be changed
+            # while one is open.
+            connection.rollback()
+            raise
+        finally:
+            _sqlite_restore_fk(raw)
 
 
 if context.is_offline_mode():

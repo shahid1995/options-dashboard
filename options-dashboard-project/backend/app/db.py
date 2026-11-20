@@ -1,6 +1,9 @@
+import logging
 import os
+import sqlite3
 
 from sqlalchemy import create_engine, text, event
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from app.config import settings
@@ -30,6 +33,37 @@ _BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DEFAULT_DB_PATH = os.path.join(_BACKEND_DIR, "paper_journal.db")
 
 
+#: Result of the one-time SQLite foreign-key preflight, keyed by database path.
+#: Exposed for diagnostics: "enforced", "violations" or "clean" (fresh file).
+_SQLITE_FK_STATE: dict[str, str] = {}
+
+
+def _sqlite_fk_preflight(database: str | None) -> tuple[bool, int, list[str]]:
+    """Check an existing SQLite file for foreign-key violations before enforcing.
+
+    Enforcing ``foreign_keys=ON`` on a database that already contains orphan
+    rows would make writes that previously succeeded start failing -- a deploy
+    would turn a latent inconsistency into an outage. So the decision is made
+    once, from the existing rows, before any connection is handed out.
+
+    Returns ``(safe_to_enforce, violation_count, offending_tables)``. A missing
+    file is trivially safe: it has no rows to violate anything.
+    """
+    if not database or database == ":memory:" or database.startswith("file:"):
+        return True, 0, []
+    if not os.path.exists(database):
+        return True, 0, []
+
+    conn = sqlite3.connect(database)
+    try:
+        rows = conn.execute("PRAGMA foreign_key_check").fetchall()
+    finally:
+        conn.close()
+
+    tables = sorted({row[0] for row in rows})
+    return (not rows), len(rows), tables
+
+
 def _engine():
     if settings.DATABASE_URL:
         url = settings.DATABASE_URL
@@ -39,11 +73,49 @@ def _engine():
     if url.startswith("sqlite"):
         connect_args = {"check_same_thread": False}
         eng = create_engine(url, connect_args=connect_args)
-        # Phase 7.23B: Switch SQLite to WAL journal mode for crash safety.
+
+        # Exactly one connect listener. The previous code registered the same
+        # WAL pragma pair twice (once inside this branch, once again after it),
+        # which ran both statements twice on every new connection.
+        #
+        # foreign_keys=ON is what makes the schema's foreign keys actually
+        # apply: SQLite defaults to OFF, so without this every FK in the
+        # database is inert. Migrations are the one exception -- Alembic's
+        # batch rebuilds must drop and recreate tables, which SQLite refuses
+        # while enforcement is on. alembic/env.py therefore turns enforcement
+        # off on the raw DBAPI connection for the duration of a migration and
+        # restores it in a finally block (a transaction-scoped pragma cannot
+        # work: the check on DROP TABLE is immediate, not deferrable), so this
+        # listener can leave enforcement on for the life of the application.
+        #
+        # One precondition: an existing database may already contain orphan
+        # rows from the era when nothing was enforced. Turning enforcement on
+        # there would reject writes that used to succeed, so the rows are
+        # checked first and enforcement is skipped (loudly) if they are dirty.
+        database = make_url(url).database
+        fk_safe, fk_violations, fk_tables = _sqlite_fk_preflight(database)
+        _SQLITE_FK_STATE[database or ":memory:"] = (
+            "enforced" if fk_safe else "violations"
+        )
+        if not fk_safe:
+            logging.getLogger(__name__).error(
+                "SQLite foreign-key enforcement is OFF for %s: %d existing "
+                "violation(s) in %s. Enforcing now would reject writes that "
+                "previously succeeded. Repair these rows and restart to turn "
+                "enforcement on.",
+                database,
+                fk_violations,
+                ", ".join(fk_tables) or "unknown tables",
+            )
+
         @event.listens_for(eng, "connect")
-        def _set_wal(dbapi_conn, _rec):
-            dbapi_conn.execute("PRAGMA journal_mode=WAL")
-            dbapi_conn.execute("PRAGMA synchronous=NORMAL")
+        def _set_sqlite_pragmas(dbapi_conn, _rec):
+            cur = dbapi_conn.cursor()
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA synchronous=NORMAL")
+            if fk_safe:
+                cur.execute("PRAGMA foreign_keys=ON")
+            cur.close()
     else:
         # Phase 9E: Production PostgreSQL configuration
         eng = create_engine(
@@ -54,12 +126,6 @@ def _engine():
             pool_recycle=1800,
             pool_pre_ping=True,
         )
-
-    if url.startswith("sqlite"):
-        @event.listens_for(eng, "connect")
-        def _set_wal(dbapi_conn, _rec):
-            dbapi_conn.execute("PRAGMA journal_mode=WAL")
-            dbapi_conn.execute("PRAGMA synchronous=NORMAL")
 
     return eng
 
