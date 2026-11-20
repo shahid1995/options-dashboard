@@ -39,7 +39,7 @@ Root control documents:
 
 ## 3. Current Runtime Topology
 
-Production:
+Production (current endpoint; legacy, unreachable — to be retired):
 
 ```
 Browser
@@ -51,15 +51,17 @@ Vercel
 Render
    |
    v
-CockroachDB
+CockroachDB (legacy production endpoint, unreachable; target Neon PostgreSQL per ADR-019)
 ```
 
 - Frontend: Vercel
 - Backend: Render
-- Production database: CockroachDB
+- Current production database endpoint: CockroachDB (legacy; unreachable; retirement in progress).
+- Target production database: Neon PostgreSQL, established as a clean database using the approved schema/migration chain (ADR-019). Not yet provisioned or cutover.
+- Neon staging is a separate database/environment from the future production database.
 - Local/default persistence may use SQLite when the configured database URL is absent.
 
-Do not use historical Railway/PostgreSQL deployment descriptions as the current production topology.
+Do not describe production as already running on Neon until deployment/cutover evidence exists. Do not use historical Railway deployment descriptions as the current production topology.
 
 ## 4. Application Stack
 
@@ -122,9 +124,9 @@ SQLAlchemy is the application ORM.
 
 Alembic is the authoritative production schema migration mechanism.
 
-Production persistence is CockroachDB. SQLite is permitted for local/default operation where repository configuration selects it.
+Production persistence target is Neon PostgreSQL (clean-slate, per ADR-019); the current production endpoint is CockroachDB (legacy, unreachable) until cutover. SQLite is permitted for local/default operation where repository configuration selects it.
 
-Do not use ad-hoc startup table creation as a substitute for production migrations.
+Do not use ad-hoc startup table creation as a substitute for production migrations. Do not treat the Neon staging database as production.
 
 ## 7. Verification
 

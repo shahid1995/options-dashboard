@@ -280,7 +280,7 @@ Schema changes must consider:
 - indexes and constraints;
 - rollback/forward-compatibility;
 - SQLite development/test behavior;
-- CockroachDB production behavior.
+- PostgreSQL/Neon production behavior (CockroachDB is retired as a production target per ADR-019; historical CockroachDB-specific behavior remains traceable but is not required for new work).
 
 A migration is incomplete until the affected existing-data path has been verified.
 

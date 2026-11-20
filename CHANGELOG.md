@@ -40,7 +40,7 @@ Do not add entries for:
 
 - Frontend runtime/deployment: Vercel.
 - Backend runtime/deployment: Render.
-- Production database: CockroachDB.
+- Production database: CockroachDB (legacy current endpoint, unreachable; target Neon PostgreSQL per ADR-019; not yet cutover).
 - The application should not be described as currently hosted on Railway.
 
 ### 2026-09 — AI workspace documentation baseline
@@ -101,7 +101,7 @@ Historical collection should therefore not be enabled implicitly merely because 
 
 - SQLAlchemy defines the ORM model.
 - Alembic is the authoritative production schema migration mechanism.
-- Production persistence is the configured CockroachDB environment.
+- Production persistence target is Neon PostgreSQL (clean-slate, per ADR-019); current endpoint is CockroachDB (legacy, unreachable) until cutover.
 - Local development may use SQLite when DATABASE_URL is absent.
 
 Do not treat startup table creation or local SQLite behavior as the production schema authority.
@@ -133,6 +133,39 @@ SECURITY.md §12.1; INV-007 (credential ownership) and INV-024 (server-boundary 
 **Commit/PR**
 
 See the `security/auth-register-no-password-linking` pull request.
+
+### 2026-11-20 — D-1 resolved: CockroachDB retired as production target; Neon PostgreSQL clean-slate adopted
+
+**Category:** Data / Architecture
+
+**Change**
+
+ADR-019 (Proposed) records the founder decision that CockroachDB is no longer required as the production database, existing CockroachDB data is not required, and no CockroachDB backup recovery/export/historical-data migration is required. Neon PostgreSQL is adopted as the production database target, to be established as a clean database using the approved application schema/migration chain (Alembic). Neon staging remains separate from the future production database. CockroachDB is removed as a required target for the migration-lease protocol and its future acceptance tests.
+
+**Why**
+
+The configured production CockroachDB cluster (`strikenova-production-20972`) was unreachable (`codeParamsRoutingFailed: cluster ... not found`); authoritative version evidence was recorded as insufficient. The founder resolved ADR-017 decision D-1 in favour of the PostgreSQL-only direction.
+
+**Impact**
+
+- Current production is not yet running on Neon; the old CockroachDB endpoint remains the current (unreachable) endpoint until cutover evidence exists.
+- No CockroachDB backup/export/recovery work is required.
+- Migration-lease protocol and acceptance tests no longer require CockroachDB.
+- Decisions D-2 through D-7 and approval of the complete lease protocol remain separate.
+
+**Verification**
+
+Documentation/governance change only. No source code, migration, database, service configuration, or PR state changed.
+
+**Related decision/invariant**
+
+ADR-019; supersedes ADR-013. ADR-017, ADR-018 remain Proposed.
+
+**Commit/PR**
+
+Documentation review branch (isolated).
+
+---
 
 ---
 

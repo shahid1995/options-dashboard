@@ -41,7 +41,7 @@ The required layer depends on the risk and scope of the change.
 - pytest-asyncio with asyncio_mode = auto
 - SQLAlchemy test databases where appropriate
 - SQLite/in-memory test setups for isolated tests
-- CockroachDB production integration expectations for persistence-sensitive work; PostgreSQL-compatible behavior may be used only where the specific test/database contract requires it
+- PostgreSQL/Neon production integration expectations for persistence-sensitive work (CockroachDB is retired as a production target per ADR-019 and is no longer a required target for the migration-lease protocol or its future acceptance tests); SQLite/in-memory setups remain for isolated tests
 
 ### Frontend
 

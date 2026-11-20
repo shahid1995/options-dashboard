@@ -61,6 +61,10 @@ Do not rewrite historical decisions to make the history look cleaner. When direc
 | ADR-009 | Keep historical market-data collection disabled by default and operationally bounded | Active |
 | ADR-010 | Keep the public website and authenticated application as separate application/deployment concerns | Active |
 | ADR-011 | Preserve GitHub as implementation/project authority and keep durable knowledge outside implementation state | Active |
+| ADR-013 | Treat CockroachDB as the strategic production database target | Superseded (by ADR-019) |
+| ADR-017 | Database-backed migration lease (MigrationLease) for Alembic concurrency | Proposed |
+| ADR-018 | Default-privilege carve-out for `migration_internal` schema | Proposed |
+| ADR-019 | Retire CockroachDB as a production target; adopt Neon PostgreSQL as a clean-slate production database | Proposed |
 
 The entries below capture the decision intent and implementation consequences.
 
@@ -572,6 +576,98 @@ A change to an accepted architectural decision requires an explicit decision tra
 - `PROJECT-CONTROL.md`
 - `options-dashboard-project/docs/PROJECT_STATUS_CURRENT.md`
 - current AI workspace control documents.
+
+---
+
+## ADR-013 — Treat CockroachDB as the Strategic Production Database Target
+
+**Status:** Superseded (by ADR-019)  \
+**Date:** 2026-09  \
+**Category:** Data / Deployment Topology
+
+### Context
+
+Earlier StrikeNova topology and data documents treated CockroachDB as the strategic production database target, and production persistence was described as the configured CockroachDB environment.
+
+### Decision (historical)
+
+CockroachDB was the production database target; production persistence was the configured CockroachDB environment.
+
+### Supersession
+
+ADR-019 supersedes this direction: CockroachDB is retired as a production target; the future production database is Neon PostgreSQL, established as a clean database. Historical ADR-013 is retained for traceability and is not silently rewritten.
+
+---
+
+## ADR-017 — Database-Backed Migration Lease (MigrationLease)
+
+**Status:** Proposed  \
+**Date:** 2026-11  \
+**Category:** Data / Concurrency
+
+### Context
+
+Alembic production migrations must be serialized across concurrent runners. A database-backed migration lease (MigrationLease) is proposed to coordinate this. CockroachDB is no longer a required target for this protocol or its future acceptance tests (see ADR-019); the protocol must be portable to PostgreSQL/Neon.
+
+### Note
+
+Implementation of ADR-017 is not authorized by this entry. Decisions D-2 through D-7 and approval of the complete lease protocol remain separate.
+
+---
+
+## ADR-018 — Default-Privilege Carve-Out for `migration_internal` Schema
+
+**Status:** Proposed  \
+**Date:** 2026-11  \
+**Category:** Data / Privileges
+
+### Context
+
+A `migration_internal` schema with zero runtime privileges is proposed to host migration-lease objects, with a default-privilege carve-out so runtime roles cannot access lease state. CockroachDB is no longer a required target (see ADR-019); the carve-out must be verified on PostgreSQL/Neon.
+
+### Note
+
+Implementation of ADR-018 is not authorized by this entry.
+
+---
+
+## ADR-019 — Retire CockroachDB as a Production Target; Adopt Neon PostgreSQL as a Clean-Slate Production Database
+
+**Status:** Proposed  \
+**Date:** 2026-11-20  \
+**Category:** Data / Deployment Topology
+
+### Context
+
+The founder has decided that CockroachDB is no longer required as the production database. Existing CockroachDB data is not required. No CockroachDB backup recovery, export, or historical-data migration is required. Neon PostgreSQL is the production database target. The production database will be established as a clean database using the approved application schema/migration chain. Existing Neon staging must remain separate from the future production database.
+
+The configured production CockroachDB cluster (`strikenova-production-20972`) was found unreachable (`codeParamsRoutingFailed: cluster ... not found`); authoritative version evidence is recorded as insufficient in `docs/PROD_CRDB_VERSION_EVIDENCE.md` (published on branch `docs/prod-crdb-version-evidence`).
+
+### Decision
+
+1. CockroachDB is retired as a production target. It is not required for new work, including the migration-lease protocol and its future acceptance tests.
+2. Neon PostgreSQL is the production database target.
+3. The production database is established as a clean database using the approved application schema/migration chain (Alembic). No historical CockroachDB data migration is required or performed.
+4. Neon staging remains a separate database/environment from the future production database.
+5. The production Neon database must be separately provisioned and verified before production cutover. This decision does not itself provision, modify, or activate any database, and does not authorize cutover.
+6. Historical ADR-013 (CockroachDB strategic target) is superseded by this ADR and retained for traceability.
+
+### Consequences
+
+- Current production is not yet running on Neon; the old CockroachDB endpoint remains the (unreachable) current production endpoint until cutover evidence exists.
+- No CockroachDB backup/export/recovery work is required.
+- Migration-lease protocol and acceptance tests no longer require CockroachDB; PostgreSQL/Neon is the target.
+- D-1 is resolved in favour of the PostgreSQL-only direction.
+- Decisions D-2 through D-7 and approval of the complete lease protocol remain separate and are not resolved by this ADR.
+
+### Evidence
+
+- Founder decision recorded 2026-11-20.
+- `docs/PROD_CRDB_VERSION_EVIDENCE.md` (branch `docs/prod-crdb-version-evidence`).
+
+### Supersedes
+
+- ADR-013 (Treat CockroachDB as the strategic production database target).
 
 ---
 

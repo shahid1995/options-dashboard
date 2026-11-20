@@ -423,11 +423,11 @@ Unknown market state is not treated as open.
 The application uses SQLAlchemy ORM with:
 
 - SQLite for local/default operation;
-- CockroachDB when `DATABASE_URL` is configured for production; SQLite remains available for local/default operation.
+- PostgreSQL (Neon) as the production database target, established as a clean database using the approved schema/migration chain (ADR-019); CockroachDB is retired as a production target and is not required for new work.
 
 SQLite is configured with WAL behavior for local resilience.
 
-CockroachDB connections use the configured SQLAlchemy database URL and health-oriented connection settings.
+The current production endpoint remains CockroachDB (legacy, unreachable) until cutover evidence exists. PostgreSQL/Neon connections use the configured SQLAlchemy database URL. Do not treat the Neon staging database as production.
 
 ### 7.2 Schema authority
 
@@ -663,7 +663,7 @@ GitHub
   └──────────────▶ Render
                     └── FastAPI backend
                          │
-                         └── CockroachDB
+                         └── CockroachDB (legacy; target Neon PostgreSQL per ADR-019)
 ```
 
 ### Current hosting responsibilities
@@ -672,9 +672,10 @@ GitHub
 |---|---|---|
 | Frontend | Vercel | Next.js public website and authenticated web application |
 | Backend | Render | FastAPI application, authentication, broker integration, business logic, paper execution, analytics APIs |
-| Database | CockroachDB | Durable application database used by the backend |
+| Database (current endpoint, legacy) | CockroachDB | Legacy durable application database used by the backend (unreachable; retirement in progress) |
+| Database (target) | Neon PostgreSQL | Future production database, established as a clean database using the approved schema/migration chain (ADR-019; not yet provisioned or cutover) |
 
-The backend connects to CockroachDB through the configured database connection rather than relying on platform-local database storage.
+The backend connects to its configured database through the SQLAlchemy database URL. Neon staging is a separate database/environment from the future production database. Do not describe production as already running on Neon until cutover evidence exists.
 
 The public website and authenticated application have separate frontend/deployment concerns within the product architecture.
 

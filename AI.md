@@ -75,9 +75,9 @@ The current production topology is:
        Render
          |
          v
-    CockroachDB
+    CockroachDB (legacy current endpoint; target Neon PostgreSQL per ADR-019)
 
-Do not reintroduce stale assumptions that the current backend is hosted on Railway or that the production database is PostgreSQL.
+Do not assume production is already running on Neon/PostgreSQL until cutover evidence exists. Do not reintroduce stale assumptions that the current backend is hosted on Railway.
 
 For authoritative details, consult ARCHITECTURE.md.
 

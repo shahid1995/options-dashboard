@@ -711,7 +711,7 @@ It does require that:
 - user transactional data and sensitive credential data are included in recovery planning;
 - recovery does not silently violate user ownership.
 
-The production database currently resides on CockroachDB. Backup/restore controls belong to the production database operations environment as well as the application.
+The production database target is Neon PostgreSQL (clean-slate, per ADR-019); the current production endpoint is CockroachDB (legacy, unreachable) until cutover. Backup/restore controls belong to the production database operations environment as well as the application. Neon staging is a separate database/environment and must not be treated as production.
 
 ---
 
@@ -804,7 +804,7 @@ Next.js frontend
 FastAPI backend on Render
       |
       ▼
-CockroachDB
+CockroachDB (legacy current endpoint, unreachable; target Neon PostgreSQL per ADR-019)
       |
       ├── identity / session data
       ├── broker connection metadata and encrypted secrets
@@ -815,7 +815,7 @@ CockroachDB
 
 Local development may use SQLite through the backend configuration when DATABASE_URL is not set.
 
-Production persistence must be treated as the configured CockroachDB environment, not as the local SQLite file.
+Production persistence target is Neon PostgreSQL (clean-slate, per ADR-019). The current endpoint remains CockroachDB (legacy, unreachable) until cutover evidence exists. The Neon staging database is separate and must not be treated as production. Do not treat the local SQLite file as production persistence.
 
 ---
 
