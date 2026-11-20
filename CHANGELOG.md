@@ -34,6 +34,24 @@ Do not add entries for:
 
 ---
 
+## 2026-10-19 — ChatGPT Markdown-only engineering-supervisor boundary
+
+- Made the accepted ChatGPT authoring boundary explicit in the `main` branch
+  control documents: planning, research, review, verification interpretation,
+  coding-agent supervision, issue/PR preparation, and Markdown documentation
+  are allowed; direct creation or modification of non-Markdown repository
+  files is prohibited.
+- Added the rule to `AGENTS.md`, linked it as `INV-035` in `INVARIANTS.md`,
+  and surfaced it in `AI.md` and `PROJECT-CONTROL.md`.
+- The Spec Kit constitution path used on the Day-35 feature branch does not
+  exist on `main`; this change deliberately does not import unrelated
+  feature-branch scaffolding or create a duplicate governance document.
+- Documentation-only. No code, tests, scripts, configuration, dependencies,
+  workflows, migrations, SQL/schema files, deployment, or production data were
+  changed.
+
+---
+
 ## Current baseline
 
 ### 2026-09 — Runtime topology

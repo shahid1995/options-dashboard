@@ -394,6 +394,16 @@ It must never contain:
 - copied production credentials;
 - other live secret material.
 
+
+### INV-035 — ChatGPT is Markdown-only for repository file changes
+
+ChatGPT may plan, research, brainstorm, review code/diffs, interpret test and CI
+evidence, supervise authorised coding agents, write prompts/tasks, prepare
+issues and pull requests, and author Markdown documentation. ChatGPT must not
+create, edit, delete, generate, or apply patches to non-Markdown repository
+files. Non-Markdown implementation is delegated to an authorised coding agent.
+See the ChatGPT engineering-supervisor boundary in [AGENTS.md](AGENTS.md).
+
 ---
 
 ## 10. What requires a decision record
