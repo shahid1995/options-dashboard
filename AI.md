@@ -58,6 +58,7 @@ If the apparent conflict cannot be resolved from these sources, stop and surface
 - **GitHub:** implementation authority.
 - **Obsidian:** knowledge/context authority.
 - **Founder:** final authority for product and architectural decisions.
+- **Primary Independent Engineering Reviewer (currently ChatGPT):** independently evaluates substantive engineering changes and verification evidence; this role advises the Founder and does not own implementation, product decisions, risk acceptance, merge, or release authority. See `PROJECT-CONTROL.md`.
 - **Code:** evidence of what is implemented; it does not automatically redefine accepted decisions.
 - **Tests:** evidence of verified behavior; passing tests do not authorize violating an invariant.
 - **Historical documents/commits:** evidence of what existed previously, not automatically the current specification.
