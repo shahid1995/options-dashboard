@@ -490,7 +490,7 @@ It is read-only, takes no row lock, and is the only lease function whose output 
 |---|---|---|
 | `45001` | Ownership mismatch (presented token is not the recorded owner) | Abort; never retry with the same token |
 | `45002` | Invalid lease state (held by another, no owner, expired own lease, bootstrap quiescence refused) | `acquire`: retry within budget; `enter`: abort |
-| `45004` | Configuration error (short token, invalid TTL or `lock_timeout`, misconfigured identity/protocol, **deployment barrier closed**) | Abort; run a bootstrap mode (§11.4.4) |
+| `45004` | Configuration error (short token, invalid TTL or `lock_timeout`, misconfigured identity/protocol, **deployment barrier closed**) | Abort; run a bootstrap mode (§11.4.5) |
 | `45005` | Required bootstrap object missing | Abort; run the guarded bootstrap |
 | `45006` | Unsupported protocol version | Abort; deploy the matching release or run the approved protocol upgrade |
 | `55P03` | Lock not available (`lock_timeout`) | `acquire`: retry within budget; `enter`: abort |
@@ -527,13 +527,13 @@ finally:
 
 ### 6.9 PostgreSQL 16 semantic review of the four functions
 
-Reviewed by inspection against PostgreSQL 16 behaviour. **None of it has been executed**; the assertion level is "design-level review", and §14 tests must confirm it.
+Reviewed by inspection against PostgreSQL 16 behaviour, then executed on a disposable PostgreSQL 16.16 instance for the four functions and the barrier/privilege checks (§14.1). The table records the semantics; §14.1 records what was observed, including a statement in this review that was wrong (the `NaN` row). The rest of the §14 matrix is still unexecuted.
 
 | Issue | PostgreSQL 16 behaviour | Resolution in this design |
 |---|---|---|
 | `lock_timeout = 0` | `0` **disables** the timeout (waits indefinitely); it does not mean "do not wait" | `acquire` and `enter` reject `< 1` with `45004`; bounds are 1–600000 ms. A zero never reaches `set_config` |
 | `lock_timeout` leakage | `set_config(..., true)` is transaction-local, so it also applies to every later lock wait in the same transaction (including Alembic DDL) | Each function saves `current_setting('lock_timeout')` and restores it immediately after the row lock is taken; the DDL transaction keeps the operator's value |
-| `make_interval` units | `make_interval(secs => x)` takes **seconds** as `double precision`; fractional seconds are allowed and there is no implicit millisecond interpretation | TTL is passed in seconds, bounded to `0 < ttl <= 86400`; `not (ttl > 0)` rejects `NULL`, `NaN` and negatives in one expression |
+| `make_interval` units | `make_interval(secs => x)` takes **seconds** as `double precision`; fractional seconds are allowed and there is no implicit millisecond interpretation | TTL is passed in seconds, bounded to `0 < ttl <= 86400`; `not (ttl > 0)` rejects `NULL` and negatives, and the upper bound rejects `NaN` and `Infinity`, because PostgreSQL orders `NaN` above every finite number (executed: §14.1 V-5) |
 | `%ROWTYPE` vs OUT parameters | `RETURNS TABLE (...)` columns become PL/pgSQL variables, which can collide with table columns in unqualified SQL | OUT parameters are prefixed `out_`; every table reference is aliased (`l.`, `pr.`); `lease_protocol_info_v1` keeps matching names but fully qualifies each column |
 | `session_user` type | `session_user` is `name`, and `owner_role` is `name`; relying on an implicit assignment cast is unnecessary | Assignment uses `session_user::name` |
 | `has_function_privilege` signature | It resolves a `regprocedure`, i.e. the **identity argument** types only; result/OUT columns and parameter names are irrelevant | §10.3 uses `float8` (the canonical spelling) rather than `double precision`, and no function has default arguments |
@@ -725,7 +725,7 @@ Bootstrap is one operator command with three modes, all executed by the migratio
 | Mode | Purpose | May write `barrier_state` |
 |---|---|---|
 | `bootstrap-lease` (install/verify) | Create or verify protocol objects; leave the database ready | Yes — sets `open` on success |
-| `bootstrap-lease --close-barrier` | Start a maintenance window; block new admissions without touching a live owner | Yes — sets `closed` |
+| `bootstrap-lease --close-barrier` | Start a maintenance window; block new admissions without waiting for, locking or aborting a live owner | Yes — sets `closed`; never sets `open` |
 | `bootstrap-lease --upgrade-protocol N` | Install/activate protocol `N` and reopen | Yes — sets `closed` then `open` in one transaction |
 
 Only these modes may write the protocol row. No application code path, migration revision or raw-SQL runbook updates `barrier_state`.
@@ -755,8 +755,9 @@ COMMIT                                                   -- atomic release of bo
 - `lock_timeout` bounds the wait: `55P03` means another bootstrap is running. The caller retries within the same monotonic budget used by `acquire`, then fails startup.
 - Step 4 requires quiescence: an owner whose lease is still live is never hijacked by an upgrade. Bootstrap waits or fails with `45002`; it never terminates a backend itself (§12).
 - Step 5 happens **before** installing anything, so no worker can admit against a half-installed protocol. Because the same transaction also sets `open` at step 8, the closed window is invisible to a worker that was blocked on the row lock.
-- A failure anywhere rolls the whole bootstrap back. If the operator had pre-closed the barrier, it stays closed (fail closed) and the application stays down until a bootstrap mode succeeds — this is the recovery path in §11.4.4, not a deadlock.
+- A failure anywhere rolls the whole bootstrap back. If the operator had pre-closed the barrier, it stays closed (fail closed) and the application stays down until a bootstrap mode succeeds — this is the recovery path in §11.4.5, not a deadlock.
 - `bootstrap_state = 'installing'` is written only inside this transaction and is therefore never visible to another session; it is diagnostic, not a lock.
+- **`--close-barrier` is exempt from steps 3, 4 and 8.** It has its own check order in §11.4.4 precisely because a live owner holds the lease row lock for the whole DDL transaction: taking that lock here would fail with `55P03` exactly when the operator needs the drain window (executed: §14.1 V-11, V-12). It writes `closed` and commits; only a later install/verify or `--upgrade-protocol` reopens.
 
 ### 9.3 Idempotent installation is verified, not assumed
 
@@ -896,22 +897,22 @@ Direct ACL inspection is necessary but not sufficient. Verification must cover:
 2. **Role memberships and inheritance** — a runtime role that is a member of the migrator (or of a role the migrator is a member of) inherits access even with an empty ACL:
 
 ```sql
-WITH RECURSIVE reach(roleid, memberid, depth) AS (
-    SELECT m.roleid, m.memberid, 1
+WITH RECURSIVE reach(roleid, member_id, depth) AS (
+    SELECT m.roleid, m.member, 1
       FROM pg_auth_members m
-     WHERE m.memberid = 'strikenova_production_app'::regrole
+     WHERE m.member = 'strikenova_production_app'::regrole
     UNION ALL
-    SELECT m.roleid, m.memberid, r.depth + 1
-      FROM pg_auth_members m JOIN reach r ON m.memberid = r.roleid
+    SELECT m.roleid, m.member, r.depth + 1
+      FROM pg_auth_members m JOIN reach r ON m.member = r.roleid
      WHERE r.depth < 10
 )
-SELECT roleid::regrole AS grants_access_to, memberid::regrole, depth FROM reach;
+SELECT roleid::regrole AS grants_access_to, member_id::regrole, depth FROM reach;
 
 SELECT rolname, rolinherit, rolsuper, rolbypassrls
   FROM pg_roles WHERE rolname IN ('strikenova_production_app','strikenova_prod_migrator');
 ```
 
-A runtime role must not reach the migrator/owner role at any depth, and must not be `SUPERUSER` or `BYPASSRLS`.
+A runtime role must not reach the migrator/owner role at any depth, and must not be `SUPERUSER` or `BYPASSRLS`. `pg_auth_members.member` is the PostgreSQL 16 column name; the pre-16 spelling `memberid` fails on 16 with `42703` (executed: §14.1 V-17).
 
 3. **Effective privilege functions** (these account for ownership, membership and `PUBLIC`):
 
@@ -958,7 +959,7 @@ Both must return zero rows. `acldefault(...)` matters: a `NULL` ACL means "the d
 - `SECURITY DEFINER` on all four functions, owned by the migration role.
 - `SET search_path = pg_catalog` on each function, with every object reference schema-qualified. `pg_temp` is deliberately excluded so a temp-schema object cannot shadow a referenced name.
 - No dynamic SQL in the functions; no `EXECUTE format(...)`.
-- Function bodies do not read `current_setting(...)` at all, which is what makes GUC forgery irrelevant rather than merely mitigated.
+- Function bodies read exactly one GUC, the caller's `lock_timeout`, saved and restored around the row lock (§6.9); they never derive identity, ownership or the barrier from a GUC, which is what makes GUC forgery irrelevant rather than merely mitigated.
 
 ---
 
@@ -1001,7 +1002,7 @@ The design removes that class of failure:
 - `barrier_state = 'closed'` blocks **every admission path**. A normal startup that passes the version checks fails with `45004` and changes nothing else in the database.
 - **Bootstrap/protocol upgrade is the only operation allowed while `barrier_state = 'closed'`**, and the only writer that can set it back to `open` (§9.2). There is no raw-SQL reopen path, no application path, and no migration revision that writes it.
 - Closing the barrier does **not** abort an already-admitted owner. `enter` ignores the barrier by design (6.4); quiescence is enforced by bootstrap's live-owner check, not by the barrier itself.
-- If an operator closes the barrier and the rollout is abandoned, the database deliberately stays closed. Recovery is a successful bootstrap mode, never a manual `UPDATE` (§11.4.4).
+- If an operator closes the barrier and the rollout is abandoned, the database deliberately stays closed. Recovery is a successful bootstrap mode, never a manual `UPDATE` (§11.4.5).
 
 #### 11.4.2 Check order — normal application startup
 
@@ -1034,19 +1035,54 @@ Step 5 fails fast to avoid a pointless retry budget; step 6 is the authoritative
 
 Ordering is the deadlock fix: step 5 executes **before** any install work, step 8 executes **in the same transaction** as step 5, and step 4 guarantees no admitted worker is mid-flight. A closed barrier can therefore always be reopened by this path, and only by this path.
 
-#### 11.4.4 Recovering from a closed barrier
+#### 11.4.4 Check order — `bootstrap-lease --close-barrier`
+
+`--close-barrier` is the one mode that must succeed **while an admitted owner is live**, so it must not take the lease row lock. An owner holds that lock for the whole DDL transaction and for every per-user transaction (§7.1, §7.3); a `SELECT … FOR UPDATE` here would therefore return `55P03` (or hang forever with `lock_timeout = 0`) at exactly the moment the drain window is requested. Executed evidence: §14.1 V-11 (documented order fails `55P03`) and V-12 (this order completes in 0.00 s).
+
+| Step | Check | Failure |
+|---|---|---|
+| 1 | Effective identity is the migration identity that owns `migration_internal`, checked before any write | `42501` from PostgreSQL; `45004` if the metadata is readable but the identity is not the expected one |
+| 2 | Session `lock_timeout` is bounded and non-zero (`> 0`); `0` means "wait forever" and is refused before anything else | `45004` |
+| 3 | `pg_advisory_xact_lock(hashtextextended('strikenova:migration_internal:bootstrap', 0))`, bounded by that `lock_timeout` — serializes with every other bootstrap mode | `55P03` |
+| 4 | `lease_protocol` contains exactly one row. A missing row means "never bootstrapped", not "close it" | `45005`; two or more rows `45004` |
+| 5 | `SELECT … FROM migration_internal.lease_protocol WHERE singleton FOR UPDATE` — the protocol row, **not** the lease row. Every documented writer of this row also holds the step-3 advisory lock, so this is the explicit backstop against a future or manual writer; bounded | `55P03` |
+| 6 | Observe (do **not** lock) the lease row: record `owner_fingerprint`, `expires_at` and whether the owner is live. A live owner is reported and **not** refused | none — `45002` is never raised by this mode |
+| 7 | `UPDATE migration_internal.lease_protocol SET barrier_state = 'closed', updated_at = now()`, idempotent when already closed | none |
+| 8 | `COMMIT` — releases the protocol row lock and the advisory lock together | none |
+
+What each live-owner situation does:
+
+| Situation | Steps 5–8 | Result |
+|---|---|---|
+| No owner, barrier `open` | 5 → 8 | Barrier `closed`; exit 0 |
+| Barrier already `closed` | 7 rewrites the same value | Exit 0, "already closed"; no error and no state change |
+| **Live owner holds the lease row lock (mid-DDL or mid-backfill)** | 5 locks only the protocol row; `acquire`/`enter` read that row without locking it, so there is no contention with the owner | Barrier `closed` in one short transaction; the owner continues via `enter`, which ignores the barrier (§6.4) |
+| Live owner between transactions (row unlocked) | same; step 6 reports fingerprint and `expires_at` | Barrier `closed`; the owner's next `enter` still succeeds because the token matches |
+| Another bootstrap or `--upgrade-protocol` is running (holds the step-3 advisory lock) | 3 waits until `lock_timeout` | `55P03`; retry once that bootstrap commits, or follow §12.4 if it was abandoned |
+| A backend left `idle in transaction` holding the protocol row lock (for example an abandoned manual session) | 3 succeeds, 5 waits until `lock_timeout` | `55P03`; diagnose per §12.3, terminate per §12.4 |
+| No protocol row (never bootstrapped) | 4 | `45005`; run `bootstrap-lease` install instead |
+
+Properties this order guarantees:
+
+- `--close-barrier` never sets `open` and never creates or repairs objects. A failed or abandoned close leaves the metadata as it was and cannot half-reopen anything.
+- It imposes no quiescence. `45002` is not a possible outcome; that check belongs to install/verify and `--upgrade-protocol` (§11.4.3 step 4), which is what stops an upgrade from hijacking a live owner.
+- **Ordering against a concurrent `acquire`.** `acquire` reads `barrier_state` under the lease row lock (§6.3). If the close commits before that read, the admission fails `45004` and changes nothing. If the read happened before the close committed, the admission is concurrent with the close and is treated as already admitted — the close never retroactively aborts an owner (§11.4.1). Once the close commits, no later `acquire` can pass.
+- Exit status is 0 for a successful close, including the already-closed case. A live owner is logged with fingerprint and `expires_at`, never with the token.
+
+#### 11.4.5 Recovering from a closed barrier
 
 | Situation | Action | Result |
 |---|---|---|
 | Operator closed the barrier and the rollout was cancelled | Run `bootstrap-lease` (install/verify) at the deployed version | Steps 1–8 run; barrier reopens; app starts |
 | Operator closed the barrier and a new protocol was installed but the app was not deployed | Run `bootstrap-lease --upgrade-protocol <installed>`; the target equals `installed_version`, which is permitted | Barrier reopens without a version change |
-| A live owner still holds the lease | Bootstrap fails `45002` | Wait for `expires_at` or follow the termination procedure (§12.4); then rerun. Bootstrap never terminates a backend |
+| A live owner must be drained before maintenance | Run `bootstrap-lease --close-barrier` (§11.4.4) | Barrier closes immediately even though the owner holds the lease row lock; the owner may finish |
+| A live owner still holds the lease when reopening (install/verify or `--upgrade-protocol`) | Quiescence check fails `45002` | Wait for `expires_at` or follow the termination procedure (§12.4); then rerun. Bootstrap never terminates a backend |
 | The owner's backend is stuck holding the row lock | Bootstrap fails `55P03` | Diagnose and terminate per §12.4, then rerun |
 | Bootstrap itself fails midway | Transaction rolls back; barrier keeps its prior state | Fix the cause and rerun; no half-installed protocol |
 
-`bootstrap-lease --close-barrier` is the only mode that may run while an owner is live, because its purpose is to drain one; it never waits for quiescence.
+`bootstrap-lease --close-barrier` is the only mode that may run while an owner is live, because its purpose is to drain one. It neither waits for quiescence nor takes the lease row lock, so a live owner can never block it (§11.4.4).
 
-#### 11.4.5 Required deployment properties
+#### 11.4.6 Required deployment properties
 
 To be confirmed, not assumed (§17):
 
@@ -1194,7 +1230,7 @@ This behaviour is **not assumed silently**: acceptance tests T-18/T-20 assert it
 
 ## 14. Acceptance-test design (PostgreSQL 16)
 
-**Status of these tests: designed, none executed.** Database-locking and privilege behavior must be exercised against a real PostgreSQL 16 server; SQLite tests cannot substitute. The existing GitHub workflow that provisions a disposable `postgres:16` service is the intended host (PR #146 already contains such a harness for its own scenarios; this matrix supersedes its lease expectations and must be re-authored during implementation).
+**Status: designed. §14.1 records a partial execution against a disposable PostgreSQL 16.16 instance; the T-01…T-22 matrix itself has not been run as written.** Database-locking and privilege behavior must be exercised against a real PostgreSQL 16 server; SQLite tests cannot substitute. The existing GitHub workflow that provisions a disposable `postgres:16` service is the intended host (PR #146 already contains such a harness for its own scenarios; this matrix supersedes its lease expectations and must be re-authored during implementation).
 
 Conventions below: `W1`, `W2` are separate processes/connections using the migration identity and distinct 256-bit tokens; `APP` is the runtime role; "row state" means `(owner_token_hash IS NULL, expires_at, generation)`. "Regression signal" is what a future failure would look like.
 
@@ -1220,7 +1256,7 @@ Conventions below: `W1`, `W2` are separate processes/connections using the migra
 | T-18 | Bootstrapped DB; run `python -m app.migrate upgrade head` | one | lease acquired, entered, DDL applied, pre-commit `enter` executed, committed, released; row unowned with `released_at` set | none | any step skipped, or row left owned |
 | T-19 | Force `backfill_exposures` to raise (e.g. injected error) and force `release` to fail (revoke EXECUTE mid-run) | one | DDL (if any) committed/rolled back per its own step; no lease left held after cleanup attempt; no partial user transaction | original exception type propagates; cleanup failure only logged | cleanup exception replaces the original, or the process reports success |
 | T-20 | Database already at `head`; run the supported command | one | `alembic_version` unchanged; backfill idempotent; lease still acquired/entered/committed/released; exactly one commit on the DDL connection | none | DDL re-run, version rewritten, or `begin_transaction()` issuing a second `COMMIT` |
-| T-21 | Operator runs `bootstrap-lease --close-barrier`; then a normal startup; then `bootstrap-lease --upgrade-protocol <installed>`; then a normal startup again | operator, W1 | after close: barrier `closed`, lease untouched; bootstrap upgrade reopens in one transaction; final state `open`, version unchanged, lease unowned | startup while closed: `45004`; bootstrap with a live owner: `45002`; bootstrap success has no error | startup succeeds while closed, or no bootstrap path can set `open` (deadlock), or bootstrap runs while an owner is live |
+| T-21 | Operator runs `bootstrap-lease --close-barrier` **while W1 is inside its DDL transaction holding the lease row lock**; then a normal startup; then `bootstrap-lease --upgrade-protocol <installed>`; then a normal startup again | operator, W1 | close completes without touching the lease row; W1's next `enter` still succeeds; bootstrap upgrade reopens in one transaction; final state `open`, version unchanged, lease unowned | startup while closed: `45004`; close-barrier with a live owner: success, never `45002`/`55P03`; upgrade with a live owner: `45002`; bootstrap success has no error | startup succeeds while closed, or no bootstrap path can set `open`, or close-barrier blocks or returns `55P03` while an owner holds the row lock |
 | T-22 | `acquire` and `enter` called with `p_lock_timeout_ms = 0` (and separately `p_ttl_seconds = 0`) | W1 | no lease change | `45004` immediately; the call must **not** wait indefinitely | the call blocks (proving `lock_timeout = 0` reached PostgreSQL) |
 
 Additional assertions applied to every test:
@@ -1229,6 +1265,41 @@ Additional assertions applied to every test:
 - the connection used for `enter` is the same connection used for the writes being protected;
 - `owner_fingerprint` in logs matches the lease row while owned;
 - no test leaves the lease row owned (except T-11/T-12, which assert the recovery end state).
+
+### 14.1 Executed evidence — disposable PostgreSQL 16.16 (2026-11-20)
+
+**Scope.** A local, disposable PostgreSQL 16.16 cluster (`server_version_num = 160016`), two roles (`strikenova_prod_migrator` as owner, `strikenova_production_app` as runtime), no network. The SQL executed was **extracted from this document's fenced blocks** (§6.1, §6.3, §6.4, §6.5, §6.6, and the §10.3 query) rather than retyped, so the evidence applies to the text above. **37 checks, 37 passed.**
+
+This is not Neon, not a provisioned role set, and not an application run. U3, U4 and U7 remain open.
+
+| # | Check | Observed |
+|---|---|---|
+| V-1 | All four `CREATE FUNCTION` statements compile as written (`%ROWTYPE`, `out_`-prefixed OUT parameters, `RETURNS TABLE`) | compiled; `lease_protocol_info_v1` returned `(1,1,1,'open','ready')` |
+| V-2 | `acquire` happy path | fingerprint = `sha256(token)[:12]`, `generation = 1` |
+| V-3 | `enter` twice inside one transaction | refresh, no deadlock, `generation` unchanged |
+| V-4 | Live lease / wrong token on `enter` / `enter` unowned / wrong token on `release` / `release` twice | `45002` / `45001` / `45002` / `45001` / `false` |
+| V-5 | TTL `0`, negative, `NaN`, `Infinity`, `86400.5` rejected; `86400` accepted | `45004` five times; `86400` accepted |
+| V-6 | `p_lock_timeout_ms` `0`, `-1`, `600001` | `45004` three times |
+| V-7 | Contended `acquire` with `p_lock_timeout_ms = 250` | `55P03` after 0.25 s, no internal retry |
+| V-8 | Caller `SET LOCAL lock_timeout = '1234ms'`, then `acquire` | `1234ms` still set afterwards — no leak into later DDL waits |
+| V-9 | Session `lock_timeout = 0`, contended `acquire` | still waiting after 2 s, completed when the lock was released — `0` really means "wait forever" |
+| V-10 | Barrier `closed`: new `acquire`; admitted owner `enter` | `45004`; `enter` still succeeded |
+| V-11 | §9.2 step 3 (`lease … FOR UPDATE`) against a live owner holding the row lock | `55P03` — the shared bootstrap order cannot start a drain window |
+| V-12 | §11.4.4 order (protocol row `FOR UPDATE` only) against the same live owner | close completed in 0.00 s; leader untouched |
+| V-13 | Default `PUBLIC EXECUTE` before the revoke set | `has_function_privilege(runtime, …, 'EXECUTE') = true` |
+| V-14 | §10.2 revokes, then the §10.3 query | all seven effective-privilege values `false`; runtime call and direct `SELECT` both `42501` |
+| V-15 | Identity-argument spelling | `float8` and `double precision` both resolve to the same `regprocedure`; `lease_release_v1(integer,integer)` → `42883` |
+| V-16 | `pg_temp.sha256(bytea)` shadow created in the caller's session | not used; the fingerprint still matched the real SHA-256, so `search_path = pg_catalog` resolves the built-in |
+| V-17 | §10.3 membership CTE as written in the previous revision | **failed `42703`: `pg_auth_members.memberid` does not exist in PostgreSQL 16** (renamed `member`) — corrected in §10.3 |
+
+**Gaps this run found in the document, and their corrections**
+
+1. **`--close-barrier` could not start a drain window.** §9.2 gave every mode the same lease-row `FOR UPDATE` and quiescence steps, so with a live owner the close returned `55P03` (V-11) — the opposite of its purpose. It now has its own order in §11.4.4, which takes only the protocol row lock and never requires quiescence (V-12).
+2. **§10.3 used a pre-16 catalog column.** `pg_auth_members.memberid` fails on PostgreSQL 16 (V-17); the query now uses `member`.
+3. **§10.4 overstated the GUC property.** It claimed function bodies never call `current_setting(...)`; `acquire`, `enter` and `release` do, for `lock_timeout`. Corrected. The security property is unchanged: no identity, ownership or barrier value is derived from a GUC.
+4. **§6.9 attributed `NaN` rejection to the wrong expression.** In PostgreSQL `NaN > 86400` is true and `NOT (NaN > 0)` is false, so the upper bound is what rejects `NaN` (V-5). Corrected.
+
+**Not covered by this run:** Neon or any provisioned database, `pg_default_acl` state, application-table ownership, Alembic behavior, the per-user backfill, Render non-overlap (§11.4.6), and any concurrency beyond two sessions. U1–U10 remain open; U11 is only partly closed.
 
 ---
 
@@ -1252,6 +1323,8 @@ Nothing is silently dropped. "Resolved by design" means the design removes the f
 | F12 | Cleanup error masking | **Resolved by design.** Original exception preserved; cleanup logged; aborted-transaction rollback before release | §6.8 | T-19 |
 | F13 | Alembic transaction integration | **Resolved by design.** Connection sharing, external transaction, one commit, fail-closed bare CLI, prohibited non-transactional ops | §13 | T-17, T-18, T-20 |
 | F14 | Incorrect CockroachDB compatibility assumptions | **Resolved.** PostgreSQL-only protocol; no CockroachDB tests; D-1 not reopened | §3 | Review |
+| F15 | `--close-barrier` shared the lease-row `FOR UPDATE` and quiescence steps, so a live owner made the close fail `55P03` and no drain window could start | **Resolved by design.** Mode-specific check order without the lease row lock; executed V-11/V-12 | §9.2, §11.4.4 | T-21 |
+| F16 | §10.3 used `pg_auth_members.memberid` (pre-16) and §6.9/§10.4 overstated two facts | **Resolved.** Corrected after execution on 16.16 | §6.9, §10.3, §10.4 | V-5, V-17 |
 
 ---
 
@@ -1293,7 +1366,7 @@ These are recorded rather than resolved. None may be presented as settled.
 | U8 | TTL and timeout values are defaults, not measurements | No backfill timing evidence for the target dataset | Measure per-user backfill duration; set TTL/`statement_timeout` accordingly (D-7) |
 | U9 | Whether the existing PR #146 harness scenarios encode the old protocol | E13: PR #146 is based on a feature branch and its tests target a lease that does not exist in `main` | Re-author the harness from §14 before implementation; do not merge PR #146 as-is |
 | U10 | Production provisioning and cutover | Not authorized (ADR-019, §3) | Separate authorized work |
-| U11 | The four lease functions were reviewed by inspection, not executed | No PostgreSQL instance was used in this task, so §6.9 records PostgreSQL 16 semantics reasoning, not observed behaviour | T-21/T-22 plus the full §14 matrix on a disposable PostgreSQL 16 during implementation |
+| U11 | **Partly closed.** The four lease functions, the barrier paths and the privilege query now have executed evidence on a disposable PostgreSQL 16.16 instance (§14.1, 37 checks). Nothing has run on Neon, and no application, Alembic or backfill path has been executed | A bare two-role cluster is not the target environment: default ACLs, table ownership, connection topology and platform overlap stay untested (U3, U4, U7) | Treat §14.1 as the design baseline, run the full T-01…T-22 matrix on a disposable PostgreSQL 16 during implementation, then repeat on staging |
 
 ---
 
@@ -1313,8 +1386,9 @@ These are recorded rather than resolved. None may be presented as settled.
 ## 19. Verification statement for this document
 
 - This document is a design and acceptance plan only.
-- No SQL in it has been executed; §6.9 is an inspection-level PostgreSQL 16 semantic review, not observed behaviour.
-- No acceptance test in §14 has been run.
+- The four lease functions, the barrier checks and the §10.3 privilege query were executed against a **disposable local PostgreSQL 16.16 cluster** (§14.1, 37 checks). Every other SQL statement in this document is unexecuted, and §6.9's remaining rows are inspection-level.
+- No acceptance test in the T-01…T-22 matrix has been run as written; §14.1 is a partial, adapted execution on a bare cluster, not on Neon and not through the application.
+- No Neon, Render, staging or production resource was read or modified. The cluster used for §14.1 was created locally for this verification.
 - No database, role, grant, Render service or secret was read or modified while producing it.
 - Repository facts in §2 were read from `main` at `eeeebff`; the only file added by this change is this document.
 - Approval of D-2 … D-7 is required before any implementation begins.
