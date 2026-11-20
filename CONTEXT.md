@@ -37,9 +37,9 @@ Root control documents:
 - `TESTING.md`
 - `CHANGELOG.md`
 
-## 3. Current Runtime Topology
+## 3. Target Runtime Topology
 
-Production:
+The target production topology is:
 
 ```
 Browser
@@ -51,15 +51,19 @@ Vercel
 Render
    |
    v
-CockroachDB
+Neon PostgreSQL
 ```
 
 - Frontend: Vercel
 - Backend: Render
-- Production database: CockroachDB
+- Target production database: Neon PostgreSQL
 - Local/default persistence may use SQLite when the configured database URL is absent.
 
-Do not use historical Railway/PostgreSQL deployment descriptions as the current production topology.
+CockroachDB is historical: it was evaluated and rejected as a target and is not a compatibility requirement. See `DECISIONS.md` (ADR-012, "Historical engine evidence").
+
+Neon is the target, not a measured deployment fact. No Neon run has been performed, and migration execution is still coupled to application startup (see the ADR-012 and Neon audit findings).
+
+Do not use historical Railway, self-hosted PostgreSQL or CockroachDB deployment descriptions as the current production topology.
 
 ## 4. Application Stack
 
@@ -122,7 +126,7 @@ SQLAlchemy is the application ORM.
 
 Alembic is the authoritative production schema migration mechanism.
 
-Production persistence is CockroachDB. SQLite is permitted for local/default operation where repository configuration selects it.
+Target production persistence is Neon PostgreSQL. SQLite is permitted for local/default operation where repository configuration selects it. CockroachDB is historical and is not a supported target.
 
 Do not use ad-hoc startup table creation as a substitute for production migrations.
 

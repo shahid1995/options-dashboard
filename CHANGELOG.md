@@ -40,7 +40,7 @@ Do not add entries for:
 
 - Frontend runtime/deployment: Vercel.
 - Backend runtime/deployment: Render.
-- Production database: CockroachDB.
+- Production database as recorded at that time: CockroachDB. It was subsequently evaluated and retired as a target (see ADR-013); the current target is Neon PostgreSQL.
 - The application should not be described as currently hosted on Railway.
 
 ### 2026-09 — AI workspace documentation baseline
@@ -101,7 +101,7 @@ Historical collection should therefore not be enabled implicitly merely because 
 
 - SQLAlchemy defines the ORM model.
 - Alembic is the authoritative production schema migration mechanism.
-- Production persistence is the configured CockroachDB environment.
+- Production persistence as recorded at that time: the configured CockroachDB environment. That engine has since been retired as a target (see ADR-013); the current target is Neon PostgreSQL.
 - Local development may use SQLite when DATABASE_URL is absent.
 
 Do not treat startup table creation or local SQLite behavior as the production schema authority.
@@ -133,6 +133,38 @@ SECURITY.md §12.1; INV-007 (credential ownership) and INV-024 (server-boundary 
 **Commit/PR**
 
 See the `security/auth-register-no-password-linking` pull request.
+
+---
+
+### 2026-11 — Neon PostgreSQL becomes the target database engine; CockroachDB retired
+
+**Category:** Architecture
+
+**Change**
+
+Neon PostgreSQL is now the target production database, reached through the ordinary PostgreSQL SQLAlchemy dialect (`postgresql+psycopg2`), with the intended connection split of a pooled endpoint for application traffic and a direct, unpooled endpoint for schema migrations. CockroachDB has been evaluated and retired as a target: it is recorded as historical evidence only and is no longer a compatibility, certification or release requirement.
+
+The control documents were updated to match: AI.md (deployment facts), CONTEXT.md (target runtime topology, persistence), DATA.md (target storage topology, recovery), ARCHITECTURE.md (§7.1 database technology, §7.2 schema authority note, §13 runtime topology), INVARIANTS.md (INV-021 and the new INV-023a), TESTING.md (§2 environments, §5 engine evidence status and Neon acceptance list, §16 database-test rules), and DECISIONS.md (ADR-013; ADR-012 cross-reference).
+
+**Why**
+
+The previous engine could not host the schema. Revision `125e1807df8d` branches on `dialect == "postgresql"` and falls through to a SQLite-shaped predicate for every other dialect, emitting `CREATE UNIQUE INDEX … WHERE is_default = 1` against a `BOOLEAN` column; that engine rejects it (`unsupported comparison operator: <bool> = <int>`), so revision 2 of 10 blocked revisions 3 to 10 and the current head was unreachable. The evaluation itself ran on 24.1.0, whose support ended 2026-10-21. The application was already a PostgreSQL application in every respect that matters — dialect, upserts, `FOR UPDATE`, `timestamptz`, `bytea`, text-encoded JSON, and string/UUID identifiers with no sequences — so the target changed without a rewrite.
+
+**Impact**
+
+Documentation and recorded target only. No application code, migration, schema, fixture, test or configuration change. No Neon project or branch has been provisioned, and no Neon run has been performed: Neon is an unverified target, and existing certification still covers SQLite and local PostgreSQL 16 only. Migration execution remains coupled to application startup on the application engine (which, under the target, is the pooled endpoint); moving it to a direct-URL release step is proposed and neither approved nor implemented. Whether records held by the previous engine must be preserved is unresolved, and no document assumes the source is empty.
+
+**Verification**
+
+Documentation review only, checked by re-reading each edited section and by searching every control document for remaining engine references, classifying each as historical evidence, explicitly retired target, or an accidental current-engine assumption. No test, migration or database command was run, because the change is documentary.
+
+**Related decision/invariant**
+
+ADR-013 (target engine; also cross-references ADR-007 and ADR-012); ADR-012 remains Proposed — NOT READY with F-1 to F-12 open; INV-021 (migration compatibility) and INV-023a (engine requirements are technology-independent, with explicit evidence status); TESTING.md §5 (engine evidence status and outstanding Neon acceptance list).
+
+**Commit/PR**
+
+`docs: target Neon PostgreSQL and retire CockroachDB in the control documents`. The subject is recorded instead of a hash because this entry is part of that same commit, and a commit cannot contain its own final SHA.
 
 ---
 

@@ -41,7 +41,10 @@ The required layer depends on the risk and scope of the change.
 - pytest-asyncio with asyncio_mode = auto
 - SQLAlchemy test databases where appropriate
 - SQLite/in-memory test setups for isolated tests
-- CockroachDB production integration expectations for persistence-sensitive work; PostgreSQL-compatible behavior may be used only where the specific test/database contract requires it
+- local PostgreSQL 16 for dialect-specific behaviour, migrations, constraints, locking and transaction semantics
+- Neon PostgreSQL as the target engine for persistence-sensitive work, to be exercised on a disposable branch once one is provisioned
+
+No Neon run has been performed. Existing certification covers SQLite and PostgreSQL 16 only; see §5 for the exact scope of that evidence and the Neon acceptance list that is still outstanding.
 
 ### Frontend
 
@@ -179,6 +182,41 @@ Verify:
 - no request-path DDL is introduced.
 
 Relevant areas include test_alembic_migrations.py and test_db_migration.py.
+
+#### Engine evidence status
+
+The three tiers below are separate evidence classes. Do not present one as another.
+
+| Tier | What it is | Status |
+|---|---|---|
+| SQLite tests | Isolated per-test files/in-memory databases; foreign keys enforced; the default suite | Existing evidence |
+| Local PostgreSQL 16 tests | Per-test throwaway databases; migrations, constraints, indexes, `FOR UPDATE` locking and two-writer behaviour | Existing evidence |
+| CockroachDB historical experiments | One engine run on 24.1.0 (end of support 2026-10-21), reached by stamping a mid-chain revision onto an empty database; two of ten revisions applied; one retry transition and one two-thread race observed | Historical only — not evidence about the target, and not a release gate |
+| Neon PostgreSQL | The target engine (ADR-013) | **Not started.** Unverified: no branch provisioned, no run performed |
+
+Local PostgreSQL 16 results do not certify Neon. A managed Neon branch differs in connection handling (pooler versus direct, compute suspend), and those differences are exactly what the acceptance list below tests.
+
+#### Neon acceptance list (all outstanding)
+
+Each item below must be executed on a disposable Neon branch and its result recorded. None has passed.
+
+1. **Full Alembic chain on an empty branch** — `alembic upgrade head` from an empty database with no `stamp` and no skipped revision; assert the head revision, the full table inventory, the composite foreign keys, and the three delivery indexes, including that the `is_default` partial-unique index carries the PostgreSQL predicate.
+2. **Migration and downgrade verification on disposable branches** — upgrade, targeted downgrade, re-upgrade; record any revision whose downgrade is not lossless rather than working around it.
+3. **Retry-writer integration tests** — the delivery suites run against Neon through a direct connection, with only the documented skips.
+4. **Row-lock concurrency behaviour** — two writers against one delivery: exactly one successor, the loser refused on state; record the observed wait behaviour rather than assuming it.
+5. **Transaction rollback and ambiguous-commit handling** — rollback at each fault-injection stage still leaves no partial transition; an unobservable commit is resolved by re-reading durable state.
+6. **Timestamp and timezone correctness** — `timestamptz` round-trips preserve the instant; typed reads normalize to aware UTC; no mixed-format comparison.
+7. **Connection recovery after compute suspension** — after the branch suspends, the next request succeeds through connection health checks without surfacing a raw driver error to the API layer.
+
+Run migrations over the **direct** endpoint and application-style traffic over the **pooled** endpoint; the two paths are separate tests, not one.
+
+#### Historical-engine references
+
+CockroachDB is historical and is not a test target (ADR-013). It appears in this document only to explain historical evidence and its limitations: an out-of-support engine, a stamped schema, and a migration chain that could not complete there. CockroachDB-only release gates are removed, and no new ones may be added.
+
+#### Data-migration testing
+
+Whether records currently held by the previous engine must be preserved is **not established**, and testing must not assume the source is empty. A one-time, explicitly authorized export or migration exercise is permitted, and its verification is a reconciliation exercise (table inventory, row counts, identifier and foreign-key integrity, timestamp and decimal fidelity, text-encoded JSON hashes, encrypted credential decryptability, migration-history state) reporting counts and hashes only — never row contents or credentials. What is not permitted is ongoing CockroachDB-specific application, runtime or recovery behaviour.
 
 ### GEX and quant calculations
 
@@ -357,6 +395,14 @@ Multi-user security tests should use at least two distinct users.
 Use isolated test databases for service logic and appropriate integration databases for dialect-specific behavior, migrations, constraints, locking, and transaction semantics.
 
 The closer a change is to database correctness or concurrency, the less acceptable it is to rely only on mocks.
+
+Engine rules:
+
+- migrations run against a **direct** (unpooled) connection; application-style traffic runs against the **pooled** connection;
+- a Neon test runs on a **disposable branch**, created for the run and deleted afterwards — never against a shared or production branch;
+- a migration test never begins with `alembic stamp`; stamping hides exactly the failures these tests exist to find;
+- SQLite (including in-memory) results do not stand in for PostgreSQL or Neon results, and local PostgreSQL 16 results do not stand in for Neon;
+- a skip that exists because a behaviour is untested on the target engine is recorded as missing evidence, not as a pass.
 
 ---
 

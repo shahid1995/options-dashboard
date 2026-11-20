@@ -423,11 +423,22 @@ Unknown market state is not treated as open.
 The application uses SQLAlchemy ORM with:
 
 - SQLite for local/default operation;
-- CockroachDB when `DATABASE_URL` is configured for production; SQLite remains available for local/default operation.
+- Neon PostgreSQL as the target production database, reached through the ordinary PostgreSQL dialect (`postgresql+psycopg2`).
 
 SQLite is configured with WAL behavior for local resilience.
 
-CockroachDB connections use the configured SQLAlchemy database URL and health-oriented connection settings.
+PostgreSQL connections use the configured SQLAlchemy database URL with health-oriented connection settings (bounded pool, `pool_pre_ping`, recycling). Neon exposes two hostnames for one branch, and the intended split is:
+
+| Purpose | Endpoint | Reason |
+|---|---|---|
+| Application runtime | pooled (`-pooler` hostname) | many short-lived clients, transaction-mode pooling |
+| Schema migrations | direct, unpooled hostname | DDL and any session-level state; migrations are never run through the pooler |
+
+**Engine status — target, not measurement.** Neon PostgreSQL is the target production database. It has **not** been provisioned, exercised or certified for StrikeNova, and no Neon result exists. The engine evidence that does exist is SQLite and local PostgreSQL 16 (see ADR-012 and `TESTING.md` §5). Statements in this document describe the target architecture; none of them asserts a live Neon deployment, and none of them certifies Neon behaviour.
+
+**Data-migration safeguard.** It is not established whether records currently held by the previous engine must be preserved. This document therefore does not prohibit a one-time, explicitly authorized data export or migration exercise. It does prohibit new CockroachDB-specific *ongoing* behaviour: no CockroachDB dialect branch beyond the single historical leftover already present in the code, and no CockroachDB fixture, backup procedure, monitoring path or release gate. Do not assume the source database is empty (ADR-013).
+
+**CockroachDB is historical** and is not a supported target (ADR-013). No CockroachDB-specific schema, dialect handling, fixture or release gate may be added.
 
 ### 7.2 Schema authority
 
@@ -447,6 +458,8 @@ Idempotent data backfill / startup maintenance
       ▼
 Application ready
 ```
+
+Note on the target: migrations today execute at application startup on the application engine, which under §7.1 is the pooled endpoint, and every process boot attempts them. Moving migration execution to a direct-URL release step is proposed and **not approved or implemented**; this document records the current behaviour, not the intended end state.
 
 The production architecture must not fall back to ORM `create_all()` or runtime column mutation as the schema authority.
 
@@ -652,7 +665,7 @@ Secrets belong in environment/configuration infrastructure, never source-control
 
 ## 13. Runtime and deployment architecture
 
-The current runtime topology is:
+The target runtime topology is:
 
 ```text
 GitHub
@@ -663,18 +676,20 @@ GitHub
   └──────────────▶ Render
                     └── FastAPI backend
                          │
-                         └── CockroachDB
+                         └── Neon PostgreSQL
 ```
 
-### Current hosting responsibilities
+### Target hosting responsibilities
 
-| Layer | Current platform | Responsibility |
+| Layer | Platform | Responsibility |
 |---|---|---|
 | Frontend | Vercel | Next.js public website and authenticated web application |
 | Backend | Render | FastAPI application, authentication, broker integration, business logic, paper execution, analytics APIs |
-| Database | CockroachDB | Durable application database used by the backend |
+| Database | Neon PostgreSQL (target) | Durable application database used by the backend |
 
-The backend connects to CockroachDB through the configured database connection rather than relying on platform-local database storage.
+The backend connects to PostgreSQL through the configured database connection rather than relying on platform-local database storage. The runtime connection is intended to be Neon's pooled endpoint and the migration connection its direct endpoint (§7.1).
+
+Neon is the target engine, not a measured deployment fact: it has not been provisioned, exercised or certified, and no Neon run has been performed. Nothing in this section should be read as describing a live Neon deployment. CockroachDB is historical (ADR-013): the previous engine is recorded for history, and its deployment descriptions are not current topology.
 
 The public website and authenticated application have separate frontend/deployment concerns within the product architecture.
 
