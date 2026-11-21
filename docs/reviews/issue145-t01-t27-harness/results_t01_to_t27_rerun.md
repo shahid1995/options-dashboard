@@ -147,18 +147,34 @@ outcome.
   the observed definition; static comparison cannot prove live catalog output.
 - The runner calls `prepare_scenario_database()` and `drop_scenario_db()` for
   each scenario, the latter in a `finally` path. Each created database carries
-  the marker `strikenova-issue145-harness-disposable:<system_identifier>` in its
-  catalog comment, and a pre-existing database without that exact marker is
-  refused rather than adopted, terminated or dropped.
+  the marker `strikenova-issue145-harness-disposable:<identifier>:<guard nonce>`
+  in its catalog comment, and a pre-existing database without that exact marker
+  is refused rather than adopted, terminated or dropped.
 - The destructive gate refuses before connecting without
-  `ALLOW_DESTRUCTIVE_TESTS=1`, `HARNESS_CLUSTER_LABEL=issue145-disposable` and a
-  matching `HARNESS_TARGET_SYSTEM_IDENTIFIER`. Cluster identity comes from
-  `pg_control_system().system_identifier`, not from the label, and an `issue145_*`
-  name alone is not evidence of ownership. Existing roles must have the exact
-  expected `LOGIN` attribute and no `SUPERUSER` / `BYPASSRLS` / `CREATEROLE` /
-  `CREATEDB`; existing memberships must be exactly
+  `ALLOW_DESTRUCTIVE_TESTS=1`, `HARNESS_CLUSTER_LABEL=issue145-disposable`, a
+  matching `HARNESS_TARGET_SYSTEM_IDENTIFIER` and the pre-provisioned
+  `HARNESS_CLUSTER_GUARD`. Cluster identity comes from
+  `pg_control_system().system_identifier`, not from the label. The guard database
+  must already exist with the comment
+  `issue145-harness-guard:<identifier>:<nonce>`; the harness never creates it,
+  never writes the comment and never generates the nonce, so a matching label
+  and identifier cannot substitute for it, and a guard copied from another
+  cluster is refused. Existing databases are limited to the guard database and
+  exactly `issue145_t01` … `issue145_t27` with a valid ownership marker; any
+  other name, including another `issue145_*` name, is refused. Existing roles
+  must have the exact expected `LOGIN` attribute and no `SUPERUSER` /
+  `BYPASSRLS` / `CREATEROLE` / `CREATEDB`; existing memberships must be exactly
   `owner -> migrator` with `INHERIT FALSE, SET TRUE, ADMIN FALSE`. Nothing is
-  altered to make a target acceptable.
+  altered to make a target acceptable, and every refusal happens before any role
+  or database mutation.
+- Reading `pg_control_system()` requires superuser or `pg_monitor` membership on
+  PostgreSQL 16. A `42501` there is caught and reported as a refused target (all
+  27 NOT RUN, exit status 2) before any mutation; the harness never grants
+  `pg_monitor`, superuser or function `EXECUTE`.
+- §10.3 transitive membership is enforced over the complete membership graph with
+  no depth limit and cycle-safe traversal, so a path of any length from the
+  runtime role to the migrator or owner is rejected. The direct-membership check
+  is preserved.
 - T-16 issues its four application-table and sequence grants on a separate
   administrator connection to `issue145_t16`, after asserting
   `current_database() = 'issue145_t16'`; the cluster-level `postgres` connection
@@ -166,8 +182,9 @@ outcome.
 - The runner probes `SHOW server_version` / `server_version_num` and accepts only
   PostgreSQL major 16 with minor 16 or later. PostgreSQL 15, 17 and 18 are
   refused, so a lower bound alone does not silently admit another major version.
-- The DB-free self-test published in the harness passes: 12 checks, 0 failures
-  (`--self-test`, no server contacted).
+- The DB-free self-test published in the harness passes: 17 checks, 0 failures
+  (`--self-test`, no server contacted). It also increments a real-connect counter,
+  which confirms the self-test opened no PostgreSQL connection.
 
 ## Execution model and safety gate
 
@@ -179,9 +196,10 @@ statement of each protected transaction.
 
 Because the harness drops fixed-name databases and mutates cluster-level role
 membership, it requires `ALLOW_DESTRUCTIVE_TESTS=1`,
-`HARNESS_CLUSTER_LABEL=issue145-disposable` and a matching
-`HARNESS_TARGET_SYSTEM_IDENTIFIER`, then validates the target read-only before
-any mutation. It creates three cluster roles if absent
+`HARNESS_CLUSTER_LABEL=issue145-disposable`, a matching
+`HARNESS_TARGET_SYSTEM_IDENTIFIER` and the pre-provisioned
+`HARNESS_CLUSTER_GUARD`, then validates the target read-only before any mutation.
+It creates three cluster roles if absent
 (`strikenova_prod_migrator`, `strikenova_production_app`,
 `strikenova_prod_owner`), the owner→migrator membership, and the `issue145_t01`…
 `issue145_t27` databases, dropping each database after its scenario. The roles and

@@ -21,9 +21,15 @@ Design rules enforced here:
     `HARNESS_CLUSTER_LABEL`, and supplies the cluster's independently observed
     `system_identifier` in `HARNESS_TARGET_SYSTEM_IDENTIFIER`. The label is a
     declaration, not proof: identity is established from `pg_control_system()`,
-    and an existing database counts as harness-owned only when its catalog
-    comment carries the matching marker. Existing roles and memberships are
-    validated against exact expected attributes and options, never altered.
+    and the run additionally requires a pre-provisioned guard database whose
+    comment binds the cluster identity to `HARNESS_CLUSTER_GUARD` — a value the
+    harness never creates or generates. An existing database counts as
+    harness-owned only when its catalog comment carries the guard-bound marker,
+    and only the guard database plus `issue145_t01`…`issue145_t27` may exist.
+    Existing roles and memberships are validated against exact expected
+    attributes and options, never altered.
+  * The runtime role's transitive membership is traversed completely (no depth
+    limit, cycle-safe) and must reach no role at all.
   * Success results are the documented function results (3-column rows for
     acquire/enter, a boolean for release, five columns for protocol info).
   * Errors are PostgreSQL exceptions; SQLSTATE is read from the driver's
@@ -123,9 +129,24 @@ REQUIRED_CLUSTER_LABEL = "issue145-disposable"
 # confirmed separately while provisioning the disposable cluster.
 HARNESS_TARGET_SYSTEM_IDENTIFIER = os.getenv("HARNESS_TARGET_SYSTEM_IDENTIFIER", "")
 
+# Pre-provisioned disposable-cluster guard. The operator creates `HARNESS_GUARD_DATABASE`
+# and writes its guard comment once, before any destructive run; the harness
+# never creates it. The comment carries the cluster's `system_identifier` and a
+# random nonce the operator supplies, so a copied or look-alike cluster cannot
+# satisfy it even with a matching label.
+HARNESS_GUARD_DATABASE = os.getenv("HARNESS_GUARD_DATABASE", "issue145_guard")
+HARNESS_CLUSTER_GUARD = os.getenv("HARNESS_CLUSTER_GUARD", "")
+GUARD_COMMENT_PREFIX = "issue145-harness-guard:"
+GUARD_MIN_LENGTH = 32
+
+# The only existing databases the harness may touch: the guard database and the
+# 27 fixed scenario databases. Anything else is refused, never adopted.
+SCENARIO_DATABASE_NAMES = tuple(f"issue145_t{number:02d}" for number in range(1, 28))
+
 # Marker written into the catalog comment of every database this harness
 # creates. An existing database counts as harness-owned only when its comment
-# equals this exact value, which binds it to the verified cluster identity.
+# equals this exact value, which binds it to the verified cluster identity and
+# to the guard nonce confirmed during provisioning.
 HARNESS_DB_MARKER_PREFIX = "strikenova-issue145-harness-disposable:"
 
 SAFETY_REFUSAL_EXIT_CODE = 2
@@ -592,7 +613,8 @@ def require_destructive_optin():
 
 def expected_database_marker():
     """The marker a harness-created database must carry in this cluster."""
-    return HARNESS_DB_MARKER_PREFIX + HARNESS_TARGET_SYSTEM_IDENTIFIER
+    return (HARNESS_DB_MARKER_PREFIX + HARNESS_TARGET_SYSTEM_IDENTIFIER
+            + ":" + HARNESS_CLUSTER_GUARD)
 
 
 def _scenario_database_state(admin, db_name):
@@ -611,8 +633,19 @@ def verify_cluster_identity(admin):
         raise SafetyRefusal(
             "HARNESS_TARGET_SYSTEM_IDENTIFIER is not set, so the target cluster's "
             "identity cannot be established independently of HARNESS_CLUSTER_LABEL")
-    row = admin.execute(
-        "SELECT system_identifier::text FROM pg_control_system()").fetchone()
+    try:
+        row = admin.execute(
+            "SELECT system_identifier::text FROM pg_control_system()").fetchone()
+    except psycopg.Error as exc:
+        # PostgreSQL 16 restricts pg_control_system() to superusers and members
+        # of pg_monitor. The harness never grants that itself; it refuses.
+        state = getattr(exc, "sqlstate", None)
+        raise SafetyRefusal(
+            "cluster identity cannot be established: reading "
+            f"pg_control_system() failed with SQLSTATE {state}. PostgreSQL 16 "
+            "allows this function to superusers and members of pg_monitor; the "
+            "cluster owner must grant pg_monitor (or EXECUTE) outside this "
+            "harness, which never grants, elevates or changes a role") from exc
     actual = row[0] if row else None
     if actual is None:
         raise SafetyRefusal(
@@ -622,6 +655,44 @@ def verify_cluster_identity(admin):
             f"cluster system_identifier {actual!r} does not match the independently "
             "confirmed HARNESS_TARGET_SYSTEM_IDENTIFIER")
     return actual
+
+
+def verify_guard(admin, system_identifier):
+    """Verify the pre-provisioned guard for this exact cluster.
+
+    The guard must already exist: it is created by the operator while
+    provisioning the disposable cluster, never by the run whose safety it
+    authorizes. A matching label and system identifier are not a substitute.
+    """
+    if len(HARNESS_CLUSTER_GUARD) < GUARD_MIN_LENGTH:
+        raise SafetyRefusal(
+            "HARNESS_CLUSTER_GUARD must hold the random value written into the "
+            f"guard database during provisioning (at least {GUARD_MIN_LENGTH} "
+            "characters). The harness never generates or writes it")
+    exists, comment = _scenario_database_state(admin, HARNESS_GUARD_DATABASE)
+    if not exists:
+        raise SafetyRefusal(
+            f"guard database {HARNESS_GUARD_DATABASE!r} does not exist; provision "
+            "it and its guard comment before any destructive run")
+    if not comment or not comment.startswith(GUARD_COMMENT_PREFIX):
+        raise SafetyRefusal(
+            f"guard database {HARNESS_GUARD_DATABASE!r} has no guard comment "
+            f"starting with {GUARD_COMMENT_PREFIX!r}; refusing to run")
+    payload = comment[len(GUARD_COMMENT_PREFIX):]
+    if ":" not in payload:
+        raise SafetyRefusal(
+            f"guard comment {comment!r} is not '<prefix><system_identifier>:<nonce>'")
+    guard_identifier, guard_nonce = payload.rsplit(":", 1)
+    if guard_identifier != system_identifier:
+        raise SafetyRefusal(
+            "the pre-provisioned guard is bound to cluster system_identifier "
+            f"{guard_identifier!r}, not the verified {system_identifier!r}; this "
+            "cluster is not the one the guard was provisioned for")
+    if guard_nonce != HARNESS_CLUSTER_GUARD:
+        raise SafetyRefusal(
+            "the guard nonce does not match HARNESS_CLUSTER_GUARD; the guard was "
+            "provisioned with a different value")
+    return guard_nonce
 
 
 # Exact attributes the harness provisions; an existing role that differs is
@@ -639,7 +710,8 @@ def validate_destructive_target(admin):
     closed: the harness stops rather than repairing or adopting what it finds,
     and every statement executed here is read-only.
     """
-    verify_cluster_identity(admin)
+    system_identifier = verify_cluster_identity(admin)
+    verify_guard(admin, system_identifier)
 
     problems = []
     marker = expected_database_marker()
@@ -648,12 +720,19 @@ def validate_destructive_target(admin):
         "FROM pg_database d "
         "WHERE d.datname NOT IN ('postgres', 'template0', 'template1') "
         "ORDER BY d.datname").fetchall()
-    unowned = [f"{name} (marker {comment!r})" for name, comment in databases
-               if comment != marker]
+    unowned = []
+    for name, comment in databases:
+        if name == HARNESS_GUARD_DATABASE:
+            continue  # verified independently by verify_guard()
+        if name not in SCENARIO_DATABASE_NAMES:
+            unowned.append(f"{name} (not a harness scenario database name)")
+        elif comment != marker:
+            unowned.append(f"{name} (marker {comment!r})")
     if unowned:
         problems.append(
-            "cluster holds databases this harness cannot prove it created (no "
-            "matching disposable-cluster marker): " + ", ".join(unowned))
+            "cluster holds databases this harness cannot prove it created (only "
+            "the guard database and issue145_t01..issue145_t27 carrying a valid "
+            "ownership marker are accepted): " + ", ".join(unowned))
 
     role_rows = admin.execute(
         "SELECT rolname, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb, "
@@ -698,7 +777,13 @@ def validate_destructive_target(admin):
         raise SafetyRefusal("; ".join(problems))
 
 
+# Counts real driver connect attempts. The self-test asserts this stays zero.
+_REAL_CONNECT_ATTEMPTS = 0
+
+
 def _default_connect(**kwargs):
+    global _REAL_CONNECT_ATTEMPTS
+    _REAL_CONNECT_ATTEMPTS += 1
     return psycopg.connect(**kwargs)
 
 
@@ -1042,6 +1127,40 @@ def _normalize_sql_text(value):
     return " ".join((value or "").lower().split())
 
 
+def reachable_roles(start_role, edges):
+    """Every role reachable from `start_role` through any membership chain.
+
+    Complete traversal with a visited set: no depth limit (ADR §10.3 forbids
+    reaching the migration or owner role at any depth) and cycle-safe, so a
+    membership cycle terminates instead of recursing forever.
+    """
+    graph = {}
+    for granted, member in edges:
+        graph.setdefault(member, set()).add(granted)
+    reached = set()
+    frontier = [start_role]
+    while frontier:
+        for granted in graph.get(frontier.pop(), ()):
+            if granted not in reached:
+                reached.add(granted)
+                frontier.append(granted)
+    return reached
+
+
+def assert_runtime_role_reaches_nothing(app_role, edges,
+                                        forbidden=(MIGRATOR_ROLE, OWNER_ROLE)):
+    """ADR §10.3: the runtime role must reach no role, at any depth."""
+    reached = reachable_roles(app_role, edges)
+    if not reached:
+        return
+    leaked = sorted(reached & set(forbidden))
+    detail = (f"; it reaches the forbidden role(s) {leaked}" if leaked
+              else "; it must reach no role at all")
+    raise ProtocolFailure(
+        f"§10.3 verification failed: {app_role} reaches roles through transitive "
+        f"membership at any depth: {sorted(reached)}{detail}")
+
+
 def assert_constraint_definitions(rows):
     """Compare complete constraint definitions. Pure function: needs no database.
 
@@ -1245,18 +1364,17 @@ def verify_installation(conn, expected_version=1, expect_active=True):
             if granted:
                 fail(f"{APP_ROLE} holds effective EXECUTE on {proname}")
 
-        reaches = run_sql(
+        # Complete membership graph, traversed in Python with a visited set: no
+        # depth limit and no reliance on a recursive CTE that could stop early
+        # or loop on a cycle. Every edge is read, then §10.3 is enforced on all
+        # reachable roles.
+        edges = run_sql(
             conn,
-            "WITH RECURSIVE reach(roleid, member_id, depth) AS ("
-            "  SELECT m.roleid, m.member, 1 FROM pg_auth_members m "
-            "   WHERE m.member = %s "
-            "  UNION ALL "
-            "  SELECT m.roleid, m.member, r.depth + 1 FROM pg_auth_members m "
-            "    JOIN reach r ON m.member = r.roleid WHERE r.depth < 10) "
-            "SELECT roleid::regrole::text, member_id::regrole::text, depth FROM reach",
-            (app_oid,), fetch_mode="all")
-        if reaches:
-            fail(f"{APP_ROLE} reaches roles through transitive membership: {reaches}")
+            "SELECT r.rolname, m.rolname FROM pg_auth_members am "
+            "JOIN pg_roles r ON r.oid = am.roleid "
+            "JOIN pg_roles m ON m.oid = am.member",
+            fetch_mode="all")
+        assert_runtime_role_reaches_nothing(APP_ROLE, edges)
 
         attributes = run_sql(
             conn, "SELECT rolname, rolsuper, rolbypassrls, rolinherit "
@@ -2393,11 +2511,18 @@ class _FakeConnection:
         return _FakeTransaction(self)
 
 
-def _fake_admin(identity="12345", databases=(), roles=(), memberships=()):
+def _fake_admin(identity="12345", databases=(), roles=(), memberships=(),
+                pg_control_sqlstate=None):
+    databases = list(databases)
+
     def handler(query, params):
         if "pg_control_system" in query:
+            if pg_control_sqlstate:
+                raise _FakeDriverError(pg_control_sqlstate)
             return [(identity,)]
         if "FROM pg_database" in query:
+            if params:
+                return [row for row in databases if row[0] == params[0]]
             return list(databases)
         if "FROM pg_roles" in query:
             return list(roles)
@@ -2405,6 +2530,30 @@ def _fake_admin(identity="12345", databases=(), roles=(), memberships=()):
             return list(memberships)
         return []
     return _FakeConnection(handler, dbname="postgres")
+
+
+GUARD_TEST_NONCE = "guard-nonce-" + "g" * 32
+
+
+def _guard_comment(identifier, guard):
+    return GUARD_COMMENT_PREFIX + identifier + ":" + guard
+
+
+def _gate_env(identifier="123", guard=GUARD_TEST_NONCE):
+    return _temporary_globals(HARNESS_TARGET_SYSTEM_IDENTIFIER=identifier,
+                              HARNESS_CLUSTER_GUARD=guard)
+
+
+def _gate_admin(identifier="123", guard=GUARD_TEST_NONCE, databases=None,
+                roles=(), memberships=(), pg_control_sqlstate=None):
+    """A fake cluster that already carries the pre-provisioned guard database."""
+    databases = list(databases or [])
+    if not any(name == HARNESS_GUARD_DATABASE for name, _ in databases):
+        databases.append((HARNESS_GUARD_DATABASE,
+                          _guard_comment(identifier, guard)))
+    return _fake_admin(identity=identifier, databases=databases, roles=roles,
+                       memberships=memberships,
+                       pg_control_sqlstate=pg_control_sqlstate)
 
 
 def _temporary_globals(**values):
@@ -2505,13 +2654,12 @@ def _self_test_checks():
         finally:
             restore()
 
-    @check("an existing scenario database without the marker is refused")
+    @check("an existing scenario database without the guard-derived marker is refused")
     def _marker_gate():
-        restore = _temporary_globals(HARNESS_TARGET_SYSTEM_IDENTIFIER="123")
+        restore = _gate_env()
         try:
             marker = expected_database_marker()
-            unmarked = _fake_admin(identity="123",
-                                   databases=[("issue145_t01", None)])
+            unmarked = _gate_admin(databases=[("issue145_t01", None)])
             try:
                 validate_destructive_target(unmarked)
             except SafetyRefusal:
@@ -2523,15 +2671,14 @@ def _self_test_checks():
                         if q.upper().startswith(mutating)], \
                 "the gate mutated the cluster before refusing"
 
-            marked = _fake_admin(identity="123",
-                                 databases=[("issue145_t01", marker)])
+            marked = _gate_admin(databases=[("issue145_t01", marker)])
             validate_destructive_target(marked)
         finally:
             restore()
 
     @check("drop_scenario_db refuses a database it cannot prove it created")
     def _drop_guard():
-        restore = _temporary_globals(HARNESS_TARGET_SYSTEM_IDENTIFIER="123")
+        restore = _gate_env()
         try:
             def handler(query, params):
                 if "FROM pg_database" in query:
@@ -2554,22 +2701,21 @@ def _self_test_checks():
 
     @check("role login attributes and exact membership options are validated")
     def _roles():
-        restore = _temporary_globals(HARNESS_TARGET_SYSTEM_IDENTIFIER="123")
+        restore = _gate_env()
         try:
             good_roles = [(MIGRATOR_ROLE, False, False, False, False, True),
                           (OWNER_ROLE, False, False, False, False, False),
                           (APP_ROLE, False, False, False, False, True)]
             good_membership = (OWNER_ROLE, MIGRATOR_ROLE, False, True, False)
-            validate_destructive_target(_fake_admin(
-                identity="123", roles=good_roles, memberships=[good_membership]))
+            validate_destructive_target(_gate_admin(
+                roles=good_roles, memberships=[good_membership]))
 
             for bad_membership in ((OWNER_ROLE, MIGRATOR_ROLE, True, True, False),
                                    (OWNER_ROLE, MIGRATOR_ROLE, False, False, False),
                                    (OWNER_ROLE, MIGRATOR_ROLE, False, True, True)):
                 try:
-                    validate_destructive_target(_fake_admin(
-                        identity="123", roles=good_roles,
-                        memberships=[bad_membership]))
+                    validate_destructive_target(_gate_admin(
+                        roles=good_roles, memberships=[bad_membership]))
                 except SafetyRefusal:
                     pass
                 else:
@@ -2578,8 +2724,7 @@ def _self_test_checks():
 
             nologin_migrator = [(MIGRATOR_ROLE, False, False, False, False, False)]
             try:
-                validate_destructive_target(_fake_admin(
-                    identity="123", roles=nologin_migrator))
+                validate_destructive_target(_gate_admin(roles=nologin_migrator))
             except SafetyRefusal:
                 pass
             else:
@@ -2587,8 +2732,7 @@ def _self_test_checks():
 
             superuser_owner = [(OWNER_ROLE, True, False, False, False, False)]
             try:
-                validate_destructive_target(_fake_admin(
-                    identity="123", roles=superuser_owner))
+                validate_destructive_target(_gate_admin(roles=superuser_owner))
             except SafetyRefusal:
                 pass
             else:
@@ -2693,6 +2837,156 @@ def _self_test_checks():
         assert "SET installed_version" not in source
         assert "lease_protocol SET" not in source
 
+    @check("a pre-provisioned guard is required, identity-bound and nonce-checked")
+    def _guard():
+        # No guard value at all: refused even with a correct identifier.
+        restore = _temporary_globals(HARNESS_TARGET_SYSTEM_IDENTIFIER="123",
+                                     HARNESS_CLUSTER_GUARD="")
+        try:
+            try:
+                validate_destructive_target(_gate_admin())
+            except SafetyRefusal:
+                pass
+            else:
+                raise AssertionError("a run without HARNESS_CLUSTER_GUARD was accepted")
+        finally:
+            restore()
+
+        # Identifier and label alone are not enough: no guard database exists.
+        restore = _gate_env()
+        try:
+            try:
+                validate_destructive_target(_fake_admin(identity="123"))
+            except SafetyRefusal as exc:
+                assert "guard" in str(exc).lower(), str(exc)
+            else:
+                raise AssertionError("a missing guard database was accepted")
+        finally:
+            restore()
+
+        # The guard comment must exist and carry the guard prefix.
+        restore = _gate_env()
+        try:
+            for comment in (None, "something-else"):
+                bare = _fake_admin(identity="123",
+                                   databases=[(HARNESS_GUARD_DATABASE, comment)])
+                try:
+                    validate_destructive_target(bare)
+                except SafetyRefusal:
+                    pass
+                else:
+                    raise AssertionError(f"guard comment {comment!r} was accepted")
+        finally:
+            restore()
+
+        # Guard nonce mismatch.
+        restore = _gate_env(guard="x" * 40)
+        try:
+            try:
+                validate_destructive_target(_gate_admin())
+            except SafetyRefusal:
+                pass
+            else:
+                raise AssertionError("a guard nonce mismatch was accepted")
+        finally:
+            restore()
+
+        # Guard bound to another cluster identity: the copied-cluster case.
+        restore = _gate_env()
+        try:
+            foreign = _fake_admin(identity="123", databases=[
+                (HARNESS_GUARD_DATABASE, _guard_comment("999", GUARD_TEST_NONCE))])
+            try:
+                validate_destructive_target(foreign)
+            except SafetyRefusal:
+                pass
+            else:
+                raise AssertionError("a guard bound to another cluster was accepted")
+            validate_destructive_target(_gate_admin())
+        finally:
+            restore()
+
+    @check("existing databases are restricted to issue145_t01..t27 plus the guard")
+    def _allowlist():
+        restore = _gate_env()
+        try:
+            marker = expected_database_marker()
+            for name in ("issue145_t28", "issue145_t00", "issue145_disposable",
+                         "issue145_t01_backup", "app_db"):
+                try:
+                    validate_destructive_target(
+                        _gate_admin(databases=[(name, marker)]))
+                except SafetyRefusal:
+                    pass
+                else:
+                    raise AssertionError(f"database {name!r} was accepted")
+            for name in ("issue145_t01", "issue145_t27"):
+                validate_destructive_target(_gate_admin(databases=[(name, marker)]))
+        finally:
+            restore()
+
+    @check("insufficient privilege for pg_control_system() fails closed")
+    def _permission():
+        restore = _gate_env()
+        try:
+            denied = _gate_admin(pg_control_sqlstate="42501")
+            try:
+                validate_destructive_target(denied)
+            except SafetyRefusal as exc:
+                message = str(exc)
+                assert "42501" in message, message
+                assert "pg_monitor" in message, message
+            else:
+                raise AssertionError("a 42501 on pg_control_system() was not handled")
+            mutating = ("DROP", "CREATE", "GRANT", "COMMENT", "ALTER", "REVOKE")
+            assert not [q for _, q, _ in denied.statements
+                        if q.upper().startswith(mutating)], \
+                "the gate mutated the cluster after a permission failure"
+        finally:
+            restore()
+
+    @check("transitive membership is complete, cycle-safe and unbounded")
+    def _membership_depth():
+        # A 14-role chain below the runtime role, ending at the migrator.
+        edges = [("chain_role_00", APP_ROLE)]
+        edges += [(f"chain_role_{index:02d}", f"chain_role_{index - 1:02d}")
+                  for index in range(1, 14)]
+        edges.append((MIGRATOR_ROLE, "chain_role_13"))
+        assert len(reachable_roles(APP_ROLE, edges)) == 15
+        try:
+            assert_runtime_role_reaches_nothing(APP_ROLE, edges)
+        except ProtocolFailure as exc:
+            assert MIGRATOR_ROLE in str(exc), str(exc)
+        else:
+            raise AssertionError(
+                "a membership path longer than ten levels was accepted")
+
+        # The direct membership check is preserved.
+        try:
+            assert_runtime_role_reaches_nothing(APP_ROLE, [(OWNER_ROLE, APP_ROLE)])
+        except ProtocolFailure:
+            pass
+        else:
+            raise AssertionError("a direct membership was accepted")
+
+        # A cycle terminates and is refused; no edges is accepted.
+        cycle = [("role_a", APP_ROLE), ("role_b", "role_a"),
+                 ("role_a", "role_b")]
+        assert reachable_roles(APP_ROLE, cycle) == {"role_a", "role_b"}
+        try:
+            assert_runtime_role_reaches_nothing(APP_ROLE, cycle)
+        except ProtocolFailure:
+            pass
+        else:
+            raise AssertionError("a membership cycle was accepted")
+        assert reachable_roles(APP_ROLE, []) == set()
+        assert_runtime_role_reaches_nothing(APP_ROLE, []) is None
+
+        # The unbounded traversal must not be replaced by a bounded query.
+        source = inspect.getsource(verify_installation)
+        assert "depth <" not in source
+        assert "pg_auth_members" in source
+
     return checks
 
 
@@ -2712,8 +3006,15 @@ def run_self_test():
             print(f"FAIL  {name} — unexpected {type(exc).__name__}: {exc}")
         else:
             print(f"PASS  {name}")
+    total = len(checks) + 1
+    if _REAL_CONNECT_ATTEMPTS:
+        failures += 1
+        print(f"FAIL  no database connection during self-test — "
+              f"{_REAL_CONNECT_ATTEMPTS} real connect attempt(s)")
+    else:
+        print("PASS  no database connection during self-test")
     print("-" * 66)
-    print(f"Total: {len(checks)}, PASS: {len(checks) - failures}, FAIL: {failures}")
+    print(f"Total: {total}, PASS: {total - failures}, FAIL: {failures}")
     return 0 if failures == 0 else 1
 
 

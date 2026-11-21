@@ -83,8 +83,9 @@ string values equal them exactly.
    including the five-column `lease_protocol_info_v1()` result; object ACLs are
    expanded with `acldefault(...)` when the catalog ACL is `NULL`; table,
    sequence, function and schema privileges are checked per privilege with
-   `has_*_privilege`; transitive membership (`pg_auth_members`, recursive) and
-   `rolsuper` / `rolbypassrls` are checked; both global and schema-scoped
+   `has_*_privilege`; the complete transitive membership graph (`pg_auth_members`,
+   traversed without a depth limit and cycle-safe) and `rolsuper` /
+   `rolbypassrls` are checked; both global and schema-scoped
    `pg_default_acl` rows are inspected. The verifier repairs nothing: every
    mismatch raises and rolls bootstrap back.
 5. **Genuine per-scenario database isolation.** The runner calls
@@ -129,19 +130,20 @@ privilege enforcement or recovery. Only execution against PostgreSQL 16.16 can.
 
 The harness drops fixed-name databases and mutates cluster-level role
 membership, so it must never run against a live environment. It refuses unless
-**all three** of these are set:
+**all four** of these are set:
 
 | Variable | Required value | Meaning |
 |---|---|---|
 | `ALLOW_DESTRUCTIVE_TESTS` | `1` | Explicit, per-run opt-in to destructive behaviour |
 | `HARNESS_CLUSTER_LABEL` | `issue145-disposable` | Declares the target a dedicated disposable cluster |
 | `HARNESS_TARGET_SYSTEM_IDENTIFIER` | the cluster's `system_identifier` | Independently observed cluster identity |
+| `HARNESS_CLUSTER_GUARD` | the random nonce written into the guard database at provisioning | Pre-provisioned proof that this cluster was set up for the harness |
 
 `HARNESS_CLUSTER_LABEL` is a declaration, not proof, and neither is an
 `issue145_*` database name. Identity is established from
-`pg_control_system().system_identifier`, which the operator reads while
-provisioning the disposable cluster (for example from `pg_controldata`, or the
-same query) and supplies separately. A mismatch refuses the run.
+`pg_control_system().system_identifier`, and ownership of an existing database
+only from a guard-bound catalog marker. A matching label plus system identifier
+without the pre-provisioned guard is refused.
 
 The gate runs in two stages:
 
@@ -151,10 +153,16 @@ The gate runs in two stages:
    every statement in this stage is read-only:
    - the cluster's `system_identifier` must equal
      `HARNESS_TARGET_SYSTEM_IDENTIFIER`;
-   - every database other than `postgres`, `template0` and `template1` must carry
-     the marker `strikenova-issue145-harness-disposable:<identifier>` in its
-     catalog comment. A database is never adopted merely because its name is
-     `issue145_*`, and is never terminated or dropped at this stage;
+   - the guard database `HARNESS_GUARD_DATABASE` must already exist and its
+     comment must read `issue145-harness-guard:<system_identifier>:<nonce>` with
+     the verified identifier and `HARNESS_CLUSTER_GUARD` as the nonce. The
+     harness never creates this database, never writes the comment and never
+     generates the nonce;
+   - every database other than `postgres`, `template0`, `template1` and the
+     guard database must be named exactly `issue145_t01` … `issue145_t27` and
+     carry the marker `strikenova-issue145-harness-disposable:<identifier>:<nonce>`
+     in its catalog comment. Any other name — including another `issue145_*`
+     name — is refused, and nothing is terminated or dropped at this stage;
    - an existing fixed-name role may not have `SUPERUSER`, `BYPASSRLS`,
      `CREATEROLE` or `CREATEDB`, and its `LOGIN`/`NOLOGIN` attribute must be the
      one the harness would provision (`migrator` and `app` are LOGIN, `owner` is
@@ -166,6 +174,40 @@ The gate runs in two stages:
 
    A refusal here leaves the cluster exactly as found.
 
+### Provisioning the guard (once, by the cluster owner, before any run)
+
+The guard is the only part of the safety model the harness cannot create for
+itself. Run this on the disposable cluster, as a role allowed to create a
+database and execute `pg_control_system()`:
+
+1. Generate a random nonce outside the harness and keep it out of Git:
+
+   ```bash
+   python3 -c 'import secrets; print(secrets.token_hex(32))'
+   ```
+
+2. Build the comment value from the cluster's own identity:
+
+   ```bash
+   psql -At -c "SELECT 'issue145-harness-guard:' || system_identifier::text || ':<nonce>' FROM pg_control_system()"
+   ```
+
+3. Create the guard database and paste that value into the comment:
+
+   ```sql
+   CREATE DATABASE issue145_guard;
+   COMMENT ON DATABASE issue145_guard IS 'issue145-harness-guard:<system_identifier>:<nonce>';
+   ```
+
+4. Export the same nonce as `HARNESS_CLUSTER_GUARD` for every run, alongside
+   `HARNESS_TARGET_SYSTEM_IDENTIFIER` from step 2.
+
+`COMMENT ON DATABASE` accepts only a literal, so the value must be pasted in
+verbatim. The nonce is not a database credential, but it is the evidence that
+this cluster was provisioned for the harness: treat it as sensitive and never
+commit it. A guard copied from another cluster keeps that cluster's identifier
+and is refused here.
+
 ### Connection configuration
 
 | Variable | Default | Used for |
@@ -173,15 +215,28 @@ The gate runs in two stages:
 | `DB_HOST` | empty (Unix socket) | all connections |
 | `DB_PORT` | `55432` | all connections |
 | `HARNESS_TARGET_SYSTEM_IDENTIFIER` | empty (run is refused) | cluster identity check, database marker |
+| `HARNESS_CLUSTER_GUARD` | empty (run is refused) | guard nonce check, database marker |
+| `HARNESS_GUARD_DATABASE` | `issue145_guard` | name of the pre-provisioned guard database |
 | `ADMIN_DB_USER` / `ADMIN_DB_PASSWORD` | falls back to `DB_USER` / `DB_PASSWORD` | administrator: create/drop databases and roles, grant on a scenario database, terminate backends |
 | `MIGRATOR_DB_USER` | `strikenova_prod_migrator` | every scenario connection |
 | `MIGRATOR_DB_PASSWORD` | empty | migrator login |
 | `DB_USER` / `DB_PASSWORD` | empty | administrator fallback, and the password fallback for the APP connection |
 
-The administrator must be allowed to create and drop databases, create roles,
-and call `pg_terminate_backend`. The migrator and APP roles must be able to log
-in. Use throwaway credentials for this disposable cluster only — no real
-StrikeNova credential belongs in this harness or its environment.
+The administrator must be allowed to:
+
+- create and drop databases (to provision and tear down scenario databases);
+- create roles (to provision the three fixed names);
+- call `pg_terminate_backend` on harness-owned backends (T-12 and teardown);
+- execute `pg_control_system()` (the cluster identity check). PostgreSQL 16
+  restricts this function to superusers and members of `pg_monitor` unless
+  `EXECUTE` is granted separately, so the administrator needs one of those. The
+  harness **never** grants `pg_monitor`, superuser or function `EXECUTE`; if the
+  check raises `42501` the run stops before any mutation and reports the
+  privilege as a refused target (exit status 2, all 27 NOT RUN).
+
+The migrator and APP roles must be able to log in. Use throwaway credentials for
+this disposable cluster only — no real StrikeNova credential belongs in this
+harness or its environment.
 
 ### Side effects, by scope
 
@@ -273,6 +328,8 @@ pip install 'psycopg[binary]>=3.1'
 export ALLOW_DESTRUCTIVE_TESTS=1        # explicit destructive opt-in
 export HARNESS_CLUSTER_LABEL=issue145-disposable
 export HARNESS_TARGET_SYSTEM_IDENTIFIER=<system_identifier of that cluster>
+export HARNESS_CLUSTER_GUARD=<nonce written into the guard database>
+export HARNESS_GUARD_DATABASE=issue145_guard   # default
 export DB_HOST=""                       # Unix socket
 export DB_PORT=55432                    # disposable PostgreSQL 16.16
 export DB_USER=""                       # administrator, CREATEROLE/CREATEDB
@@ -311,7 +368,7 @@ they are not current results and are not reused anywhere in this document.
 
   ```bash
   python3 docs/reviews/issue145-t01-t27-harness/run_t01_to_t27.py --self-test
-  # Total: 12, PASS: 12, FAIL: 0   (exit 0)
+  # Total: 17, PASS: 17, FAIL: 0   (exit 0)
   ```
 
   It injects a fake driver and contacts no server. Its checks cover: autocommit
@@ -325,9 +382,17 @@ they are not current results and are not reused anywhere in this document.
   `ADMIN TRUE` and a NOLOGIN migrator are all refused); complete constraint
   comparison rejecting `OR true`, an extra `IN` alternative and a changed
   operator; the version matrix (15.0, 16.15, 16.16, 16.20, 17.0, 18.0); bootstrap
-  verifying before activation; T-11/T-12 ordering, `FOR UPDATE NOWAIT` lock
+  verifying before activation;   T-11/T-12 ordering, `FOR UPDATE NOWAIT` lock
   probes and the `57P01`/`08006` assertion; `expect_sqlstate` reading the driver
-  SQLSTATE inside a real transaction; and T-23 remaining NOT RUN.
+  SQLSTATE inside a real transaction; and T-23 remaining NOT RUN. This revision
+  adds: the pre-provisioned guard being required, prefix-checked,
+  identity-bound and nonce-checked (including the copied-cluster case); the
+  `issue145_t01`…`issue145_t27` name allow-list rejecting `issue145_t28`,
+  `issue145_t00`, `issue145_disposable`, `issue145_t01_backup` and `app_db`; a
+  `42501` on `pg_control_system()` being reported as a refusal with no mutation;
+  an unbounded 14-role membership chain reaching the migrator, a direct
+  membership and a membership cycle all being rejected; and a counter proving no
+  real driver connection is attempted during the self-test.
 - Two no-server runs still produce 27 NOT RUN: exit 2 without the opt-in (no
   connection opened) and exit 0 with it (no server reachable; here `psycopg` is
   also absent, so the module's stub driver reports the unreachable path).
