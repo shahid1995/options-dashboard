@@ -1,0 +1,11 @@
+python: Python 3.12.16
+image_ref: postgres@sha256:3950ad7c3148ca2175ef1b6c36c9efbf78957ae8fbe8b3a5d7c35af50500382f
+image_tag: postgres:16.16
+image_digests: ["postgres@sha256:3950ad7c3148ca2175ef1b6c36c9efbf78957ae8fbe8b3a5d7c35af50500382f"]
+service_container: aa0806148575 b1aa1903f7a3475689efb87c404920d1_postgressha2563950ad7c3148ca2175ef1b6c36c9efbf78957ae8fbe8b3a5d7c35af50500382f_e1d40c postgres
+psycopg: 3.3.9
+server_version: 16.16 (Debian 16.16-1.pgdg13+1)
+server_version_num: 160016
+system_identifier: 7710566614162509864
+full_version: PostgreSQL 16.16 (Debian 16.16-1.pgdg13+1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+harness_exit_code=0

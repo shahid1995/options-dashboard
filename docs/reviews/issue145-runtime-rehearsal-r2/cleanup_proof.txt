@@ -1,0 +1,18 @@
+databases_after_run:
+  issue145_guard
+  postgres
+  template0
+  template1
+harness_roles_after_run:
+  strikenova_prod_migrator
+  strikenova_prod_owner
+  strikenova_production_app
+harness_memberships_after_run:
+  ('strikenova_prod_owner', 'strikenova_prod_migrator', False, True, False)
+backends_after_run:
+  postgres: 1
+  None: 5
+issue145_databases_after_cleanup: 0
+strikenova_roles_after_cleanup: 0
+final_databases: ['postgres', 'template0', 'template1']
+cleanup: OK (zero issue145_* databases, zero strikenova_* roles)

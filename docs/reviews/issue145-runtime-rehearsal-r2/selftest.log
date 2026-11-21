@@ -1,0 +1,24 @@
+Issue #145 harness — DB-free self-test (no server is contacted)
+==================================================================
+PASS  every connection opener sets autocommit and the expected database
+PASS  T-16 grants run as the owner inside issue145_t_16 only
+PASS  cluster identity comes from pg_control, not from the static label
+PASS  an existing scenario database without the guard-derived marker is refused
+PASS  drop_scenario_db refuses a database it cannot prove it created
+PASS  role login attributes and exact membership options are validated
+PASS  constraint definitions are compared in full, including weakened ones
+PASS  only PostgreSQL 16 with minor >= 16 is accepted
+PASS  bootstrap verifies §9.3 before it activates the protocol row
+PASS  T-11/T-12 put enter first and assert termination SQLSTATEs
+PASS  expect_sqlstate uses a real transaction and the driver SQLSTATE
+PASS  T-23 stays NOT RUN and never presents a direct UPDATE as an upgrade
+PASS  the guard database is never a system or scenario database
+PASS  a pre-provisioned guard is required, identity-bound and nonce-checked
+PASS  existing databases are restricted to issue145_t_01..t_27 plus the guard
+PASS  F-1: function identity is the catalog input-type array, not rendered names
+PASS  F-2: generated scenario names match the allow-list exactly
+PASS  insufficient privilege for pg_control_system() fails closed
+PASS  transitive membership is complete, cycle-safe and unbounded
+PASS  no database connection during self-test
+------------------------------------------------------------------
+Total: 20, PASS: 20, FAIL: 0
