@@ -54,7 +54,9 @@ jobs:
       - name: Check out the reviewed commit
         uses: actions/checkout@v4
         with:
-          ref: test/issue145-runtime-rehearsal
+          # The reviewed evidence commit, not this workflow's branch: the
+          # harness and its docs must be byte-identical to what was reviewed.
+          ref: fa49b468de8b3c9dbd900dfd77ff7b0603d818a4
 
       - name: Verify exact reviewed source
         run: |
@@ -151,8 +153,10 @@ jobs:
 
       - name: Record server state after the run
         if: always()
+        continue-on-error: true
         run: |
           set -uo pipefail
+          python3 -m pip install --quiet 'psycopg[binary]>=3.2,<4'
           python3 - <<'PY' | tee cleanup.txt
           import os
           import psycopg
