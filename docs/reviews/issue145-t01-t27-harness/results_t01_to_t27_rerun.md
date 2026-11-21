@@ -16,10 +16,28 @@ response, not inside the file it publishes.
 PostgreSQL 16.16 is unavailable in this environment. No scenario was executed
 against a database. Every one of the 27 public outcomes is **NOT RUN**.
 
-The only execution performed here was the harness's unavailability path:
+The only execution performed here was the harness's safety gate and
+unavailability path:
 
 ```
 $ python3 docs/reviews/issue145-t01-t27-harness/run_t01_to_t27.py
+Safety gate: REFUSED — destructive safety gate refused: ALLOW_DESTRUCTIVE_TESTS
+  must be exactly '1' (got ''); HARNESS_CLUSTER_LABEL must be
+  'issue145-disposable' (got '')
+No connection was opened and no database or role was touched.
+...
+Total: 27
+PASS: 0
+FAIL: 0
+INVALID_SETUP: 0
+NOT RUN: 27
+INCONCLUSIVE: 0
+$ echo $?
+2
+
+$ ALLOW_DESTRUCTIVE_TESTS=1 HARNESS_CLUSTER_LABEL=issue145-disposable \
+    python3 docs/reviews/issue145-t01-t27-harness/run_t01_to_t27.py
+Safety gate: ACCEPTED (cluster label 'issue145-disposable')
 PostgreSQL availability: UNAVAILABLE — PostgreSQL unreachable (OperationalError ...)
 ...
 Total: 27
@@ -32,8 +50,10 @@ $ echo $?
 0
 ```
 
-That run demonstrates the runner exits cleanly and classifies all scenarios
-NOT RUN when PostgreSQL is absent. It is not evidence about the lease protocol.
+Those runs demonstrate that the gate refuses before connecting without the
+explicit opt-in, and that the runner exits cleanly and classifies all scenarios
+NOT RUN when PostgreSQL is absent. They are not evidence about the lease
+protocol.
 
 ---
 
@@ -95,19 +115,53 @@ outcome.
 ## What the static review did establish
 
 - The four `CREATE FUNCTION` bodies and both `CREATE TABLE` bodies, loaded from
-  the Python module, are line-for-line identical to the pinned ADR fenced blocks.
+  the Python module, are identical to the pinned ADR fenced blocks.
 - `lease_enter_v1` declares `v_prev` and `v_exp`, saves the caller's
   `lock_timeout`, applies `p_lock_timeout_ms`, and restores the saved value
   after the lease row lock.
 - No SQL string contains a literal backslash-n.
+- Every harness connection is opened through one helper that sets
+  `autocommit=True`, so each `with conn.transaction():` block is a real
+  BEGIN/COMMIT instead of a savepoint inside an accidental implicit transaction.
 - `run_sql()` contains no `commit()`/`rollback()`; scenarios own their
-  transactions.
-- Every `run_sql()` call passes the connection first and only `params` /
+  transactions. Every call passes the connection first and only `params` /
   `fetch_mode` keywords.
-- The runner calls `drop_create_scenario_db()` and `drop_scenario_db()` for each
-  scenario.
+- Bootstrap runs as one transaction in the ADR's order: preflight, create,
+  revoke set, full verification while the protocol reads `closed` / `installing`,
+  activation to `open` / `ready`, then the protocol-info assertion. A DB-free
+  ordering assertion enforces it, so verification cannot move after activation.
+- The verifier compares constraint definitions through `pg_get_constraintdef()`,
+  complete function result signatures (including the five-column protocol-info
+  result), ACLs expanded with `acldefault(...)`, per-privilege effective
+  privileges for schema, tables, sequences and functions, transitive role
+  membership, `rolsuper` / `rolbypassrls`, and both global and schema-scoped
+  default ACLs. It issues no GRANT or REVOKE.
+- The runner calls `prepare_scenario_database()` and `drop_scenario_db()` for
+  each scenario, the latter in a `finally` path.
+- The destructive gate refuses before connecting without `ALLOW_DESTRUCTIVE_TESTS=1`
+  and `HARNESS_CLUSTER_LABEL=issue145-disposable`, and refuses a target holding
+  foreign databases, a production-like fixed-name role, or an unexpected role
+  membership.
 - The runner probes `SHOW server_version` / `server_version_num` and requires
   `160016`; `SELECT 1` alone is not used to establish the version.
+
+## Execution model and safety gate
+
+Every harness connection is `autocommit=True`; each atomic operation is an
+explicit `with conn.transaction():` block. This makes the two facts T-11 and T-12
+assert true in the code rather than incidental: the application table creation is
+committed before the lease is acquired, and `lease_enter_v1` is the first
+statement of each protected transaction.
+
+Because the harness drops fixed-name databases and mutates cluster-level role
+membership, it requires `ALLOW_DESTRUCTIVE_TESTS=1` and
+`HARNESS_CLUSTER_LABEL=issue145-disposable`, then validates the target before any
+mutation. It creates three cluster roles if absent
+(`strikenova_prod_migrator`, `strikenova_production_app`,
+`strikenova_prod_owner`), the owner→migrator membership, and the `issue145_t01`…
+`issue145_t27` databases, dropping each database after its scenario. The roles and
+their membership survive, because dropping a database does not drop roles. None
+of this was exercised here: no database was contacted.
 
 ## What remains unverified
 

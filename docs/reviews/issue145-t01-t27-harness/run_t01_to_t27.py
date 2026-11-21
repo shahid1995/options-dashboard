@@ -12,6 +12,14 @@ sequences: every SQL string uses real line breaks.
 Design rules enforced here:
   * `run_sql()` never commits or rolls back. Transaction ownership stays with
     the scenario, which uses explicit `conn.transaction()` blocks.
+  * Every harness connection is opened with `autocommit=True`, so a standalone
+    statement is its own committed transaction and each `conn.transaction()`
+    block is a real BEGIN/COMMIT instead of a savepoint inside an accidental
+    implicit transaction.
+  * A destructive-run gate refuses to connect unless the operator sets
+    `ALLOW_DESTRUCTIVE_TESTS=1` and `HARNESS_CLUSTER_LABEL` names a dedicated
+    disposable cluster; it then validates that cluster and any pre-existing
+    fixed-name roles before creating, dropping or granting anything.
   * Success results are the documented function results (3-column rows for
     acquire/enter, a boolean for release, five columns for protocol info).
   * Errors are PostgreSQL exceptions; SQLSTATE is read from the driver's
@@ -51,6 +59,23 @@ ADMIN_DB_USER = os.getenv("ADMIN_DB_USER", DB_USER)
 ADMIN_DB_PASSWORD = os.getenv("ADMIN_DB_PASSWORD", DB_PASSWORD)
 MIGRATOR_DB_USER = os.getenv("MIGRATOR_DB_USER", "strikenova_prod_migrator")
 MIGRATOR_DB_PASSWORD = os.getenv("MIGRATOR_DB_PASSWORD", "")
+
+# ---------------------------------------------------------------------------
+# Destructive-run safety gate
+# ---------------------------------------------------------------------------
+# This harness drops fixed-name databases and mutates cluster-level role
+# membership. It must never be run casually against a live environment, so it
+# refuses to connect at all unless the operator opts in explicitly *and* names
+# a dedicated disposable cluster. Neither condition is a default.
+ALLOW_DESTRUCTIVE_TESTS = os.getenv("ALLOW_DESTRUCTIVE_TESTS", "")
+HARNESS_CLUSTER_LABEL = os.getenv("HARNESS_CLUSTER_LABEL", "")
+REQUIRED_CLUSTER_LABEL = "issue145-disposable"
+
+SAFETY_REFUSAL_EXIT_CODE = 2
+
+
+class SafetyRefusal(Exception):
+    """The destructive-run gate refused the configured target."""
 
 MIGRATOR_ROLE = "strikenova_prod_migrator"
 OWNER_ROLE = "strikenova_prod_owner"
@@ -491,9 +516,90 @@ def _conn_kwargs(dbname, user=None, password=None):
     return kwargs
 
 
+def require_destructive_optin():
+    """Refuse before any connection unless the operator opted in explicitly."""
+    problems = []
+    if ALLOW_DESTRUCTIVE_TESTS != "1":
+        problems.append("ALLOW_DESTRUCTIVE_TESTS must be exactly '1' "
+                        f"(got {ALLOW_DESTRUCTIVE_TESTS!r})")
+    if HARNESS_CLUSTER_LABEL != REQUIRED_CLUSTER_LABEL:
+        problems.append(f"HARNESS_CLUSTER_LABEL must be {REQUIRED_CLUSTER_LABEL!r} "
+                        f"(got {HARNESS_CLUSTER_LABEL!r})")
+    if problems:
+        raise SafetyRefusal("; ".join(problems))
+
+
+HARNESS_CREATED_DBS_PATTERN = "issue145\\_%"
+
+
+def validate_destructive_target(admin):
+    """Refuse a target that is not a dedicated disposable cluster.
+
+    Runs after the version probe and before any role or database mutation, so a
+    production-like target is never adopted or altered. Every condition fails
+    closed: the harness stops rather than repairing or adopting what it finds.
+    """
+    problems = []
+
+    foreign_databases = [row[0] for row in admin.execute(
+        "SELECT datname FROM pg_database "
+        "WHERE datname NOT IN ('postgres', 'template0', 'template1') "
+        "AND datname NOT LIKE %s ORDER BY datname",
+        (HARNESS_CREATED_DBS_PATTERN,)).fetchall()]
+    if foreign_databases:
+        problems.append("cluster holds databases this harness did not create: "
+                        + ", ".join(foreign_databases))
+
+    role_rows = admin.execute(
+        "SELECT rolname, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb "
+        "FROM pg_roles WHERE rolname = ANY(%s) ORDER BY rolname",
+        ([MIGRATOR_ROLE, OWNER_ROLE, APP_ROLE],)).fetchall()
+    for rolname, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb in role_rows:
+        risky = [flag for flag, value in (
+            ("SUPERUSER", rolsuper), ("BYPASSRLS", rolbypassrls),
+            ("CREATEROLE", rolcreaterole), ("CREATEDB", rolcreatedb)) if value]
+        if risky:
+            problems.append(f"existing role {rolname} has {', '.join(risky)}; "
+                            "refusing to adopt a production-like role set")
+
+    allowed_memberships = {(OWNER_ROLE, MIGRATOR_ROLE)}
+    memberships = admin.execute(
+        "SELECT r.rolname, m.rolname FROM pg_auth_members am "
+        "JOIN pg_roles r ON r.oid = am.roleid "
+        "JOIN pg_roles m ON m.oid = am.member "
+        "WHERE r.rolname = ANY(%s) OR m.rolname = ANY(%s) ORDER BY 1, 2",
+        ([MIGRATOR_ROLE, OWNER_ROLE, APP_ROLE],
+         [MIGRATOR_ROLE, OWNER_ROLE, APP_ROLE])).fetchall()
+    unexpected = [pair for pair in memberships if tuple(pair) not in allowed_memberships]
+    if unexpected:
+        problems.append("existing role memberships this harness did not create: "
+                        + ", ".join(f"{role} -> {member}"
+                                    for role, member in unexpected))
+
+    if problems:
+        raise SafetyRefusal("; ".join(problems))
+
+
+def harness_connect(**kwargs):
+    """Open a harness connection whose transaction boundaries are explicit.
+
+    autocommit=True is deliberate, not incidental. With psycopg's default
+    (autocommit=False) a bare DDL or verification statement silently opens a
+    transaction, and every later `with conn.transaction():` becomes a savepoint
+    inside it. Statements would then not be committed when the scenario claims
+    they are, and "the first statement of the protected transaction" would be
+    false. With autocommit=True each standalone statement is its own committed
+    transaction and each `with conn.transaction():` block is a real BEGIN/COMMIT.
+    """
+    conn = psycopg.connect(**kwargs)
+    conn.autocommit = True
+    return conn
+
+
 def connect_as(role, dbname, password=""):
     """Open a connection to one database as an explicit role."""
-    return psycopg.connect(**_conn_kwargs(dbname, user=role, password=password or None))
+    return harness_connect(**_conn_kwargs(dbname, user=role,
+                                          password=password or None))
 
 
 def connect_migrator(dbname):
@@ -503,12 +609,19 @@ def connect_migrator(dbname):
 
 def admin_connect():
     """Administrative connection used only for disposable provisioning."""
-    return psycopg.connect(**_conn_kwargs("postgres", user=ADMIN_DB_USER,
+    return harness_connect(**_conn_kwargs("postgres", user=ADMIN_DB_USER,
                                           password=ADMIN_DB_PASSWORD))
 
 
 def provision_cluster_roles(admin):
-    """Create the cluster-level test roles before any scenario runs."""
+    """Create the cluster-level test roles before any scenario runs.
+
+    `validate_destructive_target()` has already refused any existing role that
+    looks production-like, so this only ever creates a missing role or re-adds
+    the one membership the harness owns. Cluster-level side effect: these three
+    roles and the owner->migrator membership survive after the run, because
+    dropping a database does not drop roles.
+    """
     for name, login in ((MIGRATOR_ROLE, True), (APP_ROLE, True), (OWNER_ROLE, False)):
         exists = admin.execute("SELECT 1 FROM pg_roles WHERE rolname = %s",
                                (name,)).fetchone()
@@ -532,9 +645,8 @@ def prepare_scenario_database(admin_conn, db_name):
         sql.Identifier(db_name), sql.Identifier(MIGRATOR_ROLE)))
     admin_conn.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
         sql.Identifier(db_name), sql.Identifier(APP_ROLE)))
-    scoped = psycopg.connect(**_conn_kwargs(db_name, user=ADMIN_DB_USER,
-                                            password=ADMIN_DB_PASSWORD))
-    scoped.autocommit = True
+    scoped = harness_connect(**_conn_kwargs(db_name, user=ADMIN_DB_USER,
+                                           password=ADMIN_DB_PASSWORD))
     try:
         for role in (MIGRATOR_ROLE, OWNER_ROLE):
             scoped.execute(sql.SQL("GRANT USAGE, CREATE ON SCHEMA public TO {}").format(
@@ -621,41 +733,64 @@ def preflight_first_installation(conn):
             f"(§9.2.1 step 2 -> 45004): schema={schema_present}, leftovers={leftovers}")
 
 
+BOOTSTRAP_LOCK_TIMEOUT_SQL = "SET lock_timeout = '10s'"
+
+PROTOCOL_INSERT_SQL = (
+    "INSERT INTO migration_internal.lease_protocol "
+    "(installed_version, min_supported_version, max_supported_version, "
+    "barrier_state, bootstrap_state) "
+    "VALUES (1, 1, 1, 'closed', 'installing')")
+
+LEASE_ROW_INSERT_SQL = (
+    "INSERT INTO migration_internal.migration_lease "
+    "(lease_name, protocol_version) "
+    "VALUES ('migration-lease', 1)")
+
+# ADR §9.2.1 step 11 — the only statement that moves the row to an admitted state.
+PROTOCOL_ACTIVATION_SQL = (
+    "UPDATE migration_internal.lease_protocol "
+    "SET installed_version = 1, "
+    "    min_supported_version = 1, "
+    "    max_supported_version = 1, "
+    "    barrier_state = 'open', "
+    "    bootstrap_state = 'ready', "
+    "    updated_at = now(), "
+    "    updated_by = session_user "
+    "WHERE singleton")
+
+
 def bootstrap_first_installation(conn):
-    """Execute §9.2.1 step by step in one transaction."""
+    """Execute ADR §9.2.1 steps 1–12 as one atomic transaction.
+
+    Order is the ADR's, not a convenient one: the whole structural, ownership,
+    constraint, signature, ACL and default-ACL verification (step 10) runs while
+    the protocol row still reads `closed` / `installing`, and the row is moved to
+    `open` / `ready` (step 11) only after that verification succeeded. A
+    verification failure raises ProtocolFailure inside the block, which rolls the
+    entire bootstrap back instead of leaving a half-installed schema behind.
+    """
+    run_sql(conn, BOOTSTRAP_LOCK_TIMEOUT_SQL)
     with conn.transaction():
+        # Steps 1–2: bootstrap guard and empty-database preflight.
         preflight_first_installation(conn)
+        # Steps 3–8: schema, tables, initial rows, then the four functions.
         run_sql(conn, "CREATE SCHEMA migration_internal")
         run_sql(conn, PROTOCOL_TABLE_SCHEMA)
-        run_sql(conn,
-                "INSERT INTO migration_internal.lease_protocol "
-                "(installed_version, min_supported_version, max_supported_version, "
-                "barrier_state, bootstrap_state) "
-                "VALUES (1, 1, 1, 'closed', 'installing')")
+        run_sql(conn, PROTOCOL_INSERT_SQL)
         run_sql(conn, LEASE_TABLE_SCHEMA)
-        run_sql(conn,
-                "INSERT INTO migration_internal.migration_lease "
-                "(lease_name, protocol_version) "
-                "VALUES ('migration-lease', 1)")
+        run_sql(conn, LEASE_ROW_INSERT_SQL)
         run_sql(conn, LEASE_ACQUIRE_V1_SQL)
         run_sql(conn, LEASE_ENTER_V1_SQL)
         run_sql(conn, LEASE_RELEASE_V1_SQL)
         run_sql(conn, LEASE_PROTOCOL_INFO_V1_SQL)
+        # Step 9: revoke set, after the last CREATE FUNCTION.
         run_sql(conn, REVOKE_SET_SQL)
-        run_sql(conn,
-                "UPDATE migration_internal.lease_protocol "
-                "SET installed_version = 1, "
-                "    min_supported_version = 1, "
-                "    max_supported_version = 1, "
-                "    barrier_state = 'open', "
-                "    bootstrap_state = 'ready', "
-                "    updated_at = now(), "
-                "    updated_by = session_user "
-                "WHERE singleton")
-        row = run_sql(conn, "SELECT * FROM migration_internal.lease_protocol_info_v1()",
-                      fetch_mode="one")
-        if row != (1, 1, 1, "open", "ready"):
-            raise ProtocolFailure(f"§9.2.1 step 12 verification failed: {row!r}")
+        # Step 10: full verification while the protocol is closed/installing.
+        verify_installation(conn, expected_version=1, expect_active=False)
+        # Step 11: activation, only after verification passed.
+        run_sql(conn, PROTOCOL_ACTIVATION_SQL)
+        # Step 12: final protocol-info assertion, before the same COMMIT.
+        assert_protocol_info(conn)
 
 
 EXPECTED_COLUMNS = {
@@ -680,64 +815,135 @@ EXPECTED_COLUMNS = {
     ("lease_protocol", "note"): ("text", "YES"),
 }
 
+# §9.3 "Check constraints | present with the documented expressions": each entry
+# is (contype, markers that must appear in pg_get_constraintdef()). The marker
+# form tolerates PostgreSQL's parenthesis and cast rendering while still failing
+# closed on a missing column, operator, literal or branch.
+EXPECTED_CONSTRAINTS = {
+    ("migration_lease", "migration_lease_pkey"): (
+        "p", ("primary key", "lease_name")),
+    ("lease_protocol", "lease_protocol_pkey"): (
+        "p", ("primary key", "singleton")),
+    ("migration_lease", "migration_lease_singleton_ck"): (
+        "c", ("check", "lease_name", "migration-lease")),
+    ("migration_lease", "migration_lease_generation_ck"): (
+        "c", ("check", "generation", ">= 0")),
+    ("migration_lease", "migration_lease_owner_shape_ck"): (
+        "c", ("check", "owner_token_hash is null", "owner_fingerprint is null",
+              "owner_token_hash is not null", "owner_fingerprint is not null",
+              " or ")),
+    ("migration_lease", "migration_lease_owned_expiry_ck"): (
+        "c", ("check", "owner_token_hash is null", "expires_at is not null", " or ")),
+    ("lease_protocol", "lease_protocol_barrier_state_check"): (
+        "c", ("check", "barrier_state", "open", "closed", "any")),
+    ("lease_protocol", "lease_protocol_bootstrap_state_check"): (
+        "c", ("check", "bootstrap_state", "ready", "installing", "any")),
+    ("lease_protocol", "lease_protocol_singleton_check"): (
+        "c", ("check", "singleton")),
+}
 
-def verify_installation(conn, expected_version=1):
-    """§9.3 verification phase plus the §9.4 default-ACL fail-closed rule."""
+# §9.3 "Function signatures | exactly the documented identity arguments and
+# result types", including the five-column protocol-info result.
+EXPECTED_FUNCTIONS = {
+    "lease_acquire_v1": (
+        "integer, text, double precision, integer",
+        "table(out_owner_fingerprint text, out_expires_at timestamp with time zone, "
+        "out_generation bigint)"),
+    "lease_enter_v1": (
+        "integer, text, double precision, integer",
+        "table(out_owner_fingerprint text, out_expires_at timestamp with time zone, "
+        "out_generation bigint)"),
+    "lease_release_v1": ("integer, text", "boolean"),
+    "lease_protocol_info_v1": (
+        "",
+        "table(installed_version integer, min_supported_version integer, "
+        "max_supported_version integer, barrier_state text, bootstrap_state text)"),
+}
+
+
+def _normalize_sql_text(value):
+    """Collapse whitespace and case so catalog rendering differences do not matter."""
+    return " ".join((value or "").lower().split())
+
+
+def verify_installation(conn, expected_version=1, expect_active=True):
+    """ADR §9.3 verification, §9.4 default ACLs and §10.3 effective privileges.
+
+    Runs inside the caller's transaction and repairs nothing: every mismatch
+    raises ProtocolFailure, which aborts the bootstrap transaction. With
+    `expect_active=False` this is the pre-activation pass of §9.2.1 step 10, so
+    the protocol row is required to still read `closed` / `installing`; the final
+    `open` / `ready` assertion belongs to step 12 (`assert_protocol_info`).
+    """
     def fail(message):
         raise ProtocolFailure("§9.3 verification failed: " + message)
 
+    expected_state = ("open", "ready") if expect_active else ("closed", "installing")
+
+    # -- schema -----------------------------------------------------------
     schema_owner = run_sql(
         conn, "SELECT n.nspowner::regrole::text FROM pg_namespace n "
               "WHERE n.nspname = 'migration_internal'", fetch_mode="one")
-    if schema_owner is None or schema_owner[0] != MIGRATOR_ROLE:
-        fail(f"schema owner {schema_owner!r} is not {MIGRATOR_ROLE}")
+    if schema_owner is None:
+        fail("schema migration_internal is missing")
+    if schema_owner[0] != MIGRATOR_ROLE:
+        fail(f"schema owner {schema_owner[0]!r} is not {MIGRATOR_ROLE}")
 
-    rows = run_sql(
-        conn, "SELECT c.relname, c.relkind, c.relowner::regrole::text, c.relrowsecurity "
+    # -- relations: only the two tables, correct kind, owner and row security --
+    relations = run_sql(
+        conn, "SELECT c.relname, c.relkind, c.relowner::regrole::text, "
+              "c.relrowsecurity "
               "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-              "WHERE n.nspname = 'migration_internal' AND c.relkind = 'r'",
+              "WHERE n.nspname = 'migration_internal' AND c.relkind <> 'i'",
         fetch_mode="all")
-    tables = {name: (kind, owner, rls) for name, kind, owner, rls in rows}
+    tables = {name: (kind, owner, rls) for name, kind, owner, rls in relations}
     if set(tables) != {"migration_lease", "lease_protocol"}:
-        fail(f"tables {sorted(tables)}")
+        fail(f"relations in migration_internal are {sorted(tables)}, "
+             "expected exactly migration_lease and lease_protocol")
     for name, (kind, owner, rls) in tables.items():
         if kind != "r":
-            fail(f"{name} relkind {kind!r}")
+            fail(f"{name} relkind {kind!r} is not an ordinary table")
         if owner != MIGRATOR_ROLE:
             fail(f"{name} owner {owner} is not {MIGRATOR_ROLE}")
         if rls:
             fail(f"{name} has row security enabled")
 
+    # -- columns ----------------------------------------------------------
     columns = run_sql(
         conn, "SELECT table_name, column_name, data_type, is_nullable "
               "FROM information_schema.columns WHERE table_schema = 'migration_internal'",
         fetch_mode="all")
     got_columns = {(t, c): (d, n) for t, c, d, n in columns}
     if got_columns != EXPECTED_COLUMNS:
-        fail("column names, types or nullability differ from §6.1")
+        missing = sorted(set(EXPECTED_COLUMNS) - set(got_columns))
+        extra = sorted(set(got_columns) - set(EXPECTED_COLUMNS))
+        wrong = sorted(key for key in set(got_columns) & set(EXPECTED_COLUMNS)
+                       if got_columns[key] != EXPECTED_COLUMNS[key])
+        fail(f"columns differ from §6.1 (missing {missing}, extra {extra}, "
+             f"wrong type/nullability {wrong})")
 
-    cons = run_sql(
-        conn, "SELECT c.conrelid::regclass::text, c.conname, c.contype "
+    # -- constraints: names, types and full definitions --------------------
+    constraints = run_sql(
+        conn, "SELECT c.conrelid::regclass::text, c.conname, c.contype, "
+              "pg_get_constraintdef(c.oid) "
               "FROM pg_constraint c "
               "WHERE c.connamespace = 'migration_internal'::regnamespace",
         fetch_mode="all")
-    constraint_names = {(rel.split(".")[-1], name, kind) for rel, name, kind in cons}
-    required = {
-        ("migration_lease", "migration_lease_pkey", "p"),
-        ("lease_protocol", "lease_protocol_pkey", "p"),
-        ("migration_lease", "migration_lease_singleton_ck", "c"),
-        ("migration_lease", "migration_lease_generation_ck", "c"),
-        ("migration_lease", "migration_lease_owner_shape_ck", "c"),
-        ("migration_lease", "migration_lease_owned_expiry_ck", "c"),
-    }
-    missing = required - constraint_names
-    if missing:
-        fail(f"missing constraints {sorted(missing)}")
-    protocol_checks = sum(1 for rel, _, kind in constraint_names
-                          if rel == "lease_protocol" and kind == "c")
-    if protocol_checks < 3:
-        fail(f"lease_protocol check constraints {protocol_checks} < 3")
+    observed = {(rel.split(".")[-1], name): (kind, _normalize_sql_text(definition))
+                for rel, name, kind, definition in constraints}
+    if set(observed) != set(EXPECTED_CONSTRAINTS):
+        fail(f"constraint set differs (missing "
+             f"{sorted(set(EXPECTED_CONSTRAINTS) - set(observed))}, extra "
+             f"{sorted(set(observed) - set(EXPECTED_CONSTRAINTS))})")
+    for key, (kind, markers) in EXPECTED_CONSTRAINTS.items():
+        got_kind, definition = observed[key]
+        if got_kind != kind:
+            fail(f"{key[1]} contype {got_kind!r} != {kind!r}")
+        for marker in markers:
+            if marker not in definition:
+                fail(f"{key[1]} definition {definition!r} lacks {marker!r}")
 
+    # -- functions: identity args, complete result, owner, security, search_path --
     funcs = run_sql(
         conn, "SELECT p.proname, pg_get_function_identity_arguments(p.oid), "
               "pg_get_function_result(p.oid), p.proowner::regrole::text, "
@@ -745,93 +951,179 @@ def verify_installation(conn, expected_version=1):
               "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
               "WHERE n.nspname = 'migration_internal'", fetch_mode="all")
     by_name = {row[0]: row[1:] for row in funcs}
-    expected_args = {
-        "lease_acquire_v1": "integer, text, double precision, integer",
-        "lease_enter_v1": "integer, text, double precision, integer",
-        "lease_release_v1": "integer, text",
-        "lease_protocol_info_v1": "",
-    }
-    if set(by_name) != set(expected_args):
-        fail(f"function set {sorted(by_name)}")
-    for name, args in expected_args.items():
-        got_args, result, owner, secdef, config = by_name[name]
-        if got_args != args:
-            fail(f"{name} identity arguments {got_args!r}")
+    if set(by_name) != set(EXPECTED_FUNCTIONS):
+        fail(f"function set {sorted(by_name)} differs from "
+             f"{sorted(EXPECTED_FUNCTIONS)}")
+    for name, (args, result) in EXPECTED_FUNCTIONS.items():
+        got_args, got_result, owner, secdef, config = by_name[name]
+        if _normalize_sql_text(got_args) != _normalize_sql_text(args):
+            fail(f"{name} identity arguments {got_args!r} != {args!r}")
+        if _normalize_sql_text(got_result) != _normalize_sql_text(result):
+            fail(f"{name} result signature {got_result!r} != {result!r}")
         if owner != MIGRATOR_ROLE:
             fail(f"{name} owner {owner} is not {MIGRATOR_ROLE}")
         if not secdef:
             fail(f"{name} is not SECURITY DEFINER")
-        if config != ["search_path=pg_catalog"]:
-            fail(f"{name} proconfig {config!r}")
-        if name == "lease_release_v1":
-            if result != "boolean":
-                fail(f"{name} result {result!r}")
-        else:
-            if not result.startswith("TABLE("):
-                fail(f"{name} result {result!r}")
-        if name in ("lease_acquire_v1", "lease_enter_v1"):
-            for marker in ("out_owner_fingerprint", "out_expires_at", "out_generation"):
-                if marker not in result:
-                    fail(f"{name} result lacks {marker}")
+        if list(config or []) != ["search_path=pg_catalog"]:
+            fail(f"{name} proconfig {config!r} is not exactly "
+                 "{search_path=pg_catalog}")
 
-    acl_queries = [
-        ("SELECT count(*) FROM pg_class c "
-         "JOIN pg_namespace n ON n.oid = c.relnamespace, aclexplode(c.relacl) a "
-         "WHERE n.nspname = 'migration_internal' AND a.grantee = 0", None),
-        ("SELECT count(*) FROM pg_proc p "
-         "JOIN pg_namespace n ON n.oid = p.pronamespace, aclexplode(p.proacl) a "
-         "WHERE n.nspname = 'migration_internal' AND a.grantee = 0", None),
-        ("SELECT count(*) FROM pg_namespace n, aclexplode(n.nspacl) a "
-         "WHERE n.nspname = 'migration_internal' AND a.grantee = 0", None),
-        ("SELECT count(*) FROM pg_class c "
-         "JOIN pg_namespace n ON n.oid = c.relnamespace, aclexplode(c.relacl) a "
-         "WHERE n.nspname = 'migration_internal' "
-         "AND a.grantee = (SELECT oid FROM pg_roles WHERE rolname = %s)", APP_ROLE),
-        ("SELECT count(*) FROM pg_proc p "
-         "JOIN pg_namespace n ON n.oid = p.pronamespace, aclexplode(p.proacl) a "
-         "WHERE n.nspname = 'migration_internal' "
-         "AND a.grantee = (SELECT oid FROM pg_roles WHERE rolname = %s)", APP_ROLE),
-    ]
-    for query, role in acl_queries:
-        params = (role,) if role else None
-        if run_sql(conn, query, params, fetch_mode="one")[0] != 0:
-            fail(f"residual ACL entry from {query}")
+    # -- §10.3 item 4: expand ACLs, including NULL ACLs, and look for PUBLIC --
+    public_entries = run_sql(
+        conn,
+        "SELECT 'table:' || c.relname, a.privilege_type "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "CROSS JOIN LATERAL aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) a "
+        "WHERE n.nspname = 'migration_internal' AND c.relkind = 'r' AND a.grantee = 0 "
+        "UNION ALL "
+        "SELECT 'function:' || p.proname, a.privilege_type "
+        "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+        "CROSS JOIN LATERAL aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a "
+        "WHERE n.nspname = 'migration_internal' AND a.grantee = 0 "
+        "UNION ALL "
+        "SELECT 'schema:migration_internal', a.privilege_type "
+        "FROM pg_namespace n "
+        "CROSS JOIN LATERAL aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) a "
+        "WHERE n.nspname = 'migration_internal' AND a.grantee = 0",
+        fetch_mode="all")
+    if public_entries:
+        fail(f"PUBLIC holds expanded privileges: {public_entries}")
 
-    if run_sql(conn, "SELECT has_schema_privilege(%s, 'migration_internal', 'USAGE')",
-               (APP_ROLE,), fetch_mode="one")[0]:
-        fail("runtime role holds schema USAGE")
-    if run_sql(conn, "SELECT has_table_privilege(%s, "
-                    "'migration_internal.migration_lease', 'SELECT')",
-               (APP_ROLE,), fetch_mode="one")[0]:
-        fail("runtime role holds table SELECT")
-    if run_sql(conn, "SELECT has_function_privilege(%s, "
-                    "'migration_internal.lease_acquire_v1(integer,text,float8,integer)', "
-                    "'EXECUTE')", (APP_ROLE,), fetch_mode="one")[0]:
-        fail("runtime role holds function EXECUTE")
+    # -- §10.3 items 1–3: runtime role, when it exists ---------------------
+    app_oid_row = run_sql(conn, "SELECT oid FROM pg_roles WHERE rolname = %s",
+                          (APP_ROLE,), fetch_mode="one")
+    if app_oid_row is None:
+        # §9.5: on a clean database before provisioning the runtime role may be
+        # absent; bootstrap records that and proceeds. T-15 re-runs these checks
+        # after provisioning. Nothing is skipped for PUBLIC above.
+        print(f"  note: runtime role {APP_ROLE} is absent; "
+              "effective-privilege checks deferred to T-15")
+    else:
+        app_oid = app_oid_row[0]
+        role_entries = run_sql(
+            conn,
+            "SELECT 'table:' || c.relname, a.privilege_type "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "CROSS JOIN LATERAL aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) a "
+            "WHERE n.nspname = 'migration_internal' AND c.relkind = 'r' "
+            "AND a.grantee = %s "
+            "UNION ALL "
+            "SELECT 'function:' || p.proname, a.privilege_type "
+            "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "CROSS JOIN LATERAL aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a "
+            "WHERE n.nspname = 'migration_internal' AND a.grantee = %s "
+            "UNION ALL "
+            "SELECT 'schema:migration_internal', a.privilege_type "
+            "FROM pg_namespace n "
+            "CROSS JOIN LATERAL aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) a "
+            "WHERE n.nspname = 'migration_internal' AND a.grantee = %s",
+            (app_oid, app_oid, app_oid), fetch_mode="all")
+        if role_entries:
+            fail(f"{APP_ROLE} holds expanded privileges: {role_entries}")
 
-    bad_defaults = run_sql(
-        conn, "SELECT count(*) FROM pg_default_acl d "
-              "CROSS JOIN LATERAL aclexplode(d.defaclacl) a "
-              "WHERE d.defaclrole = (SELECT oid FROM pg_roles WHERE rolname = %s) "
-              "AND (d.defaclnamespace = 0 "
-              "     OR d.defaclnamespace = 'migration_internal'::regnamespace) "
-              "AND (a.grantee = 0 "
-              "     OR a.grantee = (SELECT oid FROM pg_roles WHERE rolname = %s))",
-        (MIGRATOR_ROLE, APP_ROLE), fetch_mode="one")[0]
-    if bad_defaults != 0:
-        fail(f"default ACL grants {bad_defaults} privilege(s) to PUBLIC or the runtime role")
+        if run_sql(conn, "SELECT has_schema_privilege(%s, 'migration_internal', "
+                         "'USAGE')", (APP_ROLE,), fetch_mode="one")[0]:
+            fail(f"{APP_ROLE} holds effective schema USAGE")
 
+        table_privileges = run_sql(
+            conn,
+            "SELECT c.relname, p.priv, has_table_privilege(%s, c.oid, p.priv) "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE')) "
+            "AS p(priv) "
+            "WHERE n.nspname = 'migration_internal' AND c.relkind = 'r'",
+            (APP_ROLE,), fetch_mode="all")
+        for relname, priv, granted in table_privileges:
+            if granted:
+                fail(f"{APP_ROLE} holds effective {priv} on migration_internal.{relname}")
+
+        for relname, usage, select in run_sql(
+                conn,
+                "SELECT c.relname, has_sequence_privilege(%s, c.oid, 'USAGE'), "
+                "has_sequence_privilege(%s, c.oid, 'SELECT') "
+                "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = 'migration_internal' AND c.relkind = 'S'",
+                (APP_ROLE, APP_ROLE), fetch_mode="all"):
+            if usage or select:
+                fail(f"{APP_ROLE} holds effective sequence privileges on {relname}")
+
+        for proname, granted in run_sql(
+                conn,
+                "SELECT p.proname, has_function_privilege(%s, p.oid, 'EXECUTE') "
+                "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                "WHERE n.nspname = 'migration_internal'",
+                (APP_ROLE,), fetch_mode="all"):
+            if granted:
+                fail(f"{APP_ROLE} holds effective EXECUTE on {proname}")
+
+        reaches = run_sql(
+            conn,
+            "WITH RECURSIVE reach(roleid, member_id, depth) AS ("
+            "  SELECT m.roleid, m.member, 1 FROM pg_auth_members m "
+            "   WHERE m.member = %s "
+            "  UNION ALL "
+            "  SELECT m.roleid, m.member, r.depth + 1 FROM pg_auth_members m "
+            "    JOIN reach r ON m.member = r.roleid WHERE r.depth < 10) "
+            "SELECT roleid::regrole::text, member_id::regrole::text, depth FROM reach",
+            (app_oid,), fetch_mode="all")
+        if reaches:
+            fail(f"{APP_ROLE} reaches roles through transitive membership: {reaches}")
+
+        attributes = run_sql(
+            conn, "SELECT rolname, rolsuper, rolbypassrls, rolinherit "
+                  "FROM pg_roles WHERE rolname = %s", (APP_ROLE,), fetch_mode="one")
+        if attributes is None:
+            fail(f"{APP_ROLE} disappeared during verification")
+        _, rolsuper, rolbypassrls, _rolinherit = attributes
+        if rolsuper:
+            fail(f"{APP_ROLE} is SUPERUSER")
+        if rolbypassrls:
+            fail(f"{APP_ROLE} is BYPASSRLS")
+
+    # -- §9.4: global and schema-scoped default ACLs -----------------------
+    app_oid_for_defaults = app_oid_row[0] if app_oid_row is not None else -1
+    default_entries = run_sql(
+        conn,
+        "SELECT CASE WHEN d.defaclnamespace = 0 THEN '<global>' "
+        "            ELSE d.defaclnamespace::regnamespace::text END, "
+        "       d.defaclobjtype, a.grantee, a.privilege_type "
+        "FROM pg_default_acl d "
+        "CROSS JOIN LATERAL aclexplode(d.defaclacl) a "
+        "WHERE d.defaclrole = (SELECT oid FROM pg_roles WHERE rolname = %s) "
+        "AND (d.defaclnamespace = 0 "
+        "     OR d.defaclnamespace = 'migration_internal'::regnamespace)",
+        (MIGRATOR_ROLE,), fetch_mode="all")
+    for scope, objtype, grantee, privilege in default_entries:
+        if grantee == 0:
+            fail(f"default ACL {scope} on {objtype} grants {privilege} to PUBLIC")
+        if grantee == app_oid_for_defaults:
+            fail(f"default ACL {scope} on {objtype} grants {privilege} to {APP_ROLE}")
+
+    # -- singleton rows ---------------------------------------------------
     protocol = run_sql(
         conn, "SELECT count(*), min(installed_version), min(min_supported_version), "
               "min(max_supported_version), min(barrier_state), min(bootstrap_state) "
               "FROM migration_internal.lease_protocol", fetch_mode="one")
-    if protocol != (1, expected_version, expected_version, expected_version, "open", "ready"):
-        fail(f"protocol row state {protocol!r}")
+    expected_protocol = (1, expected_version, expected_version, expected_version,
+                         expected_state[0], expected_state[1])
+    if protocol != expected_protocol:
+        fail(f"protocol row state {protocol!r} != {expected_protocol!r}")
     lease = run_sql(
         conn, "SELECT count(*), min(lease_name) FROM migration_internal.migration_lease",
         fetch_mode="one")
     if lease != (1, "migration-lease"):
         fail(f"lease row state {lease!r}")
+
+
+def assert_protocol_info(conn, expected_version=1):
+    """ADR §9.2.1 step 12: exactly one row reading ('open', 'ready')."""
+    rows = run_sql(
+        conn, "SELECT * FROM migration_internal.lease_protocol_info_v1()",
+        fetch_mode="all")
+    expected = [(expected_version, expected_version, expected_version, "open", "ready")]
+    if rows != expected:
+        raise ProtocolFailure(
+            f"§9.2.1 step 12 verification failed: protocol info {rows!r} != {expected!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -900,10 +1192,10 @@ def scenario_T01(conn):
     if run_sql(conn, "SELECT to_regclass('alembic_version')", fetch_mode="one")[0] is not None:
         raise ProtocolFailure("T-01 database is not empty: alembic_version exists")
 
-    # §9.2.1 step 1–2 must pass on a genuinely empty database.
-    with conn.transaction():
-        preflight_first_installation(conn)
-
+    # §9.2.1 runs as one transaction: preflight, create, revoke set, verify while
+    # the protocol is still closed/installing, then activate and commit. Because
+    # the connection is autocommit, every read after this point is its own
+    # statement — no implicit transaction stays open around acquisition and entry.
     bootstrap_first_installation(conn)
     verify_installation(conn, expected_version=1)
 
@@ -1100,6 +1392,9 @@ def scenario_T10(conn):
 def scenario_T11(conn):
     """T-11: a real user write rolls back when the pre-commit enter finds the lease expired."""
     bootstrap_first_installation(conn)
+    # Standalone DDL on an autocommit connection: committed here, before the
+    # lease is acquired, so the protected transaction below contains only the
+    # user write it is supposed to roll back.
     run_sql(conn, "CREATE TABLE public.positions (id int PRIMARY KEY, user_id int)")
     short_ttl = 1
     with conn.transaction():
@@ -1164,6 +1459,7 @@ def scenario_T11(conn):
 def scenario_T12(conn):
     """T-12: kill W1's backend inside a protected transaction and verify recovery."""
     bootstrap_first_installation(conn)
+    # Committed before W1's protected transaction starts.
     run_sql(conn, "CREATE TABLE public.positions (id int PRIMARY KEY, user_id int)")
     ttl = 5
     with conn.transaction():
@@ -1192,12 +1488,21 @@ def scenario_T12(conn):
         except psycopg.Error as exc:
             observed = getattr(exc, "sqlstate", None)
 
-        if observed not in ("57P01", "08006") and not conn.closed:
+        # Backend termination has its own SQLSTATE; a merely closed connection is
+        # not evidence and neither is an absent exception.
+        if observed not in ("57P01", "08006"):
             raise ProtocolFailure(
-                f"T-12: backend death was not observed (sqlstate {observed})")
+                "T-12: expected backend-termination SQLSTATE 57P01 or 08006, "
+                f"got {observed!r}")
         if run_sql(w2, "SELECT count(*) FROM public.positions", fetch_mode="one")[0] != 0:
             raise ProtocolFailure(
                 "T-12: the killed transaction's application write was not rolled back")
+
+        # The dead backend's transaction released the lease row lock; only the
+        # recorded ownership survives until expiry.
+        with w2.transaction():
+            run_sql(w2, "SELECT 1 FROM migration_internal.migration_lease "
+                        "WHERE lease_name = 'migration-lease' FOR UPDATE NOWAIT")
 
         # Before expiry the recorded owner is still live.
         with w2.transaction():
@@ -1665,14 +1970,24 @@ def run_harness():
     print()
 
     try:
+        require_destructive_optin()
+    except SafetyRefusal as exc:
+        reason = f"destructive safety gate refused: {exc}"
+        print(f"Safety gate: REFUSED — {reason}")
+        print("No connection was opened and no database or role was touched.")
+        results = not_run_all(reason)
+        _report(results)
+        return results, SAFETY_REFUSAL_EXIT_CODE
+    print(f"Safety gate: ACCEPTED (cluster label {HARNESS_CLUSTER_LABEL!r})")
+
+    try:
         admin = admin_connect()
-        admin.autocommit = True
     except Exception as exc:
         reason = f"PostgreSQL unreachable ({type(exc).__name__}: {exc})"
         print(f"PostgreSQL availability: UNAVAILABLE — {reason}")
         results = not_run_all(reason)
         _report(results)
-        return results
+        return results, 0
 
     try:
         try:
@@ -1682,7 +1997,7 @@ def run_harness():
             print(f"PostgreSQL availability: UNAVAILABLE — {reason}")
             results = not_run_all(reason)
             _report(results)
-            return results
+            return results, 0
 
         print(f"PostgreSQL server_version: {version_text} "
               f"(server_version_num={version_num})")
@@ -1692,9 +2007,23 @@ def run_harness():
             print(f"PostgreSQL availability: UNAVAILABLE — {reason}")
             results = not_run_all(reason)
             _report(results)
-            return results
+            return results, 0
 
         print("PostgreSQL availability: AVAILABLE (16.16+)")
+        print()
+
+        # The gate inspects the target before anything is created, dropped or
+        # granted. A refusal here leaves the cluster exactly as it was found.
+        try:
+            validate_destructive_target(admin)
+        except SafetyRefusal as exc:
+            reason = f"destructive safety gate refused: {exc}"
+            print(f"Safety gate: REFUSED — {reason}")
+            print("No role or database was created, altered or dropped.")
+            results = not_run_all(reason)
+            _report(results)
+            return results, SAFETY_REFUSAL_EXIT_CODE
+        print("Target check: ACCEPTED (dedicated disposable cluster)")
         print()
 
         try:
@@ -1704,7 +2033,7 @@ def run_harness():
             print(f"Precondition: INVALID_SETUP — {reason}")
             results = {key: f"INVALID_SETUP — {reason}" for key in SCENARIOS}
             _report(results, {})
-            return results
+            return results, 0
 
         results = {}
         cleanup_failures = {}
@@ -1716,7 +2045,7 @@ def run_harness():
                 cleanup_failures[key] = cleanup_error
             print(f"  {outcome.splitlines()[0]}")
         _report(results, cleanup_failures)
-        return results
+        return results, 0
     finally:
         admin.close()
 
@@ -1747,4 +2076,5 @@ def _report(results, cleanup_failures=None):
 
 
 if __name__ == "__main__":
-    run_harness()
+    _, exit_code = run_harness()
+    sys.exit(exit_code)
