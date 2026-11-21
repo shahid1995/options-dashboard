@@ -1,0 +1,399 @@
+name: Issue 145 disposable harness rehearsal R2 (test branch only)
+
+# Test-only workflow on an ephemeral, throw-away branch. It has no deployment,
+# publishing or release step: its only side effects are inside the disposable
+# postgres:16.16 service container created for this single job, which the
+# GitHub-hosted runner destroys when the job ends. The image is pinned by digest
+# for reproducibility; the live server_version is still asserted below.
+on:
+  push:
+    branches:
+      - test/issue145-runtime-rehearsal-r2
+
+permissions:
+  contents: read
+
+jobs:
+  rehearsal:
+    name: PostgreSQL 16.16 disposable rehearsal R2
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres@sha256:3950ad7c3148ca2175ef1b6c36c9efbf78957ae8fbe8b3a5d7c35af50500382f
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+          # Trust authentication only inside this single-run, isolated
+          # container: the harness creates its migrator/APP roles without
+          # passwords. Never enabled on a shared or persistent server.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: "55432"
+      DB_USER: postgres
+      DB_PASSWORD: ""
+      ADMIN_DB_USER: postgres
+      ADMIN_DB_PASSWORD: ""
+      MIGRATOR_DB_USER: strikenova_prod_migrator
+      MIGRATOR_DB_PASSWORD: ""
+      HARNESS_CLUSTER_LABEL: issue145-disposable
+      HARNESS_GUARD_DATABASE: issue145_guard
+      ALLOW_DESTRUCTIVE_TESTS: "1"
+      EXPECTED_COMMIT: 8f1e25ea98e64da6185dec9364ef65d42c813e78
+      EXPECTED_SHA256: 36c2fab3b4e1790bc7dc983cc6e0d773d1842d93388f822ad35c525e69e08b63
+      HARNESS_PATH: docs/reviews/issue145-t01-t27-harness/run_t01_to_t27.py
+
+    steps:
+      - name: Check out the harness-fix commit
+        uses: actions/checkout@v4
+        with:
+          # The exact harness-fix commit, not this workflow's branch: the
+          # harness, its docs and the ADR must be exactly what was reviewed.
+          ref: 8f1e25ea98e64da6185dec9364ef65d42c813e78
+
+      - name: Verify exact reviewed source
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+          echo "checked out: $head_sha"
+          test "$head_sha" = "$EXPECTED_COMMIT" || { echo "unexpected commit"; exit 1; }
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "working tree is not clean"; git status --porcelain; exit 1
+          fi
+          harness_sha="$(sha256sum "$HARNESS_PATH" | cut -d' ' -f1)"
+          echo "harness sha256: $harness_sha"
+          test "$harness_sha" = "$EXPECTED_SHA256" || { echo "harness source differs"; exit 1; }
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Record image identity and install psycopg
+        run: |
+          set -euo pipefail
+          {
+            echo "python: $(python3 -V)"
+            echo "image_ref: postgres@sha256:3950ad7c3148ca2175ef1b6c36c9efbf78957ae8fbe8b3a5d7c35af50500382f"
+            echo "image_tag: postgres:16.16"
+            echo "image_digests: $(docker image inspect postgres@sha256:3950ad7c3148ca2175ef1b6c36c9efbf78957ae8fbe8b3a5d7c35af50500382f --format '{{json .RepoDigests}}')"
+            echo "service_container: $(docker ps --format '{{.ID}} {{.Names}} {{.Image}}')"
+          } | tee versions.txt
+          python3 -m pip install --quiet 'psycopg[binary]>=3.2,<4'
+          python3 -c "import psycopg; print('psycopg:', psycopg.__version__)" | tee -a versions.txt
+
+      - name: Verify server version, provision the guard and pre-seed T-01
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, secrets
+          import psycopg
+          from psycopg import sql
+
+          conn = psycopg.connect(
+              host=os.environ["DB_HOST"], port=os.environ["DB_PORT"],
+              user="postgres", dbname="postgres", autocommit=True)
+          with conn.cursor() as cur:
+              cur.execute("SHOW server_version");  server_version = cur.fetchone()[0]
+              cur.execute("SHOW server_version_num"); version_num = cur.fetchone()[0]
+              cur.execute("SELECT system_identifier::text FROM pg_control_system()")
+              system_identifier = cur.fetchone()[0]
+              cur.execute("SELECT version()"); full_version = cur.fetchone()[0]
+
+          lines = [
+              f"server_version: {server_version}",
+              f"server_version_num: {version_num}",
+              f"system_identifier: {system_identifier}",
+              f"full_version: {full_version}",
+          ]
+          print("\n".join(lines))
+          with open("versions.txt", "a", encoding="utf-8") as fh:
+              fh.write("\n".join(lines) + "\n")
+
+          if version_num != "160016" or not server_version.startswith("16.16"):
+              raise SystemExit(
+                  f"refusing rehearsal: expected PostgreSQL 16.16 exactly, "
+                  f"got {server_version} ({version_num})")
+
+          nonce = secrets.token_hex(24)  # 48 characters, never printed
+          print(f"::add-mask::{nonce}")
+          conn.execute("CREATE DATABASE issue145_guard")
+          # COMMENT takes a literal, not a bind parameter.
+          conn.execute(sql.SQL("COMMENT ON DATABASE issue145_guard IS {}").format(
+              sql.Literal(f"issue145-harness-guard:{system_identifier}:{nonce}")))
+
+          # F-2 live regression control: one correctly marked scenario database
+          # already exists under the generated name before the harness starts.
+          # Only this one; the harness must accept it and safely replace it.
+          marker = f"strikenova-issue145-harness-disposable:{system_identifier}:{nonce}"
+          conn.execute("CREATE DATABASE issue145_t_01")
+          conn.execute(sql.SQL("COMMENT ON DATABASE issue145_t_01 IS {}").format(
+              sql.Literal(marker)))
+          with conn.cursor() as cur:
+              cur.execute("SELECT shobj_description(oid, 'pg_database') "
+                          "FROM pg_database WHERE datname = 'issue145_t_01'")
+              stored = cur.fetchone()[0]
+              cur.execute("SELECT datname FROM pg_database ORDER BY datname")
+              databases = [name for (name,) in cur.fetchall()]
+          conn.close()
+
+          preseed = [
+              "preseeded_marked_database: issue145_t_01",
+              f"preseeded_marker_matches_expected: {stored == marker}",
+              f"databases_before_run: {databases}",
+          ]
+          print("\n".join(preseed))
+          with open("preseed_control.txt", "w", encoding="utf-8") as fh:
+              fh.write("\n".join(preseed) + "\n")
+          if stored != marker:
+              raise SystemExit("pre-seeded scenario marker was not stored exactly")
+          if "issue145_t_01" not in databases:
+              raise SystemExit("pre-seeded scenario database is missing")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
+              fh.write(f"HARNESS_TARGET_SYSTEM_IDENTIFIER={system_identifier}\n")
+              fh.write(f"HARNESS_CLUSTER_GUARD={nonce}\n")
+          print("guard: pre-provisioned separately by the operator (this step), "
+                "not by the harness")
+          PY
+
+      - name: Compile and run the built-in self-test
+        run: |
+          set -euo pipefail
+          python3 -m py_compile "$HARNESS_PATH"
+          python3 "$HARNESS_PATH" --self-test | tee selftest.log
+          grep -q "Total: 20, PASS: 20, FAIL: 0" selftest.log
+
+      - name: Run the harness-fix harness against the disposable cluster
+        run: |
+          set +e
+          python3 "$HARNESS_PATH" 2>&1 | tee runtime.log
+          code="${PIPESTATUS[0]}"
+          echo "harness_exit_code=$code" | tee -a versions.txt
+          echo "HARNESS_EXIT=$code" >> "$GITHUB_ENV"
+          exit 0
+
+      - name: Parse the scenario summary
+        id: summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import os, re
+
+          gate_errors = []
+          try:
+              log = open("runtime.log", encoding="utf-8", errors="replace").read()
+          except FileNotFoundError:
+              log = ""
+              gate_errors.append("runtime.log missing: the harness did not start")
+
+          categories = ("PASS", "FAIL", "INVALID_SETUP", "NOT RUN", "INCONCLUSIVE")
+          counts = {}
+          for category in categories:
+              found = re.findall(rf"^{re.escape(category)}: (\d+)$", log, re.M)
+              counts[category] = int(found[-1]) if found else None
+
+          rows = re.findall(r"^(T-\d\d): (.*)$", log, re.M)
+          total = sum(value for value in counts.values() if value is not None)
+          missing = [name for name, value in counts.items() if value is None]
+          if missing:
+              gate_errors.append(f"missing summary counts: {missing}")
+          if total != 27:
+              gate_errors.append(f"outcome counts sum to {total}, not 27")
+          if len(rows) != 27:
+              gate_errors.append(f"summary lists {len(rows)} scenarios, not 27")
+          for category in ("FAIL", "INVALID_SETUP", "INCONCLUSIVE"):
+              if counts.get(category):
+                  gate_errors.append(f"{counts[category]} {category} scenario(s)")
+
+          lines = [
+              f"harness_exit_code: {os.environ.get('HARNESS_EXIT', 'unknown')}",
+              f"scenario_summary_rows: {len(rows)}",
+          ]
+          lines += [f"{category}: {counts[category]}" for category in categories]
+          lines += [f"counts_total: {total}"]
+          lines += ["", "scenario matrix:"]
+          lines += [f"  {key}: {value}" for key, value in rows]
+          status = "OK" if not gate_errors else "FAILED: " + "; ".join(gate_errors)
+          lines += ["", f"GATE: {status}"]
+
+          text = "\n".join(lines)
+          print(text)
+          with open("summary.txt", "w", encoding="utf-8") as fh:
+              fh.write(text + "\n")
+          with open("outcome_gate.txt", "w", encoding="utf-8") as fh:
+              fh.write(status + "\n")
+          PY
+
+      - name: Record cleanup proof and remove every harness object
+        if: always()
+        run: |
+          set -uo pipefail
+          python3 -m pip install --quiet 'psycopg[binary]>=3.2,<4'
+          python3 - <<'PY' | tee cleanup.txt
+          import os
+          import psycopg
+          from psycopg import sql
+
+          def connect(dbname="postgres"):
+              return psycopg.connect(host=os.environ["DB_HOST"],
+                                     port=os.environ["DB_PORT"], user="postgres",
+                                     dbname=dbname, autocommit=True)
+
+          conn = connect()
+          with conn.cursor() as cur:
+              cur.execute("SELECT datname FROM pg_database ORDER BY datname")
+              print("databases_after_run:")
+              for (name,) in cur.fetchall():
+                  print(f"  {name}")
+              cur.execute("SELECT rolname FROM pg_roles WHERE rolname LIKE 'strikenova%' "
+                          "ORDER BY rolname")
+              print("harness_roles_after_run:")
+              for (name,) in cur.fetchall():
+                  print(f"  {name}")
+              # PostgreSQL 16: the column is inherit_option (renamed from inherit).
+              cur.execute("SELECT r.rolname, m.rolname, am.inherit_option, "
+                          "am.set_option, am.admin_option FROM pg_auth_members am "
+                          "JOIN pg_roles r ON r.oid = am.roleid "
+                          "JOIN pg_roles m ON m.oid = am.member "
+                          "WHERE r.rolname LIKE 'strikenova%' ORDER BY 1, 2")
+              print("harness_memberships_after_run:")
+              for row in cur.fetchall():
+                  print(f"  {row}")
+              cur.execute("SELECT datname, count(*) FROM pg_stat_activity "
+                          "GROUP BY datname ORDER BY datname")
+              print("backends_after_run:")
+              for name, count in cur.fetchall():
+                  print(f"  {name}: {count}")
+          conn.close()
+
+          # Cleanup boundary: terminate only harness backends, then drop every
+          # remaining issue145_* database including the guard, then remove the
+          # membership and the three harness roles.
+          errors = []
+          conn = connect()
+          with conn.cursor() as cur:
+              cur.execute("SELECT datname FROM pg_database WHERE datname LIKE 'issue145%'")
+              remaining = [name for (name,) in cur.fetchall()]
+              if remaining:
+                  cur.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                              "WHERE datname = ANY(%s) AND pid <> pg_backend_pid()",
+                              (remaining,))
+              for name in remaining:
+                  try:
+                      cur.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(
+                          sql.Identifier(name)))
+                  except Exception as exc:  # noqa: BLE001
+                      errors.append(f"drop {name}: {type(exc).__name__}: {exc}")
+          conn.close()
+
+          conn = connect()
+          with conn.cursor() as cur:
+              cur.execute("SELECT 1 FROM pg_auth_members am "
+                          "JOIN pg_roles r ON r.oid = am.roleid "
+                          "JOIN pg_roles m ON m.oid = am.member "
+                          "WHERE r.rolname = 'strikenova_prod_owner' "
+                          "AND m.rolname = 'strikenova_prod_migrator'")
+              has_membership = cur.fetchone() is not None
+          if has_membership:
+              try:
+                  with conn.cursor() as cur:
+                      cur.execute("REVOKE strikenova_prod_owner "
+                                  "FROM strikenova_prod_migrator")
+              except Exception as exc:  # noqa: BLE001
+                  errors.append(f"revoke membership: {type(exc).__name__}: {exc}")
+          for role in ("strikenova_production_app", "strikenova_prod_migrator",
+                       "strikenova_prod_owner"):
+              try:
+                  with conn.cursor() as cur:
+                      cur.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(
+                          sql.Identifier(role)))
+              except Exception as exc:  # noqa: BLE001
+                  errors.append(f"drop role {role}: {type(exc).__name__}: {exc}")
+          conn.close()
+
+          conn = connect()
+          with conn.cursor() as cur:
+              cur.execute("SELECT count(*) FROM pg_database WHERE datname LIKE 'issue145%'")
+              databases_left = cur.fetchone()[0]
+              cur.execute("SELECT count(*) FROM pg_roles WHERE rolname LIKE 'strikenova%'")
+              roles_left = cur.fetchone()[0]
+              cur.execute("SELECT datname FROM pg_database ORDER BY datname")
+              final_databases = [name for (name,) in cur.fetchall()]
+          conn.close()
+
+          print(f"issue145_databases_after_cleanup: {databases_left}")
+          print(f"strikenova_roles_after_cleanup: {roles_left}")
+          print(f"final_databases: {final_databases}")
+          if errors:
+              for error in errors:
+                  print(f"cleanup_error: {error}")
+          if databases_left or roles_left or errors:
+              raise SystemExit("cleanup failed: harness objects remain")
+          print("cleanup: OK (zero issue145_* databases, zero strikenova_* roles)")
+          PY
+
+      - name: Publish results to the job summary
+        if: always()
+        run: |
+          {
+            echo "## Issue 145 disposable rehearsal R2"
+            echo
+            echo "### Scenario summary"
+            echo '```'
+            cat summary.txt 2>/dev/null || echo "summary.txt missing"
+            echo '```'
+            echo
+            echo "### F-2 pre-seeded regression control"
+            echo '```'
+            cat preseed_control.txt 2>/dev/null || echo "preseed_control.txt missing"
+            echo '```'
+            echo
+            echo "### Environment"
+            echo '```'
+            cat versions.txt 2>/dev/null || true
+            echo '```'
+            echo "### Cleanup proof"
+            echo '```'
+            cat cleanup.txt 2>/dev/null || true
+            echo '```'
+            echo "### Self-test"
+            echo '```'
+            tail -n 6 selftest.log 2>/dev/null || echo "selftest.log missing"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload sanitized evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue145-runtime-rehearsal-r2
+          path: |
+            runtime.log
+            selftest.log
+            versions.txt
+            summary.txt
+            preseed_control.txt
+            cleanup.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce the scenario outcome gate
+        if: always()
+        run: |
+          set -euo pipefail
+          test -f outcome_gate.txt || { echo "outcome gate never ran"; exit 1; }
+          status="$(cat outcome_gate.txt)"
+          if [ "$status" != "OK" ]; then
+            echo "Rehearsal outcome is not acceptable: $status"
+            exit 1
+          fi
+          echo "Rehearsal outcome gate: OK (27 scenarios accounted for, none FAIL/INVALID_SETUP/INCONCLUSIVE)"
