@@ -17,9 +17,13 @@ Design rules enforced here:
     block is a real BEGIN/COMMIT instead of a savepoint inside an accidental
     implicit transaction.
   * A destructive-run gate refuses to connect unless the operator sets
-    `ALLOW_DESTRUCTIVE_TESTS=1` and `HARNESS_CLUSTER_LABEL` names a dedicated
-    disposable cluster; it then validates that cluster and any pre-existing
-    fixed-name roles before creating, dropping or granting anything.
+    `ALLOW_DESTRUCTIVE_TESTS=1`, names a dedicated disposable cluster in
+    `HARNESS_CLUSTER_LABEL`, and supplies the cluster's independently observed
+    `system_identifier` in `HARNESS_TARGET_SYSTEM_IDENTIFIER`. The label is a
+    declaration, not proof: identity is established from `pg_control_system()`,
+    and an existing database counts as harness-owned only when its catalog
+    comment carries the matching marker. Existing roles and memberships are
+    validated against exact expected attributes and options, never altered.
   * Success results are the documented function results (3-column rows for
     acquire/enter, a boolean for release, five columns for protocol info).
   * Errors are PostgreSQL exceptions; SQLSTATE is read from the driver's
@@ -33,15 +37,57 @@ Design rules enforced here:
 
 This harness performs no runtime verification in this environment because
 PostgreSQL 16.16 is unavailable. It reports NOT RUN, it does not claim PASS.
+
+`python3 run_t01_to_t27.py --self-test` runs the harness's own DB-free
+regression checks against an injected fake driver. It opens no connection,
+reads no credentials and contacts no server.
 """
 
+import datetime
+import inspect
 import os
 import sys
 import time
-import datetime
 
-import psycopg
-from psycopg import sql
+try:  # psycopg is needed to run scenarios, not to run the built-in self-test.
+    import psycopg
+    from psycopg import sql
+    PSYCOPG_AVAILABLE = True
+except ModuleNotFoundError:  # pragma: no cover - only without psycopg installed
+    PSYCOPG_AVAILABLE = False
+
+    class _StubError(Exception):
+        sqlstate = None
+
+    class _StubSQL(str):
+        def format(self, *args, **kwargs):
+            rendered = str(self)
+            for arg in args:
+                rendered = rendered.replace("{}", str(arg), 1)
+            return _StubSQL(rendered)
+
+    def _stub_identifier(name):
+        return _StubSQL('"' + str(name).replace('"', '""') + '"')
+
+    def _stub_literal(value):
+        return _StubSQL("'" + str(value).replace("'", "''") + "'")
+
+    class _StubSQLModule:
+        SQL = _StubSQL
+        Identifier = staticmethod(_stub_identifier)
+        Literal = staticmethod(_stub_literal)
+
+    class _StubPsycopgModule:
+        Error = _StubError
+        sql = _StubSQLModule()
+
+        @staticmethod
+        def connect(**kwargs):
+            raise RuntimeError(
+                "psycopg is not installed; install 'psycopg[binary]' to run scenarios")
+
+    psycopg = _StubPsycopgModule()
+    sql = _StubSQLModule()
 
 # ---------------------------------------------------------------------------
 # Environment configuration
@@ -71,6 +117,17 @@ ALLOW_DESTRUCTIVE_TESTS = os.getenv("ALLOW_DESTRUCTIVE_TESTS", "")
 HARNESS_CLUSTER_LABEL = os.getenv("HARNESS_CLUSTER_LABEL", "")
 REQUIRED_CLUSTER_LABEL = "issue145-disposable"
 
+# The label above is an operator declaration, not evidence of cluster identity.
+# Identity is established independently: `pg_control_system().system_identifier`
+# is read from pg_control and compared with a value the operator obtained and
+# confirmed separately while provisioning the disposable cluster.
+HARNESS_TARGET_SYSTEM_IDENTIFIER = os.getenv("HARNESS_TARGET_SYSTEM_IDENTIFIER", "")
+
+# Marker written into the catalog comment of every database this harness
+# creates. An existing database counts as harness-owned only when its comment
+# equals this exact value, which binds it to the verified cluster identity.
+HARNESS_DB_MARKER_PREFIX = "strikenova-issue145-harness-disposable:"
+
 SAFETY_REFUSAL_EXIT_CODE = 2
 
 
@@ -81,7 +138,11 @@ MIGRATOR_ROLE = "strikenova_prod_migrator"
 OWNER_ROLE = "strikenova_prod_owner"
 APP_ROLE = "strikenova_production_app"
 
-REQUIRED_SERVER_VERSION_NUM = 160016  # PostgreSQL 16.16
+# Only the PostgreSQL 16 major version is supported, and only minor 16 or later
+# within it. A lower bound alone would silently accept PostgreSQL 17, whose
+# catalog rendering this harness was not written or approved against.
+REQUIRED_SERVER_MAJOR = 16
+REQUIRED_SERVER_MINOR = 16
 ADR_SOURCE_COMMIT = "ae2226ef592dc48d5e9619bd2198de33285911df"
 ADR_SOURCE_PATH = "docs/ADR-017-018-POSTGRES-LEASE-DESIGN.md"
 
@@ -529,55 +590,121 @@ def require_destructive_optin():
         raise SafetyRefusal("; ".join(problems))
 
 
-HARNESS_CREATED_DBS_PATTERN = "issue145\\_%"
+def expected_database_marker():
+    """The marker a harness-created database must carry in this cluster."""
+    return HARNESS_DB_MARKER_PREFIX + HARNESS_TARGET_SYSTEM_IDENTIFIER
+
+
+def _scenario_database_state(admin, db_name):
+    """Return (exists, catalog comment marker) for one database name."""
+    row = admin.execute(
+        "SELECT d.datname, shobj_description(d.oid, 'pg_database') "
+        "FROM pg_database d WHERE d.datname = %s", (db_name,)).fetchone()
+    if row is None:
+        return False, None
+    return True, row[1]
+
+
+def verify_cluster_identity(admin):
+    """Establish cluster identity from pg_control, never from a static label."""
+    if not HARNESS_TARGET_SYSTEM_IDENTIFIER:
+        raise SafetyRefusal(
+            "HARNESS_TARGET_SYSTEM_IDENTIFIER is not set, so the target cluster's "
+            "identity cannot be established independently of HARNESS_CLUSTER_LABEL")
+    row = admin.execute(
+        "SELECT system_identifier::text FROM pg_control_system()").fetchone()
+    actual = row[0] if row else None
+    if actual is None:
+        raise SafetyRefusal(
+            "the cluster did not report pg_control_system().system_identifier")
+    if actual != HARNESS_TARGET_SYSTEM_IDENTIFIER:
+        raise SafetyRefusal(
+            f"cluster system_identifier {actual!r} does not match the independently "
+            "confirmed HARNESS_TARGET_SYSTEM_IDENTIFIER")
+    return actual
+
+
+# Exact attributes the harness provisions; an existing role that differs is
+# refused rather than altered.
+ROLE_LOGIN_EXPECTATIONS = {MIGRATOR_ROLE: True, APP_ROLE: True, OWNER_ROLE: False}
+# (granted role, member, INHERIT, SET, ADMIN) — the only membership it creates.
+ALLOWED_MEMBERSHIP = (OWNER_ROLE, MIGRATOR_ROLE, False, True, False)
 
 
 def validate_destructive_target(admin):
-    """Refuse a target that is not a dedicated disposable cluster.
+    """Refuse a target that is not a proven dedicated disposable cluster.
 
     Runs after the version probe and before any role or database mutation, so a
     production-like target is never adopted or altered. Every condition fails
-    closed: the harness stops rather than repairing or adopting what it finds.
+    closed: the harness stops rather than repairing or adopting what it finds,
+    and every statement executed here is read-only.
     """
-    problems = []
+    verify_cluster_identity(admin)
 
-    foreign_databases = [row[0] for row in admin.execute(
-        "SELECT datname FROM pg_database "
-        "WHERE datname NOT IN ('postgres', 'template0', 'template1') "
-        "AND datname NOT LIKE %s ORDER BY datname",
-        (HARNESS_CREATED_DBS_PATTERN,)).fetchall()]
-    if foreign_databases:
-        problems.append("cluster holds databases this harness did not create: "
-                        + ", ".join(foreign_databases))
+    problems = []
+    marker = expected_database_marker()
+    databases = admin.execute(
+        "SELECT d.datname, shobj_description(d.oid, 'pg_database') "
+        "FROM pg_database d "
+        "WHERE d.datname NOT IN ('postgres', 'template0', 'template1') "
+        "ORDER BY d.datname").fetchall()
+    unowned = [f"{name} (marker {comment!r})" for name, comment in databases
+               if comment != marker]
+    if unowned:
+        problems.append(
+            "cluster holds databases this harness cannot prove it created (no "
+            "matching disposable-cluster marker): " + ", ".join(unowned))
 
     role_rows = admin.execute(
-        "SELECT rolname, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb "
-        "FROM pg_roles WHERE rolname = ANY(%s) ORDER BY rolname",
+        "SELECT rolname, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb, "
+        "rolcanlogin FROM pg_roles WHERE rolname = ANY(%s) ORDER BY rolname",
         ([MIGRATOR_ROLE, OWNER_ROLE, APP_ROLE],)).fetchall()
-    for rolname, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb in role_rows:
+    for (rolname, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb,
+         rolcanlogin) in role_rows:
         risky = [flag for flag, value in (
             ("SUPERUSER", rolsuper), ("BYPASSRLS", rolbypassrls),
             ("CREATEROLE", rolcreaterole), ("CREATEDB", rolcreatedb)) if value]
         if risky:
             problems.append(f"existing role {rolname} has {', '.join(risky)}; "
                             "refusing to adopt a production-like role set")
+        want_login = ROLE_LOGIN_EXPECTATIONS[rolname]
+        if bool(rolcanlogin) != want_login:
+            found = "LOGIN" if rolcanlogin else "NOLOGIN"
+            expected = "LOGIN" if want_login else "NOLOGIN"
+            problems.append(
+                f"existing role {rolname} is {found}; this harness provisions it as "
+                f"{expected} and will not alter an existing role")
 
-    allowed_memberships = {(OWNER_ROLE, MIGRATOR_ROLE)}
     memberships = admin.execute(
-        "SELECT r.rolname, m.rolname FROM pg_auth_members am "
+        "SELECT r.rolname, m.rolname, am.inherit_option, am.set_option, "
+        "am.admin_option FROM pg_auth_members am "
         "JOIN pg_roles r ON r.oid = am.roleid "
         "JOIN pg_roles m ON m.oid = am.member "
         "WHERE r.rolname = ANY(%s) OR m.rolname = ANY(%s) ORDER BY 1, 2",
         ([MIGRATOR_ROLE, OWNER_ROLE, APP_ROLE],
          [MIGRATOR_ROLE, OWNER_ROLE, APP_ROLE])).fetchall()
-    unexpected = [pair for pair in memberships if tuple(pair) not in allowed_memberships]
-    if unexpected:
-        problems.append("existing role memberships this harness did not create: "
-                        + ", ".join(f"{role} -> {member}"
-                                    for role, member in unexpected))
+    for role, member, inherit_option, set_option, admin_option in memberships:
+        observed = (role, member, bool(inherit_option), bool(set_option),
+                    bool(admin_option))
+        if observed != ALLOWED_MEMBERSHIP:
+            problems.append(
+                f"existing membership {role} -> {member} has options (INHERIT "
+                f"{bool(inherit_option)}, SET {bool(set_option)}, ADMIN "
+                f"{bool(admin_option)}); the harness requires exactly INHERIT "
+                "FALSE, SET TRUE, ADMIN FALSE and will not alter an existing "
+                "membership")
 
     if problems:
         raise SafetyRefusal("; ".join(problems))
+
+
+def _default_connect(**kwargs):
+    return psycopg.connect(**kwargs)
+
+
+# Indirection so the built-in self-test can inject a fake driver. Production
+# code never replaces this.
+_connect_impl = _default_connect
 
 
 def harness_connect(**kwargs):
@@ -591,7 +718,7 @@ def harness_connect(**kwargs):
     false. With autocommit=True each standalone statement is its own committed
     transaction and each `with conn.transaction():` block is a real BEGIN/COMMIT.
     """
-    conn = psycopg.connect(**kwargs)
+    conn = _connect_impl(**kwargs)
     conn.autocommit = True
     return conn
 
@@ -607,9 +734,21 @@ def connect_migrator(dbname):
     return connect_as(MIGRATOR_DB_USER, dbname, MIGRATOR_DB_PASSWORD)
 
 
-def admin_connect():
-    """Administrative connection used only for disposable provisioning."""
-    return harness_connect(**_conn_kwargs("postgres", user=ADMIN_DB_USER,
+def admin_connect(dbname="postgres"):
+    """Administrative connection used only for disposable provisioning.
+
+    The default is the cluster's `postgres` database, where roles are
+    provisioned and backends are inspected. Objects that live in a scenario
+    database must be touched through `scenario_admin_connect()` instead:
+    application tables do not exist in `postgres`.
+    """
+    return harness_connect(**_conn_kwargs(dbname, user=ADMIN_DB_USER,
+                                          password=ADMIN_DB_PASSWORD))
+
+
+def scenario_admin_connect(db_name):
+    """Administrator connection to one scenario database, for its own objects."""
+    return harness_connect(**_conn_kwargs(db_name, user=ADMIN_DB_USER,
                                           password=ADMIN_DB_PASSWORD))
 
 
@@ -628,25 +767,54 @@ def provision_cluster_roles(admin):
         if not exists:
             admin.execute(sql.SQL("CREATE ROLE {} {}").format(
                 sql.Identifier(name), sql.SQL("LOGIN" if login else "NOLOGIN")))
-    admin.execute(sql.SQL("GRANT {} TO {} WITH INHERIT FALSE, SET TRUE, ADMIN FALSE").format(
-        sql.Identifier(OWNER_ROLE), sql.Identifier(MIGRATOR_ROLE)))
+    # `validate_destructive_target()` already refused any existing membership
+    # with different options; an existing correct membership is left untouched
+    # rather than re-granted.
+    membership = admin.execute(
+        "SELECT 1 FROM pg_auth_members am "
+        "JOIN pg_roles r ON r.oid = am.roleid "
+        "JOIN pg_roles m ON m.oid = am.member "
+        "WHERE r.rolname = %s AND m.rolname = %s",
+        (OWNER_ROLE, MIGRATOR_ROLE)).fetchone()
+    if not membership:
+        admin.execute(sql.SQL("GRANT {} TO {} WITH INHERIT FALSE, SET TRUE, ADMIN FALSE").format(
+            sql.Identifier(OWNER_ROLE), sql.Identifier(MIGRATOR_ROLE)))
 
 
-def prepare_scenario_database(admin_conn, db_name):
-    """Create a genuinely empty database and its minimal provisioning grants."""
+def _terminate_scenario_backends(admin_conn, db_name):
+    """Terminate backends connected to one harness-owned scenario database."""
     admin_conn.execute(
         "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
         "WHERE datname = %s AND pid <> pg_backend_pid()",
         (db_name,),
     )
-    admin_conn.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(db_name)))
+
+
+def prepare_scenario_database(admin_conn, db_name):
+    """Create a genuinely empty database and its minimal provisioning grants.
+
+    An existing database with the same name is only touched when its catalog
+    comment carries this harness's marker for this cluster identity. A database
+    is never terminated or dropped merely because its name looks like a
+    scenario name.
+    """
+    exists, marker = _scenario_database_state(admin_conn, db_name)
+    if exists:
+        if marker != expected_database_marker():
+            raise SafetyRefusal(
+                f"database {db_name} already exists and does not carry this "
+                "harness's disposable-cluster marker; refusing to terminate or "
+                "drop it")
+        _terminate_scenario_backends(admin_conn, db_name)
+        admin_conn.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(db_name)))
     admin_conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(db_name)))
+    admin_conn.execute(sql.SQL("COMMENT ON DATABASE {} IS {}").format(
+        sql.Identifier(db_name), sql.Literal(expected_database_marker())))
     admin_conn.execute(sql.SQL("GRANT CONNECT, CREATE ON DATABASE {} TO {}").format(
         sql.Identifier(db_name), sql.Identifier(MIGRATOR_ROLE)))
     admin_conn.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
         sql.Identifier(db_name), sql.Identifier(APP_ROLE)))
-    scoped = harness_connect(**_conn_kwargs(db_name, user=ADMIN_DB_USER,
-                                           password=ADMIN_DB_PASSWORD))
+    scoped = scenario_admin_connect(db_name)
     try:
         for role in (MIGRATOR_ROLE, OWNER_ROLE):
             scoped.execute(sql.SQL("GRANT USAGE, CREATE ON SCHEMA public TO {}").format(
@@ -656,13 +824,16 @@ def prepare_scenario_database(admin_conn, db_name):
 
 
 def drop_scenario_db(admin_conn, db_name):
-    """Safely remove a scenario database."""
-    admin_conn.execute(
-        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-        "WHERE datname = %s AND pid <> pg_backend_pid()",
-        (db_name,),
-    )
-    admin_conn.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(db_name)))
+    """Remove a scenario database only when this harness provably created it."""
+    exists, marker = _scenario_database_state(admin_conn, db_name)
+    if not exists:
+        return
+    if marker != expected_database_marker():
+        raise SafetyRefusal(
+            f"refusing to drop {db_name}: it does not carry this harness's "
+            "disposable-cluster marker")
+    _terminate_scenario_backends(admin_conn, db_name)
+    admin_conn.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(db_name)))
 
 
 def run_sql(conn, query, params=None, fetch_mode=None):
@@ -815,31 +986,36 @@ EXPECTED_COLUMNS = {
     ("lease_protocol", "note"): ("text", "YES"),
 }
 
-# §9.3 "Check constraints | present with the documented expressions": each entry
-# is (contype, markers that must appear in pg_get_constraintdef()). The marker
-# form tolerates PostgreSQL's parenthesis and cast rendering while still failing
-# closed on a missing column, operator, literal or branch.
+# §9.3 "Check constraints | present with the documented expressions". Each entry
+# is the COMPLETE expected `pg_get_constraintdef()` text, not a set of marker
+# fragments: an added Boolean branch (`OR true`), a dropped conjunct, an extra
+# `IN` alternative or a changed operator produces a different string and fails.
+#
+# These are the canonical PostgreSQL 16 renderings of the §6.1 DDL. They were NOT
+# observed through `pg_get_constraintdef()` in this environment (no PostgreSQL
+# 16.16 is installed here), so the first real run must confirm them: a mismatch
+# is reported with the observed text and is never silently accepted, which is
+# the fail-closed direction.
 EXPECTED_CONSTRAINTS = {
     ("migration_lease", "migration_lease_pkey"): (
-        "p", ("primary key", "lease_name")),
+        "p", "primary key (lease_name)"),
     ("lease_protocol", "lease_protocol_pkey"): (
-        "p", ("primary key", "singleton")),
+        "p", "primary key (singleton)"),
     ("migration_lease", "migration_lease_singleton_ck"): (
-        "c", ("check", "lease_name", "migration-lease")),
+        "c", "check ((lease_name = 'migration-lease'::text))"),
     ("migration_lease", "migration_lease_generation_ck"): (
-        "c", ("check", "generation", ">= 0")),
+        "c", "check ((generation >= 0))"),
     ("migration_lease", "migration_lease_owner_shape_ck"): (
-        "c", ("check", "owner_token_hash is null", "owner_fingerprint is null",
-              "owner_token_hash is not null", "owner_fingerprint is not null",
-              " or ")),
+        "c", "check ((((owner_token_hash is null) and (owner_fingerprint is null)) "
+             "or ((owner_token_hash is not null) and (owner_fingerprint is not null))))"),
     ("migration_lease", "migration_lease_owned_expiry_ck"): (
-        "c", ("check", "owner_token_hash is null", "expires_at is not null", " or ")),
+        "c", "check (((owner_token_hash is null) or (expires_at is not null)))"),
     ("lease_protocol", "lease_protocol_barrier_state_check"): (
-        "c", ("check", "barrier_state", "open", "closed", "any")),
+        "c", "check ((barrier_state = any (array['open'::text, 'closed'::text])))"),
     ("lease_protocol", "lease_protocol_bootstrap_state_check"): (
-        "c", ("check", "bootstrap_state", "ready", "installing", "any")),
+        "c", "check ((bootstrap_state = any (array['ready'::text, 'installing'::text])))"),
     ("lease_protocol", "lease_protocol_singleton_check"): (
-        "c", ("check", "singleton")),
+        "c", "check (singleton)"),
 }
 
 # §9.3 "Function signatures | exactly the documented identity arguments and
@@ -864,6 +1040,31 @@ EXPECTED_FUNCTIONS = {
 def _normalize_sql_text(value):
     """Collapse whitespace and case so catalog rendering differences do not matter."""
     return " ".join((value or "").lower().split())
+
+
+def assert_constraint_definitions(rows):
+    """Compare complete constraint definitions. Pure function: needs no database.
+
+    `rows` are (relation, constraint name, contype, pg_get_constraintdef) tuples.
+    Any difference from EXPECTED_CONSTRAINTS raises, including a definition that
+    still contains every expected fragment but adds a branch.
+    """
+    observed = {(rel.split(".")[-1], name): (kind, _normalize_sql_text(definition))
+                for rel, name, kind, definition in rows}
+    if set(observed) != set(EXPECTED_CONSTRAINTS):
+        raise ProtocolFailure(
+            "§9.3 verification failed: constraint set differs (missing "
+            f"{sorted(set(EXPECTED_CONSTRAINTS) - set(observed))}, extra "
+            f"{sorted(set(observed) - set(EXPECTED_CONSTRAINTS))})")
+    for key, (kind, definition) in EXPECTED_CONSTRAINTS.items():
+        got_kind, got_definition = observed[key]
+        if got_kind != kind:
+            raise ProtocolFailure(
+                f"§9.3 verification failed: {key[1]} contype {got_kind!r} != {kind!r}")
+        if got_definition != definition:
+            raise ProtocolFailure(
+                f"§9.3 verification failed: {key[1]} definition {got_definition!r} "
+                f"is not the documented definition {definition!r}")
 
 
 def verify_installation(conn, expected_version=1, expect_active=True):
@@ -929,19 +1130,7 @@ def verify_installation(conn, expected_version=1, expect_active=True):
               "FROM pg_constraint c "
               "WHERE c.connamespace = 'migration_internal'::regnamespace",
         fetch_mode="all")
-    observed = {(rel.split(".")[-1], name): (kind, _normalize_sql_text(definition))
-                for rel, name, kind, definition in constraints}
-    if set(observed) != set(EXPECTED_CONSTRAINTS):
-        fail(f"constraint set differs (missing "
-             f"{sorted(set(EXPECTED_CONSTRAINTS) - set(observed))}, extra "
-             f"{sorted(set(observed) - set(EXPECTED_CONSTRAINTS))})")
-    for key, (kind, markers) in EXPECTED_CONSTRAINTS.items():
-        got_kind, definition = observed[key]
-        if got_kind != kind:
-            fail(f"{key[1]} contype {got_kind!r} != {kind!r}")
-        for marker in markers:
-            if marker not in definition:
-                fail(f"{key[1]} definition {definition!r} lacks {marker!r}")
+    assert_constraint_definitions(constraints)
 
     # -- functions: identity args, complete result, owner, security, search_path --
     funcs = run_sql(
@@ -1648,13 +1837,37 @@ def scenario_T15(conn):
     return "PASS"
 
 
+def grant_topology_b_application_privileges(scenario_admin, db_name):
+    """Apply §8.3's four grants in the database that owns the tables.
+
+    Application tables exist only in the scenario database, so a GRANT issued on
+    the cluster's `postgres` database would target objects that do not exist
+    there. The connected database is asserted before any grant is issued.
+    """
+    current = run_sql(scenario_admin, "SELECT current_database()", fetch_mode="one")
+    connected = None if current is None else current[0]
+    if connected != db_name:
+        raise ProtocolFailure(
+            "T-16: refusing to grant application privileges outside the scenario "
+            f"database {db_name!r}; the connection is to {connected!r}")
+    for statement in (
+        f"GRANT SELECT ON public.positions TO {MIGRATOR_ROLE}",
+        f"GRANT SELECT ON public.paper_orders TO {MIGRATOR_ROLE}",
+        f"GRANT SELECT, INSERT ON public.strategy_leg_exposures TO {MIGRATOR_ROLE}",
+        f"GRANT USAGE ON SEQUENCE public.strategy_leg_exposures_id_seq TO {MIGRATOR_ROLE}",
+    ):
+        scenario_admin.execute(statement)
+
+
 def scenario_T16(conn):
     """T-16: Topology B — the migrator elevates to the owner only inside SET ROLE."""
     if run_sql(conn, "SELECT session_user::text", fetch_mode="one")[0] != MIGRATOR_ROLE:
         raise SetupFailure("T-16 must run on a migrator connection")
 
-    admin = admin_connect()
-    admin.autocommit = True
+    db_name = scenario_db_name("T-16")
+    # Administrator connection to the scenario database that owns the tables.
+    # T-16 needs no cluster-level operation, so it opens no `postgres` connection.
+    scenario_admin = scenario_admin_connect(db_name)
     try:
         # The non-login owner creates the application tables through an explicit
         # elevation window; the migrator never gains owner rights by inheritance.
@@ -1681,14 +1894,9 @@ def scenario_T16(conn):
             run_sql(conn, "REVOKE ALL ON ALL FUNCTIONS IN SCHEMA migration_internal FROM "
                           + APP_ROLE)
 
-        # Four minimal grants, issued by the administrator on the owner's objects.
-        for statement in (
-            f"GRANT SELECT ON public.positions TO {MIGRATOR_ROLE}",
-            f"GRANT SELECT ON public.paper_orders TO {MIGRATOR_ROLE}",
-            f"GRANT SELECT, INSERT ON public.strategy_leg_exposures TO {MIGRATOR_ROLE}",
-            f"GRANT USAGE ON SEQUENCE public.strategy_leg_exposures_id_seq TO {MIGRATOR_ROLE}",
-        ):
-            admin.execute(statement)
+        # Four minimal grants on the owner's objects, issued in the scenario
+        # database that actually contains them — never on `postgres`.
+        grant_topology_b_application_privileges(scenario_admin, db_name)
 
         with conn.transaction():
             expected_matrix = {
@@ -1753,7 +1961,7 @@ def scenario_T16(conn):
                 raise ProtocolFailure("T-16: RESET ROLE did not restore the migrator")
         return "PASS"
     finally:
-        admin.close()
+        scenario_admin.close()
 
 
 def scenario_T17(conn):
@@ -1917,6 +2125,25 @@ def server_version(admin):
     return version_text, version_num
 
 
+def server_version_supported(version_num):
+    """Accept exactly PostgreSQL 16, minor version 16 or later.
+
+    A lower bound alone would silently accept PostgreSQL 17 and later, whose
+    catalog rendering and behaviour this harness was not written or approved
+    against; a different major version needs a separate design decision.
+    """
+    major, minor = divmod(int(version_num), 10000)
+    if major != REQUIRED_SERVER_MAJOR:
+        return False, (f"PostgreSQL major version {major} is not supported; this "
+                       f"harness requires {REQUIRED_SERVER_MAJOR}."
+                       f"{REQUIRED_SERVER_MINOR} or a later "
+                       f"{REQUIRED_SERVER_MAJOR}.x minor release")
+    if minor < REQUIRED_SERVER_MINOR:
+        return False, (f"PostgreSQL {major}.{minor} is older than the required "
+                       f"{REQUIRED_SERVER_MAJOR}.{REQUIRED_SERVER_MINOR}")
+    return True, None
+
+
 def not_run_all(reason):
     return {key: f"NOT RUN — {reason}" for key in SCENARIOS}
 
@@ -1978,7 +2205,8 @@ def run_harness():
         results = not_run_all(reason)
         _report(results)
         return results, SAFETY_REFUSAL_EXIT_CODE
-    print(f"Safety gate: ACCEPTED (cluster label {HARNESS_CLUSTER_LABEL!r})")
+    print(f"Safety gate: ACCEPTED (label {HARNESS_CLUSTER_LABEL!r}; cluster identity "
+          "is established independently after the version probe)")
 
     try:
         admin = admin_connect()
@@ -2001,15 +2229,16 @@ def run_harness():
 
         print(f"PostgreSQL server_version: {version_text} "
               f"(server_version_num={version_num})")
-        if version_num < REQUIRED_SERVER_VERSION_NUM:
-            reason = (f"PostgreSQL {version_text} is older than the required 16.16 "
-                      f"({REQUIRED_SERVER_VERSION_NUM})")
+        supported, unsupported_reason = server_version_supported(version_num)
+        if not supported:
+            reason = f"PostgreSQL {version_text} is unsupported: {unsupported_reason}"
             print(f"PostgreSQL availability: UNAVAILABLE — {reason}")
             results = not_run_all(reason)
             _report(results)
             return results, 0
 
-        print("PostgreSQL availability: AVAILABLE (16.16+)")
+        print(f"PostgreSQL availability: AVAILABLE ({REQUIRED_SERVER_MAJOR}."
+              f"{REQUIRED_SERVER_MINOR}+ within major {REQUIRED_SERVER_MAJOR})")
         print()
 
         # The gate inspects the target before anything is created, dropped or
@@ -2023,7 +2252,8 @@ def run_harness():
             results = not_run_all(reason)
             _report(results)
             return results, SAFETY_REFUSAL_EXIT_CODE
-        print("Target check: ACCEPTED (dedicated disposable cluster)")
+        print("Target check: ACCEPTED (verified cluster identity, harness-owned "
+              "databases, exact role attributes and membership options)")
         print()
 
         try:
@@ -2075,6 +2305,420 @@ def _report(results, cleanup_failures=None):
             print(f"{key}: cleanup failed: {cleanup_failures[key]}")
 
 
+# ---------------------------------------------------------------------------
+# Built-in DB-free self-test
+# ---------------------------------------------------------------------------
+# `python3 run_t01_to_t27.py --self-test` exercises the harness's own logic
+# against an injected fake driver. It opens no connection, reads no credential
+# and contacts no server. This is the published source of the regression checks
+# quoted in the evidence report.
+
+class _FakeDriverError(psycopg.Error):
+    def __init__(self, sqlstate):
+        super().__init__(f"fake driver error ({sqlstate})")
+        self.sqlstate = sqlstate
+
+
+class _FakeResult:
+    def __init__(self, rows):
+        self._rows = list(rows or [])
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+class _FakeTransaction:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def __enter__(self):
+        self.conn.transactions += 1
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None:
+            self.conn.rollbacks += 1
+        return False
+
+
+class _FakeCursor:
+    def __init__(self, conn):
+        self.conn = conn
+        self._result = _FakeResult([])
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def execute(self, query, params=None):
+        self._result = self.conn.execute(query, params)
+
+    def fetchone(self):
+        return self._result.fetchone()
+
+    def fetchall(self):
+        return self._result.fetchall()
+
+
+class _FakeConnection:
+    """Minimal psycopg stand-in: records every statement, answers via handler."""
+
+    def __init__(self, handler=None, dbname="unknown"):
+        self.handler = handler or (lambda query, params: [])
+        self.dbname = dbname
+        self.autocommit = False
+        self.closed = False
+        self.statements = []
+        self.transactions = 0
+        self.rollbacks = 0
+
+    def execute(self, query, params=None):
+        if self.closed:
+            raise _FakeDriverError("08003")
+        self.statements.append((self.dbname, str(query), params))
+        return _FakeResult(self.handler(str(query), params))
+
+    def cursor(self):
+        return _FakeCursor(self)
+
+    def close(self):
+        self.closed = True
+
+    def transaction(self):
+        return _FakeTransaction(self)
+
+
+def _fake_admin(identity="12345", databases=(), roles=(), memberships=()):
+    def handler(query, params):
+        if "pg_control_system" in query:
+            return [(identity,)]
+        if "FROM pg_database" in query:
+            return list(databases)
+        if "FROM pg_roles" in query:
+            return list(roles)
+        if "FROM pg_auth_members" in query:
+            return list(memberships)
+        return []
+    return _FakeConnection(handler, dbname="postgres")
+
+
+def _temporary_globals(**values):
+    saved = {name: globals()[name] for name in values}
+    globals().update(values)
+
+    def restore():
+        globals().update(saved)
+
+    return restore
+
+
+def _self_test_checks():
+    """Return [(name, callable)]; each callable raises AssertionError on failure."""
+    checks = []
+
+    def check(name):
+        def register(fn):
+            checks.append((name, fn))
+            return fn
+        return register
+
+    @check("every connection opener sets autocommit and the expected database")
+    def _autocommit():
+        opened = []
+        original = _connect_impl
+
+        def fake_connect(**kwargs):
+            conn = _FakeConnection(dbname=kwargs.get("dbname", "unknown"))
+            conn.connect_kwargs = dict(kwargs)
+            opened.append(conn)
+            return conn
+
+        globals()["_connect_impl"] = fake_connect
+        try:
+            cluster = admin_connect()
+            scenario = scenario_admin_connect("issue145_t16")
+            migrator = connect_migrator("issue145_t01")
+            bare = harness_connect(dbname="anything")
+        finally:
+            globals()["_connect_impl"] = original
+        assert len(opened) == 4, f"expected four connections, got {len(opened)}"
+        assert all(conn.autocommit is True for conn in opened), \
+            "a connection opener left autocommit off"
+        assert cluster.dbname == "postgres", f"admin connected to {cluster.dbname!r}"
+        assert scenario.dbname == "issue145_t16"
+        assert migrator.dbname == "issue145_t01"
+        assert bare.dbname == "anything"
+
+    @check("T-16 grants run on the scenario database, never on postgres")
+    def _t16_target():
+        scenario = _FakeConnection(lambda q, p: [("issue145_t16",)],
+                                   dbname="issue145_t16")
+        grant_topology_b_application_privileges(scenario, "issue145_t16")
+        grants = [q for _, q, _ in scenario.statements
+                  if q.upper().startswith("GRANT")]
+        assert len(grants) == 4, f"expected four GRANT statements, got {grants}"
+        assert all(db == "issue145_t16" for db, _, _ in scenario.statements)
+
+        wrong = _FakeConnection(lambda q, p: [("postgres",)], dbname="postgres")
+        try:
+            grant_topology_b_application_privileges(wrong, "issue145_t16")
+        except ProtocolFailure:
+            pass
+        else:
+            raise AssertionError("a GRANT was accepted while connected to postgres")
+        assert not [q for _, q, _ in wrong.statements
+                    if q.upper().startswith("GRANT")], \
+            "a GRANT reached postgres"
+
+        source = inspect.getsource(scenario_T16)
+        assert "grant_topology_b_application_privileges(scenario_admin, db_name)" in source
+        assert "GRANT " not in source, "T-16 still issues a GRANT inline"
+        assert "scenario_admin_connect(db_name)" in source
+
+    @check("cluster identity comes from pg_control, not from the static label")
+    def _identity():
+        restore = _temporary_globals(HARNESS_TARGET_SYSTEM_IDENTIFIER="")
+        try:
+            try:
+                verify_cluster_identity(_fake_admin())
+            except SafetyRefusal:
+                pass
+            else:
+                raise AssertionError("a missing target identity was accepted")
+        finally:
+            restore()
+
+        restore = _temporary_globals(HARNESS_TARGET_SYSTEM_IDENTIFIER="999")
+        try:
+            try:
+                verify_cluster_identity(_fake_admin(identity="123"))
+            except SafetyRefusal:
+                pass
+            else:
+                raise AssertionError("a mismatched system_identifier was accepted")
+            assert verify_cluster_identity(_fake_admin(identity="999")) == "999"
+        finally:
+            restore()
+
+    @check("an existing scenario database without the marker is refused")
+    def _marker_gate():
+        restore = _temporary_globals(HARNESS_TARGET_SYSTEM_IDENTIFIER="123")
+        try:
+            marker = expected_database_marker()
+            unmarked = _fake_admin(identity="123",
+                                   databases=[("issue145_t01", None)])
+            try:
+                validate_destructive_target(unmarked)
+            except SafetyRefusal:
+                pass
+            else:
+                raise AssertionError("an unmarked issue145_t01 database was adopted")
+            mutating = ("DROP", "CREATE", "GRANT", "COMMENT", "ALTER", "REVOKE")
+            assert not [q for _, q, _ in unmarked.statements
+                        if q.upper().startswith(mutating)], \
+                "the gate mutated the cluster before refusing"
+
+            marked = _fake_admin(identity="123",
+                                 databases=[("issue145_t01", marker)])
+            validate_destructive_target(marked)
+        finally:
+            restore()
+
+    @check("drop_scenario_db refuses a database it cannot prove it created")
+    def _drop_guard():
+        restore = _temporary_globals(HARNESS_TARGET_SYSTEM_IDENTIFIER="123")
+        try:
+            def handler(query, params):
+                if "FROM pg_database" in query:
+                    return [("issue145_t01", None)]
+                return []
+
+            admin = _FakeConnection(handler, dbname="postgres")
+            try:
+                drop_scenario_db(admin, "issue145_t01")
+            except SafetyRefusal:
+                pass
+            else:
+                raise AssertionError("an unmarked database was dropped")
+            assert not [q for _, q, _ in admin.statements
+                        if "DROP DATABASE" in q.upper()]
+            assert not [q for _, q, _ in admin.statements
+                        if "pg_terminate_backend" in q]
+        finally:
+            restore()
+
+    @check("role login attributes and exact membership options are validated")
+    def _roles():
+        restore = _temporary_globals(HARNESS_TARGET_SYSTEM_IDENTIFIER="123")
+        try:
+            good_roles = [(MIGRATOR_ROLE, False, False, False, False, True),
+                          (OWNER_ROLE, False, False, False, False, False),
+                          (APP_ROLE, False, False, False, False, True)]
+            good_membership = (OWNER_ROLE, MIGRATOR_ROLE, False, True, False)
+            validate_destructive_target(_fake_admin(
+                identity="123", roles=good_roles, memberships=[good_membership]))
+
+            for bad_membership in ((OWNER_ROLE, MIGRATOR_ROLE, True, True, False),
+                                   (OWNER_ROLE, MIGRATOR_ROLE, False, False, False),
+                                   (OWNER_ROLE, MIGRATOR_ROLE, False, True, True)):
+                try:
+                    validate_destructive_target(_fake_admin(
+                        identity="123", roles=good_roles,
+                        memberships=[bad_membership]))
+                except SafetyRefusal:
+                    pass
+                else:
+                    raise AssertionError(
+                        f"membership options {bad_membership[2:]} were accepted")
+
+            nologin_migrator = [(MIGRATOR_ROLE, False, False, False, False, False)]
+            try:
+                validate_destructive_target(_fake_admin(
+                    identity="123", roles=nologin_migrator))
+            except SafetyRefusal:
+                pass
+            else:
+                raise AssertionError("a NOLOGIN migrator was adopted")
+
+            superuser_owner = [(OWNER_ROLE, True, False, False, False, False)]
+            try:
+                validate_destructive_target(_fake_admin(
+                    identity="123", roles=superuser_owner))
+            except SafetyRefusal:
+                pass
+            else:
+                raise AssertionError("a SUPERUSER owner role was adopted")
+        finally:
+            restore()
+
+    @check("constraint definitions are compared in full, including weakened ones")
+    def _constraints():
+        def rows(overrides=None):
+            overrides = overrides or {}
+            return [("migration_internal." + table, name, kind,
+                     overrides.get(name, definition))
+                    for (table, name), (kind, definition) in EXPECTED_CONSTRAINTS.items()]
+
+        assert_constraint_definitions(rows())
+
+        weakened_shape = (
+            "check ((((owner_token_hash is null) and (owner_fingerprint is null)) "
+            "or ((owner_token_hash is not null) and (owner_fingerprint is not null)) "
+            "or (true)))")
+        try:
+            assert_constraint_definitions(rows({
+                "migration_lease_owner_shape_ck": weakened_shape}))
+        except ProtocolFailure:
+            pass
+        else:
+            raise AssertionError("an added OR true branch was accepted")
+
+        widened_barrier = (
+            "check ((barrier_state = any (array['open'::text, 'closed'::text, "
+            "'degraded'::text])))")
+        try:
+            assert_constraint_definitions(rows({
+                "lease_protocol_barrier_state_check": widened_barrier}))
+        except ProtocolFailure:
+            pass
+        else:
+            raise AssertionError("an extra IN alternative was accepted")
+
+        # OR weakened to AND: every expected fragment is still present.
+        changed_operator = (
+            "check (((owner_token_hash is null) and (expires_at is not null)))")
+        try:
+            assert_constraint_definitions(rows({
+                "migration_lease_owned_expiry_ck": changed_operator}))
+        except ProtocolFailure:
+            pass
+        else:
+            raise AssertionError("a changed expression was accepted")
+
+    @check("only PostgreSQL 16 with minor >= 16 is accepted")
+    def _version():
+        for number, expected in ((150000, False), (160015, False), (160016, True),
+                                 (160020, True), (170000, False), (180000, False)):
+            accepted, reason = server_version_supported(number)
+            assert accepted is expected, \
+                f"server_version_num {number} -> {accepted}, expected {expected}"
+            if not accepted:
+                assert reason, f"no refusal reason for {number}"
+
+    @check("bootstrap verifies §9.3 before it activates the protocol row")
+    def _bootstrap_order():
+        source = inspect.getsource(bootstrap_first_installation)
+        verify_at = source.index("verify_installation(")
+        activate_at = source.index("PROTOCOL_ACTIVATION_SQL")
+        assert verify_at < activate_at, "verification does not precede activation"
+        assert "expect_active=False" in source[verify_at:activate_at], \
+            "the pre-activation pass does not expect the inactive state"
+        assert "expect_active=False" in inspect.getsource(verify_installation)
+
+    @check("T-11/T-12 put enter first and assert termination SQLSTATEs")
+    def _transactions():
+        t11 = inspect.getsource(scenario_T11)
+        t12 = inspect.getsource(scenario_T12)
+        assert t11.index("lease_enter_v1") < t11.index("INSERT INTO public.positions")
+        assert t12.index("lease_enter_v1") < t12.index("INSERT INTO public.positions")
+        assert 'observed not in ("57P01", "08006")' in t12
+        assert "pg_terminate_backend" in t12
+        assert "FOR UPDATE NOWAIT" in t11 and "FOR UPDATE NOWAIT" in t12
+
+    @check("expect_sqlstate uses a real transaction and the driver SQLSTATE")
+    def _sqlstate():
+        plain = _FakeConnection(lambda q, p: [])
+        matched, observed = expect_sqlstate(plain, "SELECT broken", None, "55P03")
+        assert not matched and observed is None
+        assert plain.transactions == 1 and plain.rollbacks == 0
+
+        def failing(query, params):
+            raise _FakeDriverError("55P03")
+
+        erroring = _FakeConnection(failing)
+        matched, observed = expect_sqlstate(erroring, "SELECT 1", None, "55P03")
+        assert matched is True and observed == "55P03"
+        assert erroring.transactions == 1 and erroring.rollbacks == 1
+
+    @check("T-23 stays NOT RUN and never presents a direct UPDATE as an upgrade")
+    def _t23():
+        outcome = scenario_T23(None)
+        assert classify(outcome) == "NOT RUN", f"T-23 classified as {outcome!r}"
+        source = inspect.getsource(scenario_T23)
+        assert "SET installed_version" not in source
+        assert "lease_protocol SET" not in source
+
+    return checks
+
+
+def run_self_test():
+    print("Issue #145 harness — DB-free self-test (no server is contacted)")
+    print("=" * 66)
+    failures = 0
+    checks = _self_test_checks()
+    for name, fn in checks:
+        try:
+            fn()
+        except AssertionError as exc:
+            failures += 1
+            print(f"FAIL  {name} — {exc}")
+        except Exception as exc:  # noqa: BLE001 - a broken test is a failure too
+            failures += 1
+            print(f"FAIL  {name} — unexpected {type(exc).__name__}: {exc}")
+        else:
+            print(f"PASS  {name}")
+    print("-" * 66)
+    print(f"Total: {len(checks)}, PASS: {len(checks) - failures}, FAIL: {failures}")
+    return 0 if failures == 0 else 1
+
+
 if __name__ == "__main__":
+    if "--self-test" in sys.argv[1:]:
+        sys.exit(run_self_test())
     _, exit_code = run_harness()
     sys.exit(exit_code)

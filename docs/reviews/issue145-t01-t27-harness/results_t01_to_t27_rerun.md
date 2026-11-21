@@ -37,8 +37,10 @@ $ echo $?
 
 $ ALLOW_DESTRUCTIVE_TESTS=1 HARNESS_CLUSTER_LABEL=issue145-disposable \
     python3 docs/reviews/issue145-t01-t27-harness/run_t01_to_t27.py
-Safety gate: ACCEPTED (cluster label 'issue145-disposable')
-PostgreSQL availability: UNAVAILABLE — PostgreSQL unreachable (OperationalError ...)
+Safety gate: ACCEPTED (label 'issue145-disposable'; cluster identity is
+  established independently after the version probe)
+PostgreSQL availability: UNAVAILABLE — PostgreSQL unreachable
+  (RuntimeError: psycopg is not installed; install 'psycopg[binary]' to run scenarios)
 ...
 Total: 27
 PASS: 0
@@ -53,7 +55,9 @@ $ echo $?
 Those runs demonstrate that the gate refuses before connecting without the
 explicit opt-in, and that the runner exits cleanly and classifies all scenarios
 NOT RUN when PostgreSQL is absent. They are not evidence about the lease
-protocol.
+protocol. `psycopg` is not installed in this environment, so the module's
+DB-free stub driver is what reports the unreachable path; the harness's own
+self-test exercises the same code paths with an injected fake driver.
 
 ---
 
@@ -130,20 +134,40 @@ outcome.
   revoke set, full verification while the protocol reads `closed` / `installing`,
   activation to `open` / `ready`, then the protocol-info assertion. A DB-free
   ordering assertion enforces it, so verification cannot move after activation.
-- The verifier compares constraint definitions through `pg_get_constraintdef()`,
-  complete function result signatures (including the five-column protocol-info
-  result), ACLs expanded with `acldefault(...)`, per-privilege effective
-  privileges for schema, tables, sequences and functions, transitive role
-  membership, `rolsuper` / `rolbypassrls`, and both global and schema-scoped
+- The verifier compares complete constraint definitions through
+  `pg_get_constraintdef()` (the whole normalized expression, not marker
+  fragments), complete function result signatures (including the five-column
+  protocol-info result), ACLs expanded with `acldefault(...)`, per-privilege
+  effective privileges for schema, tables, sequences and functions, transitive
+  role membership, `rolsuper` / `rolbypassrls`, and both global and schema-scoped
   default ACLs. It issues no GRANT or REVOKE.
+- The expected constraint strings are PostgreSQL 16 renderings of the §6.1 DDL.
+  They were not observed through `pg_get_constraintdef()` here, because no
+  PostgreSQL 16.16 exists in this environment. A mismatch fails closed and prints
+  the observed definition; static comparison cannot prove live catalog output.
 - The runner calls `prepare_scenario_database()` and `drop_scenario_db()` for
-  each scenario, the latter in a `finally` path.
-- The destructive gate refuses before connecting without `ALLOW_DESTRUCTIVE_TESTS=1`
-  and `HARNESS_CLUSTER_LABEL=issue145-disposable`, and refuses a target holding
-  foreign databases, a production-like fixed-name role, or an unexpected role
-  membership.
-- The runner probes `SHOW server_version` / `server_version_num` and requires
-  `160016`; `SELECT 1` alone is not used to establish the version.
+  each scenario, the latter in a `finally` path. Each created database carries
+  the marker `strikenova-issue145-harness-disposable:<system_identifier>` in its
+  catalog comment, and a pre-existing database without that exact marker is
+  refused rather than adopted, terminated or dropped.
+- The destructive gate refuses before connecting without
+  `ALLOW_DESTRUCTIVE_TESTS=1`, `HARNESS_CLUSTER_LABEL=issue145-disposable` and a
+  matching `HARNESS_TARGET_SYSTEM_IDENTIFIER`. Cluster identity comes from
+  `pg_control_system().system_identifier`, not from the label, and an `issue145_*`
+  name alone is not evidence of ownership. Existing roles must have the exact
+  expected `LOGIN` attribute and no `SUPERUSER` / `BYPASSRLS` / `CREATEROLE` /
+  `CREATEDB`; existing memberships must be exactly
+  `owner -> migrator` with `INHERIT FALSE, SET TRUE, ADMIN FALSE`. Nothing is
+  altered to make a target acceptable.
+- T-16 issues its four application-table and sequence grants on a separate
+  administrator connection to `issue145_t16`, after asserting
+  `current_database() = 'issue145_t16'`; the cluster-level `postgres` connection
+  is not used for them.
+- The runner probes `SHOW server_version` / `server_version_num` and accepts only
+  PostgreSQL major 16 with minor 16 or later. PostgreSQL 15, 17 and 18 are
+  refused, so a lower bound alone does not silently admit another major version.
+- The DB-free self-test published in the harness passes: 12 checks, 0 failures
+  (`--self-test`, no server contacted).
 
 ## Execution model and safety gate
 
@@ -154,9 +178,10 @@ committed before the lease is acquired, and `lease_enter_v1` is the first
 statement of each protected transaction.
 
 Because the harness drops fixed-name databases and mutates cluster-level role
-membership, it requires `ALLOW_DESTRUCTIVE_TESTS=1` and
-`HARNESS_CLUSTER_LABEL=issue145-disposable`, then validates the target before any
-mutation. It creates three cluster roles if absent
+membership, it requires `ALLOW_DESTRUCTIVE_TESTS=1`,
+`HARNESS_CLUSTER_LABEL=issue145-disposable` and a matching
+`HARNESS_TARGET_SYSTEM_IDENTIFIER`, then validates the target read-only before
+any mutation. It creates three cluster roles if absent
 (`strikenova_prod_migrator`, `strikenova_production_app`,
 `strikenova_prod_owner`), the owner→migrator membership, and the `issue145_t01`…
 `issue145_t27` databases, dropping each database after its scenario. The roles and

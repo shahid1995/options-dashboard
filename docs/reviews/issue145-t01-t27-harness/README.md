@@ -73,7 +73,12 @@ string values equal them exactly.
    bootstrap; the pre-activation pass uses `expect_active=False` so it cannot
    mistake "not yet activated" for a defect.
 4. **Complete §9.3 / §9.4 / §10.3 verifier.** Constraint *definitions* are
-   compared through `pg_get_constraintdef()`, not merely names and types;
+   compared in full through `pg_get_constraintdef()` — the whole normalized
+   expression, not marker fragments — so an added `OR true` branch, a dropped
+   conjunct, a changed operator or an extra `IN` alternative fails; the expected
+   strings are PostgreSQL 16 renderings of the §6.1 DDL that have not been
+   observed in this environment, and a mismatch reports the observed text instead
+   of accepting it;
    function identity arguments and complete result signatures are compared,
    including the five-column `lease_protocol_info_v1()` result; object ACLs are
    expanded with `acldefault(...)` when the catalog ACL is `NULL`; table,
@@ -86,15 +91,20 @@ string values equal them exactly.
    `prepare_scenario_database()` for every scenario, connects to that unique
    database, runs the scenario, then calls `drop_scenario_db()` in a `finally`
    path. The helper is on the execution path, not merely defined.
-6. **Separate identities.** The administrator connection only provisions
-   disposable databases and cluster roles. Every scenario connection uses
-   `strikenova_prod_migrator`, and the cluster roles are provisioned once before
-   T-01. T-15 exercises a real APP session; T-16 opens the owner window with
-   `SET ROLE` and returns with `RESET ROLE`.
+6. **Separate identities.** The administrator connection provisions disposable
+   databases and cluster roles, and issues T-16's four grants on a second
+   administrator connection *to `issue145_t16`* after asserting
+   `current_database()`; no application-table grant is attempted on `postgres`.
+   Every scenario connection uses `strikenova_prod_migrator`, and the cluster
+   roles are provisioned once before T-01. T-15 exercises a real APP session;
+   T-16 opens the owner window with `SET ROLE` and returns with `RESET ROLE`.
 7. **Unavailability handling.** The connection attempt and the server-version
-   probe are both wrapped. If the server is unreachable, or
-   `server_version_num` is below `160016`, the runner reports all 27 NOT RUN with
-   exit 0. `SELECT 1` alone is never treated as proof of PostgreSQL 16.16.
+   probe are both wrapped. If the server is unreachable, or it is not PostgreSQL
+   major 16 with minor 16 or later, the runner reports all 27 NOT RUN with exit 0.
+   A lower bound alone is not used: PostgreSQL 17 and later are refused because
+   this harness was not written or approved against another major version, and a
+   different major needs a separate design decision. `SELECT 1` alone is never
+   treated as proof of version.
 8. **Result contracts and error handling.** Successful `acquire`/`enter` return
    the documented 3-column row; `release` returns a boolean; `protocol_info`
    returns five columns. SQLSTATE is read from the driver's `sqlstate` attribute,
@@ -119,25 +129,42 @@ privilege enforcement or recovery. Only execution against PostgreSQL 16.16 can.
 
 The harness drops fixed-name databases and mutates cluster-level role
 membership, so it must never run against a live environment. It refuses unless
-**both** of these are set:
+**all three** of these are set:
 
 | Variable | Required value | Meaning |
 |---|---|---|
 | `ALLOW_DESTRUCTIVE_TESTS` | `1` | Explicit, per-run opt-in to destructive behaviour |
 | `HARNESS_CLUSTER_LABEL` | `issue145-disposable` | Declares the target a dedicated disposable cluster |
+| `HARNESS_TARGET_SYSTEM_IDENTIFIER` | the cluster's `system_identifier` | Independently observed cluster identity |
+
+`HARNESS_CLUSTER_LABEL` is a declaration, not proof, and neither is an
+`issue145_*` database name. Identity is established from
+`pg_control_system().system_identifier`, which the operator reads while
+provisioning the disposable cluster (for example from `pg_controldata`, or the
+same query) and supplies separately. A mismatch refuses the run.
 
 The gate runs in two stages:
 
 1. **Before any connection.** Missing or incorrect opt-in refuses immediately:
    nothing is opened, and the run reports 27 NOT RUN with exit status 2.
-2. **After the version probe, before any mutation.** The target is inspected and
-   refused if it holds any database other than `postgres`, `template0`,
-   `template1` or the harness's own `issue145_*` databases; if a fixed-name role
-   already exists with `SUPERUSER`, `BYPASSRLS`, `CREATEROLE` or `CREATEDB`; or if
-   any of the three fixed-name roles has a membership the harness did not create.
-   A refusal here leaves the cluster exactly as found — the harness does not adopt
-   or repair a production-like role set, and does not create, drop or grant
-   anything.
+2. **After the version probe, before any mutation.** Every check fails closed and
+   every statement in this stage is read-only:
+   - the cluster's `system_identifier` must equal
+     `HARNESS_TARGET_SYSTEM_IDENTIFIER`;
+   - every database other than `postgres`, `template0` and `template1` must carry
+     the marker `strikenova-issue145-harness-disposable:<identifier>` in its
+     catalog comment. A database is never adopted merely because its name is
+     `issue145_*`, and is never terminated or dropped at this stage;
+   - an existing fixed-name role may not have `SUPERUSER`, `BYPASSRLS`,
+     `CREATEROLE` or `CREATEDB`, and its `LOGIN`/`NOLOGIN` attribute must be the
+     one the harness would provision (`migrator` and `app` are LOGIN, `owner` is
+     NOLOGIN). A mismatch is refused, never repaired with `ALTER ROLE`;
+   - every membership involving those roles must be exactly
+     `strikenova_prod_owner -> strikenova_prod_migrator` with `INHERIT FALSE,
+     SET TRUE, ADMIN FALSE`. Any other membership, or any other option set, is
+     refused rather than altered.
+
+   A refusal here leaves the cluster exactly as found.
 
 ### Connection configuration
 
@@ -145,7 +172,8 @@ The gate runs in two stages:
 |---|---|---|
 | `DB_HOST` | empty (Unix socket) | all connections |
 | `DB_PORT` | `55432` | all connections |
-| `ADMIN_DB_USER` / `ADMIN_DB_PASSWORD` | falls back to `DB_USER` / `DB_PASSWORD` | administrator: create/drop databases, create roles, terminate backends |
+| `HARNESS_TARGET_SYSTEM_IDENTIFIER` | empty (run is refused) | cluster identity check, database marker |
+| `ADMIN_DB_USER` / `ADMIN_DB_PASSWORD` | falls back to `DB_USER` / `DB_PASSWORD` | administrator: create/drop databases and roles, grant on a scenario database, terminate backends |
 | `MIGRATOR_DB_USER` | `strikenova_prod_migrator` | every scenario connection |
 | `MIGRATOR_DB_PASSWORD` | empty | migrator login |
 | `DB_USER` / `DB_PASSWORD` | empty | administrator fallback, and the password fallback for the APP connection |
@@ -172,10 +200,12 @@ roles):**
 - per-scenario-database `CONNECT`/`CREATE` grants and `USAGE, CREATE` on
   `public`.
 
-**Per-scenario cleanup:** `drop_scenario_db()` terminates backends connected to
-that scenario database (never any other database), then drops it. T-12
-additionally terminates one backend **inside its own scenario database**, which
-is that scenario's subject under test.
+**Per-scenario cleanup:** `prepare_scenario_database()` writes the marker comment
+on each database it creates, and `drop_scenario_db()` terminates backends
+connected to that scenario database (never any other database) and drops it only
+when the marker matches. A pre-existing database without the marker is refused,
+not adopted. T-12 additionally terminates one backend **inside its own scenario
+database**, which is that scenario's subject under test.
 
 ---
 
@@ -216,7 +246,7 @@ not accepted as evidence.
 | T-13 | Interrupted backfill and recovery | NOT RUN | Requires the real backfill |
 | T-14 | Version mismatch and closed barrier | NOT RUN | Implemented; not executed |
 | T-15 | Topology A — runtime APP has no lease privilege | NOT RUN | Implemented; not executed |
-| T-16 | Topology B — non-inherited membership and grants | NOT RUN | Implemented (migrator session, `SET ROLE` owner window, owner denied functions, return to migrator matrix); not executed |
+| T-16 | Topology B — non-inherited membership and grants | NOT RUN | Implemented (migrator session, `SET ROLE` owner window, the four grants issued on a separate administrator connection to `issue145_t16` after asserting `current_database()`, owner denied functions, return to migrator matrix); not executed |
 | T-17 | `alembic upgrade head` directly | NOT RUN | No Alembic binary |
 | T-18 | `python -m app.migrate upgrade head` | NOT RUN | No application runner |
 | T-19 | Injected backfill and release failures | NOT RUN | Requires a blocker session |
@@ -242,6 +272,7 @@ pip install 'psycopg[binary]>=3.1'
 
 export ALLOW_DESTRUCTIVE_TESTS=1        # explicit destructive opt-in
 export HARNESS_CLUSTER_LABEL=issue145-disposable
+export HARNESS_TARGET_SYSTEM_IDENTIFIER=<system_identifier of that cluster>
 export DB_HOST=""                       # Unix socket
 export DB_PORT=55432                    # disposable PostgreSQL 16.16
 export DB_USER=""                       # administrator, CREATEROLE/CREATEDB
@@ -275,15 +306,33 @@ they are not current results and are not reused anywhere in this document.
 - `python3 -m py_compile` — passed.
 - Loaded SQL constants compared exactly with the pinned ADR blocks for §6.1
   (both tables), §6.3, §6.4, §6.5, §6.6 and §10.2 — all match; no literal
-  backslash-n.
-- DB-free suite with an injected fake driver: every connection opener sets
-  `autocommit=True`; the gate refuses before connecting; the accepted-but-
-  unreachable path reports 27 NOT RUN with exit 0; target validation refuses a
-  foreign database, a `SUPERUSER`/`BYPASSRLS` role and an unexpected membership;
-  `expect_sqlstate` reads the driver SQLSTATE inside a real transaction.
-- Structural assertions: bootstrap order is preflight → create → revoke →
-  verify → activate → protocol-info, verification is pre-activation, T-11/T-12
-  commit the application table before acquisition and place `enter` before the
-  protected write, T-12 asserts `57P01`/`08006`, the verifier contains every
-  required §9.3/§9.4/§10.3 check and no GRANT/REVOKE, and T-23 remains NOT RUN.
+  backslash-n; the SQL constants are unchanged from the previous revision.
+- Built-in DB-free self-test, reproducible and published in the harness itself:
+
+  ```bash
+  python3 docs/reviews/issue145-t01-t27-harness/run_t01_to_t27.py --self-test
+  # Total: 12, PASS: 12, FAIL: 0   (exit 0)
+  ```
+
+  It injects a fake driver and contacts no server. Its checks cover: autocommit
+  on every connection opener and the expected database per opener; T-16 issuing
+  its four grants on the `issue145_t16` connection and refusing them on
+  `postgres` (with a source assertion that T-16 contains no inline `GRANT`);
+  cluster identity from `pg_control_system()` rejecting a missing or mismatched
+  identifier; refusal of an unmarked pre-existing scenario database with no
+  mutation; `drop_scenario_db()` refusing an unmarked database; exact role
+  `LOGIN` and membership-option validation (`INHERIT TRUE`, `SET FALSE`,
+  `ADMIN TRUE` and a NOLOGIN migrator are all refused); complete constraint
+  comparison rejecting `OR true`, an extra `IN` alternative and a changed
+  operator; the version matrix (15.0, 16.15, 16.16, 16.20, 17.0, 18.0); bootstrap
+  verifying before activation; T-11/T-12 ordering, `FOR UPDATE NOWAIT` lock
+  probes and the `57P01`/`08006` assertion; `expect_sqlstate` reading the driver
+  SQLSTATE inside a real transaction; and T-23 remaining NOT RUN.
+- Two no-server runs still produce 27 NOT RUN: exit 2 without the opt-in (no
+  connection opened) and exit 0 with it (no server reachable; here `psycopg` is
+  also absent, so the module's stub driver reports the unreachable path).
 - No protocol behaviour was exercised against a database in this environment.
+- **Unverified here:** PostgreSQL 16.16 `pg_get_constraintdef()` rendering of
+  the nine expected definitions, `pg_control_system()` output shape, and every
+  runtime SQLSTATE, lock and privilege observation. Static comparison cannot
+  establish live catalog output.
