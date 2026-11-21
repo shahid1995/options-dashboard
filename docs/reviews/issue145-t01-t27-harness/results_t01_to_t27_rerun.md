@@ -52,7 +52,7 @@ NOT RUN when PostgreSQL is absent. It is not evidence about the lease protocol.
 | T-09 | Concurrent backfill of three users | NOT RUN | Backfill implementation |
 | T-10 | Two `enter` calls per backfill transaction | NOT RUN | Backfill implementation |
 | T-11 | TTL genuinely exceeded by the database clock | NOT RUN | PostgreSQL 16.16 |
-| T-12 | Terminate W1's backend mid-transaction | NOT RUN | PostgreSQL 16.16 |
+| T-12 | Terminate W1's backend inside a protected transaction | NOT RUN | PostgreSQL 16.16 |
 | T-13 | Interrupted backfill and recovery | NOT RUN | Backfill implementation |
 | T-14 | Version mismatch and closed barrier | NOT RUN | PostgreSQL 16.16 |
 | T-15 | Topology A — runtime APP has no lease privilege | NOT RUN | PostgreSQL 16.16 |
@@ -63,7 +63,7 @@ NOT RUN when PostgreSQL is absent. It is not evidence about the lease protocol.
 | T-20 | Supported command on a database already at head | NOT RUN | Application command |
 | T-21 | Operator close-barrier sequence | NOT RUN | Operator commands |
 | T-22 | `p_lock_timeout_ms = 0` / `p_ttl_seconds = 0` | NOT RUN | PostgreSQL 16.16 |
-| T-23 | Stale protocol-1 worker after upgrade to 2 | NOT RUN | PostgreSQL 16.16 |
+| T-23 | Stale protocol-1 worker after upgrade to 2 | NOT RUN | `bootstrap-lease --upgrade-protocol` flow |
 | T-24 | Cross-version concurrency | NOT RUN | `*_v2` function set + concurrency |
 | T-25 | Plain bootstrap verify refuses a mismatch | NOT RUN | `bootstrap-lease` command |
 | T-26 | Explicit upgrade, refusal and cancellation | NOT RUN | Operator commands |
@@ -82,6 +82,13 @@ NOT RUN when PostgreSQL is absent. It is not evidence about the lease protocol.
 
 Every scenario has exactly one category. NOT RUN is never counted as FAIL, and
 no scenario was counted from an earlier run.
+
+When scenarios do execute, the runner classifies them separately: failed
+assertions and unexpected PostgreSQL SQLSTATEs are `FAIL`, database or identity
+provisioning failures are `INVALID_SETUP`, and only genuinely absent
+prerequisites are `NOT RUN`. Database teardown runs in a `finally` path, and a
+teardown error is recorded on its own line without replacing the scenario's
+outcome.
 
 ---
 

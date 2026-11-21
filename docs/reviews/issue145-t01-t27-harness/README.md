@@ -65,6 +65,22 @@ Structural rules the current file enforces:
 10. **No stale publication metadata.** This README does not embed a commit SHA
     or file hash for its own publication; those are reported with the commit
     that publishes it.
+11. **Runner classification and teardown.** Executed scenarios are classified
+    separately: a failed assertion or an unexpected PostgreSQL SQLSTATE is
+    `FAIL`; a failure to create the database or connect as the migrator is
+    `INVALID_SETUP`; a scenario whose prerequisite genuinely does not exist
+    returns `NOT RUN`. Database teardown runs in a `finally` path, and a
+    teardown error is reported separately rather than replacing the scenario
+    outcome.
+12. **Separate identities.** The administrator connection only provisions
+    disposable databases and cluster roles. Every scenario connection uses
+    `strikenova_prod_migrator`, and the cluster roles
+    (`strikenova_prod_migrator`, `strikenova_prod_owner`,
+    `strikenova_production_app`) are provisioned once, before T-01 runs.
+
+Static source checks cannot establish runtime SQLSTATE values, lock behaviour,
+privilege enforcement or recovery. Only an execution against PostgreSQL 16.16
+can do that, and none was performed here.
 
 ### Database-local versus cluster-level objects
 
@@ -99,19 +115,19 @@ the assertion is `42501`, read from the driver.
 | T-08 | Two workers run `alembic upgrade head` | NOT RUN | Requires the real Alembic chain |
 | T-09 | Concurrent backfill of three users | NOT RUN | Requires the real backfill |
 | T-10 | Two `enter` calls per backfill transaction | NOT RUN | Requires the real backfill |
-| T-11 | TTL genuinely exceeded by the database clock | NOT RUN | Implemented; not executed |
-| T-12 | Terminate W1's backend mid-transaction | NOT RUN | Implemented (admin + W1); not executed |
+| T-11 | TTL genuinely exceeded by the database clock | NOT RUN | Implemented (protected write, rollback, lock release, takeover); not executed |
+| T-12 | Terminate W1's backend mid-transaction | NOT RUN | Implemented (enter first, protected write, real backend kill, rollback, 45002, expiry, takeover); not executed |
 | T-13 | Interrupted backfill and recovery | NOT RUN | Requires the real backfill |
 | T-14 | Version mismatch and closed barrier | NOT RUN | Implemented; not executed |
 | T-15 | Topology A — runtime APP has no lease privilege | NOT RUN | Implemented; not executed |
-| T-16 | Topology B — non-inherited membership and grants | NOT RUN | Implemented; not executed |
+| T-16 | Topology B — non-inherited membership and grants | NOT RUN | Implemented (migrator session, `SET ROLE` owner window, owner denied functions, return to migrator matrix); not executed |
 | T-17 | `alembic upgrade head` directly | NOT RUN | No Alembic binary |
 | T-18 | `python -m app.migrate upgrade head` | NOT RUN | No application runner |
 | T-19 | Injected backfill and release failures | NOT RUN | Requires a blocker session |
 | T-20 | Supported command on a database already at head | NOT RUN | No application command |
 | T-21 | Operator close-barrier sequence | NOT RUN | Requires operator commands |
 | T-22 | `p_lock_timeout_ms = 0` / `p_ttl_seconds = 0` | NOT RUN | Implemented; not executed |
-| T-23 | Stale protocol-1 worker after upgrade to 2 | NOT RUN | Implemented (two connections); not executed |
+| T-23 | Stale protocol-1 worker after upgrade to 2 | NOT RUN | Requires the `bootstrap-lease --upgrade-protocol` flow; a direct version `UPDATE` is not an upgrade |
 | T-24 | Cross-version concurrency | NOT RUN | Requires `*_v2` function set and concurrency |
 | T-25 | Plain bootstrap verify refuses a mismatch | NOT RUN | Requires the `bootstrap-lease` command |
 | T-26 | Explicit upgrade, refusal and cancellation | NOT RUN | Requires operator commands |
