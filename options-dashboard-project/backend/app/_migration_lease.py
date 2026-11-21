@@ -1,0 +1,1486 @@
+"""ADR-017 PostgreSQL migration lease (transactional ownership).
+
+This module replaces the retired renewal-thread lease (``_migration_lock``).
+Ownership is proven by the PostgreSQL row lock on
+``migration_internal.migration_lease`` plus a 256-bit owner token whose
+SHA-256 hash is the only owner credential stored in the database.
+
+Design contract (``docs/ADR-017-018-POSTGRES-LEASE-DESIGN.md``, commit
+``ae2226e``):
+
+* ``migration_internal.lease_protocol`` is the single authoritative control
+  row (installed version, supported range, barrier, bootstrap state).
+* ``migration_internal.migration_lease`` is the single shared lease row.
+* ``lease_acquire_v1`` / ``lease_enter_v1`` / ``lease_release_v1`` are
+  ``SECURITY DEFINER`` functions owned by the migration identity, with
+  ``search_path = pg_catalog`` and strict ACLs.
+* Every protected transaction starts with ``enter`` (which takes the
+  cross-version advisory guard ``M`` and then the lease row lock) and ends
+  with a second ``enter`` immediately before ``COMMIT``.
+* Expiry uses the database clock. There is no renewal thread, no handoff
+  mode and no GUC/session-variable ownership.
+
+Nothing in this module ever logs, formats or transmits the raw owner token;
+only the 12-hex ``owner_fingerprint`` may appear in logs and exceptions.
+"""
+
+from __future__ import annotations
+
+import logging
+import random
+import secrets
+import time
+from dataclasses import dataclass
+from typing import Iterable
+
+from sqlalchemy import text
+from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import DBAPIError
+
+logger = logging.getLogger(__name__)
+
+SCHEMA = "migration_internal"
+LEASE_TABLE = "migration_internal.migration_lease"
+PROTOCOL_TABLE = "migration_internal.lease_protocol"
+LEASE_NAME = "migration-lease"
+
+#: Cross-version guard (ADR §6.10). Fixed by the protocol: every version of
+#: every lease function takes this exact key.
+GUARD_SQL = "hashtextextended('strikenova:migration_internal:migration_guard', 0)"
+#: Bootstrap guard (ADR §6.10). Bootstrap modes only.
+BOOTSTRAP_GUARD_SQL = "hashtextextended('strikenova:migration_internal:bootstrap', 0)"
+
+#: The protocol version this binary implements (ADR §11.2).
+EXPECTED_PROTOCOL_VERSION = 1
+SUPPORTED_PROTOCOL_MIN = 1
+SUPPORTED_PROTOCOL_MAX = 1
+#: Versions from which this binary may perform ``--upgrade-protocol``.
+AUTHORIZED_UPGRADE_SOURCES: tuple[int, ...] = ()
+
+#: SQLSTATEs (ADR §6.7).
+SQLSTATE_OWNER_MISMATCH = "45001"
+SQLSTATE_INVALID_STATE = "45002"
+SQLSTATE_CONFIG = "45004"
+SQLSTATE_MISSING = "45005"
+SQLSTATE_PROTOCOL = "45006"
+SQLSTATE_LOCK_NOT_AVAILABLE = "55P03"
+SQLSTATE_SERIALIZATION = "40001"
+SQLSTATE_DEADLOCK = "40P01"
+
+RETRYABLE_SQLSTATES = frozenset(
+    {SQLSTATE_INVALID_STATE, SQLSTATE_LOCK_NOT_AVAILABLE, SQLSTATE_SERIALIZATION, SQLSTATE_DEADLOCK}
+)
+
+DEFAULT_TTL_SECONDS = 300.0
+DEFAULT_LOCK_TIMEOUT_MS = 10_000
+DEFAULT_WAIT_SECONDS = 180.0
+
+
+class LeaseError(RuntimeError):
+    """A lease protocol failure carrying the PostgreSQL SQLSTATE.
+
+    Messages never contain the raw owner token or its full hash.
+    """
+
+    def __init__(self, sqlstate: str | None, message: str, *, fingerprint: str | None = None):
+        super().__init__(message)
+        self.sqlstate = sqlstate
+        self.fingerprint = fingerprint
+
+
+def sqlstate_of(exc: BaseException) -> str | None:
+    """Return the PostgreSQL SQLSTATE for a SQLAlchemy/psycopg exception."""
+    orig = getattr(exc, "orig", None)
+    for candidate in (getattr(orig, "sqlstate", None), getattr(getattr(orig, "diag", None), "sqlstate", None)):
+        if candidate:
+            return str(candidate)
+    if isinstance(orig, BaseException) and orig.args:
+        # psycopg2 exposes ``pgcode``.
+        code = getattr(orig, "pgcode", None)
+        if code:
+            return str(code)
+    return None
+
+
+def token_hash(token: str) -> str:
+    """Lowercase hex SHA-256 of the raw owner token (ADR §6.2)."""
+    import hashlib
+
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def fingerprint(token: str) -> str:
+    """First 12 hex characters of the token hash — the only loggable value."""
+    return token_hash(token)[:12]
+
+
+def generate_token(nonce_prefix: str = "") -> str:
+    """Return a 256-bit owner token (``secrets.token_hex(32)``).
+
+    An optional process nonce prefix is accepted so a rehearsal run can
+    correlate a single run's tokens without ever publishing them; the token
+    still carries at least 128 bits of fresh entropy beyond the prefix.
+    """
+    return f"{nonce_prefix}{secrets.token_hex(32)}"
+
+
+def _retry_delay(attempt: int) -> float:
+    """Backoff starting near 200 ms, capped at 2 s, with jitter (ADR §6.7)."""
+    base = min(2.0, 0.2 * (2 ** max(0, attempt - 1)))
+    return base * (0.5 + random.random())
+
+
+# ---------------------------------------------------------------------------
+# Protocol objects (ADR §6.1, §6.3–§6.6, §10.2)
+# ---------------------------------------------------------------------------
+
+CREATE_SCHEMA_SQL = f"CREATE SCHEMA {SCHEMA}"
+
+CREATE_TABLES_SQL = (
+    f"""
+CREATE TABLE {LEASE_TABLE} (
+    lease_name        text        PRIMARY KEY,
+    protocol_version  integer     NOT NULL,
+    owner_token_hash  text,
+    owner_fingerprint text,
+    owner_role        name,
+    acquired_at       timestamptz,
+    expires_at        timestamptz,
+    released_at       timestamptz,
+    generation        bigint      NOT NULL DEFAULT 0,
+    updated_at        timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT migration_lease_singleton_ck CHECK (lease_name = 'migration-lease'),
+    CONSTRAINT migration_lease_generation_ck CHECK (generation >= 0),
+    CONSTRAINT migration_lease_owner_shape_ck CHECK (
+        (owner_token_hash IS NULL AND owner_fingerprint IS NULL)
+        OR (owner_token_hash IS NOT NULL AND owner_fingerprint IS NOT NULL)
+    ),
+    CONSTRAINT migration_lease_owned_expiry_ck CHECK (
+        owner_token_hash IS NULL OR expires_at IS NOT NULL
+    )
+);
+""",
+    f"""
+CREATE TABLE {PROTOCOL_TABLE} (
+    singleton             boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    installed_version     integer NOT NULL,
+    min_supported_version integer NOT NULL,
+    max_supported_version integer NOT NULL,
+    barrier_state         text NOT NULL CHECK (barrier_state IN ('open', 'closed')),
+    bootstrap_state       text NOT NULL CHECK (bootstrap_state IN ('ready', 'installing')),
+    updated_at            timestamptz NOT NULL DEFAULT now(),
+    updated_by            name NOT NULL DEFAULT session_user,
+    note                  text
+);
+""",
+)
+
+ACQUIRE_SQL = f"""
+CREATE FUNCTION {SCHEMA}.lease_acquire_v1(
+    p_protocol integer,
+    p_token text,
+    p_ttl_seconds double precision,
+    p_lock_timeout_ms integer
+) RETURNS TABLE (out_owner_fingerprint text, out_expires_at timestamptz, out_generation bigint)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+    v_hash  text;
+    v_fp    text;
+    v_row   migration_internal.migration_lease%ROWTYPE;
+    v_inst  integer;
+    v_min   integer;
+    v_max   integer;
+    v_bar   text;
+    v_boot  text;
+    v_prev  text;
+    v_now   timestamptz;
+    v_exp   timestamptz;
+    v_gen   bigint;
+BEGIN
+    IF p_token IS NULL OR length(p_token) < 32
+       OR p_ttl_seconds IS NULL OR NOT (p_ttl_seconds > 0) OR p_ttl_seconds > 86400
+       OR p_lock_timeout_ms IS NULL OR p_lock_timeout_ms < 1 OR p_lock_timeout_ms > 600000 THEN
+        RAISE EXCEPTION 'lease configuration invalid' USING ERRCODE = '45004';
+    END IF;
+
+    v_hash := encode(sha256(convert_to(p_token, 'UTF8')), 'hex');
+    v_fp   := left(v_hash, 12);
+
+    v_prev := current_setting('lock_timeout');
+    PERFORM set_config('lock_timeout', p_lock_timeout_ms::text, true);
+
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('strikenova:migration_internal:migration_guard', 0));
+
+    SELECT l.* INTO v_row
+      FROM migration_internal.migration_lease AS l
+     WHERE l.lease_name = 'migration-lease'
+       FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'lease row missing; bootstrap required' USING ERRCODE = '45005';
+    END IF;
+
+    PERFORM set_config('lock_timeout', v_prev, true);
+
+    SELECT pr.installed_version, pr.min_supported_version, pr.max_supported_version,
+           pr.barrier_state, pr.bootstrap_state
+      INTO v_inst, v_min, v_max, v_bar, v_boot
+      FROM migration_internal.lease_protocol AS pr
+     WHERE pr.singleton;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'protocol row missing; bootstrap required' USING ERRCODE = '45005';
+    END IF;
+
+    IF v_inst <> p_protocol OR p_protocol < v_min OR p_protocol > v_max THEN
+        RAISE EXCEPTION 'protocol % not admissible: installed %, supported %..%',
+            p_protocol, v_inst, v_min, v_max USING ERRCODE = '45006';
+    END IF;
+
+    IF v_boot <> 'ready' THEN
+        RAISE EXCEPTION 'bootstrap incomplete (state %)', v_boot USING ERRCODE = '45005';
+    END IF;
+
+    IF v_row.protocol_version <> v_inst THEN
+        RAISE EXCEPTION 'lease row protocol % disagrees with installed %',
+            v_row.protocol_version, v_inst USING ERRCODE = '45006';
+    END IF;
+
+    IF v_bar = 'closed' THEN
+        RAISE EXCEPTION 'deployment barrier closed; only bootstrap may write'
+            USING ERRCODE = '45004';
+    END IF;
+
+    v_now := clock_timestamp();
+
+    IF v_row.owner_token_hash IS NOT NULL
+       AND (v_row.expires_at IS NULL OR v_row.expires_at > v_now) THEN
+        RAISE EXCEPTION 'lease held by % until %',
+            coalesce(v_row.owner_fingerprint, 'unknown'),
+            coalesce(v_row.expires_at::text, 'unknown')
+            USING ERRCODE = '45002';
+    END IF;
+
+    v_exp := v_now + make_interval(secs => p_ttl_seconds);
+
+    UPDATE migration_internal.migration_lease AS l
+       SET protocol_version  = p_protocol,
+           owner_token_hash  = v_hash,
+           owner_fingerprint = v_fp,
+           owner_role        = session_user::name,
+           acquired_at       = v_now,
+           expires_at        = v_exp,
+           released_at       = NULL,
+           generation        = l.generation + 1,
+           updated_at        = v_now
+     WHERE l.lease_name = 'migration-lease'
+    RETURNING l.generation INTO v_gen;
+
+    RETURN QUERY SELECT v_fp, v_exp, v_gen;
+END;
+$$;
+"""
+
+ENTER_SQL = f"""
+CREATE FUNCTION {SCHEMA}.lease_enter_v1(
+    p_protocol integer,
+    p_token text,
+    p_ttl_seconds double precision,
+    p_lock_timeout_ms integer
+) RETURNS TABLE (out_owner_fingerprint text, out_expires_at timestamptz, out_generation bigint)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+    v_hash text;
+    v_fp   text;
+    v_row  migration_internal.migration_lease%ROWTYPE;
+    v_inst integer;
+    v_min  integer;
+    v_max  integer;
+    v_boot text;
+    v_prev text;
+    v_now  timestamptz;
+    v_exp  timestamptz;
+BEGIN
+    IF p_token IS NULL OR length(p_token) < 32
+       OR p_ttl_seconds IS NULL OR NOT (p_ttl_seconds > 0) OR p_ttl_seconds > 86400
+       OR p_lock_timeout_ms IS NULL OR p_lock_timeout_ms < 1 OR p_lock_timeout_ms > 600000 THEN
+        RAISE EXCEPTION 'lease configuration invalid' USING ERRCODE = '45004';
+    END IF;
+
+    v_hash := encode(sha256(convert_to(p_token, 'UTF8')), 'hex');
+    v_fp   := left(v_hash, 12);
+
+    v_prev := current_setting('lock_timeout');
+    PERFORM set_config('lock_timeout', p_lock_timeout_ms::text, true);
+
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('strikenova:migration_internal:migration_guard', 0));
+
+    SELECT l.* INTO v_row
+      FROM migration_internal.migration_lease AS l
+     WHERE l.lease_name = 'migration-lease'
+       FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'lease row missing; bootstrap required' USING ERRCODE = '45005';
+    END IF;
+
+    PERFORM set_config('lock_timeout', v_prev, true);
+
+    SELECT pr.installed_version, pr.min_supported_version, pr.max_supported_version,
+           pr.bootstrap_state
+      INTO v_inst, v_min, v_max, v_boot
+      FROM migration_internal.lease_protocol AS pr
+     WHERE pr.singleton;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'protocol row missing; bootstrap required' USING ERRCODE = '45005';
+    END IF;
+
+    IF v_inst <> p_protocol OR p_protocol < v_min OR p_protocol > v_max THEN
+        RAISE EXCEPTION 'protocol % not admissible: installed %, supported %..%',
+            p_protocol, v_inst, v_min, v_max USING ERRCODE = '45006';
+    END IF;
+
+    IF v_boot <> 'ready' THEN
+        RAISE EXCEPTION 'bootstrap incomplete (state %)', v_boot USING ERRCODE = '45005';
+    END IF;
+
+    IF v_row.protocol_version <> v_inst THEN
+        RAISE EXCEPTION 'lease row protocol % disagrees with installed %',
+            v_row.protocol_version, v_inst USING ERRCODE = '45006';
+    END IF;
+
+    IF v_row.owner_token_hash IS NULL THEN
+        RAISE EXCEPTION 'lease has no owner' USING ERRCODE = '45002';
+    END IF;
+
+    IF v_row.owner_token_hash <> v_hash THEN
+        RAISE EXCEPTION 'lease owner mismatch (presented %)', v_fp USING ERRCODE = '45001';
+    END IF;
+
+    v_now := clock_timestamp();
+
+    IF v_row.expires_at IS NULL OR v_row.expires_at <= v_now THEN
+        RAISE EXCEPTION 'lease owned by % has expired at %', v_fp,
+            coalesce(v_row.expires_at::text, 'unknown')
+            USING ERRCODE = '45002';
+    END IF;
+
+    v_exp := v_now + make_interval(secs => p_ttl_seconds);
+
+    UPDATE migration_internal.migration_lease AS l
+       SET expires_at = v_exp,
+           updated_at = v_now
+     WHERE l.lease_name = 'migration-lease';
+
+    RETURN QUERY SELECT v_fp, v_exp, v_row.generation;
+END;
+$$;
+"""
+
+RELEASE_SQL = f"""
+CREATE FUNCTION {SCHEMA}.lease_release_v1(p_protocol integer, p_token text)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+    v_hash text;
+    v_row  migration_internal.migration_lease%ROWTYPE;
+    v_inst integer;
+    v_min  integer;
+    v_max  integer;
+    v_prev text;
+    v_now  timestamptz;
+BEGIN
+    IF p_token IS NULL OR length(p_token) < 32 THEN
+        RAISE EXCEPTION 'lease configuration invalid' USING ERRCODE = '45004';
+    END IF;
+
+    v_hash := encode(sha256(convert_to(p_token, 'UTF8')), 'hex');
+
+    v_prev := current_setting('lock_timeout');
+    PERFORM set_config('lock_timeout', '5000', true);
+
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('strikenova:migration_internal:migration_guard', 0));
+
+    SELECT l.* INTO v_row
+      FROM migration_internal.migration_lease AS l
+     WHERE l.lease_name = 'migration-lease'
+       FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'lease row missing; bootstrap required' USING ERRCODE = '45005';
+    END IF;
+
+    PERFORM set_config('lock_timeout', v_prev, true);
+
+    SELECT pr.installed_version, pr.min_supported_version, pr.max_supported_version
+      INTO v_inst, v_min, v_max
+      FROM migration_internal.lease_protocol AS pr
+     WHERE pr.singleton;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'protocol row missing; bootstrap required' USING ERRCODE = '45005';
+    END IF;
+
+    IF v_inst <> p_protocol OR p_protocol < v_min OR p_protocol > v_max THEN
+        RAISE EXCEPTION 'protocol % not admissible: installed %, supported %..%',
+            p_protocol, v_inst, v_min, v_max USING ERRCODE = '45006';
+    END IF;
+
+    IF v_row.protocol_version <> v_inst THEN
+        RAISE EXCEPTION 'lease row protocol % disagrees with installed %',
+            v_row.protocol_version, v_inst USING ERRCODE = '45006';
+    END IF;
+
+    IF v_row.owner_token_hash IS NULL THEN
+        RETURN false;
+    END IF;
+
+    IF v_row.owner_token_hash <> v_hash THEN
+        RAISE EXCEPTION 'lease owner mismatch (release)' USING ERRCODE = '45001';
+    END IF;
+
+    v_now := clock_timestamp();
+
+    UPDATE migration_internal.migration_lease AS l
+       SET owner_token_hash  = NULL,
+           owner_fingerprint = NULL,
+           owner_role        = NULL,
+           expires_at        = v_now,
+           released_at       = v_now,
+           updated_at        = v_now
+     WHERE l.lease_name = 'migration-lease';
+
+    RETURN true;
+END;
+$$;
+"""
+
+INFO_SQL = f"""
+CREATE FUNCTION {SCHEMA}.lease_protocol_info_v1()
+RETURNS TABLE (
+    installed_version     integer,
+    min_supported_version integer,
+    max_supported_version integer,
+    barrier_state         text,
+    bootstrap_state       text
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+BEGIN
+    RETURN QUERY
+        SELECT pr.installed_version,
+               pr.min_supported_version,
+               pr.max_supported_version,
+               pr.barrier_state,
+               pr.bootstrap_state
+          FROM migration_internal.lease_protocol AS pr
+         WHERE pr.singleton;
+END;
+$$;
+"""
+
+FUNCTION_SQL: tuple[str, ...] = (ACQUIRE_SQL, ENTER_SQL, RELEASE_SQL, INFO_SQL)
+
+REVOKE_SQL: tuple[str, ...] = (
+    f"REVOKE ALL ON SCHEMA {SCHEMA} FROM PUBLIC",
+    f"REVOKE ALL ON ALL TABLES    IN SCHEMA {SCHEMA} FROM PUBLIC",
+    f"REVOKE ALL ON ALL SEQUENCES IN SCHEMA {SCHEMA} FROM PUBLIC",
+    f"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA {SCHEMA} FROM PUBLIC",
+    f"REVOKE ALL ON SCHEMA {SCHEMA} FROM {{runtime_role}}",
+    f"REVOKE ALL ON ALL TABLES    IN SCHEMA {SCHEMA} FROM {{runtime_role}}",
+    f"REVOKE ALL ON ALL SEQUENCES IN SCHEMA {SCHEMA} FROM {{runtime_role}}",
+    f"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA {SCHEMA} FROM {{runtime_role}}",
+)
+
+
+# ---------------------------------------------------------------------------
+# Catalog verification (ADR §9.3, §9.4, §10.3)
+# ---------------------------------------------------------------------------
+
+EXPECTED_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
+    "migration_lease": {
+        "lease_name": ("text", "NO"),
+        "protocol_version": ("integer", "NO"),
+        "owner_token_hash": ("text", "YES"),
+        "owner_fingerprint": ("text", "YES"),
+        "owner_role": ("name", "YES"),
+        "acquired_at": ("timestamp with time zone", "YES"),
+        "expires_at": ("timestamp with time zone", "YES"),
+        "released_at": ("timestamp with time zone", "YES"),
+        "generation": ("bigint", "NO"),
+        "updated_at": ("timestamp with time zone", "NO"),
+    },
+    "lease_protocol": {
+        "singleton": ("boolean", "NO"),
+        "installed_version": ("integer", "NO"),
+        "min_supported_version": ("integer", "NO"),
+        "max_supported_version": ("integer", "NO"),
+        "barrier_state": ("text", "NO"),
+        "bootstrap_state": ("text", "NO"),
+        "updated_at": ("timestamp with time zone", "NO"),
+        "updated_by": ("name", "NO"),
+        "note": ("text", "YES"),
+    },
+}
+
+EXPECTED_CONSTRAINTS: dict[str, set[str]] = {
+    "migration_lease": {
+        "migration_lease_pkey",
+        "migration_lease_singleton_ck",
+        "migration_lease_generation_ck",
+        "migration_lease_owner_shape_ck",
+        "migration_lease_owned_expiry_ck",
+    },
+    "lease_protocol": {
+        "lease_protocol_pkey",
+        "lease_protocol_singleton_check",
+        "lease_protocol_barrier_state_check",
+        "lease_protocol_bootstrap_state_check",
+    },
+}
+
+EXPECTED_FUNCTIONS: dict[str, tuple[tuple[str, ...], str]] = {
+    # identity-argument types (format_type) -> result type
+    "lease_acquire_v1": (("integer", "text", "double precision", "integer"), "record"),
+    "lease_enter_v1": (("integer", "text", "double precision", "integer"), "record"),
+    "lease_release_v1": (("integer", "text"), "boolean"),
+    "lease_protocol_info_v1": ((), "record"),
+}
+
+
+def _problems_raise(problems: Iterable[str], context: str) -> None:
+    items = list(problems)
+    if items:
+        raise LeaseError(
+            SQLSTATE_CONFIG,
+            f"{context}: " + "; ".join(items),
+        )
+
+
+def _exec_sql(conn: Connection, sql: str):
+    """Execute literal SQL without DBAPI placeholder processing.
+
+    psycopg's pyformat paramstyle treats ``%`` as a placeholder introducer, and
+    the lease functions contain PL/pgSQL ``RAISE ... %`` placeholders and
+    ``%ROWTYPE``. Running the statement on the driver cursor with no parameters
+    keeps the SQL byte-exact, which is what the ADR specifies.
+    """
+    cur = conn.connection.cursor()
+    try:
+        cur.execute(sql)
+    finally:
+        cur.close()
+
+
+def _scalar(conn: Connection, sql: str, **params):
+    return conn.execute(text(sql), params).scalar()
+
+
+def _role_oid(conn: Connection, role: str) -> int | None:
+    return conn.execute(
+        text("SELECT oid FROM pg_roles WHERE rolname = :role"), {"role": role}
+    ).scalar()
+
+
+def verify_installation(
+    conn: Connection,
+    *,
+    migrator_role: str,
+    runtime_role: str | None,
+    expected_version: int,
+) -> None:
+    """Verify the installed protocol objects fail-closed (ADR §9.3–§9.5).
+
+    This function creates, repairs and drops nothing. Any mismatch raises
+    ``LeaseError`` with SQLSTATE 45004/45005 and the caller's transaction
+    rolls back.
+    """
+    problems: list[str] = []
+
+    migrator_oid = _role_oid(conn, migrator_role)
+    if migrator_oid is None:
+        raise LeaseError(
+            SQLSTATE_CONFIG, f"migration identity {migrator_role!r} does not exist"
+        )
+
+    schema = conn.execute(
+        text(
+            "SELECT n.nspowner::regrole::text AS owner, "
+            "(SELECT count(*) FROM pg_class c WHERE c.relnamespace = n.oid "
+            "  AND c.relkind = 'r') AS tables "
+            "FROM pg_namespace n WHERE n.nspname = :schema"
+        ),
+        {"schema": SCHEMA},
+    ).first()
+    if schema is None:
+        raise LeaseError(SQLSTATE_MISSING, f"schema {SCHEMA} is missing; bootstrap required")
+    if schema.owner != migrator_role:
+        problems.append(f"schema owner is {schema.owner}, expected {migrator_role}")
+    if int(schema.tables) != 2:
+        problems.append(f"schema has {schema.tables} tables, expected 2")
+
+    for table in EXPECTED_COLUMNS:
+        row = conn.execute(
+            text(
+                "SELECT c.relkind::text AS relkind, c.relowner::regrole::text AS owner, "
+                "c.relrowsecurity AS rls, c.relacl::text AS acl "
+                "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = :schema AND c.relname = :table"
+            ),
+            {"schema": SCHEMA, "table": table},
+        ).first()
+        if row is None:
+            problems.append(f"{SCHEMA}.{table} is missing")
+            continue
+        if row.relkind != "r":
+            problems.append(f"{SCHEMA}.{table} relkind is {row.relkind}, expected r")
+        if row.owner != migrator_role:
+            problems.append(f"{SCHEMA}.{table} owner is {row.owner}, expected {migrator_role}")
+        if row.rls:
+            problems.append(f"{SCHEMA}.{table} has row security enabled")
+
+        columns = {
+            r.column_name: (r.data_type, r.is_nullable)
+            for r in conn.execute(
+                text(
+                    "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
+                    "WHERE table_schema = :schema AND table_name = :table"
+                ),
+                {"schema": SCHEMA, "table": table},
+            )
+        }
+        expected_columns = EXPECTED_COLUMNS[table]
+        if set(columns) != set(expected_columns):
+            problems.append(
+                f"{table} columns {sorted(columns)} != {sorted(expected_columns)}"
+            )
+        else:
+            for name, signature in expected_columns.items():
+                if columns[name] != signature:
+                    problems.append(
+                        f"{table}.{name} is {columns[name]}, expected {signature}"
+                    )
+
+        constraints = {
+            r.conname
+            for r in conn.execute(
+                text(
+                    "SELECT conname FROM pg_constraint "
+                    "WHERE connamespace = cast(:schema AS regnamespace)"
+                ),
+                {"schema": SCHEMA},
+            )
+            if r.conname in EXPECTED_CONSTRAINTS[table]
+        }
+        missing = EXPECTED_CONSTRAINTS[table] - constraints
+        if missing:
+            problems.append(f"{table} missing constraints {sorted(missing)}")
+
+    # Functions: identity arguments from the catalog types, never text.
+    functions = {
+        r.proname: r
+        for r in conn.execute(
+            text(
+                "SELECT p.proname, "
+                " (SELECT array_agg(format_type(t, NULL)) FROM "
+                "    unnest(p.proargtypes::oid[]) WITH ORDINALITY AS u(t, ord)) AS argtypes, "
+                " pg_get_function_result(p.oid) AS result, "
+                " p.proowner::regrole::text AS owner, p.prosecdef, p.proconfig, "
+                " p.proacl::text AS acl "
+                "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                "WHERE n.nspname = :schema"
+            ),
+            {"schema": SCHEMA},
+        )
+    }
+    for name, (expected_args, expected_result) in EXPECTED_FUNCTIONS.items():
+        row = functions.get(name)
+        if row is None:
+            problems.append(f"function {name} is missing")
+            continue
+        actual_args = tuple(row.argtypes or ())
+        if actual_args != expected_args:
+            problems.append(f"{name} args {actual_args} != {expected_args}")
+        if row.owner != migrator_role:
+            problems.append(f"{name} owner is {row.owner}, expected {migrator_role}")
+        if not row.prosecdef:
+            problems.append(f"{name} is not SECURITY DEFINER")
+        if list(row.proconfig or []) != ["search_path=pg_catalog"]:
+            problems.append(f"{name} proconfig is {row.proconfig}, expected search_path=pg_catalog")
+        if expected_result == "boolean" and row.result != "boolean":
+            problems.append(f"{name} result is {row.result}, expected boolean")
+        if expected_result == "record" and "TABLE" not in (row.result or ""):
+            problems.append(f"{name} result is {row.result}, expected TABLE")
+
+    unknown = set(functions) - set(EXPECTED_FUNCTIONS)
+    if unknown:
+        problems.append(f"unexpected functions in {SCHEMA}: {sorted(unknown)}")
+
+    problems.extend(_acl_problems(conn, runtime_role))
+    problems.extend(_default_acl_problems(conn, migrator_role, runtime_role))
+    problems.extend(_row_problems(conn, expected_version))
+
+    _problems_raise(problems, "migration lease installation verification failed")
+
+
+def _acl_problems(conn: Connection, runtime_role: str | None) -> list[str]:
+    """No PUBLIC (grantee 0) and no runtime-role grants on lease objects."""
+    problems: list[str] = []
+    runtime_oid = _role_oid(conn, runtime_role) if runtime_role else None
+
+    for row in conn.execute(
+        text(
+            "SELECT c.relname, a.grantee, a.privilege_type "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "CROSS JOIN LATERAL aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) a "
+            "WHERE n.nspname = :schema AND c.relkind IN ('r', 'S') "
+            "  AND (a.grantee = 0 OR a.grantee = :runtime_oid)"
+        ),
+        {"schema": SCHEMA, "runtime_oid": runtime_oid or -1},
+    ):
+        problems.append(
+            f"{SCHEMA}.{row.relname} grants {row.privilege_type} to grantee {row.grantee}"
+        )
+
+    for row in conn.execute(
+        text(
+            "SELECT p.proname, a.grantee, a.privilege_type "
+            "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "CROSS JOIN LATERAL aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a "
+            "WHERE n.nspname = :schema AND (a.grantee = 0 OR a.grantee = :runtime_oid)"
+        ),
+        {"schema": SCHEMA, "runtime_oid": runtime_oid or -1},
+    ):
+        problems.append(
+            f"{SCHEMA}.{row.proname} grants {row.privilege_type} to grantee {row.grantee}"
+        )
+
+    # schema USAGE for the runtime role
+    if runtime_oid is not None:
+        usage = conn.execute(
+            text(
+                "SELECT has_schema_privilege(:runtime, :schema, 'USAGE')"
+            ),
+            {"runtime": runtime_role, "schema": SCHEMA},
+        ).scalar()
+        if usage:
+            problems.append(f"runtime role {runtime_role} has USAGE on {SCHEMA}")
+        for row in conn.execute(
+            text(
+                "SELECT c.relname, p.priv, "
+                "has_table_privilege(:runtime, c.oid, p.priv) AS effective "
+                "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE')) AS p(priv) "
+                "WHERE n.nspname = :schema AND c.relkind = 'r'"
+            ),
+            {"runtime": runtime_role, "schema": SCHEMA},
+        ):
+            if row.effective:
+                problems.append(
+                    f"runtime role has {row.priv} on {SCHEMA}.{row.relname}"
+                )
+        for row in conn.execute(
+            text(
+                "SELECT p.proname, has_function_privilege(:runtime, p.oid, 'EXECUTE') AS effective "
+                "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                "WHERE n.nspname = :schema"
+            ),
+            {"runtime": runtime_role, "schema": SCHEMA},
+        ):
+            if row.effective:
+                problems.append(f"runtime role has EXECUTE on {row.proname}")
+    return problems
+
+
+def _default_acl_problems(
+    conn: Connection, migrator_role: str, runtime_role: str | None
+) -> list[str]:
+    """Inspect global AND schema-scoped default ACLs (ADR §9.4)."""
+    problems: list[str] = []
+    runtime_oid = _role_oid(conn, runtime_role) if runtime_role else None
+    rows = conn.execute(
+        text(
+            "SELECT CASE WHEN d.defaclnamespace = 0 THEN '<global>' "
+            "            ELSE d.defaclnamespace::regnamespace::text END AS scope, "
+            "       d.defaclobjtype, a.grantee, a.privilege_type "
+            "FROM pg_default_acl d "
+            "CROSS JOIN LATERAL aclexplode(d.defaclacl) a "
+            "WHERE d.defaclrole = cast(:migrator AS regrole) "
+            "  AND (d.defaclnamespace = 0 "
+            "       OR d.defaclnamespace = cast(:schema AS regnamespace)) "
+            "  AND (a.grantee = 0 OR a.grantee = :runtime_oid)"
+        ),
+        {"migrator": migrator_role, "schema": SCHEMA, "runtime_oid": runtime_oid or -1},
+    )
+    for row in rows:
+        problems.append(
+            f"default ACL ({row.scope}, {row.defaclobjtype}) grants "
+            f"{row.privilege_type} to grantee {row.grantee}"
+        )
+    return problems
+
+
+def _row_problems(conn: Connection, expected_version: int) -> list[str]:
+    problems: list[str] = []
+    protocol_rows = conn.execute(
+        text(f"SELECT count(*) AS n FROM {PROTOCOL_TABLE}")
+    ).scalar()
+    if int(protocol_rows) != 1:
+        problems.append(f"{PROTOCOL_TABLE} has {protocol_rows} rows, expected 1")
+    lease_rows = conn.execute(
+        text(f"SELECT count(*) AS n FROM {LEASE_TABLE} WHERE lease_name = :name"),
+        {"name": LEASE_NAME},
+    ).scalar()
+    if int(lease_rows) != 1:
+        problems.append(f"{LEASE_TABLE} has {lease_rows} '{LEASE_NAME}' rows, expected 1")
+    if int(protocol_rows) == 1:
+        row = conn.execute(
+            text(f"SELECT installed_version, min_supported_version, max_supported_version, "
+                 f"barrier_state, bootstrap_state FROM {PROTOCOL_TABLE} WHERE singleton")
+        ).first()
+        if row is not None:
+            if not (row.min_supported_version <= int(row.installed_version) <= row.max_supported_version):
+                problems.append(
+                    f"installed version {row.installed_version} is outside the stored range "
+                    f"{row.min_supported_version}..{row.max_supported_version}"
+                )
+            if row.barrier_state not in ("open", "closed"):
+                problems.append(f"barrier_state {row.barrier_state!r} is invalid")
+            if row.bootstrap_state not in ("ready", "installing"):
+                problems.append(f"bootstrap_state {row.bootstrap_state!r} is invalid")
+    return problems
+
+
+# ---------------------------------------------------------------------------
+# Protocol state reads
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ProtocolInfo:
+    installed_version: int
+    min_supported_version: int
+    max_supported_version: int
+    barrier_state: str
+    bootstrap_state: str
+
+
+def read_protocol_info(engine: Engine) -> ProtocolInfo:
+    """Read the control row through ``lease_protocol_info_v1`` (no lock)."""
+    with engine.connect() as conn:
+        try:
+            row = conn.execute(
+                text(f"SELECT * FROM {SCHEMA}.lease_protocol_info_v1()")
+            ).first()
+        except DBAPIError as exc:
+            state = sqlstate_of(exc)
+            if state in ("42P01", "42883"):
+                raise LeaseError(
+                    SQLSTATE_MISSING,
+                    "migration lease is not installed; run 'python -m app.migrate bootstrap-lease'",
+                ) from None
+            raise LeaseError(state, "lease protocol state is unavailable") from None
+    if row is None:
+        raise LeaseError(SQLSTATE_MISSING, "lease protocol row is missing; bootstrap required")
+    return ProtocolInfo(
+        installed_version=int(row.installed_version),
+        min_supported_version=int(row.min_supported_version),
+        max_supported_version=int(row.max_supported_version),
+        barrier_state=str(row.barrier_state),
+        bootstrap_state=str(row.bootstrap_state),
+    )
+
+
+def preflight(
+    engine: Engine,
+    *,
+    expected_version: int = EXPECTED_PROTOCOL_VERSION,
+    supported_min: int = SUPPORTED_PROTOCOL_MIN,
+    supported_max: int = SUPPORTED_PROTOCOL_MAX,
+) -> ProtocolInfo:
+    """Fail-fast preflight (ADR §11.4.2 steps 2–5).
+
+    Advisory only: every admission re-checks the authoritative row inside
+    ``lease_acquire_v1`` under the guard and the lease row lock.
+    """
+    info = read_protocol_info(engine)
+    if info.bootstrap_state != "ready":
+        raise LeaseError(
+            SQLSTATE_MISSING,
+            f"bootstrap incomplete (state {info.bootstrap_state}); run bootstrap-lease",
+        )
+    if not (supported_min <= info.installed_version <= supported_max):
+        raise LeaseError(
+            SQLSTATE_PROTOCOL,
+            f"installed protocol {info.installed_version} is outside this release's "
+            f"supported range {supported_min}..{supported_max}",
+        )
+    if info.installed_version != expected_version:
+        raise LeaseError(
+            SQLSTATE_PROTOCOL,
+            f"database protocol {info.installed_version} != release protocol {expected_version}; "
+            "run the approved protocol upgrade",
+        )
+    if info.barrier_state != "open":
+        raise LeaseError(
+            SQLSTATE_CONFIG, "deployment barrier closed; only bootstrap may write"
+        )
+    return info
+
+
+# ---------------------------------------------------------------------------
+# Lease client
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LeaseState:
+    fingerprint: str
+    expires_at: object
+    generation: int
+
+
+class MigrationLease:
+    """Owner-side client for the ADR-017 lease protocol.
+
+    ``acquire`` retries within a monotonic budget; ``enter`` never retries.
+    ``release`` runs in its own short transaction and never masks the
+    original failure (ADR §6.8).
+    """
+
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        ttl_seconds: float | None = None,
+        lock_timeout_ms: int | None = None,
+        wait_seconds: float | None = None,
+        protocol: int = EXPECTED_PROTOCOL_VERSION,
+        token: str | None = None,
+    ):
+        from app.config import settings
+
+        self.engine = engine
+        self.ttl_seconds = float(
+            ttl_seconds if ttl_seconds is not None else settings.MIGRATION_LEASE_TTL_SECONDS
+        )
+        self.lock_timeout_ms = int(
+            lock_timeout_ms
+            if lock_timeout_ms is not None
+            else settings.MIGRATION_LEASE_LOCK_TIMEOUT_MS
+        )
+        self.wait_seconds = float(
+            wait_seconds if wait_seconds is not None else settings.MIGRATION_LEASE_WAIT_SECONDS
+        )
+        self.protocol = protocol
+        self._token = token or generate_token()
+        self.state: LeaseState | None = None
+
+    # -- credentials -----------------------------------------------------
+    @property
+    def fingerprint(self) -> str:
+        return fingerprint(self._token)
+
+    def _token_for_sql(self) -> str:  # pragma: no cover - trivial indirection
+        return self._token
+
+    # -- admission -------------------------------------------------------
+    def acquire(self) -> LeaseState:
+        """Acquire ownership, retrying within the monotonic budget."""
+        deadline = time.monotonic() + self.wait_seconds
+        attempt = 0
+        last: LeaseError | None = None
+        while True:
+            attempt += 1
+            try:
+                with self.engine.connect() as conn:
+                    with conn.begin():
+                        row = conn.execute(
+                            text(
+                                f"SELECT * FROM {SCHEMA}.lease_acquire_v1("
+                                ":protocol, :token, :ttl, :lock_timeout)"
+                            ),
+                            {
+                                "protocol": self.protocol,
+                                "token": self._token,
+                                "ttl": self.ttl_seconds,
+                                "lock_timeout": self.lock_timeout_ms,
+                            },
+                        ).one()
+                self.state = LeaseState(
+                    fingerprint=row.out_owner_fingerprint,
+                    expires_at=row.out_expires_at,
+                    generation=int(row.out_generation),
+                )
+                logger.info(
+                    "migration lease acquired (fingerprint=%s generation=%s)",
+                    self.state.fingerprint,
+                    self.state.generation,
+                )
+                return self.state
+            except DBAPIError as exc:
+                last = LeaseError(
+                    sqlstate_of(exc), _sanitize(exc), fingerprint=self.fingerprint
+                )
+            except LeaseError as exc:  # pragma: no cover - defensive
+                last = exc
+
+            if last.sqlstate not in RETRYABLE_SQLSTATES:
+                raise last
+            if time.monotonic() + _retry_delay(attempt) >= deadline:
+                raise LeaseError(
+                    last.sqlstate,
+                    f"migration lease not acquired within {self.wait_seconds:.0f}s "
+                    f"(last: {last})",
+                    fingerprint=self.fingerprint,
+                )
+            time.sleep(_retry_delay(attempt))
+
+    # -- protected transaction entry ------------------------------------
+    def enter(self, conn: Connection) -> LeaseState:
+        """Take the guard and the lease row lock, verify ownership, refresh expiry.
+
+        Must be the first SQL statement of every protected transaction.
+        """
+        try:
+            row = conn.execute(
+                text(
+                    f"SELECT * FROM {SCHEMA}.lease_enter_v1("
+                    ":protocol, :token, :ttl, :lock_timeout)"
+                ),
+                {
+                    "protocol": self.protocol,
+                    "token": self._token,
+                    "ttl": self.ttl_seconds,
+                    "lock_timeout": self.lock_timeout_ms,
+                },
+            ).one()
+        except DBAPIError as exc:
+            raise LeaseError(
+                sqlstate_of(exc), _sanitize(exc), fingerprint=self.fingerprint
+            ) from None
+        state = LeaseState(
+            fingerprint=row.out_owner_fingerprint,
+            expires_at=row.out_expires_at,
+            generation=int(row.out_generation),
+        )
+        self.state = state
+        return state
+
+    # -- release ---------------------------------------------------------
+    def release(self) -> bool:
+        """Release ownership in its own short transaction (never inside work)."""
+        try:
+            with self.engine.connect() as conn:
+                with conn.begin():
+                    released = conn.execute(
+                        text(
+                            f"SELECT {SCHEMA}.lease_release_v1(:protocol, :token)"
+                        ),
+                        {"protocol": self.protocol, "token": self._token},
+                    ).scalar()
+            logger.info(
+                "migration lease released (fingerprint=%s released=%s)",
+                self.fingerprint,
+                released,
+            )
+            return bool(released)
+        except DBAPIError as exc:
+            raise LeaseError(
+                sqlstate_of(exc), _sanitize(exc), fingerprint=self.fingerprint
+            ) from None
+
+
+def _sanitize(exc: BaseException) -> str:
+    """Best-effort single-line message that carries no connection material."""
+    message = str(getattr(exc, "orig", exc)).strip().splitlines()
+    return message[0] if message else type(exc).__name__
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap and operator modes (ADR §9.2, §11.4.4)
+# ---------------------------------------------------------------------------
+
+
+def bootstrap_lease(
+    engine: Engine,
+    *,
+    mode: str = "verify",
+    upgrade_to: int | None = None,
+    expected_version: int | None = None,
+    supported_min: int | None = None,
+    supported_max: int | None = None,
+    authorized_sources: tuple[int, ...] = AUTHORIZED_UPGRADE_SOURCES,
+    migrator_role: str | None = None,
+    runtime_role: str | None = None,
+    lock_timeout: str = "10s",
+) -> dict:
+    """Run one bootstrap mode: ``verify`` (install/verify), ``close_barrier``, ``upgrade``.
+
+    Returns a small report dict for the CLI. Raises :class:`LeaseError` on
+    any refusal; the transaction rolls back and nothing changes.
+    """
+    from app.config import settings
+
+    migrator_role = migrator_role or settings.STRIKENOVA_MIGRATOR_ROLE
+    runtime_role = runtime_role if runtime_role is not None else settings.STRIKENOVA_RUNTIME_ROLE
+    expected_version = (
+        expected_version if expected_version is not None else EXPECTED_PROTOCOL_VERSION
+    )
+    supported_min = supported_min if supported_min is not None else SUPPORTED_PROTOCOL_MIN
+    supported_max = supported_max if supported_max is not None else SUPPORTED_PROTOCOL_MAX
+
+    if mode not in ("verify", "close_barrier", "upgrade"):
+        raise LeaseError(SQLSTATE_CONFIG, f"unknown bootstrap mode {mode!r}")
+    if mode == "close_barrier":
+        return _close_barrier(engine, migrator_role=migrator_role, lock_timeout=lock_timeout)
+    if mode == "upgrade":
+        if upgrade_to is None:
+            raise LeaseError(SQLSTATE_CONFIG, "--upgrade-protocol requires a target version")
+
+    with engine.connect() as conn:
+        try:
+            _exec_sql(conn, f"SET lock_timeout = '{lock_timeout}'")
+            conn.commit()
+        except DBAPIError as exc:
+            raise LeaseError(sqlstate_of(exc), _sanitize(exc)) from None
+
+        with conn.begin():
+            _assert_migrator_identity(conn, migrator_role)
+            _exec_sql(conn, f"SELECT pg_advisory_xact_lock({BOOTSTRAP_GUARD_SQL})")
+
+            installed = conn.execute(
+                text(f"SELECT to_regclass('{PROTOCOL_TABLE}') IS NOT NULL AS present")
+            ).scalar()
+            report: dict = {"mode": mode}
+
+            if not installed:
+                if mode == "upgrade":
+                    raise LeaseError(
+                        SQLSTATE_MISSING,
+                        "migration lease is not installed; run bootstrap-lease first",
+                    )
+                report.update(
+                    _first_install(
+                        conn,
+                        expected_version=expected_version,
+                        supported_min=supported_min,
+                        supported_max=supported_max,
+                        migrator_role=migrator_role,
+                        runtime_role=runtime_role,
+                    )
+                )
+            else:
+                report.update(
+                    _verify_or_upgrade(
+                        conn,
+                        mode=mode,
+                        upgrade_to=upgrade_to,
+                        expected_version=expected_version,
+                        supported_min=supported_min,
+                        supported_max=supported_max,
+                        authorized_sources=authorized_sources,
+                        migrator_role=migrator_role,
+                        runtime_role=runtime_role,
+                    )
+                )
+
+            info = conn.execute(
+                text(f"SELECT * FROM {SCHEMA}.lease_protocol_info_v1()")
+            ).one()
+            if info.installed_version != (upgrade_to if mode == "upgrade" else expected_version):
+                raise LeaseError(
+                    SQLSTATE_CONFIG,
+                    "post-bootstrap protocol state does not match the requested version",
+                )
+            if info.barrier_state != "open" or info.bootstrap_state != "ready":
+                raise LeaseError(
+                    SQLSTATE_CONFIG,
+                    f"post-bootstrap state is {info.barrier_state}/{info.bootstrap_state}, "
+                    "expected open/ready",
+                )
+            report.update(
+                installed_version=int(info.installed_version),
+                barrier_state=info.barrier_state,
+                bootstrap_state=info.bootstrap_state,
+            )
+            return report
+
+
+def _assert_migrator_identity(conn: Connection, migrator_role: str) -> None:
+    current = conn.exec_driver_sql("SELECT current_user").scalar()
+    if current != migrator_role:
+        raise LeaseError(
+            SQLSTATE_CONFIG,
+            f"bootstrap must run as {migrator_role!r}; current_user is {current!r}",
+        )
+
+
+def _first_install(
+    conn: Connection,
+    *,
+    expected_version: int,
+    supported_min: int,
+    supported_max: int,
+    migrator_role: str,
+    runtime_role: str | None,
+) -> dict:
+    """ADR §9.2.1 — create, seed, install, revoke, verify, then open/ready."""
+    schema_present = conn.execute(
+        text("SELECT to_regnamespace(:schema) IS NOT NULL"), {"schema": SCHEMA}
+    ).scalar()
+    lease_present = conn.execute(
+        text(f"SELECT to_regclass('{LEASE_TABLE}') IS NOT NULL")
+    ).scalar()
+    alembic_present = conn.execute(
+        text("SELECT to_regclass('public.alembic_version') IS NOT NULL")
+    ).scalar()
+    if schema_present or lease_present or alembic_present:
+        raise LeaseError(
+            SQLSTATE_CONFIG,
+            "partial or out-of-order installation detected (migration_internal, "
+            "migration_lease or alembic_version already exists without a protocol row); "
+            "refusing to create",
+        )
+
+    _exec_sql(conn, CREATE_SCHEMA_SQL)
+    for statement in CREATE_TABLES_SQL:
+        _exec_sql(conn, statement)
+    conn.execute(
+        text(
+            f"INSERT INTO {PROTOCOL_TABLE} (installed_version, min_supported_version, "
+            "max_supported_version, barrier_state, bootstrap_state) "
+            "VALUES (:installed, :min, :max, 'closed', 'installing')"
+        ),
+        {"installed": expected_version, "min": supported_min, "max": supported_max},
+    )
+    conn.execute(
+        text(
+            f"INSERT INTO {LEASE_TABLE} (lease_name, protocol_version) "
+            "VALUES (:name, :protocol)"
+        ),
+        {"name": LEASE_NAME, "protocol": expected_version},
+    )
+    for statement in FUNCTION_SQL:
+        _exec_sql(conn, statement)
+    for statement in REVOKE_SQL:
+        _exec_sql(conn, statement.format(runtime_role=_quote_ident(runtime_role)))
+
+    verify_installation(
+        conn,
+        migrator_role=migrator_role,
+        runtime_role=runtime_role,
+        expected_version=expected_version,
+    )
+
+    conn.execute(
+        text(
+            f"UPDATE {PROTOCOL_TABLE} SET installed_version = :installed, "
+            "min_supported_version = :min, max_supported_version = :max, "
+            "barrier_state = 'open', bootstrap_state = 'ready', "
+            "updated_at = now(), updated_by = session_user WHERE singleton"
+        ),
+        {"installed": expected_version, "min": supported_min, "max": supported_max},
+    )
+    return {"installed": "created"}
+
+
+def _verify_or_upgrade(
+    conn: Connection,
+    *,
+    mode: str,
+    upgrade_to: int | None,
+    expected_version: int,
+    supported_min: int,
+    supported_max: int,
+    authorized_sources: tuple[int, ...],
+    migrator_role: str,
+    runtime_role: str | None,
+) -> dict:
+    """ADR §9.2.2 / §11.4.3 steps 3–8 for an existing installation."""
+    row = conn.execute(
+        text(
+            f"SELECT owner_token_hash, owner_fingerprint, expires_at, "
+            f"clock_timestamp() AS now FROM {LEASE_TABLE} "
+            "WHERE lease_name = :name FOR UPDATE"
+        ),
+        {"name": LEASE_NAME},
+    ).first()
+    if row is None:
+        raise LeaseError(SQLSTATE_MISSING, f"{LEASE_TABLE} row is missing")
+
+    if row.owner_token_hash is not None and (
+        row.expires_at is None or row.expires_at > row.now
+    ):
+        raise LeaseError(
+            SQLSTATE_INVALID_STATE,
+            f"lease is held by {row.owner_fingerprint or 'unknown'} until {row.expires_at}; "
+            "bootstrap requires quiescence",
+            fingerprint=row.owner_fingerprint,
+        )
+
+    conn.execute(
+        text(
+            f"UPDATE {PROTOCOL_TABLE} SET barrier_state = 'closed', "
+            "updated_at = now(), updated_by = session_user WHERE singleton"
+        )
+    )
+
+    verify_installation(
+        conn,
+        migrator_role=migrator_role,
+        runtime_role=runtime_role,
+        expected_version=expected_version,
+    )
+
+    control = conn.execute(
+        text(
+            f"SELECT installed_version, min_supported_version, max_supported_version "
+            f"FROM {PROTOCOL_TABLE} WHERE singleton"
+        )
+    ).one()
+
+    if mode == "verify":
+        if int(control.installed_version) != expected_version:
+            raise LeaseError(
+                SQLSTATE_PROTOCOL,
+                f"installed protocol {control.installed_version} != this release's "
+                f"expected protocol {expected_version}; use --upgrade-protocol",
+            )
+        if not (
+            control.min_supported_version
+            <= expected_version
+            <= control.max_supported_version
+        ):
+            raise LeaseError(
+                SQLSTATE_PROTOCOL,
+                f"installed protocol {expected_version} is outside the stored range "
+                f"{control.min_supported_version}..{control.max_supported_version}",
+            )
+        conn.execute(
+            text(
+                f"UPDATE {PROTOCOL_TABLE} SET barrier_state = 'open', "
+                "bootstrap_state = 'ready', updated_at = now(), "
+                "updated_by = session_user WHERE singleton"
+            )
+        )
+        return {"installed": "verified"}
+
+    # upgrade mode
+    target = int(upgrade_to)  # type: ignore[arg-type]
+    if target != expected_version:
+        raise LeaseError(
+            SQLSTATE_PROTOCOL,
+            f"--upgrade-protocol {target} is not this release's expected protocol "
+            f"{expected_version}",
+        )
+    if target < int(control.installed_version):
+        raise LeaseError(
+            SQLSTATE_PROTOCOL,
+            f"refusing downgrade from {control.installed_version} to {target}",
+        )
+    if int(control.installed_version) not in authorized_sources:
+        raise LeaseError(
+            SQLSTATE_PROTOCOL,
+            f"installed protocol {control.installed_version} is not an authorized "
+            f"upgrade source for {target}",
+        )
+
+    conn.execute(
+        text(
+            f"UPDATE {PROTOCOL_TABLE} SET installed_version = :target, "
+            "min_supported_version = :min, max_supported_version = :max, "
+            "barrier_state = 'open', bootstrap_state = 'ready', "
+            "updated_at = now(), updated_by = session_user WHERE singleton"
+        ),
+        {"target": target, "min": supported_min, "max": supported_max},
+    )
+    conn.execute(
+        text(
+            f"UPDATE {LEASE_TABLE} SET protocol_version = :target, updated_at = now() "
+            "WHERE lease_name = :name"
+        ),
+        {"target": target, "name": LEASE_NAME},
+    )
+    return {"installed": f"upgraded {control.installed_version}->{target}"}
+
+
+def _close_barrier(engine: Engine, *, migrator_role: str, lock_timeout: str) -> dict:
+    """ADR §11.4.4 — drain window without waiting on the lease row lock."""
+    with engine.connect() as conn:
+        try:
+            _exec_sql(conn, f"SET lock_timeout = '{lock_timeout}'")
+            conn.commit()
+        except DBAPIError as exc:
+            raise LeaseError(sqlstate_of(exc), _sanitize(exc)) from None
+
+        with conn.begin():
+            _assert_migrator_identity(conn, migrator_role)
+            _exec_sql(conn, f"SELECT pg_advisory_xact_lock({BOOTSTRAP_GUARD_SQL})")
+
+            rows = conn.execute(text(f"SELECT count(*) FROM {PROTOCOL_TABLE}")).scalar()
+            if int(rows) == 0:
+                raise LeaseError(
+                    SQLSTATE_MISSING,
+                    "migration lease is not installed; run bootstrap-lease",
+                )
+            if int(rows) != 1:
+                raise LeaseError(SQLSTATE_CONFIG, f"{PROTOCOL_TABLE} has {rows} rows")
+
+            conn.execute(
+                text(f"SELECT 1 FROM {PROTOCOL_TABLE} WHERE singleton FOR UPDATE")
+            )
+
+            report: dict = {"mode": "close_barrier"}
+            _exec_sql(conn, "SAVEPOINT close_probe")
+            try:
+                probe = conn.execute(
+                    text(
+                        f"SELECT owner_fingerprint, expires_at FROM {LEASE_TABLE} "
+                        "WHERE lease_name = :name FOR UPDATE NOWAIT"
+                    ),
+                    {"name": LEASE_NAME},
+                ).first()
+                report["lease_row_lock"] = "free"
+                report["owner_fingerprint"] = (
+                    probe.owner_fingerprint if probe is not None else None
+                )
+                report["expires_at"] = str(probe.expires_at) if probe is not None else None
+            except DBAPIError as exc:
+                if sqlstate_of(exc) != SQLSTATE_LOCK_NOT_AVAILABLE:
+                    raise LeaseError(sqlstate_of(exc), _sanitize(exc)) from None
+                report["lease_row_lock"] = "held"
+                report["owner_fingerprint"] = None
+                report["expires_at"] = None
+            finally:
+                _exec_sql(conn, "ROLLBACK TO SAVEPOINT close_probe")
+
+            conn.execute(
+                text(
+                    f"UPDATE {PROTOCOL_TABLE} SET barrier_state = 'closed', "
+                    "updated_at = now(), updated_by = session_user WHERE singleton"
+                )
+            )
+            return report
+
+
+def _quote_ident(identifier: str | None) -> str:
+    """Quote a role name for the bootstrap REVOKE set."""
+    if not identifier:
+        return "PUBLIC"
+    return '"' + identifier.replace('"', '""') + '"'

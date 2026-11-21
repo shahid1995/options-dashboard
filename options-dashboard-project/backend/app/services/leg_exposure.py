@@ -375,14 +375,24 @@ def backfill_exposures(db: Session, user_id: str) -> int:
             db, user_id, position.strategy_execution_id, entry_orders, position.updated_at or position.opened_at
         )
         created += len(new_rows)
-    db.commit()
+    # The transaction boundary belongs to the caller (ADR §7.3). On PostgreSQL
+    # the startup path wraps each user in one protected transaction whose first
+    # statement is lease entry and whose last statement before COMMIT refreshes
+    # the lease; a commit here would break that contract.
+    db.flush()
     return created
 
 
 def backfill_all_exposures(db: Session) -> int:
-    """Run the conservative backfill for every user (startup migration)."""
+    """Run the conservative backfill for every user (SQLite startup path).
+
+    Commits once per user. The PostgreSQL startup path does not use this
+    helper: it drives the same ``backfill_exposures`` per-user function inside
+    lease-protected transactions (see ``app.db.run_startup_backfill``).
+    """
     user_ids = list(db.scalars(select(Position.user_id).distinct()).all())
     total = 0
     for user_id in user_ids:
         total += backfill_exposures(db, user_id)
+        db.commit()
     return total

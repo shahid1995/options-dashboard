@@ -1,0 +1,190 @@
+name: Issue #145 - ADR-017/018 application integration (PostgreSQL 16.16)
+
+# Runs the REAL application migration path against a disposable, isolated
+# PostgreSQL 16.16 service container:
+#   * app.db.init_db() / concurrent startup, Alembic under the lease
+#   * per-user backfill as the migration identity, kill and failure recovery
+#   * python -m app.migrate upgrade / bootstrap-lease / barrier / protocol
+#   * ADR-018 privilege boundary (runtime vs migrator vs owner)
+#
+# No persistent volume, no provider credential, no Neon connection and no
+# production or staging database is contacted. The suite provisions and drops
+# its own uniquely named databases and roles.
+#
+# The job fails when any assertion fails: pytest's exit status is preserved in
+# the gate step that produces the job outcome.
+
+on:
+  push:
+    branches: [test/issue145-application-pg16]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  application-integration:
+    name: PostgreSQL 16.16 application lease integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        # Pinned digest of postgres:16.16 (the acceptance version).
+        image: postgres@sha256:3950ad7c3148ca2175ef1b6c36c9efbf78957ae8fbe8b3a5d7c35af50500382f
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+          POSTGRES_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}-issue145
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    defaults:
+      run:
+        working-directory: options-dashboard-project/backend
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Configure disposable PostgreSQL connection
+        env:
+          PG_SERVICE_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}-issue145
+        run: |
+          echo "::add-mask::$PG_SERVICE_PASSWORD"
+          printf 'ISSUE145_PG_ADMIN_URL=postgresql://postgres:%s@127.0.0.1:5432/postgres\n' "$PG_SERVICE_PASSWORD" >> "$GITHUB_ENV"
+
+      - name: Require PostgreSQL 16.16 exactly
+        run: |
+          python - <<'PY'
+          import os
+          import psycopg
+
+          with psycopg.connect(os.environ["ISSUE145_PG_ADMIN_URL"]) as conn:
+              banner = conn.execute("SHOW server_version").fetchone()[0]
+              num = int(conn.execute("SHOW server_version_num").fetchone()[0])
+              sysid = conn.execute(
+                  "SELECT system_identifier FROM pg_control_system()"
+              ).fetchone()[0]
+          print("server_version:", banner)
+          print("server_version_num:", num)
+          print("system_identifier:", sysid)
+          if num != 160016:
+              raise SystemExit(f"expected PostgreSQL 16.16 (160016), got {num}")
+          PY
+
+      - name: ADR-017/018 application integration tests
+        env:
+          STRIKENOVA_ENV: ""
+        run: |
+          if python -m pytest -q \
+              tests/test_issue145_application_integration.py \
+              --junitxml=issue145-application.xml > issue145-application.log 2>&1; then
+            echo "0" > issue145-application.rc
+          else
+            echo "$?" > issue145-application.rc
+          fi
+          exit 0
+
+      - name: Migration and SQLite regression suite
+        env:
+          STRIKENOVA_ENV: ""
+        run: |
+          if python -m pytest -q \
+              tests/test_migration_serialization.py \
+              tests/test_db_migration.py \
+              tests/test_migration_identity_separation.py \
+              tests/test_alembic_migrations.py \
+              tests/test_alembic_single_head.py \
+              tests/test_alembic_env_resolution.py \
+              tests/test_day5_alembic_authority.py \
+              tests/test_leg_exposure.py > issue145-regression.log 2>&1; then
+            echo "0" > issue145-regression.rc
+          else
+            echo "$?" > issue145-regression.rc
+          fi
+          exit 0
+
+      - name: Gate on the actual test results
+        if: always()
+        run: |
+          set -uo pipefail
+          status=0
+          for stem in issue145-application issue145-regression; do
+            rc=$(cat "$stem.rc" 2>/dev/null || echo "missing")
+            echo "===== $stem (exit $rc) ====="
+            tail -n 60 "$stem.log" 2>/dev/null || echo "no log produced"
+            if [ "$rc" != "0" ]; then
+              status=1
+            fi
+          done
+          if [ -f issue145-application.log ]; then
+            if grep -qE "[0-9]+ failed" issue145-application.log; then
+              status=1
+            fi
+            if ! grep -qE "[0-9]+ passed" issue145-application.log; then
+              echo "the integration suite produced no passing tests"
+              status=1
+            fi
+          else
+            status=1
+          fi
+          exit $status
+
+      - name: Drop leftover test databases and roles
+        if: always()
+        run: |
+          python - <<'PY'
+          import os
+          import psycopg
+
+          try:
+              with psycopg.connect(os.environ["ISSUE145_PG_ADMIN_URL"], autocommit=True) as conn:
+                  dbs = [r[0] for r in conn.execute(
+                      "SELECT datname FROM pg_database WHERE datname LIKE 'sn145\\_%'"
+                  )]
+                  for db in dbs:
+                      conn.execute(
+                          "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                          "WHERE datname = %s AND pid <> pg_backend_pid()", (db,)
+                      )
+                      conn.execute(f'DROP DATABASE IF EXISTS "{db}"')
+                  roles = [r[0] for r in conn.execute(
+                      "SELECT rolname FROM pg_roles WHERE rolname LIKE 'sn145\\_%'"
+                  )]
+                  for role in roles:
+                      conn.execute(f'DROP ROLE IF EXISTS "{role}"')
+                  print(f"cleanup: dropped {len(dbs)} database(s), {len(roles)} role(s)")
+          except Exception as exc:  # noqa: BLE001 - cleanup must not mask results
+              print(f"cleanup skipped: {type(exc).__name__}")
+          PY
+
+      - name: Upload sanitized evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue145-application-pg16-evidence
+          path: |
+            options-dashboard-project/backend/issue145-application.log
+            options-dashboard-project/backend/issue145-application.xml
+            options-dashboard-project/backend/issue145-regression.log
+            options-dashboard-project/backend/issue145-application.rc
+            options-dashboard-project/backend/issue145-regression.rc
+          if-no-files-found: warn
+          retention-days: 14

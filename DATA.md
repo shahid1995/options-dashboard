@@ -97,22 +97,29 @@ Alembic revisions) therefore automatically carry runtime DML/USAGE. The
 runtime identity gains no CREATE/ALTER/DROP/TRUNCATE/ownership/admin through
 this mechanism. **The defaults do not follow a creator-role change:** if
 migrations ever run under a different role, re-apply the defaults for that
-role as part of the change (Invariant 6e, ADR-018). Do not revoke these rows
+role as part of the change (Invariant 6f, ADR-018). Do not revoke these rows
 while the migrator-creator model is in force.
 
-**Migration serialization.** The single-row lease table `_migration_lock`
-(ADR-017) is owned by `strikenova_prod_migrator`; the lock must be free
-(`locked_by IS NULL`) outside an active migration. The lease TTL must be
->= 2 seconds (`MIGRATION_LOCK_TTL_SECONDS`, default 120; renewal interval
-`max(1.0, TTL/3)` — configuration rejects smaller values). The manual
-operator CLI path (`alembic upgrade head`) remains outside the application
-lock (ADR-017 Residual). It resolves its database with the same precedence
-as startup migrations — explicit operator `sqlalchemy.url`, then
-`STRIKENOVA_MIGRATION_DATABASE_URL` (the migration identity), then
-`DATABASE_URL` — so a standalone CLI run must use the migration identity
-(`strikenova_prod_migrator`) unless an explicit operator URL is
-intentionally supplied; running it under the DML-only runtime identity
-would create future tables that lack the runtime default privileges.
+**Migration serialization.** The ADR-017/018 lease lives in its own schema
+`migration_internal`, owned by `strikenova_prod_owner`, and consists of the
+single-row `migration_lease` table plus the `lease_protocol` control row and
+the `SECURITY DEFINER` function set (`acquire_lease`, `enter_lease`,
+`release_lease`; `search_path=pg_catalog`; no `PUBLIC` EXECUTE). Outside an
+active migration the lease row is unowned (`owner_token_hash IS NULL`) and the
+barrier is `open`; `bootstrap_state` is `ready` only after a verified
+bootstrap. Only the SHA-256 of the 256-bit owner token is stored. Nobody —
+including the runtime role — gets `USAGE` on `migration_internal`, and the
+schema's default ACLs grant nothing. The renewal thread is retired: ownership
+is the lease row lock, `MIGRATION_LEASE_TTL_SECONDS` (default 300) bounds
+recovery of an abandoned row, and
+`MIGRATION_LEASE_WAIT_SECONDS`/`MIGRATION_LEASE_LOCK_TIMEOUT_MS` bound
+admission. `python -m app.migrate` is the only supported migration path; a
+bare `alembic upgrade head` fails closed. Operating detail:
+`docs/ADR-017-018-IMPLEMENTATION-RUNBOOK.md`. A standalone CLI run must use
+the migration identity (`strikenova_prod_migrator`) unless an explicit
+operator URL is intentionally supplied; running it under the DML-only runtime
+identity would create future tables that lack the runtime default privileges,
+and on PostgreSQL the unguarded path is refused outright.
 
 ## 6. Historical data architecture
 
