@@ -143,6 +143,11 @@ GUARD_MIN_LENGTH = 32
 # 27 fixed scenario databases. Anything else is refused, never adopted.
 SCENARIO_DATABASE_NAMES = tuple(f"issue145_t{number:02d}" for number in range(1, 28))
 
+# The guard is skipped by name in the target check, so an ambiguous guard name
+# would exempt the wrong object. System and scenario databases are never guards.
+SYSTEM_DATABASE_NAMES = ("postgres", "template0", "template1")
+RESERVED_DATABASE_NAMES = SYSTEM_DATABASE_NAMES + SCENARIO_DATABASE_NAMES
+
 # Marker written into the catalog comment of every database this harness
 # creates. An existing database counts as harness-owned only when its comment
 # equals this exact value, which binds it to the verified cluster identity and
@@ -657,6 +662,30 @@ def verify_cluster_identity(admin):
     return actual
 
 
+def guard_database_name():
+    """The configured guard database name, refused when it is reserved.
+
+    The default is the fixed name `issue145_guard`. The variable stays
+    overridable for a cluster provisioned under another name, but whatever the
+    value it may never be a PostgreSQL system database or one of the scenario
+    databases: the target check skips the guard by name, so an ambiguous name
+    would exempt the wrong object from the checks.
+    """
+    name = (HARNESS_GUARD_DATABASE or "").strip()
+    if not name:
+        raise SafetyRefusal(
+            "HARNESS_GUARD_DATABASE is empty; name the pre-provisioned guard database")
+    if name in SYSTEM_DATABASE_NAMES:
+        raise SafetyRefusal(
+            f"refusing HARNESS_GUARD_DATABASE={name!r}: a PostgreSQL system "
+            "database can never be the guard database")
+    if name in SCENARIO_DATABASE_NAMES:
+        raise SafetyRefusal(
+            f"refusing HARNESS_GUARD_DATABASE={name!r}: a scenario database can "
+            "never be the guard database; the guard must be a separate database")
+    return name
+
+
 def verify_guard(admin, system_identifier):
     """Verify the pre-provisioned guard for this exact cluster.
 
@@ -664,19 +693,20 @@ def verify_guard(admin, system_identifier):
     provisioning the disposable cluster, never by the run whose safety it
     authorizes. A matching label and system identifier are not a substitute.
     """
+    guard_name = guard_database_name()
     if len(HARNESS_CLUSTER_GUARD) < GUARD_MIN_LENGTH:
         raise SafetyRefusal(
             "HARNESS_CLUSTER_GUARD must hold the random value written into the "
             f"guard database during provisioning (at least {GUARD_MIN_LENGTH} "
             "characters). The harness never generates or writes it")
-    exists, comment = _scenario_database_state(admin, HARNESS_GUARD_DATABASE)
+    exists, comment = _scenario_database_state(admin, guard_name)
     if not exists:
         raise SafetyRefusal(
-            f"guard database {HARNESS_GUARD_DATABASE!r} does not exist; provision "
+            f"guard database {guard_name!r} does not exist; provision "
             "it and its guard comment before any destructive run")
     if not comment or not comment.startswith(GUARD_COMMENT_PREFIX):
         raise SafetyRefusal(
-            f"guard database {HARNESS_GUARD_DATABASE!r} has no guard comment "
+            f"guard database {guard_name!r} has no guard comment "
             f"starting with {GUARD_COMMENT_PREFIX!r}; refusing to run")
     payload = comment[len(GUARD_COMMENT_PREFIX):]
     if ":" not in payload:
@@ -711,6 +741,7 @@ def validate_destructive_target(admin):
     and every statement executed here is read-only.
     """
     system_identifier = verify_cluster_identity(admin)
+    guard_name = guard_database_name()
     verify_guard(admin, system_identifier)
 
     problems = []
@@ -722,8 +753,8 @@ def validate_destructive_target(admin):
         "ORDER BY d.datname").fetchall()
     unowned = []
     for name, comment in databases:
-        if name == HARNESS_GUARD_DATABASE:
-            continue  # verified independently by verify_guard()
+        if name == guard_name:
+            continue  # the validated, separate guard database; checked above
         if name not in SCENARIO_DATABASE_NAMES:
             unowned.append(f"{name} (not a harness scenario database name)")
         elif comment != marker:
@@ -1955,26 +1986,40 @@ def scenario_T15(conn):
     return "PASS"
 
 
-def grant_topology_b_application_privileges(scenario_admin, db_name):
-    """Apply §8.3's four grants in the database that owns the tables.
+def grant_topology_b_application_privileges(conn, db_name):
+    """Apply §8.3's four grants as the table owner, in the tables' database.
 
-    Application tables exist only in the scenario database, so a GRANT issued on
-    the cluster's `postgres` database would target objects that do not exist
-    there. The connected database is asserted before any grant is issued.
+    The application tables are owned by `strikenova_prod_owner`, and the cluster
+    administrator is not assumed to be a superuser, the owner, a member of the
+    owner role or a grant-option holder. The grants therefore run on a migrator
+    connection inside an explicit `SET ROLE strikenova_prod_owner` window, using
+    the designed `SET TRUE` membership, and never with administrator authority.
+    The database and both role contexts are asserted before, and after, the
+    grants respectively, and no GRANT executes outside that window.
     """
-    current = run_sql(scenario_admin, "SELECT current_database()", fetch_mode="one")
+    current = run_sql(conn, "SELECT current_database()", fetch_mode="one")
     connected = None if current is None else current[0]
     if connected != db_name:
         raise ProtocolFailure(
             "T-16: refusing to grant application privileges outside the scenario "
             f"database {db_name!r}; the connection is to {connected!r}")
-    for statement in (
-        f"GRANT SELECT ON public.positions TO {MIGRATOR_ROLE}",
-        f"GRANT SELECT ON public.paper_orders TO {MIGRATOR_ROLE}",
-        f"GRANT SELECT, INSERT ON public.strategy_leg_exposures TO {MIGRATOR_ROLE}",
-        f"GRANT USAGE ON SEQUENCE public.strategy_leg_exposures_id_seq TO {MIGRATOR_ROLE}",
-    ):
-        scenario_admin.execute(statement)
+    with conn.transaction():
+        run_sql(conn, "SET ROLE " + OWNER_ROLE)
+        if run_sql(conn, "SELECT current_user::text", fetch_mode="one")[0] != OWNER_ROLE:
+            raise ProtocolFailure(
+                "T-16: refusing to grant because SET ROLE did not establish the "
+                f"owner execution context (current_user is not {OWNER_ROLE})")
+        for statement in (
+            f"GRANT SELECT ON public.positions TO {MIGRATOR_ROLE}",
+            f"GRANT SELECT ON public.paper_orders TO {MIGRATOR_ROLE}",
+            f"GRANT SELECT, INSERT ON public.strategy_leg_exposures TO {MIGRATOR_ROLE}",
+            f"GRANT USAGE ON SEQUENCE public.strategy_leg_exposures_id_seq TO {MIGRATOR_ROLE}",
+        ):
+            conn.execute(statement)
+        run_sql(conn, "RESET ROLE")
+        if run_sql(conn, "SELECT current_user::text", fetch_mode="one")[0] != MIGRATOR_ROLE:
+            raise ProtocolFailure(
+                "T-16: RESET ROLE did not restore the migrator after granting")
 
 
 def scenario_T16(conn):
@@ -1983,9 +2028,9 @@ def scenario_T16(conn):
         raise SetupFailure("T-16 must run on a migrator connection")
 
     db_name = scenario_db_name("T-16")
-    # Administrator connection to the scenario database that owns the tables.
-    # T-16 needs no cluster-level operation, so it opens no `postgres` connection.
-    scenario_admin = scenario_admin_connect(db_name)
+    # No cluster-level connection: the grants use the designed SET TRUE
+    # membership on a separate migrator connection to this scenario database.
+    grant_conn = connect_migrator(db_name)
     try:
         # The non-login owner creates the application tables through an explicit
         # elevation window; the migrator never gains owner rights by inheritance.
@@ -2012,9 +2057,10 @@ def scenario_T16(conn):
             run_sql(conn, "REVOKE ALL ON ALL FUNCTIONS IN SCHEMA migration_internal FROM "
                           + APP_ROLE)
 
-        # Four minimal grants on the owner's objects, issued in the scenario
-        # database that actually contains them — never on `postgres`.
-        grant_topology_b_application_privileges(scenario_admin, db_name)
+        # Four minimal grants on the owner's objects, issued as the owner inside
+        # a SET ROLE window on a separate migrator connection to this scenario
+        # database — never by the administrator and never on `postgres`.
+        grant_topology_b_application_privileges(grant_conn, db_name)
 
         with conn.transaction():
             expected_matrix = {
@@ -2079,7 +2125,7 @@ def scenario_T16(conn):
                 raise ProtocolFailure("T-16: RESET ROLE did not restore the migrator")
         return "PASS"
     finally:
-        scenario_admin.close()
+        grant_conn.close()
 
 
 def scenario_T17(conn):
@@ -2603,17 +2649,44 @@ def _self_test_checks():
         assert migrator.dbname == "issue145_t01"
         assert bare.dbname == "anything"
 
-    @check("T-16 grants run on the scenario database, never on postgres")
-    def _t16_target():
-        scenario = _FakeConnection(lambda q, p: [("issue145_t16",)],
-                                   dbname="issue145_t16")
-        grant_topology_b_application_privileges(scenario, "issue145_t16")
-        grants = [q for _, q, _ in scenario.statements
-                  if q.upper().startswith("GRANT")]
-        assert len(grants) == 4, f"expected four GRANT statements, got {grants}"
-        assert all(db == "issue145_t16" for db, _, _ in scenario.statements)
+    @check("T-16 grants run as the owner inside issue145_t16 only")
+    def _t16_authorization():
+        state = {"database": "issue145_t16", "current_user": MIGRATOR_ROLE,
+                 "set_role": True, "reset_role": True}
 
-        wrong = _FakeConnection(lambda q, p: [("postgres",)], dbname="postgres")
+        def handler(query, params):
+            text = " ".join(query.split())
+            if text == "SELECT current_database()":
+                return [(state["database"],)]
+            if text == "SELECT current_user::text":
+                return [(state["current_user"],)]
+            if text == "SET ROLE " + OWNER_ROLE:
+                if state["set_role"]:
+                    state["current_user"] = OWNER_ROLE
+                return []
+            if text == "RESET ROLE":
+                if state["reset_role"]:
+                    state["current_user"] = MIGRATOR_ROLE
+                return []
+            return []
+
+        grant_conn = _FakeConnection(handler, dbname="issue145_t16")
+        grant_topology_b_application_privileges(grant_conn, "issue145_t16")
+        statements = [query for _, query, _ in grant_conn.statements]
+        grant_positions = [index for index, query in enumerate(statements)
+                           if query.upper().startswith("GRANT")]
+        assert len(grant_positions) == 4, statements
+        set_position = statements.index("SET ROLE " + OWNER_ROLE)
+        reset_position = statements.index("RESET ROLE")
+        assert all(set_position < index < reset_position for index in grant_positions), \
+            "a GRANT ran outside the owner window"
+        assert all(db == "issue145_t16" for db, _, _ in grant_conn.statements), \
+            "a GRANT ran on a connection to another database"
+        assert grant_conn.transactions == 1, "the grant window is not one transaction"
+
+        # Wrong database: refused before any GRANT.
+        state.update(database="postgres", current_user=MIGRATOR_ROLE, set_role=True)
+        wrong = _FakeConnection(handler, dbname="postgres")
         try:
             grant_topology_b_application_privileges(wrong, "issue145_t16")
         except ProtocolFailure:
@@ -2621,13 +2694,40 @@ def _self_test_checks():
         else:
             raise AssertionError("a GRANT was accepted while connected to postgres")
         assert not [q for _, q, _ in wrong.statements
+                    if q.upper().startswith("GRANT")], "a GRANT reached postgres"
+
+        # SET ROLE did not take effect: refused before any GRANT.
+        state.update(database="issue145_t16", current_user=MIGRATOR_ROLE,
+                     set_role=False)
+        no_elevation = _FakeConnection(handler, dbname="issue145_t16")
+        try:
+            grant_topology_b_application_privileges(no_elevation, "issue145_t16")
+        except ProtocolFailure:
+            pass
+        else:
+            raise AssertionError("a GRANT was issued without the owner context")
+        assert not [q for _, q, _ in no_elevation.statements
                     if q.upper().startswith("GRANT")], \
-            "a GRANT reached postgres"
+            "a GRANT ran without the owner context"
+
+        # RESET ROLE does not restore the migrator: the window fails closed.
+        state.update(current_user=MIGRATOR_ROLE, set_role=True, reset_role=False)
+        stuck = _FakeConnection(handler, dbname="issue145_t16")
+        try:
+            grant_topology_b_application_privileges(stuck, "issue145_t16")
+        except ProtocolFailure:
+            pass
+        else:
+            raise AssertionError("a failed RESET ROLE was accepted")
 
         source = inspect.getsource(scenario_T16)
-        assert "grant_topology_b_application_privileges(scenario_admin, db_name)" in source
+        assert "grant_conn = connect_migrator(db_name)" in source
+        assert "grant_topology_b_application_privileges(grant_conn, db_name)" in source
         assert "GRANT " not in source, "T-16 still issues a GRANT inline"
-        assert "scenario_admin_connect(db_name)" in source
+        assert "scenario_admin_connect" not in source
+        helper = inspect.getsource(grant_topology_b_application_privileges)
+        assert "SET ROLE" in helper and "RESET ROLE" in helper
+        assert "replace" not in helper
 
     @check("cluster identity comes from pg_control, not from the static label")
     def _identity():
@@ -2836,6 +2936,55 @@ def _self_test_checks():
         source = inspect.getsource(scenario_T23)
         assert "SET installed_version" not in source
         assert "lease_protocol SET" not in source
+
+    @check("the guard database is never a system or scenario database")
+    def _guard_name():
+        for name in ("postgres", "template0", "template1", "issue145_t01",
+                     "issue145_t27"):
+            restore = _temporary_globals(
+                HARNESS_TARGET_SYSTEM_IDENTIFIER="123",
+                HARNESS_CLUSTER_GUARD=GUARD_TEST_NONCE,
+                HARNESS_GUARD_DATABASE=name)
+            try:
+                admin = _fake_admin(identity="123")
+                try:
+                    validate_destructive_target(admin)
+                except SafetyRefusal as exc:
+                    assert "guard" in str(exc).lower(), str(exc)
+                else:
+                    raise AssertionError(
+                        f"HARNESS_GUARD_DATABASE={name!r} was accepted")
+                mutating = ("DROP", "CREATE", "GRANT", "COMMENT", "ALTER", "REVOKE")
+                assert not [q for _, q, _ in admin.statements
+                            if q.upper().startswith(mutating)], \
+                    f"the gate mutated the cluster before refusing {name!r}"
+            finally:
+                restore()
+
+        # An empty name is refused too.
+        restore = _temporary_globals(
+            HARNESS_TARGET_SYSTEM_IDENTIFIER="123",
+            HARNESS_CLUSTER_GUARD=GUARD_TEST_NONCE,
+            HARNESS_GUARD_DATABASE="")
+        try:
+            try:
+                validate_destructive_target(_fake_admin(identity="123"))
+            except SafetyRefusal:
+                pass
+            else:
+                raise AssertionError("an empty guard database name was accepted")
+        finally:
+            restore()
+
+        # A separate name with a valid, pre-provisioned guard is accepted.
+        restore = _temporary_globals(
+            HARNESS_TARGET_SYSTEM_IDENTIFIER="123",
+            HARNESS_CLUSTER_GUARD=GUARD_TEST_NONCE,
+            HARNESS_GUARD_DATABASE="issue145_guard")
+        try:
+            validate_destructive_target(_gate_admin())
+        finally:
+            restore()
 
     @check("a pre-provisioned guard is required, identity-bound and nonce-checked")
     def _guard():

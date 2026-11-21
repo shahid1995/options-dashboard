@@ -92,13 +92,19 @@ string values equal them exactly.
    `prepare_scenario_database()` for every scenario, connects to that unique
    database, runs the scenario, then calls `drop_scenario_db()` in a `finally`
    path. The helper is on the execution path, not merely defined.
-6. **Separate identities.** The administrator connection provisions disposable
-   databases and cluster roles, and issues T-16's four grants on a second
-   administrator connection *to `issue145_t16`* after asserting
-   `current_database()`; no application-table grant is attempted on `postgres`.
-   Every scenario connection uses `strikenova_prod_migrator`, and the cluster
-   roles are provisioned once before T-01. T-15 exercises a real APP session;
-   T-16 opens the owner window with `SET ROLE` and returns with `RESET ROLE`.
+6. **Separate identities.** The administrator connection only provisions
+   disposable databases and cluster roles; it never grants on application
+   tables, and nothing here assumes the administrator is a superuser, the table
+   owner, a member of the owner role or a grant-option holder. T-16 issues its
+   four grants on a separate `strikenova_prod_migrator` connection to
+   `issue145_t16`, after asserting `current_database()`, inside an explicit
+   `SET ROLE strikenova_prod_owner` window: the owner context is asserted before
+   the grants, `RESET ROLE` is asserted back to the migrator after them, and the
+   connection is closed in `finally`. This uses the designed `SET TRUE`
+   membership rather than giving the cluster administrator object-grant
+   authority. Every scenario connection uses the migrator, and the cluster roles
+   are provisioned once before T-01. T-15 exercises a real APP session; T-16
+   keeps its own DDL owner window and returns with `RESET ROLE`.
 7. **Unavailability handling.** The connection attempt and the server-version
    probe are both wrapped. If the server is unreachable, or it is not PostgreSQL
    major 16 with minor 16 or later, the runner reports all 27 NOT RUN with exit 0.
@@ -153,6 +159,10 @@ The gate runs in two stages:
    every statement in this stage is read-only:
    - the cluster's `system_identifier` must equal
      `HARNESS_TARGET_SYSTEM_IDENTIFIER`;
+   - the guard database name may not be a PostgreSQL system database
+     (`postgres`, `template0`, `template1`) or any scenario database
+     (`issue145_t01`…`issue145_t27`); the guard must be a separate database, and
+     this is checked before anything is provisioned;
    - the guard database `HARNESS_GUARD_DATABASE` must already exist and its
      comment must read `issue145-harness-guard:<system_identifier>:<nonce>` with
      the verified identifier and `HARNESS_CLUSTER_GUARD` as the nonce. The
@@ -199,6 +209,10 @@ database and execute `pg_control_system()`:
    COMMENT ON DATABASE issue145_guard IS 'issue145-harness-guard:<system_identifier>:<nonce>';
    ```
 
+   The guard must be its own database. It may never be `postgres`, `template0`,
+   `template1` or one of `issue145_t01`…`issue145_t27`; the gate refuses any of
+   those names before it provisions or drops anything.
+
 4. Export the same nonce as `HARNESS_CLUSTER_GUARD` for every run, alongside
    `HARNESS_TARGET_SYSTEM_IDENTIFIER` from step 2.
 
@@ -216,7 +230,7 @@ and is refused here.
 | `DB_PORT` | `55432` | all connections |
 | `HARNESS_TARGET_SYSTEM_IDENTIFIER` | empty (run is refused) | cluster identity check, database marker |
 | `HARNESS_CLUSTER_GUARD` | empty (run is refused) | guard nonce check, database marker |
-| `HARNESS_GUARD_DATABASE` | `issue145_guard` | name of the pre-provisioned guard database |
+| `HARNESS_GUARD_DATABASE` | `issue145_guard` | name of the pre-provisioned guard database; system and scenario database names are refused |
 | `ADMIN_DB_USER` / `ADMIN_DB_PASSWORD` | falls back to `DB_USER` / `DB_PASSWORD` | administrator: create/drop databases and roles, grant on a scenario database, terminate backends |
 | `MIGRATOR_DB_USER` | `strikenova_prod_migrator` | every scenario connection |
 | `MIGRATOR_DB_PASSWORD` | empty | migrator login |
@@ -301,7 +315,7 @@ not accepted as evidence.
 | T-13 | Interrupted backfill and recovery | NOT RUN | Requires the real backfill |
 | T-14 | Version mismatch and closed barrier | NOT RUN | Implemented; not executed |
 | T-15 | Topology A — runtime APP has no lease privilege | NOT RUN | Implemented; not executed |
-| T-16 | Topology B — non-inherited membership and grants | NOT RUN | Implemented (migrator session, `SET ROLE` owner window, the four grants issued on a separate administrator connection to `issue145_t16` after asserting `current_database()`, owner denied functions, return to migrator matrix); not executed |
+| T-16 | Topology B — non-inherited membership and grants | NOT RUN | Implemented (migrator session, `SET ROLE` owner window, the four grants issued on a separate migrator connection to `issue145_t16` after asserting `current_database()` and the owner context and `RESET ROLE` back, owner denied functions, return to migrator matrix); not executed |
 | T-17 | `alembic upgrade head` directly | NOT RUN | No Alembic binary |
 | T-18 | `python -m app.migrate upgrade head` | NOT RUN | No application runner |
 | T-19 | Injected backfill and release failures | NOT RUN | Requires a blocker session |
@@ -368,7 +382,7 @@ they are not current results and are not reused anywhere in this document.
 
   ```bash
   python3 docs/reviews/issue145-t01-t27-harness/run_t01_to_t27.py --self-test
-  # Total: 17, PASS: 17, FAIL: 0   (exit 0)
+  # Total: 18, PASS: 18, FAIL: 0   (exit 0)
   ```
 
   It injects a fake driver and contacts no server. Its checks cover: autocommit
@@ -391,8 +405,12 @@ they are not current results and are not reused anywhere in this document.
   `issue145_t00`, `issue145_disposable`, `issue145_t01_backup` and `app_db`; a
   `42501` on `pg_control_system()` being reported as a refusal with no mutation;
   an unbounded 14-role membership chain reaching the migrator, a direct
-  membership and a membership cycle all being rejected; and a counter proving no
-  real driver connection is attempted during the self-test.
+  membership and a membership cycle all being rejected; the guard name being
+  refused for `postgres`, `template0`, `template1` and scenario names; the four
+  T-16 grants executing only inside the asserted owner window on the
+  `issue145_t16` connection, with no GRANT on a wrong database, without the
+  owner context, or after a failed `RESET ROLE`; and a counter proving no real
+  driver connection is attempted during the self-test.
 - Two no-server runs still produce 27 NOT RUN: exit 2 without the opt-in (no
   connection opened) and exit 0 with it (no server reachable; here `psycopg` is
   also absent, so the module's stub driver reports the unreachable path).

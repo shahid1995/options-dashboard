@@ -155,7 +155,9 @@ outcome.
   matching `HARNESS_TARGET_SYSTEM_IDENTIFIER` and the pre-provisioned
   `HARNESS_CLUSTER_GUARD`. Cluster identity comes from
   `pg_control_system().system_identifier`, not from the label. The guard database
-  must already exist with the comment
+  name may not be `postgres`, `template0`, `template1` or any of
+  `issue145_t01`…`issue145_t27`, so a system or scenario database can never be
+  skipped as the guard. The guard database must already exist with the comment
   `issue145-harness-guard:<identifier>:<nonce>`; the harness never creates it,
   never writes the comment and never generates the nonce, so a matching label
   and identifier cannot substitute for it, and a guard copied from another
@@ -176,15 +178,23 @@ outcome.
   runtime role to the migrator or owner is rejected. The direct-membership check
   is preserved.
 - T-16 issues its four application-table and sequence grants on a separate
-  administrator connection to `issue145_t16`, after asserting
-  `current_database() = 'issue145_t16'`; the cluster-level `postgres` connection
-  is not used for them.
+  `strikenova_prod_migrator` connection to `issue145_t16`, after asserting
+  `current_database() = 'issue145_t16'`, inside an explicit
+  `SET ROLE strikenova_prod_owner` window whose owner context is asserted before
+  the grants and whose `RESET ROLE` back to the migrator is asserted after them;
+  the connection is closed in a `finally` path. The cluster administrator is not
+  used for the grants and is not assumed to be a superuser, table owner,
+  member of the owner role or grant-option holder.
 - The runner probes `SHOW server_version` / `server_version_num` and accepts only
   PostgreSQL major 16 with minor 16 or later. PostgreSQL 15, 17 and 18 are
   refused, so a lower bound alone does not silently admit another major version.
-- The DB-free self-test published in the harness passes: 17 checks, 0 failures
+- The DB-free self-test published in the harness passes: 18 checks, 0 failures
   (`--self-test`, no server contacted). It also increments a real-connect counter,
-  which confirms the self-test opened no PostgreSQL connection.
+  which confirms the self-test opened no PostgreSQL connection. It includes the
+  guard-name refusals (`postgres`, `template0`, `template1`, `issue145_t01`,
+  `issue145_t27`, empty) and the T-16 owner-window authorisation cases: no GRANT
+  on a wrong database, no GRANT without the owner context, and a failed
+  `RESET ROLE` failing closed.
 
 ## Execution model and safety gate
 
