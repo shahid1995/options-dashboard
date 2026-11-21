@@ -1,4 +1,6 @@
 import os
+from dataclasses import dataclass
+from typing import Callable
 
 from sqlalchemy import create_engine, text, event
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
@@ -341,32 +343,192 @@ def _migration_engine_url() -> str:
     return resolve_migration_database_url()
 
 
-def _migration_lock_url() -> str:
-    """Resolve the URL used for the migration lease lock (ADR-017).
+# ---------------------------------------------------------------------------
+# ADR-017 migration lease / ADR-018 identity separation
+# ---------------------------------------------------------------------------
 
-    The lock travels with the migration identity: when
-    ``STRIKENOVA_MIGRATION_DATABASE_URL`` is set, the lease lives under the
-    migrator credential; otherwise the runtime URL (or the local SQLite
-    fallback) is used. The runtime identity therefore never needs DDL/owner
-    rights for locking.
 
-    Delegates to :func:`resolve_migration_database_url` so the lock shares
-    the exact precedence and blank/whitespace semantics of the migration
-    resolver — it can never diverge (e.g. a whitespace-only migration URL
-    is "unset" for the lock exactly as it is for migrations).
+def _runtime_url_from_settings() -> str | None:
+    value = (settings.DATABASE_URL or "").strip()
+    return normalize_database_url(value) if value else None
+
+
+def _is_postgres_url(url: str) -> bool:
+    return url.split(":", 1)[0].startswith(("postgres", "cockroachdb"))
+
+
+def _database_identity(url: str) -> tuple:
+    """Return the identity attributes that must differ between roles.
+
+    Passwords are deliberately excluded: they are not part of the identity
+    comparison and must never appear in a log or exception.
     """
-    return resolve_migration_database_url()
+    from sqlalchemy.engine import make_url
+
+    parsed = make_url(url)
+    return (
+        parsed.get_backend_name(),
+        parsed.username,
+        parsed.host,
+        parsed.port,
+        parsed.database,
+    )
 
 
-def _run_alembic_migrations() -> None:
+def assert_guarded_migration_configuration(
+    runtime_url: str | None = None,
+    migration_url: str | None = None,
+) -> str:
+    """Fail closed on an unsafe PostgreSQL migration configuration (ADR §8.1).
+
+    On PostgreSQL the migration identity must be explicit
+    (``STRIKENOVA_MIGRATION_DATABASE_URL``) and must not resolve to the same
+    database identity as the runtime ``DATABASE_URL``. SQLite keeps its
+    single-process, single-identity behaviour.
+    """
+    runtime_url = runtime_url or _runtime_url_from_settings()
+    migration_url = migration_url or _migration_engine_url()
+
+    if not runtime_url or not _is_postgres_url(runtime_url):
+        return migration_url
+
+    explicit = (getattr(settings, "STRIKENOVA_MIGRATION_DATABASE_URL", None) or "").strip()
+    if not explicit:
+        from app._migration_lease import LeaseError, SQLSTATE_CONFIG
+
+        raise LeaseError(
+            SQLSTATE_CONFIG,
+            "STRIKENOVA_MIGRATION_DATABASE_URL is required when DATABASE_URL is "
+            "PostgreSQL: the runtime identity must never execute migrations",
+        )
+
+    explicit_url = normalize_database_url(explicit)
+    if _database_identity(explicit_url) == _database_identity(runtime_url):
+        from app._migration_lease import LeaseError, SQLSTATE_CONFIG
+
+        raise LeaseError(
+            SQLSTATE_CONFIG,
+            "the migration and runtime identities resolve to the same database "
+            "identity; refusing to run migrations as the runtime role",
+        )
+    return migration_url
+
+
+def _migration_engine():
+    """Build (and return) the engine for the dedicated migration identity."""
+    url = assert_guarded_migration_configuration()
+    return create_engine(
+        url,
+        poolclass=None,
+        pool_pre_ping=True,
+        pool_size=2,
+        max_overflow=2,
+        pool_timeout=30,
+    )
+
+
+def _quote_role(role: str) -> str:
+    return '"' + role.replace('"', '""') + '"'
+
+
+def _set_owner_role(conn) -> None:
+    """ADR §8.3 Topology B: explicit owner-role window around Alembic DDL."""
+    owner_role = (getattr(settings, "STRIKENOVA_OWNER_ROLE", "") or "").strip()
+    if not owner_role:
+        return
+    conn.exec_driver_sql(f"SET ROLE {_quote_role(owner_role)}")
+    current = conn.exec_driver_sql("SELECT current_user").scalar()
+    if current != owner_role:
+        from app._migration_lease import LeaseError, SQLSTATE_CONFIG
+
+        raise LeaseError(
+            SQLSTATE_CONFIG,
+            f"SET ROLE {owner_role!r} did not take effect (current_user={current!r})",
+        )
+
+
+def _reset_owner_role(conn) -> None:
+    owner_role = (getattr(settings, "STRIKENOVA_OWNER_ROLE", "") or "").strip()
+    if not owner_role:
+        return
+    conn.exec_driver_sql("RESET ROLE")
+    current = conn.exec_driver_sql("SELECT current_user").scalar()
+    migrator_role = settings.STRIKENOVA_MIGRATOR_ROLE
+    if current != migrator_role:
+        from app._migration_lease import LeaseError, SQLSTATE_CONFIG
+
+        raise LeaseError(
+            SQLSTATE_CONFIG,
+            f"RESET ROLE did not restore the migration identity "
+            f"(current_user={current!r}, expected {migrator_role!r})",
+        )
+
+
+def _run_guarded_migrations(
+    alembic_cfg,
+    command,
+    logger,
+    post_migration_callback: Callable[["MigrationWork"], None] | None = None,
+) -> None:
+    """Run Alembic DDL inside the ADR-017 lease transaction (ADR §7.1, §13).
+
+    The lease row lock, the advisory guard and the DDL share one physical
+    connection and one transaction. ``enter`` is the first statement of that
+    transaction and again the last statement before ``COMMIT``.
+    """
+    from app._migration_lease import MigrationLease, preflight
+
+    migration_engine = _migration_engine()
+    lease = MigrationLease(migration_engine)
+    preflight(migration_engine)
+    lease.acquire()
+    primary: BaseException | None = None
+    try:
+        with migration_engine.connect() as conn:
+            # Session-level bounded lock wait, before the transaction begins.
+            conn.exec_driver_sql(
+                f"SET lock_timeout = '{settings.MIGRATION_LEASE_LOCK_TIMEOUT_MS}ms'"
+            )
+            conn.commit()
+            with conn.begin():
+                lease.enter(conn)  # FIRST statement of the protected transaction
+                alembic_cfg.attributes["connection"] = conn
+                alembic_cfg.attributes["lease_guard"] = lease
+                _set_owner_role(conn)
+                command.upgrade(alembic_cfg, "head")
+                # Only reached on success: an exception rolls the whole
+                # transaction back, so the elevation cannot outlive it.
+                _reset_owner_role(conn)
+                lease.enter(conn)  # refresh immediately before COMMIT
+        logger.info("Alembic migrations applied successfully under the lease")
+
+        if post_migration_callback is not None:
+            post_migration_callback(MigrationWork(engine=migration_engine, lease=lease))
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        try:
+            lease.release()
+        except Exception:  # noqa: BLE001 - cleanup must never mask the cause
+            logger.exception(
+                "migration lease cleanup failed (fingerprint=%s)", lease.fingerprint
+            )
+            if primary is None:
+                raise
+        finally:
+            migration_engine.dispose()
+
+
+def _run_alembic_migrations(
+    post_migration_callback: Callable[["MigrationWork"], None] | None = None,
+) -> None:
     """Run Alembic migrations against the migration identity.
 
-    Alembic is the authoritative schema-management path. By default the
-    runtime engine is passed through Config.attributes so programmatic
-    startup and in-memory tests reuse the same connectable. When
-    ``STRIKENOVA_MIGRATION_DATABASE_URL`` is set, migrations run under that
-    (higher-privilege) identity instead, so the runtime credential does not
-    need schema-DDL/ownership rights.
+    On SQLite the historical single-process path is preserved. On PostgreSQL
+    the ADR-017 lease guards the DDL transaction and the post-migration
+    backfill (``post_migration_callback``), and the runtime identity never
+    executes DDL.
     """
     import logging
     from alembic.config import Config
@@ -374,93 +536,96 @@ def _run_alembic_migrations() -> None:
 
     logger = logging.getLogger(__name__)
     alembic_cfg = Config("alembic.ini")
-    migration_url = _migration_engine_url()
+    migration_url = assert_guarded_migration_configuration()
     alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
-    # Reuse the runtime engine when no separate migration identity is
-    # configured (single-identity deployments, in-memory tests). This is a
-    # configuration decision, not a URL-string comparison: the resolver is
-    # settings-driven, so comparing URLs against the live engine would be
-    # fragile and could silently retarget a patched/replaced engine.
-    _migration_separated = bool(
-        getattr(settings, "STRIKENOVA_MIGRATION_DATABASE_URL", None)
-        and settings.STRIKENOVA_MIGRATION_DATABASE_URL.strip()
-    )
-    if not _migration_separated:
-        alembic_cfg.attributes["connectable"] = engine
-    else:
-        logger.info(
-            "Using the dedicated migration identity for Alembic "
-            "(STRIKENOVA_MIGRATION_DATABASE_URL is set)."
-        )
-    # The SQLite bypass is decided by the MIGRATION TARGET, not the runtime
-    # engine: when the identities are separated (e.g. SQLite runtime URL,
-    # CockroachDB migration URL) the target is a shared server database and
-    # MUST be serialized exactly like any other non-SQLite target.
+
     if migration_url.startswith("sqlite"):
-        # Single-process by construction: the lease lock is a local no-op.
-        logger.info("SQLite target: migration lease lock skipped (single-process)")
+        # Single-process by construction: no distributed lease is needed.
+        logger.info("SQLite target: migration lease skipped (single-process)")
+        alembic_cfg.attributes["connectable"] = engine
         command.upgrade(alembic_cfg, "head")
         logger.info("Alembic migrations applied successfully")
+        if post_migration_callback is not None:
+            post_migration_callback(MigrationWork(engine=engine, lease=None))
         return
 
-    _execute_serialized(alembic_cfg, command, logger)
+    if migration_url.split(":", 1)[0].startswith("cockroachdb"):
+        from app._migration_lease import LeaseError, SQLSTATE_CONFIG
 
-
-def _execute_serialized(alembic_cfg, command, logger) -> None:
-    """Run ``command.upgrade`` guarded by the ADR-017 transactional lease.
-
-    Exactly one process may execute the migration chain at a time. Waiters
-    either take over an EXPIRED lease (crashed holder) or observe the lock
-    being freed, then re-check whether the chain still needs running. The
-    wait budget is bounded: a lock that stays contested beyond
-    ``MIGRATION_LOCK_WAIT_SECONDS`` fails startup closed instead of racing.
-    """
-    import socket
-    import uuid
-
-    from app import _migration_lock as mlock
-
-    lock_url = _migration_lock_url()
-    owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
-    ttl = int(getattr(settings, "MIGRATION_LOCK_TTL_SECONDS", 120))
-    wait = int(getattr(settings, "MIGRATION_LOCK_WAIT_SECONDS", 900))
-    logger.info(
-        "migration lock acquisition started (owner=%s ttl_seconds=%s wait_seconds=%s)",
-        owner,
-        ttl,
-        wait,
-    )
-    acquired, took_over = mlock.try_acquire(lock_url, owner, ttl_seconds=ttl)
-    while not acquired:
-        expired = mlock.wait_for_release(lock_url, ttl_seconds=ttl, max_wait_seconds=wait)
-        acquired, took_over = mlock.try_acquire(lock_url, owner, ttl_seconds=ttl)
-        if not acquired and not expired:
-            # Lock was freed and immediately re-taken by another instance;
-            # observe again rather than racing the new holder.
-            continue
-    renewer = mlock.LeaseRenewer(lock_url, owner, ttl)
-    renewer.start()
-    try:
-        logger.info(
-            "migration lock acquired (owner=%s took_over_expired_lease=%s)",
-            owner,
-            took_over,
+        raise LeaseError(
+            SQLSTATE_CONFIG,
+            "CockroachDB is retired (ADR-019); the ADR-017 lease is "
+            "PostgreSQL-only and no unleased CockroachDB migration path exists",
         )
-        try:
-            from alembic.script import ScriptDirectory
 
-            head_rev = ScriptDirectory.from_config(alembic_cfg).get_current_head()
-            current_rev = mlock.read_alembic_version(lock_url)
-            if head_rev and current_rev == head_rev:
-                logger.info("migration already current (version=%s)", current_rev)
-        except Exception:  # noqa: BLE001 - diagnostics only, never fatal
-            pass
-        command.upgrade(alembic_cfg, "head")
-        logger.info("Alembic migrations applied successfully")
-    finally:
-        renewer.stop()
-        released = mlock.release(lock_url, owner)
-        logger.info("migration lock released (owner=%s released=%s)", owner, released)
+    _run_guarded_migrations(alembic_cfg, command, logger, post_migration_callback)
+
+
+@dataclass
+class MigrationWork:
+    """Context handed to post-migration work (the startup exposure backfill)."""
+
+    engine: object
+    lease: object | None
+
+
+def run_startup_backfill(work: MigrationWork) -> None:
+    """Run the exposure backfill as the migration identity (ADR §7.2–§7.3).
+
+    SQLite keeps one session and one implicit transaction. PostgreSQL
+    enumerates users in a short committed transaction, then processes one
+    user per protected transaction whose FIRST statement is ``enter`` and
+    whose last statement before ``COMMIT`` is a second ``enter``.
+    """
+    import logging
+
+    from sqlalchemy.orm import Session
+
+    from app.services.leg_exposure import backfill_all_exposures, backfill_exposures
+
+    logger = logging.getLogger(__name__)
+    if work.lease is None:
+        session = sessionmaker(bind=work.engine)()
+        try:
+            backfill_all_exposures(session)
+        finally:
+            session.close()
+        return
+
+    with work.engine.connect() as conn:
+        user_ids = [
+            row[0]
+            for row in conn.execute(
+                text("SELECT DISTINCT user_id FROM positions ORDER BY user_id")
+            )
+        ]
+        # Enumeration is its own short transaction (ADR §7.2).
+        conn.commit()
+
+    logger.info("startup backfill: %d user(s) to process", len(user_ids))
+    statement_timeout_ms = settings.MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS
+    for user_id in user_ids:
+        with work.engine.connect() as conn:
+            with conn.begin():
+                work.lease.enter(conn)  # FIRST statement of the user transaction
+                conn.exec_driver_sql(
+                    f"SET LOCAL statement_timeout = {int(statement_timeout_ms)}"
+                )
+                session = Session(
+                    bind=conn,
+                    autoflush=False,
+                    expire_on_commit=False,
+                    join_transaction_mode="create_savepoint",
+                )
+                try:
+                    backfill_exposures(session, user_id)
+                    session.commit()  # release the savepoint, not the outer tx
+                except BaseException:
+                    session.rollback()
+                    raise
+                finally:
+                    session.close()
+                work.lease.enter(conn)  # MANDATORY pre-commit refresh
 
 
 # ---------------------------------------------------------------------------
@@ -498,17 +663,12 @@ def init_db():
     from app import models  # noqa: F401  (registers tables on Base.metadata)
 
     logger = logging.getLogger(__name__)
-    _run_alembic_migrations()
 
     # Conservative one-time backfill for pre-existing, provably unambiguous
-    # executions. Rows already present are never duplicated.
-    from app.services.leg_exposure import backfill_all_exposures
-
-    session = sessionmaker(bind=engine)()
-    try:
-        backfill_all_exposures(session)
-    finally:
-        session.close()
+    # executions. Rows already present are never duplicated. On PostgreSQL it
+    # runs as the migration identity inside the ADR-017 lease, one protected
+    # transaction per user (ADR §7.2–§7.3); on SQLite it runs as before.
+    _run_alembic_migrations(post_migration_callback=run_startup_backfill)
 
     # These indexes are intentionally SQLite-only and are not part of the
     # cross-dialect Alembic schema.

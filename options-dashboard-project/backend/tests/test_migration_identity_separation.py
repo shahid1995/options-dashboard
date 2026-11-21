@@ -76,4 +76,4 @@ class TestSingleIdentityBackwardCompatibility:
         import app.db as db_module
 
         src = inspect.getsource(db_module.init_db)
-        assert "_run_alembic_migrations()" in src
+        assert "_run_alembic_migrations(" in src

@@ -301,6 +301,19 @@ Render, redeploy, verify, then downgrade the runtime credential's grants).
 
 ## ADR-017 · Migration serialization via transactional lease lock · Accepted
 
+> **Superseded in part (2026-11-21, Issue #145).** The founder approved the
+> ADR-017/018 lease protocol (`docs/ADR-017-018-POSTGRES-LEASE-DESIGN.md`,
+> commit `ae2226e`), which retires the renewal thread described below. The
+> implemented protocol is a PostgreSQL row-lock lease with a 256-bit owner
+> token (only its SHA-256 hash stored), a versioned `SECURITY DEFINER`
+> function set in `migration_internal`, an authoritative `lease_protocol`
+> control row, a transaction-scoped cross-version advisory guard, a deployment
+> barrier, and `python -m app.migrate` as the only supported migration path.
+> A bare `alembic upgrade head` against PostgreSQL now fails closed. The
+> operating contract, runbook and measured TTL are recorded in
+> `docs/ADR-017-018-IMPLEMENTATION-RUNBOOK.md`. The historical decision text
+> below is retained for provenance.
+
 Context: every application instance runs `init_db() -> alembic upgrade head`
 during startup (Render free plan has no release command, so migrations cannot
 be moved to a deploy step without changing the deployment model). Two
@@ -327,8 +340,10 @@ Decision:
   (TTL >= 2) configurations. A crashed holder stops renewing;
   waiters take over the expired lease and re-run the idempotent chain, so a
   wedged holder can never block recovery permanently.
-* Waiters poll up to `MIGRATION_LOCK_WAIT_SECONDS` (default 900) and then
-  FAIL CLOSED (LeaseLockUnavailable) rather than race concurrent DDL.
+* *(Retired 2026-11-21)* Waiters polled up to `MIGRATION_LOCK_WAIT_SECONDS`
+  (default 900) and then failed closed. The implemented lease replaces this
+  with a monotonic admission budget (`MIGRATION_LEASE_WAIT_SECONDS`, default
+  180 s) over retryable SQLSTATEs only (`45002`, `55P03`, `40001`, `40P01`).
 * Lock lifecycle emits structured credential-free logs: acquisition started,
   acquired (incl. takeover flag), already-current observation, released.
 

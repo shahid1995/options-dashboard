@@ -127,8 +127,11 @@ def test_init_db_uses_alembic(monkeypatch, temp_engine):
     # pending_email_changes, security_events; 49 since Issue #17 research
     # schema e9f8a7b6c5d4 added the six gap_* research tables (research-only);
     # 51 since Day 45 (admin_controls, admin_audit_events); 52 since Day 46
-    # (notification_events, Issue #92).
-    assert len(tables) ==  52
+    # (notification_events, Issue #92); 55 since d47aa0000001 added
+    # background_jobs and d48aa0000001 added historical_dataset_governance +
+    # historical_ingestion_runs (schema drift already on the branch; unrelated
+    # to Issue #145, which changes no schema).
+    assert len(tables) == 55
 
 
 def test_init_db_creates_legacy_columns_via_baseline(monkeypatch, temp_engine):

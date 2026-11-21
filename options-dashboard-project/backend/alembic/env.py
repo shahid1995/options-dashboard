@@ -77,8 +77,50 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+def _run_on_connection(connection, lease_guard) -> None:
+    """Configure the migration context on an existing Connection and run.
+
+    When the caller supplies a Connection that is already inside a transaction
+    (the ADR-017 DDL transaction), Alembic must not open or commit its own:
+    exactly one COMMIT exists on that connection and it belongs to the caller
+    (ADR §13.1–§13.2).
+    """
+    is_postgres = connection.dialect.name != "sqlite"
+    if is_postgres and lease_guard is None:
+        raise RuntimeError(
+            "refusing to run Alembic against PostgreSQL without the ADR-017 "
+            "migration lease: use 'python -m app.migrate upgrade head'"
+        )
+
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        render_as_batch=connection.dialect.name == "sqlite",
+    )
+
+    # Diagnostic only: lets the acceptance tests prove that the lease and the
+    # DDL share one physical connection (ADR §13.1). It is never identity or
+    # authorization evidence.
+    if is_postgres:
+        config.attributes["migration_connection_pid"] = connection.exec_driver_sql(
+            "SELECT pg_backend_pid()"
+        ).scalar()
+
+    if connection.in_transaction():
+        context.run_migrations()
+    else:
+        with context.begin_transaction():
+            context.run_migrations()
+
+
 def run_migrations_online() -> None:
-    """Run migrations online using the supplied or newly-created engine."""
+    """Run migrations online using the supplied connection or a new engine."""
+    lease_guard = config.attributes.get("lease_guard")
+    connection = config.attributes.get("connection")
+    if connection is not None:
+        _run_on_connection(connection, lease_guard)
+        return
+
     connectable = config.attributes.get("connectable")
     if connectable is None:
         url = _resolve_database_url()
@@ -99,15 +141,8 @@ def run_migrations_online() -> None:
                 poolclass=pool.NullPool,
             )
 
-    with connectable.connect() as connection:
-        context.configure(
-            connection=connection,
-            target_metadata=target_metadata,
-            render_as_batch=connection.dialect.name == "sqlite",
-        )
-
-        with context.begin_transaction():
-            context.run_migrations()
+    with connectable.connect() as opened:
+        _run_on_connection(opened, lease_guard)
 
 
 if context.is_offline_mode():

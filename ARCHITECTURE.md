@@ -61,7 +61,7 @@ broker (Redis/Celery/RabbitMQ/Kafka) is introduced.
 - **Worker/queue boundary:** producer = `enqueue` (idempotent per
   `idempotency_key` — one row per key, ever; terminal rows are re-armed
   in place); consumer = `claim_next` (single conditional UPDATE lease
-  claim, the ADR-017 `_migration_lock` pattern; expired leases make
+  claim, the ADR-017 row-lock lease pattern; expired leases make
   crashed jobs claimable again); transitions out of RUNNING are
   ownership-protected (`complete_job`/`fail_job` verify RUNNING + owner +
   unexpired lease atomically, so a stale worker can never overwrite a

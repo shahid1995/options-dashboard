@@ -99,17 +99,26 @@ Founder acceptance.
    chain at a time; concurrent application startups must wait, take over an
    expired lease, or fail closed — never execute the same DDL concurrently.
    The lock must work on an empty database and under the migration identity,
-   and must never require runtime DDL/owner privileges (ADR-017). The lease
-   configuration must keep the renewal interval strictly below the TTL:
-   `MIGRATION_LOCK_TTL_SECONDS >= 2` with renewal every `max(1.0, TTL/3)`,
-   enforced at the configuration boundary. The manual operator CLI path
-   (`alembic upgrade head` run out-of-band) remains outside the application
-   lock by design (ADR-017 Residual); it resolves its database with the
-   same identity precedence as startup migrations (explicit operator URL >
-   `STRIKENOVA_MIGRATION_DATABASE_URL` > `DATABASE_URL`), so it must be run
-   under the migration identity unless an explicit operator URL is
-   intentionally supplied.
-6e. **Future application tables carry runtime DML by default.** In the
+   and must never require runtime DDL/owner privileges (ADR-017/018). The
+   implemented lease has no renewal thread: ownership is the lease row lock
+   itself, so a live owner cannot lose the lease while its transaction is
+   open, and a dead owner's transaction is aborted by the server. The lease
+   TTL only bounds how long another process waits before it may take over an
+   abandoned row. `MIGRATION_LEASE_TTL_SECONDS`, `MIGRATION_LEASE_WAIT_SECONDS`
+   and `MIGRATION_LEASE_LOCK_TIMEOUT_MS` are validated at the configuration
+   boundary, and the TTL is derived from measured backfill timing
+   (runbook §7), not guessed.
+6e. **The migration path is guarded, and the guard is verified.** On
+   PostgreSQL the lease and the Alembic DDL share one physical connection and
+   one transaction; `alembic/env.py` refuses a PostgreSQL connection that did
+   not arrive through the lease. A bare `alembic upgrade head` fails closed,
+   and `python -m app.migrate upgrade head` is the only supported path. The
+   migration URL must exist and must differ from the runtime URL; equal or
+   missing identities fail closed (`45004`). Verification
+   (`python -m app.migrate bootstrap-lease --verify`) reports state and never
+   changes installed protocol versions; upgrades use
+   `--upgrade-protocol N`, never a direct `UPDATE installed_version`.
+6f. **Future application tables carry runtime DML by default.** In the
    production database `strikenova`, default privileges bound to the
    migration/creator role (`ALTER DEFAULT PRIVILEGES FOR ROLE
    strikenova_prod_migrator IN SCHEMA public`) grant the runtime role
