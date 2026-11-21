@@ -1,0 +1,104 @@
+Issue #145 — T-01…T-27 Lease Protocol Harness
+==================================================================
+ADR source: docs/ADR-017-018-POSTGRES-LEASE-DESIGN.md @ ae2226ef592dc48d5e9619bd2198de33285911df
+No runtime SQL verification is claimed unless PostgreSQL 16.16 is present.
+
+Safety gate: ACCEPTED (label 'issue145-disposable'; cluster identity is established independently after the version probe)
+PostgreSQL server_version: 16.16 (Debian 16.16-1.pgdg13+1) (server_version_num=160016)
+PostgreSQL availability: AVAILABLE (16.16+ within major 16)
+
+Target check: ACCEPTED (verified cluster identity, harness-owned databases, exact role attributes and membership options)
+
+=== T-01 (issue145_t_01) ===
+  FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+=== T-02 (issue145_t_02) ===
+  NOT RUN — requires two independent PostgreSQL backends starting §9.2.1 simultaneously; the bootstrap guard serialization cannot be observed from one session
+=== T-03 (issue145_t_03) ===
+  NOT RUN — requires two independent PostgreSQL backends calling acquire concurrently to observe 45002/55P03 on the loser
+=== T-04 (issue145_t_04) ===
+  FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+=== T-05 (issue145_t_05) ===
+  FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+=== T-06 (issue145_t_06) ===
+  FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+=== T-07 (issue145_t_07) ===
+  FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+=== T-08 (issue145_t_08) ===
+  NOT RUN — requires the real Alembic chain and two independent backends; no Alembic binary or migration runner exists in this harness
+=== T-09 (issue145_t_09) ===
+  NOT RUN — requires the real backfill implementation and two independent backends; no backfill code exists in this harness
+=== T-10 (issue145_t_10) ===
+  NOT RUN — requires the real backfill implementation; the per-user transaction pattern cannot be exercised without it
+=== T-11 (issue145_t_11) ===
+  FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+=== T-12 (issue145_t_12) ===
+  FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+=== T-13 (issue145_t_13) ===
+  NOT RUN — requires the real multi-user backfill implementation, a killed worker and a recovery run against the same ledger
+=== T-14 (issue145_t_14) ===
+  FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+=== T-15 (issue145_t_15) ===
+  FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+=== T-16 (issue145_t_16) ===
+  FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+=== T-17 (issue145_t_17) ===
+  NOT RUN — no Alembic binary or environment exists in this harness; the real command cannot be executed
+=== T-18 (issue145_t_18) ===
+  NOT RUN — no application migration runner exists in this harness; the real command cannot be executed
+=== T-19 (issue145_t_19) ===
+  NOT RUN — requires one session inside a user transaction plus a blocker session (lease row lock or mid-run EXECUTE revoke); no blocker exists here
+=== T-20 (issue145_t_20) ===
+  NOT RUN — the supported application command does not exist in this harness; lease state alone is not evidence for T-20
+=== T-21 (issue145_t_21) ===
+  NOT RUN — requires the operator `bootstrap-lease --close-barrier` and --upgrade-protocol commands, which are not implemented here
+=== T-22 (issue145_t_22) ===
+  FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+=== T-23 (issue145_t_23) ===
+  NOT RUN — the scenario requires the documented `bootstrap-lease --upgrade-protocol` flow (barrier close, quiescence check, version and range check, `migration_lease.protocol_version` mirror transition, reopen). That operator command is not implemented here, and a direct UPDATE of installed_version is not an upgrade, so this is not exercised
+=== T-24 (issue145_t_24) ===
+  NOT RUN — requires installed *_v2 function names and two independent backends contending on the same advisory guard
+=== T-25 (issue145_t_25) ===
+  NOT RUN — requires the `bootstrap-lease` verify command; it is not implemented here, and the lease functions alone are not that evidence
+=== T-26 (issue145_t_26) ===
+  NOT RUN — requires the operator `bootstrap-lease --upgrade-protocol` command and its cancellation path
+=== T-27 (issue145_t_27) ===
+  FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+
+==================================================================
+=== Summary ===
+T-01: FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+T-02: NOT RUN — requires two independent PostgreSQL backends starting §9.2.1 simultaneously; the bootstrap guard serialization cannot be observed from one session
+T-03: NOT RUN — requires two independent PostgreSQL backends calling acquire concurrently to observe 45002/55P03 on the loser
+T-04: FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+T-05: FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+T-06: FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+T-07: FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+T-08: NOT RUN — requires the real Alembic chain and two independent backends; no Alembic binary or migration runner exists in this harness
+T-09: NOT RUN — requires the real backfill implementation and two independent backends; no backfill code exists in this harness
+T-10: NOT RUN — requires the real backfill implementation; the per-user transaction pattern cannot be exercised without it
+T-11: FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+T-12: FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+T-13: NOT RUN — requires the real multi-user backfill implementation, a killed worker and a recovery run against the same ledger
+T-14: FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+T-15: FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+T-16: FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+T-17: NOT RUN — no Alembic binary or environment exists in this harness; the real command cannot be executed
+T-18: NOT RUN — no application migration runner exists in this harness; the real command cannot be executed
+T-19: NOT RUN — requires one session inside a user transaction plus a blocker session (lease row lock or mid-run EXECUTE revoke); no blocker exists here
+T-20: NOT RUN — the supported application command does not exist in this harness; lease state alone is not evidence for T-20
+T-21: NOT RUN — requires the operator `bootstrap-lease --close-barrier` and --upgrade-protocol commands, which are not implemented here
+T-22: FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+T-23: NOT RUN — the scenario requires the documented `bootstrap-lease --upgrade-protocol` flow (barrier close, quiescence check, version and range check, `migration_lease.protocol_version` mirror transition, reopen). That operator command is not implemented here, and a direct UPDATE of installed_version is not an upgrade, so this is not exercised
+T-24: NOT RUN — requires installed *_v2 function names and two independent backends contending on the same advisory guard
+T-25: NOT RUN — requires the `bootstrap-lease` verify command; it is not implemented here, and the lease functions alone are not that evidence
+T-26: NOT RUN — requires the operator `bootstrap-lease --upgrade-protocol` command and its cancellation path
+T-27: FAIL — §9.3 verification failed: lease_acquire_v1 identity arguments 'p_protocol integer, p_token text, p_ttl_seconds double precision, p_lock_timeout_ms integer' != 'integer, text, double precision, integer'
+------------------------------------------------------------------
+Total: 27
+PASS: 0
+FAIL: 12
+INVALID_SETUP: 0
+NOT RUN: 15
+INCONCLUSIVE: 0
+------------------------------------------------------------------
+harness_exit_code=0
