@@ -1,8 +1,8 @@
 # StrikeNova — PostgreSQL Migration-Lease and Privilege Design
 
-**Status:** `Proposed — Awaiting Founder Approval — Not Implemented`
+**Status:** `Approved for implementation — Not yet implemented`
 
-**Document type:** Standalone design proposal for founder review. Consolidates the corrected ADR-017 migration-lease protocol and the ADR-018 database-privilege model.
+**Document type:** Founder-approved architecture decision and implementation contract. Consolidates the corrected ADR-017 migration-lease protocol and the ADR-018 database-privilege model.
 
 **Target database:** PostgreSQL 16, hosted on Neon. Strategic direction per accepted ADR-019.
 
@@ -10,7 +10,7 @@
 
 **Base commit for all repository evidence:** `eeeebffe5ff78bc0c46ae3dd35ac500ccc410f2b` (current `main`, the merge of PR #148 / ADR-019), 2026-11-20.
 
-**Implementation status:** Nothing described here is implemented. A limited subset of this document's SQL — the four lease functions, the three bootstrap modes, the advisory-lock order, both privilege topologies, the `enter` readiness and barrier behavior and one failed-release scenario — was executed against a **disposable local PostgreSQL 16.16 cluster**; §14.1 reports 115 checks as passing and lists them individually. The T-01…T-27 acceptance matrix below **was not run as written**. No Neon database, no Alembic application path, no backfill, no Render deployment and no staging or production system has been touched. No Neon production database exists for this design, and no provisioning or cutover is authorized.
+**Implementation status:** Founder approval of D-2 through D-7 was recorded on 2026-11-21. The architecture is approved for implementation, but the application integration is not complete. The standalone T-01…T-27 harness R2 ran against a disposable PostgreSQL 16.16 cluster: 12 PASS, 0 FAIL, 15 NOT RUN, 0 INVALID_SETUP and 0 INCONCLUSIVE ([R2 report](https://github.com/shahid1995/options-dashboard/blob/0c5335370c7ea65914df9f1e85edf09e2da833b6/docs/reviews/issue145-runtime-rehearsal-r2/RUNTIME_REHEARSAL_R2_2026-11-21.md)). Those 12 passes validate the standalone lease/privilege SQL scenarios only; they do not prove the integrated Alembic, startup backfill or operator CLI paths. No Neon database, no live Alembic application path, no Neon backfill, no Render deployment and no staging or production system has been touched. Neon production provisioning, live role/grant changes, migration execution on Neon, deployment and cutover remain separately unauthorized.
 
 ---
 
@@ -1806,18 +1806,18 @@ Nothing is silently dropped. "Resolved by design" means the design removes the f
 **D-1 — PostgreSQL/Neon-only strategic database target.**
 Accepted via ADR-019 (merged in PR #148). CockroachDB is retired; no historical data migration. This document does not reopen it.
 
-### Still requiring founder approval
+### Founder approval record
 
-None of D-2 … D-7 is approved. Each states the recommendation and the consequence of refusal.
+**D-2 through D-7: Approved by the founder on 2026-11-21, as recommended below.** This authorizes implementation and verification of the ADR-017/018 architecture. It does **not** authorize Neon production provisioning, live role/grant changes, migration execution against Neon, Render/provider changes, deployment or production cutover. D-7's actual TTL and statement-timeout values must be chosen from measured per-user backfill duration, not guessed.
 
-| Decision | Recommended choice | Consequence of refusal |
+| Decision | Approved decision | Consequence of refusal |
 |---|---|---|
-| **D-2 — Zero runtime privilege on migration infrastructure** | Approve: `strikenova_production_app` has no schema `USAGE`, table privilege, function `EXECUTE`, ownership or inherited membership on `migration_internal`; `PUBLIC` likewise | Without it, the lease can be manipulated by the runtime credential. The alternative is to keep lease access in the runtime role, which returns to the previous design's exposure and makes the privilege boundary advisory rather than enforced |
-| **D-3 — Run startup backfill under the migration identity** | Approve: add a required migration identity/URL; backfill runs there; refuse to start if migration and runtime identities are equal on PostgreSQL | Refusing means the runtime role must hold `SELECT`/`INSERT` on application tables *and* lease access, or the backfill must be dropped from startup. Dropping it leaves legacy exposure rows unattributed |
-| **D-4 — Retire the renewal-thread contract** | Approve: no background renewer, no handoff mode, no lease renewal API; long transactions use the pre-commit refresh and a TTL sized above them | Refusing keeps a second ownership mechanism, which is exactly what produced the original lease-loss defect; it would also require its own failure analysis and tests |
-| **D-5 — Require the guarded operator CLI** | Approve: `python -m app.migrate upgrade head` is the only supported path; bare `alembic upgrade head` fails closed on PostgreSQL | Refusing permits unleased DDL. The design would then need a different proof of serialization for manual migrations, which does not exist |
-| **D-6 — Authorize pre-Alembic bootstrap as a narrow exception to Alembic-only schema authority** | Approve: bootstrap may create only `migration_internal` (lease table, protocol table, four functions) before Alembic, once, under the advisory lock, verified and revocable | Refusing leaves a circular dependency: Alembic's protected transaction needs `enter`, and `enter` needs an object Alembic is not allowed to create. The alternative is no lease at all |
-| **D-7 — Accept per-user backfill transactions and the availability trade-off** | Approve: one transaction per user, each with entry and pre-commit refresh; TTL sized from measured per-user duration; a restart may repeat work but cannot duplicate rows | Refusing implies either one long transaction for all users (a single lease hold for the whole backfill, higher blast radius on failure) or skipping the per-user refresh (unsafe). A long global transaction also makes liveness worse |
+| **D-2 — Zero runtime privilege on migration infrastructure** | Approved: `strikenova_production_app` has no schema `USAGE`, table privilege, function `EXECUTE`, ownership or inherited membership on `migration_internal`; `PUBLIC` likewise | Without it, the lease can be manipulated by the runtime credential. The alternative is to keep lease access in the runtime role, which returns to the previous design's exposure and makes the privilege boundary advisory rather than enforced |
+| **D-3 — Run startup backfill under the migration identity** | Approved: add a required migration identity/URL; backfill runs there; refuse to start if migration and runtime identities are equal on PostgreSQL | Refusing means the runtime role must hold `SELECT`/`INSERT` on application tables *and* lease access, or the backfill must be dropped from startup. Dropping it leaves legacy exposure rows unattributed |
+| **D-4 — Retire the renewal-thread contract** | Approved: no background renewer, no handoff mode, no lease renewal API; long transactions use the pre-commit refresh and a TTL sized above them | Refusing keeps a second ownership mechanism, which is exactly what produced the original lease-loss defect; it would also require its own failure analysis and tests |
+| **D-5 — Require the guarded operator CLI** | Approved: `python -m app.migrate upgrade head` is the only supported path; bare `alembic upgrade head` fails closed on PostgreSQL | Refusing permits unleased DDL. The design would then need a different proof of serialization for manual migrations, which does not exist |
+| **D-6 — Authorize pre-Alembic bootstrap as a narrow exception to Alembic-only schema authority** | Approved: bootstrap may create only `migration_internal` (lease table, protocol table, four functions) before Alembic, once, under the advisory lock, verified and revocable | Refusing leaves a circular dependency: Alembic's protected transaction needs `enter`, and `enter` needs an object Alembic is not allowed to create. The alternative is no lease at all |
+| **D-7 — Accept per-user backfill transactions and the availability trade-off** | Approved: one transaction per user, each with entry and pre-commit refresh; TTL sized from measured per-user duration; a restart may repeat work but cannot duplicate rows | Refusing implies either one long transaction for all users (a single lease hold for the whole backfill, higher blast radius on failure) or skipping the per-user refresh (unsafe). A long global transaction also makes liveness worse |
 
 ---
 
