@@ -61,6 +61,11 @@ Do not rewrite historical decisions to make the history look cleaner. When direc
 | ADR-009 | Keep historical market-data collection disabled by default and operationally bounded | Active |
 | ADR-010 | Keep the public website and authenticated application as separate application/deployment concerns | Active |
 | ADR-011 | Preserve GitHub as implementation/project authority and keep durable knowledge outside implementation state | Active |
+| ADR-017 | PostgreSQL migration-lease protocol, versioned bootstrap/barrier and guarded operator migration path (see `docs/ADR-017-018-POSTGRES-LEASE-DESIGN.md`) | Approved |
+| ADR-018 | Dedicated migration identity and zero runtime privilege on migration infrastructure (see `docs/ADR-017-018-POSTGRES-LEASE-DESIGN.md`) | Approved |
+| ADR-019 | Clean-slate Neon PostgreSQL target; CockroachDB retired (`docs/ADR-019-NEON-CLEAN-SLATE.md`) | Active |
+
+**Founder approval note (2026-11-21):** ADR-017/018 decisions D-2 through D-7 are approved for implementation. This does not authorize Neon production provisioning, live role/grant changes, production migrations, deployment or cutover. The application implementation and integration verification remain incomplete.
 
 The entries below capture the decision intent and implementation consequences.
 
