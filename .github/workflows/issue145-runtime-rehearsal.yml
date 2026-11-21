@@ -94,6 +94,7 @@ jobs:
           python3 - <<'PY'
           import os, secrets
           import psycopg
+          from psycopg import sql
 
           conn = psycopg.connect(
               host=os.environ["DB_HOST"], port=os.environ["DB_PORT"],
@@ -123,9 +124,9 @@ jobs:
           nonce = secrets.token_hex(24)  # 48 characters, never printed
           print(f"::add-mask::{nonce}")
           conn.execute("CREATE DATABASE issue145_guard")
-          conn.execute(
-              "COMMENT ON DATABASE issue145_guard IS %s",
-              (f"issue145-harness-guard:{system_identifier}:{nonce}",))
+          # COMMENT takes a literal, not a bind parameter.
+          conn.execute(sql.SQL("COMMENT ON DATABASE issue145_guard IS {}").format(
+              sql.Literal(f"issue145-harness-guard:{system_identifier}:{nonce}")))
           conn.close()
 
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
@@ -177,8 +178,9 @@ jobs:
               print("harness_roles_after_run:")
               for (name,) in cur.fetchall():
                   print(f"  {name}")
-              cur.execute("SELECT r.rolname, m.rolname, am.inherit, am.set_option, "
-                          "am.admin_option FROM pg_auth_members am "
+              # PostgreSQL 16: the column is inherit_option (renamed from inherit).
+              cur.execute("SELECT r.rolname, m.rolname, am.inherit_option, "
+                          "am.set_option, am.admin_option FROM pg_auth_members am "
                           "JOIN pg_roles r ON r.oid = am.roleid "
                           "JOIN pg_roles m ON m.oid = am.member "
                           "WHERE r.rolname LIKE 'strikenova%' ORDER BY 1, 2")
