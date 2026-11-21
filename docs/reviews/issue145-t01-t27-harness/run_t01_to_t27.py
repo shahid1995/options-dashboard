@@ -25,7 +25,7 @@ Design rules enforced here:
     comment binds the cluster identity to `HARNESS_CLUSTER_GUARD` — a value the
     harness never creates or generates. An existing database counts as
     harness-owned only when its catalog comment carries the guard-bound marker,
-    and only the guard database plus `issue145_t01`…`issue145_t27` may exist.
+    and only the guard database plus `issue145_t_01`…`issue145_t_27` may exist.
     Existing roles and memberships are validated against exact expected
     attributes and options, never altered.
   * The runtime role's transitive membership is traversed completely (no depth
@@ -140,8 +140,11 @@ GUARD_COMMENT_PREFIX = "issue145-harness-guard:"
 GUARD_MIN_LENGTH = 32
 
 # The only existing databases the harness may touch: the guard database and the
-# 27 fixed scenario databases. Anything else is refused, never adopted.
-SCENARIO_DATABASE_NAMES = tuple(f"issue145_t{number:02d}" for number in range(1, 28))
+# 27 fixed scenario databases. Anything else is refused, never adopted. These
+# values must equal `scenario_db_name(key)` for T-01…T-27 exactly, because the
+# gate compares names literally: a divergence would refuse a correctly marked
+# scenario database left behind by an interrupted run.
+SCENARIO_DATABASE_NAMES = tuple(f"issue145_t_{number:02d}" for number in range(1, 28))
 
 # The guard is skipped by name in the target check, so an ambiguous guard name
 # would exempt the wrong object. System and scenario databases are never guards.
@@ -762,7 +765,7 @@ def validate_destructive_target(admin):
     if unowned:
         problems.append(
             "cluster holds databases this harness cannot prove it created (only "
-            "the guard database and issue145_t01..issue145_t27 carrying a valid "
+            "the guard database and issue145_t_01..issue145_t_27 carrying a valid "
             "ownership marker are accepted): " + ", ".join(unowned))
 
     role_rows = admin.execute(
@@ -1136,26 +1139,88 @@ EXPECTED_CONSTRAINTS = {
 
 # §9.3 "Function signatures | exactly the documented identity arguments and
 # result types", including the five-column protocol-info result.
+# The input argument types are the catalog's call signature: `pg_proc.proargtypes`
+# is an oidvector holding exactly the input argument types in ordinal position,
+# rendered through `pg_catalog.format_type()`. PostgreSQL 16 also reconstructs
+# argument *names* in `pg_get_function_identity_arguments()`; those names are not
+# part of the identity and must never enter this comparison.
 EXPECTED_FUNCTIONS = {
     "lease_acquire_v1": (
-        "integer, text, double precision, integer",
+        ("integer", "text", "double precision", "integer"),
         "table(out_owner_fingerprint text, out_expires_at timestamp with time zone, "
         "out_generation bigint)"),
     "lease_enter_v1": (
-        "integer, text, double precision, integer",
+        ("integer", "text", "double precision", "integer"),
         "table(out_owner_fingerprint text, out_expires_at timestamp with time zone, "
         "out_generation bigint)"),
-    "lease_release_v1": ("integer, text", "boolean"),
+    "lease_release_v1": (("integer", "text"), "boolean"),
     "lease_protocol_info_v1": (
-        "",
+        (),
         "table(installed_version integer, min_supported_version integer, "
         "max_supported_version integer, barrier_state text, bootstrap_state text)"),
 }
+
+# The §9.3 function query. `unnest(p.proargtypes::oid[]) WITH ORDINALITY` yields
+# each input argument type in its declared position; `format_type()` renders it.
+# A function with no input arguments aggregates to NULL, normalized to an empty
+# array. `pg_get_function_identity_arguments()` is deliberately not used: on
+# PostgreSQL 16 its rendered text includes argument names.
+FUNCTION_SIGNATURE_QUERY = (
+    "SELECT p.proname, "
+    "coalesce(a.input_argument_types, ARRAY[]::text[]), "
+    "pg_get_function_result(p.oid), p.proowner::regrole::text, "
+    "p.prosecdef, p.proconfig "
+    "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+    "LEFT JOIN LATERAL ("
+    "SELECT array_agg(pg_catalog.format_type(t.typoid, NULL) ORDER BY t.ord) "
+    "AS input_argument_types "
+    "FROM unnest(p.proargtypes::oid[]) WITH ORDINALITY AS t(typoid, ord)"
+    ") a ON true "
+    "WHERE n.nspname = 'migration_internal'")
 
 
 def _normalize_sql_text(value):
     """Collapse whitespace and case so catalog rendering differences do not matter."""
     return " ".join((value or "").lower().split())
+
+
+def assert_function_signatures(rows):
+    """Compare ordered input argument types and complete result signatures.
+
+    `rows` are (name, input_argument_types, pg_get_function_result, owner,
+    prosecdef, proconfig) tuples exactly as the §9.3 query returns them. The
+    input types come from `pg_proc.proargtypes` in ordinal order rendered by
+    `pg_catalog.format_type()`, so parameter names cannot be mistaken for part
+    of the identity signature. Pure function: it needs no database.
+    """
+    observed = {row[0]: row[1:] for row in rows}
+    if set(observed) != set(EXPECTED_FUNCTIONS):
+        raise ProtocolFailure(
+            f"§9.3 verification failed: function set {sorted(observed)} differs "
+            f"from {sorted(EXPECTED_FUNCTIONS)}")
+    for name, (args, result) in EXPECTED_FUNCTIONS.items():
+        got_args, got_result, owner, secdef, config = observed[name]
+        got_args = tuple(got_args or ())
+        if got_args != tuple(args):
+            raise ProtocolFailure(
+                f"§9.3 verification failed: {name} input argument types "
+                f"{list(got_args)!r} != {list(args)!r}")
+        if _normalize_sql_text(got_result) != _normalize_sql_text(result):
+            raise ProtocolFailure(
+                f"§9.3 verification failed: {name} result signature "
+                f"{got_result!r} != {result!r}")
+        if owner != MIGRATOR_ROLE:
+            raise ProtocolFailure(
+                f"§9.3 verification failed: {name} owner {owner} is not "
+                f"{MIGRATOR_ROLE}")
+        if not secdef:
+            raise ProtocolFailure(
+                f"§9.3 verification failed: {name} is not SECURITY DEFINER")
+        if list(config or []) != ["search_path=pg_catalog"]:
+            raise ProtocolFailure(
+                f"§9.3 verification failed: {name} proconfig {config!r} is not "
+                "exactly {search_path=pg_catalog}")
+    return True
 
 
 def reachable_roles(start_role, edges):
@@ -1282,30 +1347,12 @@ def verify_installation(conn, expected_version=1, expect_active=True):
         fetch_mode="all")
     assert_constraint_definitions(constraints)
 
-    # -- functions: identity args, complete result, owner, security, search_path --
-    funcs = run_sql(
-        conn, "SELECT p.proname, pg_get_function_identity_arguments(p.oid), "
-              "pg_get_function_result(p.oid), p.proowner::regrole::text, "
-              "p.prosecdef, p.proconfig "
-              "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
-              "WHERE n.nspname = 'migration_internal'", fetch_mode="all")
-    by_name = {row[0]: row[1:] for row in funcs}
-    if set(by_name) != set(EXPECTED_FUNCTIONS):
-        fail(f"function set {sorted(by_name)} differs from "
-             f"{sorted(EXPECTED_FUNCTIONS)}")
-    for name, (args, result) in EXPECTED_FUNCTIONS.items():
-        got_args, got_result, owner, secdef, config = by_name[name]
-        if _normalize_sql_text(got_args) != _normalize_sql_text(args):
-            fail(f"{name} identity arguments {got_args!r} != {args!r}")
-        if _normalize_sql_text(got_result) != _normalize_sql_text(result):
-            fail(f"{name} result signature {got_result!r} != {result!r}")
-        if owner != MIGRATOR_ROLE:
-            fail(f"{name} owner {owner} is not {MIGRATOR_ROLE}")
-        if not secdef:
-            fail(f"{name} is not SECURITY DEFINER")
-        if list(config or []) != ["search_path=pg_catalog"]:
-            fail(f"{name} proconfig {config!r} is not exactly "
-                 "{search_path=pg_catalog}")
+    # -- functions: input types, complete result, owner, security, search_path --
+    # The identity signature is the catalog's ordered input-type vector. It is
+    # deliberately not `pg_get_function_identity_arguments()`, whose PostgreSQL 16
+    # rendering includes argument names (`p_protocol integer, ...`).
+    funcs = run_sql(conn, FUNCTION_SIGNATURE_QUERY, fetch_mode="all")
+    assert_function_signatures(funcs)
 
     # -- §10.3 item 4: expand ACLs, including NULL ACLs, and look for PUBLIC --
     public_entries = run_sql(
@@ -2636,8 +2683,8 @@ def _self_test_checks():
         globals()["_connect_impl"] = fake_connect
         try:
             cluster = admin_connect()
-            scenario = scenario_admin_connect("issue145_t16")
-            migrator = connect_migrator("issue145_t01")
+            scenario = scenario_admin_connect("issue145_t_16")
+            migrator = connect_migrator("issue145_t_01")
             bare = harness_connect(dbname="anything")
         finally:
             globals()["_connect_impl"] = original
@@ -2645,13 +2692,13 @@ def _self_test_checks():
         assert all(conn.autocommit is True for conn in opened), \
             "a connection opener left autocommit off"
         assert cluster.dbname == "postgres", f"admin connected to {cluster.dbname!r}"
-        assert scenario.dbname == "issue145_t16"
-        assert migrator.dbname == "issue145_t01"
+        assert scenario.dbname == "issue145_t_16"
+        assert migrator.dbname == "issue145_t_01"
         assert bare.dbname == "anything"
 
-    @check("T-16 grants run as the owner inside issue145_t16 only")
+    @check("T-16 grants run as the owner inside issue145_t_16 only")
     def _t16_authorization():
-        state = {"database": "issue145_t16", "current_user": MIGRATOR_ROLE,
+        state = {"database": "issue145_t_16", "current_user": MIGRATOR_ROLE,
                  "set_role": True, "reset_role": True}
 
         def handler(query, params):
@@ -2670,8 +2717,8 @@ def _self_test_checks():
                 return []
             return []
 
-        grant_conn = _FakeConnection(handler, dbname="issue145_t16")
-        grant_topology_b_application_privileges(grant_conn, "issue145_t16")
+        grant_conn = _FakeConnection(handler, dbname="issue145_t_16")
+        grant_topology_b_application_privileges(grant_conn, "issue145_t_16")
         statements = [query for _, query, _ in grant_conn.statements]
         grant_positions = [index for index, query in enumerate(statements)
                            if query.upper().startswith("GRANT")]
@@ -2680,7 +2727,7 @@ def _self_test_checks():
         reset_position = statements.index("RESET ROLE")
         assert all(set_position < index < reset_position for index in grant_positions), \
             "a GRANT ran outside the owner window"
-        assert all(db == "issue145_t16" for db, _, _ in grant_conn.statements), \
+        assert all(db == "issue145_t_16" for db, _, _ in grant_conn.statements), \
             "a GRANT ran on a connection to another database"
         assert grant_conn.transactions == 1, "the grant window is not one transaction"
 
@@ -2688,7 +2735,7 @@ def _self_test_checks():
         state.update(database="postgres", current_user=MIGRATOR_ROLE, set_role=True)
         wrong = _FakeConnection(handler, dbname="postgres")
         try:
-            grant_topology_b_application_privileges(wrong, "issue145_t16")
+            grant_topology_b_application_privileges(wrong, "issue145_t_16")
         except ProtocolFailure:
             pass
         else:
@@ -2697,11 +2744,11 @@ def _self_test_checks():
                     if q.upper().startswith("GRANT")], "a GRANT reached postgres"
 
         # SET ROLE did not take effect: refused before any GRANT.
-        state.update(database="issue145_t16", current_user=MIGRATOR_ROLE,
+        state.update(database="issue145_t_16", current_user=MIGRATOR_ROLE,
                      set_role=False)
-        no_elevation = _FakeConnection(handler, dbname="issue145_t16")
+        no_elevation = _FakeConnection(handler, dbname="issue145_t_16")
         try:
-            grant_topology_b_application_privileges(no_elevation, "issue145_t16")
+            grant_topology_b_application_privileges(no_elevation, "issue145_t_16")
         except ProtocolFailure:
             pass
         else:
@@ -2712,9 +2759,9 @@ def _self_test_checks():
 
         # RESET ROLE does not restore the migrator: the window fails closed.
         state.update(current_user=MIGRATOR_ROLE, set_role=True, reset_role=False)
-        stuck = _FakeConnection(handler, dbname="issue145_t16")
+        stuck = _FakeConnection(handler, dbname="issue145_t_16")
         try:
-            grant_topology_b_application_privileges(stuck, "issue145_t16")
+            grant_topology_b_application_privileges(stuck, "issue145_t_16")
         except ProtocolFailure:
             pass
         else:
@@ -2759,19 +2806,19 @@ def _self_test_checks():
         restore = _gate_env()
         try:
             marker = expected_database_marker()
-            unmarked = _gate_admin(databases=[("issue145_t01", None)])
+            unmarked = _gate_admin(databases=[("issue145_t_01", None)])
             try:
                 validate_destructive_target(unmarked)
             except SafetyRefusal:
                 pass
             else:
-                raise AssertionError("an unmarked issue145_t01 database was adopted")
+                raise AssertionError("an unmarked issue145_t_01 database was adopted")
             mutating = ("DROP", "CREATE", "GRANT", "COMMENT", "ALTER", "REVOKE")
             assert not [q for _, q, _ in unmarked.statements
                         if q.upper().startswith(mutating)], \
                 "the gate mutated the cluster before refusing"
 
-            marked = _gate_admin(databases=[("issue145_t01", marker)])
+            marked = _gate_admin(databases=[("issue145_t_01", marker)])
             validate_destructive_target(marked)
         finally:
             restore()
@@ -2782,12 +2829,12 @@ def _self_test_checks():
         try:
             def handler(query, params):
                 if "FROM pg_database" in query:
-                    return [("issue145_t01", None)]
+                    return [("issue145_t_01", None)]
                 return []
 
             admin = _FakeConnection(handler, dbname="postgres")
             try:
-                drop_scenario_db(admin, "issue145_t01")
+                drop_scenario_db(admin, "issue145_t_01")
             except SafetyRefusal:
                 pass
             else:
@@ -2939,8 +2986,8 @@ def _self_test_checks():
 
     @check("the guard database is never a system or scenario database")
     def _guard_name():
-        for name in ("postgres", "template0", "template1", "issue145_t01",
-                     "issue145_t27"):
+        for name in ("postgres", "template0", "template1", "issue145_t_01",
+                     "issue145_t_27"):
             restore = _temporary_globals(
                 HARNESS_TARGET_SYSTEM_IDENTIFIER="123",
                 HARNESS_CLUSTER_GUARD=GUARD_TEST_NONCE,
@@ -3055,13 +3102,13 @@ def _self_test_checks():
         finally:
             restore()
 
-    @check("existing databases are restricted to issue145_t01..t27 plus the guard")
+    @check("existing databases are restricted to issue145_t_01..t_27 plus the guard")
     def _allowlist():
         restore = _gate_env()
         try:
             marker = expected_database_marker()
-            for name in ("issue145_t28", "issue145_t00", "issue145_disposable",
-                         "issue145_t01_backup", "app_db"):
+            for name in ("issue145_t_28", "issue145_t_00", "issue145_disposable",
+                         "issue145_t_01_backup", "issue145_t01", "app_db"):
                 try:
                     validate_destructive_target(
                         _gate_admin(databases=[(name, marker)]))
@@ -3069,8 +3116,198 @@ def _self_test_checks():
                     pass
                 else:
                     raise AssertionError(f"database {name!r} was accepted")
-            for name in ("issue145_t01", "issue145_t27"):
+            for name in ("issue145_t_01", "issue145_t_27"):
                 validate_destructive_target(_gate_admin(databases=[(name, marker)]))
+        finally:
+            restore()
+
+    @check("F-1: function identity is the catalog input-type array, not rendered names")
+    def _function_signatures():
+        def rows(overrides=None):
+            overrides = overrides or {}
+            return [(name, overrides.get(name, args), result, MIGRATOR_ROLE, True,
+                     ["search_path=pg_catalog"])
+                    for name, (args, result) in EXPECTED_FUNCTIONS.items()]
+
+        def variant(column, value):
+            out = [list(row) for row in rows()]
+            for row in out:
+                if row[0] == "lease_acquire_v1":
+                    row[column] = value
+            return [tuple(row) for row in out]
+
+        # 1. Every documented signature passes, including the zero-input function.
+        assert assert_function_signatures(rows()) is True
+        assert len(EXPECTED_FUNCTIONS) == 4
+        assert EXPECTED_FUNCTIONS["lease_protocol_info_v1"][0] == ()
+        for name, expected in (
+                ("lease_acquire_v1", ("integer", "text", "double precision", "integer")),
+                ("lease_enter_v1", ("integer", "text", "double precision", "integer")),
+                ("lease_release_v1", ("integer", "text")),
+                ("lease_protocol_info_v1", ())):
+            assert tuple(EXPECTED_FUNCTIONS[name][0]) == expected, name
+
+        # 2. A different input type in any function is rejected.
+        for overrides in (
+                {"lease_acquire_v1": ("integer", "text", "numeric", "integer")},
+                {"lease_enter_v1": ("integer", "text", "double precision", "bigint")},
+                {"lease_release_v1": ("integer", "varchar")},
+                {"lease_protocol_info_v1": ("integer",)}):
+            try:
+                assert_function_signatures(rows(overrides))
+            except ProtocolFailure as exc:
+                assert "input argument types" in str(exc), str(exc)
+            else:
+                raise AssertionError(f"a changed input type {overrides} was accepted")
+
+        # 3. The right types in the wrong order are rejected.
+        try:
+            assert_function_signatures(rows(
+                {"lease_release_v1": ("text", "integer")}))
+        except ProtocolFailure:
+            pass
+        else:
+            raise AssertionError("a reversed argument order was accepted")
+
+        # 4. An extra or a missing input argument is rejected.
+        for overrides in (
+                {"lease_acquire_v1": ("integer", "text", "double precision",
+                                      "integer", "boolean")},
+                {"lease_release_v1": ("integer",)},
+                {"lease_release_v1": ("integer", "text", "text")}):
+            try:
+                assert_function_signatures(rows(overrides))
+            except ProtocolFailure:
+                pass
+            else:
+                raise AssertionError(f"an argument count {overrides} was accepted")
+
+        # 5. The zero-input signature is compared, not skipped.
+        try:
+            assert_function_signatures(rows(
+                {"lease_protocol_info_v1": ("text",)}))
+        except ProtocolFailure:
+            pass
+        else:
+            raise AssertionError("an added info-function argument was accepted")
+
+        # 6. A wrong result signature is still rejected independently.
+        try:
+            assert_function_signatures(variant(2, "integer"))
+        except ProtocolFailure as exc:
+            assert "result signature" in str(exc), str(exc)
+        else:
+            raise AssertionError("a changed result signature was accepted")
+
+        # The owner, SECURITY DEFINER and search_path checks are preserved.
+        for column, value in ((3, APP_ROLE), (4, False),
+                              (5, ["search_path=public"])):
+            try:
+                assert_function_signatures(variant(column, value))
+            except ProtocolFailure:
+                pass
+            else:
+                raise AssertionError(f"column {column}={value!r} was accepted")
+
+        # An extra function is still rejected.
+        extra = rows() + [("lease_extra_v1", (), "boolean", MIGRATOR_ROLE, True,
+                           ["search_path=pg_catalog"])]
+        try:
+            assert_function_signatures(extra)
+        except ProtocolFailure:
+            pass
+        else:
+            raise AssertionError("an extra function was accepted")
+
+        # 7. Argument names are not part of the identity comparison: the actual
+        # PostgreSQL 16 rendering (names included) is neither expected nor
+        # accepted as a signature.
+        named = ("p_protocol integer, p_token text, p_ttl_seconds double precision, "
+                 "p_lock_timeout_ms integer")
+        try:
+            assert_function_signatures(rows({"lease_acquire_v1": named}))
+        except ProtocolFailure:
+            pass
+        else:
+            raise AssertionError("name-bearing identity text was accepted")
+        assert "pg_get_function_identity_arguments" not in FUNCTION_SIGNATURE_QUERY
+        assert "p.proargtypes" in FUNCTION_SIGNATURE_QUERY
+        assert "format_type" in FUNCTION_SIGNATURE_QUERY
+        assert "WITH ORDINALITY" in FUNCTION_SIGNATURE_QUERY
+
+    @check("F-2: generated scenario names match the allow-list exactly")
+    def _scenario_names():
+        restore = _gate_env()
+        try:
+            keys = sorted(SCENARIOS)
+            assert keys == [f"T-{number:02d}" for number in range(1, 28)], keys
+
+            # 1. Every key generates exactly one expected name.
+            expected = tuple(f"issue145_t_{number:02d}" for number in range(1, 28))
+            generated = tuple(scenario_db_name(key) for key in keys)
+            assert generated == expected, generated
+            assert scenario_db_name("T-01") == "issue145_t_01"
+            assert scenario_db_name("T-27") == "issue145_t_27"
+
+            # 2. and 3. Every generated name is allow-listed, and there are
+            # exactly 27 unique names in matching order.
+            assert SCENARIO_DATABASE_NAMES == expected, SCENARIO_DATABASE_NAMES
+            assert len(SCENARIO_DATABASE_NAMES) == 27
+            assert len(set(SCENARIO_DATABASE_NAMES)) == 27
+            assert all(name in SCENARIO_DATABASE_NAMES for name in generated)
+            assert len(set(generated)) == 27
+
+            # 4. All 27 correctly marked names are accepted by the gate, singly
+            # and together.
+            marker = expected_database_marker()
+            for name in SCENARIO_DATABASE_NAMES:
+                validate_destructive_target(
+                    _gate_admin(databases=[(name, marker)]))
+            validate_destructive_target(_gate_admin(
+                databases=[(name, marker) for name in SCENARIO_DATABASE_NAMES]))
+
+            # 6. Legacy spellings are not silently adopted, and the gate refuses
+            # 8. before executing any mutating SQL.
+            for legacy in ("issue145_t01", "issue145_t27", "issue145_t_1",
+                           "issue145_t_01 "):
+                admin = _gate_admin(databases=[(legacy, marker)])
+                try:
+                    validate_destructive_target(admin)
+                except SafetyRefusal:
+                    pass
+                else:
+                    raise AssertionError(f"legacy name {legacy!r} was adopted")
+                mutating = ("DROP", "CREATE", "GRANT", "COMMENT", "ALTER", "REVOKE")
+                assert not [q for _, q, _ in admin.statements
+                            if q.upper().startswith(mutating)], \
+                    f"the gate mutated the cluster before refusing {legacy!r}"
+
+            # 5. Every actual scenario name is refused as a guard name.
+            for name in SCENARIO_DATABASE_NAMES:
+                restore_name = _temporary_globals(HARNESS_GUARD_DATABASE=name)
+                try:
+                    try:
+                        guard_database_name()
+                    except SafetyRefusal:
+                        pass
+                    else:
+                        raise AssertionError(
+                            f"the guard accepted scenario name {name!r}")
+                finally:
+                    restore_name()
+
+            # 7. An unrecognized name remains a safety refusal.
+            admin = _gate_admin(databases=[("app_db", marker)])
+            try:
+                validate_destructive_target(admin)
+            except SafetyRefusal:
+                pass
+            else:
+                raise AssertionError("an unrecognized database name was accepted")
+            mutating = ("DROP", "CREATE", "GRANT", "COMMENT", "ALTER", "REVOKE")
+            assert not [q for _, q, _ in admin.statements
+                        if q.upper().startswith(mutating)], \
+                "the gate mutated the cluster before refusing app_db"
         finally:
             restore()
 

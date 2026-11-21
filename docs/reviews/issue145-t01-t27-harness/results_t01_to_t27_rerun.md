@@ -156,14 +156,17 @@ outcome.
   `HARNESS_CLUSTER_GUARD`. Cluster identity comes from
   `pg_control_system().system_identifier`, not from the label. The guard database
   name may not be `postgres`, `template0`, `template1` or any of
-  `issue145_t01`…`issue145_t27`, so a system or scenario database can never be
+  `issue145_t_01`…`issue145_t_27`, so a system or scenario database can never be
   skipped as the guard. The guard database must already exist with the comment
   `issue145-harness-guard:<identifier>:<nonce>`; the harness never creates it,
   never writes the comment and never generates the nonce, so a matching label
   and identifier cannot substitute for it, and a guard copied from another
   cluster is refused. Existing databases are limited to the guard database and
-  exactly `issue145_t01` … `issue145_t27` with a valid ownership marker; any
-  other name, including another `issue145_*` name, is refused. Existing roles
+  exactly `issue145_t_01` … `issue145_t_27` with a valid ownership marker. The
+  allow-list equals `scenario_db_name()` for T-01…T-27 in value and order, so a
+  marked database left by an interrupted run is accepted. Any other name,
+  including another `issue145_*` name or the legacy `issue145_t01` spelling, is
+  refused. Existing roles
   must have the exact expected `LOGIN` attribute and no `SUPERUSER` /
   `BYPASSRLS` / `CREATEROLE` / `CREATEDB`; existing memberships must be exactly
   `owner -> migrator` with `INHERIT FALSE, SET TRUE, ADMIN FALSE`. Nothing is
@@ -178,8 +181,8 @@ outcome.
   runtime role to the migrator or owner is rejected. The direct-membership check
   is preserved.
 - T-16 issues its four application-table and sequence grants on a separate
-  `strikenova_prod_migrator` connection to `issue145_t16`, after asserting
-  `current_database() = 'issue145_t16'`, inside an explicit
+  `strikenova_prod_migrator` connection to `issue145_t_16`, after asserting
+  `current_database() = 'issue145_t_16'`, inside an explicit
   `SET ROLE strikenova_prod_owner` window whose owner context is asserted before
   the grants and whose `RESET ROLE` back to the migrator is asserted after them;
   the connection is closed in a `finally` path. The cluster administrator is not
@@ -188,13 +191,29 @@ outcome.
 - The runner probes `SHOW server_version` / `server_version_num` and accepts only
   PostgreSQL major 16 with minor 16 or later. PostgreSQL 15, 17 and 18 are
   refused, so a lower bound alone does not silently admit another major version.
-- The DB-free self-test published in the harness passes: 18 checks, 0 failures
+- §9.3 function identity is verified from the catalog's call signature:
+  `pg_proc.proargtypes` is unnested `WITH ORDINALITY` and each input type is
+  rendered by `pg_catalog.format_type()`, then compared as an ordered array with
+  the documented `integer, text, double precision, integer` / `integer, text` /
+  empty sequences. The name-bearing `pg_get_function_identity_arguments()` text
+  that PostgreSQL 16 reconstructs is not used, so argument names cannot break
+  the comparison. The complete `pg_get_function_result()` signature, owner,
+  `SECURITY DEFINER` and `search_path=pg_catalog` checks are unchanged.
+- Scenario database naming is consistent between generator and gate:
+  `scenario_db_name()` produces `issue145_t_01`…`issue145_t_27` and
+  `SCENARIO_DATABASE_NAMES` holds the same 27 values in the same order, so a
+  correctly marked scenario database left behind by an interrupted run is
+  accepted and safely recreated. Legacy spellings such as `issue145_t01` are
+  refused as unrecognized names, and every scenario name is still refused as a
+  guard name.
+- The DB-free self-test published in the harness passes: 20 checks, 0 failures
   (`--self-test`, no server contacted). It also increments a real-connect counter,
   which confirms the self-test opened no PostgreSQL connection. It includes the
-  guard-name refusals (`postgres`, `template0`, `template1`, `issue145_t01`,
-  `issue145_t27`, empty) and the T-16 owner-window authorisation cases: no GRANT
-  on a wrong database, no GRANT without the owner context, and a failed
-  `RESET ROLE` failing closed.
+  guard-name refusals (`postgres`, `template0`, `template1`, `issue145_t_01`,
+  `issue145_t_27`, empty), the F-1 input-type/result-signature cases, the F-2
+  generated-name/allow-list/legacy-name cases, and the T-16 owner-window
+  authorisation cases: no GRANT on a wrong database, no GRANT without the owner
+  context, and a failed `RESET ROLE` failing closed.
 
 ## Execution model and safety gate
 
@@ -211,8 +230,8 @@ membership, it requires `ALLOW_DESTRUCTIVE_TESTS=1`,
 `HARNESS_CLUSTER_GUARD`, then validates the target read-only before any mutation.
 It creates three cluster roles if absent
 (`strikenova_prod_migrator`, `strikenova_production_app`,
-`strikenova_prod_owner`), the owner→migrator membership, and the `issue145_t01`…
-`issue145_t27` databases, dropping each database after its scenario. The roles and
+`strikenova_prod_owner`), the owner→migrator membership, and the `issue145_t_01`…
+`issue145_t_27` databases, dropping each database after its scenario. The roles and
 their membership survive, because dropping a database does not drop roles. None
 of this was exercised here: no database was contacted.
 
