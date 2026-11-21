@@ -1,0 +1,243 @@
+name: Issue 145 disposable harness rehearsal (test branch only)
+
+# Test-only workflow on an ephemeral, throw-away branch. It has no deployment,
+# publishing or release step: its only side effects are inside the disposable
+# postgres:16.16 service container created for this single job, which the
+# GitHub-hosted runner destroys when the job ends.
+on:
+  push:
+    branches:
+      - test/issue145-runtime-rehearsal
+
+permissions:
+  contents: read
+
+jobs:
+  rehearsal:
+    name: PostgreSQL 16.16 disposable rehearsal
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16.16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+          # Trust authentication only inside this single-run, isolated
+          # container: the harness creates its migrator/APP roles without
+          # passwords. Never enabled on a shared or persistent server.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: "55432"
+      DB_USER: postgres
+      DB_PASSWORD: ""
+      ADMIN_DB_USER: postgres
+      ADMIN_DB_PASSWORD: ""
+      MIGRATOR_DB_USER: strikenova_prod_migrator
+      MIGRATOR_DB_PASSWORD: ""
+      HARNESS_CLUSTER_LABEL: issue145-disposable
+      HARNESS_GUARD_DATABASE: issue145_guard
+      ALLOW_DESTRUCTIVE_TESTS: "1"
+      EXPECTED_COMMIT: fa49b468de8b3c9dbd900dfd77ff7b0603d818a4
+      EXPECTED_SHA256: b4b3d15ab7798afc6164f879d977b987c7f77b6511794ddb46ef66320f63a108
+      HARNESS_PATH: docs/reviews/issue145-t01-t27-harness/run_t01_to_t27.py
+
+    steps:
+      - name: Check out the reviewed commit
+        uses: actions/checkout@v4
+        with:
+          ref: test/issue145-runtime-rehearsal
+
+      - name: Verify exact reviewed source
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+          echo "checked out: $head_sha"
+          test "$head_sha" = "$EXPECTED_COMMIT" || { echo "unexpected commit"; exit 1; }
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "working tree is not clean"; git status --porcelain; exit 1
+          fi
+          harness_sha="$(sha256sum "$HARNESS_PATH" | cut -d' ' -f1)"
+          echo "harness sha256: $harness_sha"
+          test "$harness_sha" = "$EXPECTED_SHA256" || { echo "harness source differs"; exit 1; }
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Record image identity and install psycopg
+        run: |
+          set -euo pipefail
+          {
+            echo "python: $(python3 -V)"
+            echo "image_tag: postgres:16.16"
+            echo "image_digests: $(docker image inspect postgres:16.16 --format '{{json .RepoDigests}}')"
+            echo "service_container: $(docker ps --filter ancestor=postgres:16.16 --format '{{.ID}} {{.Names}}')"
+          } | tee versions.txt
+          python3 -m pip install --quiet 'psycopg[binary]>=3.2,<4'
+          python3 -c "import psycopg; print('psycopg:', psycopg.__version__)" | tee -a versions.txt
+
+      - name: Verify server version and provision the pre-run guard
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, secrets
+          import psycopg
+
+          conn = psycopg.connect(
+              host=os.environ["DB_HOST"], port=os.environ["DB_PORT"],
+              user="postgres", dbname="postgres", autocommit=True)
+          with conn.cursor() as cur:
+              cur.execute("SHOW server_version");  server_version = cur.fetchone()[0]
+              cur.execute("SHOW server_version_num"); version_num = cur.fetchone()[0]
+              cur.execute("SELECT system_identifier::text FROM pg_control_system()")
+              system_identifier = cur.fetchone()[0]
+              cur.execute("SELECT version()"); full_version = cur.fetchone()[0]
+
+          lines = [
+              f"server_version: {server_version}",
+              f"server_version_num: {version_num}",
+              f"system_identifier: {system_identifier}",
+              f"full_version: {full_version}",
+          ]
+          print("\n".join(lines))
+          with open("versions.txt", "a", encoding="utf-8") as fh:
+              fh.write("\n".join(lines) + "\n")
+
+          if version_num != "160016" or not server_version.startswith("16.16"):
+              raise SystemExit(
+                  f"refusing rehearsal: expected PostgreSQL 16.16 exactly, "
+                  f"got {server_version} ({version_num})")
+
+          nonce = secrets.token_hex(24)  # 48 characters, never printed
+          print(f"::add-mask::{nonce}")
+          conn.execute("CREATE DATABASE issue145_guard")
+          conn.execute(
+              "COMMENT ON DATABASE issue145_guard IS %s",
+              (f"issue145-harness-guard:{system_identifier}:{nonce}",))
+          conn.close()
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
+              fh.write(f"HARNESS_TARGET_SYSTEM_IDENTIFIER={system_identifier}\n")
+              fh.write(f"HARNESS_CLUSTER_GUARD={nonce}\n")
+          print("guard: pre-provisioned separately by the operator (this step), "
+                "not by the harness")
+          PY
+
+      - name: Compile and run the built-in self-test
+        run: |
+          set -euo pipefail
+          python3 -m py_compile "$HARNESS_PATH"
+          python3 "$HARNESS_PATH" --self-test | tee selftest.log
+          grep -q "Total: 18, PASS: 18, FAIL: 0" selftest.log
+
+      - name: Run the reviewed harness against the disposable cluster
+        run: |
+          set +e
+          python3 "$HARNESS_PATH" 2>&1 | tee runtime.log
+          code="${PIPESTATUS[0]}"
+          echo "harness_exit_code=$code" | tee -a versions.txt
+          echo "HARNESS_EXIT=$code" >> "$GITHUB_ENV"
+          exit 0
+
+      - name: Record server state after the run
+        if: always()
+        run: |
+          set -uo pipefail
+          python3 - <<'PY' | tee cleanup.txt
+          import os
+          import psycopg
+
+          def connect(dbname="postgres"):
+              return psycopg.connect(host=os.environ["DB_HOST"],
+                                     port=os.environ["DB_PORT"], user="postgres",
+                                     dbname=dbname, autocommit=True)
+
+          conn = connect()
+          with conn.cursor() as cur:
+              cur.execute("SELECT datname FROM pg_database ORDER BY datname")
+              print("databases_after_run:")
+              for (name,) in cur.fetchall():
+                  print(f"  {name}")
+              cur.execute("SELECT rolname FROM pg_roles WHERE rolname LIKE 'strikenova%' "
+                          "ORDER BY rolname")
+              print("harness_roles_after_run:")
+              for (name,) in cur.fetchall():
+                  print(f"  {name}")
+              cur.execute("SELECT r.rolname, m.rolname, am.inherit, am.set_option, "
+                          "am.admin_option FROM pg_auth_members am "
+                          "JOIN pg_roles r ON r.oid = am.roleid "
+                          "JOIN pg_roles m ON m.oid = am.member "
+                          "WHERE r.rolname LIKE 'strikenova%' ORDER BY 1, 2")
+              print("harness_memberships_after_run:")
+              for row in cur.fetchall():
+                  print(f"  {row}")
+          conn.close()
+
+          connections = []
+          conn = connect()
+          with conn.cursor() as cur:
+              cur.execute("SELECT datname, count(*) FROM pg_stat_activity "
+                          "GROUP BY datname ORDER BY datname")
+              connections = cur.fetchall()
+          conn.close()
+          print("backends_after_run:")
+          for name, count in connections:
+              print(f"  {name}: {count}")
+
+          # Final cleanup boundary: drop the guard and harness roles so nothing
+          # survives even inside the container before the runner is destroyed.
+          conn = connect()
+          with conn.cursor() as cur:
+              cur.execute("DROP DATABASE IF EXISTS issue145_guard")
+              for role in ("strikenova_production_app", "strikenova_prod_migrator",
+                           "strikenova_prod_owner"):
+                  cur.execute(f"DROP ROLE IF EXISTS {role}")
+              cur.execute("SELECT count(*) FROM pg_database WHERE datname LIKE 'issue145%'")
+              print(f"issue145_databases_after_cleanup: {cur.fetchone()[0]}")
+              cur.execute("SELECT count(*) FROM pg_roles WHERE rolname LIKE 'strikenova%'")
+              print(f"strikenova_roles_after_cleanup: {cur.fetchone()[0]}")
+          conn.close()
+          PY
+
+      - name: Publish results to the job summary
+        if: always()
+        run: |
+          {
+            echo "## Issue 145 disposable rehearsal"
+            echo
+            echo '```'
+            tail -n 45 runtime.log 2>/dev/null || echo "runtime.log missing"
+            echo '```'
+            echo
+            echo "### Environment"
+            echo '```'
+            cat versions.txt 2>/dev/null || true
+            echo '```'
+            echo "### Server state after the run"
+            echo '```'
+            cat cleanup.txt 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload sanitized logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue145-runtime-rehearsal
+          path: |
+            runtime.log
+            selftest.log
+            versions.txt
+            cleanup.txt
+          if-no-files-found: warn
+          retention-days: 14
