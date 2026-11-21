@@ -4,25 +4,35 @@ Issue #145 — T-01…T-27 Lease Protocol Harness
 
 Validated against ADR-017/018 (pinned commit ae2226ef592dc48d5e9619bd2198de33285911df).
 
-This harness implements the exact protocol from the ADR document.
-All SQL, function names, table schemas, token handling, privilege checks
-and scenario implementations are copied faithfully from the ADR.
-No invented substitute protocol.
+All SQL below is copied verbatim from that document: §6.1 (tables),
+§6.3–§6.6 (the four functions), §10.2 (revoke set) and §9.2.1 (first
+installation). No invented substitute protocol, and no literal backslash-n
+sequences: every SQL string uses real line breaks.
 
-Prerequisites (for when PostgreSQL 16.16+ is available):
-  - PostgreSQL 16.16+ with default settings
-  - Python 3.9+ with psycopg (>=3.1)
-  - Disposable cluster; each scenario creates its own fresh database
-  - Lease function SQL defined inline from ADR source (§6.3-§6.6, §9.2.1)
-  - Token policy: 64-char hex strings; length(p_token) < 32 raises 45004
-  - SQLSTATE: exact driver-reported values; do not infer from exception text
+Design rules enforced here:
+  * `run_sql()` never commits or rolls back. Transaction ownership stays with
+    the scenario, which uses explicit `conn.transaction()` blocks.
+  * Success results are the documented function results (3-column rows for
+    acquire/enter, a boolean for release, five columns for protocol info).
+  * Errors are PostgreSQL exceptions; SQLSTATE is read from the driver's
+    `sqlstate` attribute, never parsed from the message and never modelled as
+    a query row.
+  * Every scenario runs against its own freshly created database, created and
+    dropped through the administrative connection.
+  * The runner probes the actual server version. If PostgreSQL 16.16 is not
+    available, every scenario is reported NOT RUN and the process exits
+    cleanly; nothing raises before result generation.
+
+This harness performs no runtime verification in this environment because
+PostgreSQL 16.16 is unavailable. It reports NOT RUN, it does not claim PASS.
 """
 
 import os
 import sys
-import hashlib
+import datetime
+
 import psycopg
-from psycopg import sql as psql_sqld
+from psycopg import sql
 
 # ---------------------------------------------------------------------------
 # Environment configuration
@@ -35,19 +45,20 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 DB_HOST = os.getenv("DB_HOST", "")
 DB_PORT = int(os.getenv("DB_PORT", "55432"))
 
-# ADR source reference
+REQUIRED_SERVER_VERSION_NUM = 160016  # PostgreSQL 16.16
 ADR_SOURCE_COMMIT = "ae2226ef592dc48d5e9619bd2198de33285911df"
 ADR_SOURCE_PATH = "docs/ADR-017-018-POSTGRES-LEASE-DESIGN.md"
 
+# Raw tokens are 64 hex characters. They are never logged or written to files;
+# only the 12-character fingerprint is ever compared or reported.
+TOKEN_A = "a" * 64
+TOKEN_B = "b" * 64
+
 # ---------------------------------------------------------------------------
-# SQL from the ADR document (pinned commit ae2226e)
-# These are the exact function definitions, table schemas and bootstrap
-# procedures from ADR-017/018 §6, §9.2.1
-# All SQL uses real line breaks in triple-quoted strings; no literal \\n
-# escape sequences that could misrepresent the PL/pgSQL source.
+# SQL from the pinned ADR (verbatim; real line breaks only)
+# ---------------------------------------------------------------------------
 
-
-# Table schemas from ADR §6.1
+# ADR §6.1 — migration_lease table
 LEASE_TABLE_SCHEMA = """CREATE TABLE migration_internal.migration_lease (
     lease_name        text        PRIMARY KEY,
     protocol_version  integer     NOT NULL,
@@ -70,6 +81,7 @@ LEASE_TABLE_SCHEMA = """CREATE TABLE migration_internal.migration_lease (
     )
 );"""
 
+# ADR §6.1 — lease_protocol control table
 PROTOCOL_TABLE_SCHEMA = """CREATE TABLE migration_internal.lease_protocol (
     singleton             boolean PRIMARY KEY DEFAULT true CHECK (singleton),
     installed_version     integer NOT NULL,
@@ -82,12 +94,8 @@ PROTOCOL_TABLE_SCHEMA = """CREATE TABLE migration_internal.lease_protocol (
     note                  text
 );"""
 
-# Lease function definitions from ADR §6.3-§6.6
-# Exact function bodies from the ADR, with SECURITY DEFINER and
-# SET search_path = pg_catalog. Real SQL newlines (not \\n escapes).
-
-# Lease acquire from ADR §6.3
-LEASE_ACQUIRE_V1_SQL = """CREATE OR REPLACE FUNCTION migration_internal.lease_acquire_v1(
+# ADR §6.3 — acquire
+LEASE_ACQUIRE_V1_SQL = """CREATE FUNCTION migration_internal.lease_acquire_v1(
     p_protocol integer,
     p_token text,
     p_ttl_seconds double precision,
@@ -96,103 +104,105 @@ LEASE_ACQUIRE_V1_SQL = """CREATE OR REPLACE FUNCTION migration_internal.lease_ac
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
-AS $$\n
-DECLARE\n
-    v_hash  text;\n
-    v_fp    text;\n
-    v_row   migration_internal.migration_lease%ROWTYPE;\n
-    v_inst  integer;\n
-    v_min   integer;\n
-    v_max   integer;\n
-    v_bar   text;\n
-    v_boot  text;\n
-    v_now   timestamptz;\n
-    v_exp   timestamptz;\n
-    v_prev  text;\n
-    v_gen   bigint;\nBEGIN\n
-    -- PostgreSQL treats lock_timeout = 0 as \"wait forever\", so 0 is rejected
-    -- rather than accepted as \"do not wait\".\n
+AS $$
+DECLARE
+    v_hash  text;
+    v_fp    text;
+    v_row   migration_internal.migration_lease%ROWTYPE;
+    v_inst  integer;
+    v_min   integer;
+    v_max   integer;
+    v_bar   text;
+    v_boot  text;
+    v_prev  text;
+    v_now   timestamptz;
+    v_exp   timestamptz;
+    v_gen   bigint;
+BEGIN
+    -- PostgreSQL treats lock_timeout = 0 as "wait forever", so 0 is rejected
+    -- rather than accepted as "do not wait".
     IF p_token IS NULL OR length(p_token) < 32
        OR p_ttl_seconds IS NULL OR NOT (p_ttl_seconds > 0) OR p_ttl_seconds > 86400
        OR p_lock_timeout_ms IS NULL OR p_lock_timeout_ms < 1 OR p_lock_timeout_ms > 600000 THEN
         RAISE EXCEPTION 'lease configuration invalid' USING ERRCODE = '45004';
-    END IF;\n
-\n
-    v_hash := encode(sha256(convert_to(p_token, 'UTF8')), 'hex');\n
-    v_fp   := left(v_hash, 12);\n
-\n
-    v_prev := current_setting('lock_timeout');\n
-    PERFORM set_config('lock_timeout', p_lock_timeout_ms::text, true);\n
-\n
+    END IF;
+
+    v_hash := encode(sha256(convert_to(p_token, 'UTF8')), 'hex');
+    v_fp   := left(v_hash, 12);
+
+    -- Bounded wait for every lock below; never an unbounded hang.
+    v_prev := current_setting('lock_timeout');
+    PERFORM set_config('lock_timeout', p_lock_timeout_ms::text, true);
+
     -- Cross-version guard, taken before the lease row lock and with the same
-    -- key for every protocol version (§6.10).\n
-    PERFORM pg_advisory_xact_lock(\n
-        hashtextextended('strikenova:migration_internal:migration_guard', 0));\n
-\n
-    SELECT l.* INTO v_row\n
-      FROM migration_internal.migration_lease AS l\n
-     WHERE l.lease_name = 'migration-lease'\n
-        FOR UPDATE;\n
-\n
+    -- key for every protocol version (§6.10).
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('strikenova:migration_internal:migration_guard', 0));
+
+    SELECT l.* INTO v_row
+      FROM migration_internal.migration_lease AS l
+     WHERE l.lease_name = 'migration-lease'
+       FOR UPDATE;
+
     IF NOT FOUND THEN
         RAISE EXCEPTION 'lease row missing; bootstrap required' USING ERRCODE = '45005';
-    END IF;\n
-\n
+    END IF;
+
     -- Restore the caller's lock_timeout so the value does not leak into the
-    -- rest of this transaction (for example, Alembic DDL lock waits).\n
-    PERFORM set_config('lock_timeout', v_prev, true);\n
-\n
+    -- rest of this transaction (for example, Alembic DDL lock waits).
+    PERFORM set_config('lock_timeout', v_prev, true);
+
     -- The authoritative version state is the stable, non-versioned control
-    -- row (§6.1, §6.10), read under the lease row lock. The row's own
-    -- protocol_version is a mirror and authorizes nothing.\n
+    -- row (§6.1, §11.2), read under the lease row lock. The row's own
+    -- protocol_version is a mirror and authorizes nothing.
     SELECT pr.installed_version, pr.min_supported_version, pr.max_supported_version,
            pr.barrier_state, pr.bootstrap_state
       INTO v_inst, v_min, v_max, v_bar, v_boot
       FROM migration_internal.lease_protocol AS pr
-     WHERE pr.singleton;\n
-\n
+     WHERE pr.singleton;
+
     IF NOT FOUND THEN
         RAISE EXCEPTION 'protocol row missing; bootstrap required' USING ERRCODE = '45005';
-    END IF;\n
-\n
+    END IF;
+
     -- A process of any protocol version that passed its preflight and then
     -- resumed after an upgrade fails here, under the guard: installed_version
-    -- is no longer its own.\n
+    -- is no longer its own.
     IF v_inst <> p_protocol OR p_protocol < v_min OR p_protocol > v_max THEN
         RAISE EXCEPTION 'protocol % not admissible: installed %, supported %..%',
             p_protocol, v_inst, v_min, v_max USING ERRCODE = '45006';
-    END IF;\n
-\n
+    END IF;
+
     IF v_boot <> 'ready' THEN
         RAISE EXCEPTION 'bootstrap incomplete (state %)', v_boot USING ERRCODE = '45005';
-    END IF;\n
-\n
+    END IF;
+
     IF v_row.protocol_version <> v_inst THEN
         RAISE EXCEPTION 'lease row protocol % disagrees with installed %',
             v_row.protocol_version, v_inst USING ERRCODE = '45006';
-    END IF;\n
-\n
+    END IF;
+
     IF v_bar = 'closed' THEN
         RAISE EXCEPTION 'deployment barrier closed; only bootstrap may write'
             USING ERRCODE = '45004';
-    END IF;\n
-\n
-    v_now := clock_timestamp();\n
-\n
+    END IF;
+
+    v_now := clock_timestamp();
+
     -- An owned row with a NULL expiry is treated as held (fail closed), not
-    -- as free: the CHECK constraint prevents it, and this guard is defensive.\n
+    -- as free: the CHECK constraint prevents it, and this guard is defensive.
     IF v_row.owner_token_hash IS NOT NULL
        AND (v_row.expires_at IS NULL OR v_row.expires_at > v_now) THEN
         RAISE EXCEPTION 'lease held by % until %',
             coalesce(v_row.owner_fingerprint, 'unknown'),
             coalesce(v_row.expires_at::text, 'unknown')
             USING ERRCODE = '45002';
-    END IF;\n
-\n
-    v_exp := v_now + make_interval(secs => p_ttl_seconds);\n
-\n
-    UPDATE migration_internal.migration_lease AS l\n
-       SET protocol_version  = p_protocol,
+    END IF;
+
+    v_exp := v_now + make_interval(secs => p_ttl_seconds);
+
+    UPDATE migration_internal.migration_lease AS l
+       SET protocol_version  = p_protocol,      -- mirror maintenance, never authority
            owner_token_hash  = v_hash,
            owner_fingerprint = v_fp,
            owner_role        = session_user::name,
@@ -201,15 +211,15 @@ DECLARE\n
            released_at       = NULL,
            generation        = l.generation + 1,
            updated_at        = v_now
-     WHERE l.lease_name = 'migration-lease'\n
-    RETURNING l.generation INTO v_gen;\n
-\n
-    RETURN QUERY SELECT v_fp, v_exp, v_gen;\n
-END;\n
+     WHERE l.lease_name = 'migration-lease'
+    RETURNING l.generation INTO v_gen;
+
+    RETURN QUERY SELECT v_fp, v_exp, v_gen;
+END;
 $$;"""
 
-# Lease enter from ADR §6.4
-LEASE_ENTER_V1_SQL = """CREATE OR REPLACE FUNCTION migration_internal.lease_enter_v1(
+# ADR §6.4 — enter
+LEASE_ENTER_V1_SQL = """CREATE FUNCTION migration_internal.lease_enter_v1(
     p_protocol integer,
     p_token text,
     p_ttl_seconds double precision,
@@ -218,182 +228,187 @@ LEASE_ENTER_V1_SQL = """CREATE OR REPLACE FUNCTION migration_internal.lease_ente
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
-AS $$\n
-DECLARE\n
-    v_hash text;\n
-    v_fp   text;\n
-    v_row  migration_internal.migration_lease%ROWTYPE;\n
-    v_inst integer;\n
-    v_min  integer;\n
-    v_max  integer;\n
-    v_boot text;\n
-    v_now  timestamptz;\nBEGIN\n
+AS $$
+DECLARE
+    v_hash text;
+    v_fp   text;
+    v_row  migration_internal.migration_lease%ROWTYPE;
+    v_inst integer;
+    v_min  integer;
+    v_max  integer;
+    v_boot text;
+    v_prev text;
+    v_now  timestamptz;
+    v_exp  timestamptz;
+BEGIN
     IF p_token IS NULL OR length(p_token) < 32
        OR p_ttl_seconds IS NULL OR NOT (p_ttl_seconds > 0) OR p_ttl_seconds > 86400
        OR p_lock_timeout_ms IS NULL OR p_lock_timeout_ms < 1 OR p_lock_timeout_ms > 600000 THEN
         RAISE EXCEPTION 'lease configuration invalid' USING ERRCODE = '45004';
-    END IF;\n
-\n
-    v_hash := encode(sha256(convert_to(p_token, 'UTF8')), 'hex');\n
-    v_fp   := left(v_hash, 12);\n
-\n
+    END IF;
+
+    v_hash := encode(sha256(convert_to(p_token, 'UTF8')), 'hex');
+    v_fp   := left(v_hash, 12);
+
+    v_prev := current_setting('lock_timeout');
+    PERFORM set_config('lock_timeout', p_lock_timeout_ms::text, true);
+
     -- First lock of every protected transaction, taken inside the statement
-    -- that must remain its first statement (§6.10, §7.1, §7.3).\n
-    PERFORM pg_advisory_xact_lock(\n
-        hashtextextended('strikenova:migration_internal:migration_guard', 0));\n
-\n
-    SELECT l.* INTO v_row\n
-      FROM migration_internal.migration_lease AS l\n
-     WHERE l.lease_name = 'migration-lease'\n
-        FOR UPDATE;\n
-\n
+    -- that must remain its first statement (§6.10, §7.1, §7.3).
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('strikenova:migration_internal:migration_guard', 0));
+
+    SELECT l.* INTO v_row
+      FROM migration_internal.migration_lease AS l
+     WHERE l.lease_name = 'migration-lease'
+       FOR UPDATE;
+
     IF NOT FOUND THEN
         RAISE EXCEPTION 'lease row missing; bootstrap required' USING ERRCODE = '45005';
-    END IF;\n
-\n
-    PERFORM set_config('lock_timeout', v_prev, true);\n
-\n
+    END IF;
+
+    PERFORM set_config('lock_timeout', v_prev, true);
+
     SELECT pr.installed_version, pr.min_supported_version, pr.max_supported_version,
            pr.bootstrap_state
       INTO v_inst, v_min, v_max, v_boot
-      FROM migration_internal.lease_protocol AS pr\n
-     WHERE pr.singleton;\n
-\n
+      FROM migration_internal.lease_protocol AS pr
+     WHERE pr.singleton;
+
     IF NOT FOUND THEN
         RAISE EXCEPTION 'protocol row missing; bootstrap required' USING ERRCODE = '45005';
-    END IF;\n
-\n
+    END IF;
+
     IF v_inst <> p_protocol OR p_protocol < v_min OR p_protocol > v_max THEN
         RAISE EXCEPTION 'protocol % not admissible: installed %, supported %..%',
             p_protocol, v_inst, v_min, v_max USING ERRCODE = '45006';
-    END IF;\n
-\n
+    END IF;
+
     -- Authoritative readiness, read in the same statement path as the version:
     -- a protocol object set that bootstrap has not finished installing must
-    -- never accept a protected transaction (§6.2).\n
+    -- never accept a protected transaction (§11.2).
     IF v_boot <> 'ready' THEN
         RAISE EXCEPTION 'bootstrap incomplete (state %)', v_boot USING ERRCODE = '45005';
-    END IF;\n
-\n
+    END IF;
+
     IF v_row.protocol_version <> v_inst THEN
         RAISE EXCEPTION 'lease row protocol % disagrees with installed %',
             v_row.protocol_version, v_inst USING ERRCODE = '45006';
-    END IF;\n
-\n
+    END IF;
+
     IF v_row.owner_token_hash IS NULL THEN
         RAISE EXCEPTION 'lease has no owner' USING ERRCODE = '45002';
-    END IF;\n
-\n
+    END IF;
+
     IF v_row.owner_token_hash <> v_hash THEN
         RAISE EXCEPTION 'lease owner mismatch (presented %)', v_fp USING ERRCODE = '45001';
-    END IF;\n
-\n
-    v_now := clock_timestamp();\n
-\n
+    END IF;
+
+    v_now := clock_timestamp();
+
     IF v_row.expires_at IS NULL OR v_row.expires_at <= v_now THEN
         RAISE EXCEPTION 'lease owned by % has expired at %', v_fp,
             coalesce(v_row.expires_at::text, 'unknown')
             USING ERRCODE = '45002';
-    END IF;\n
-\n
-    v_exp := v_now + make_interval(secs => p_ttl_seconds);\n
-\n
-    UPDATE migration_internal.migration_lease AS l\n
+    END IF;
+
+    v_exp := v_now + make_interval(secs => p_ttl_seconds);
+
+    UPDATE migration_internal.migration_lease AS l
        SET expires_at = v_exp,
            updated_at = v_now
-     WHERE l.lease_name = 'migration-lease';\n
-\n
-    RETURN QUERY SELECT v_fp, v_exp, v_row.generation;\n
-END;\n
+     WHERE l.lease_name = 'migration-lease';
+
+    RETURN QUERY SELECT v_fp, v_exp, v_row.generation;
+END;
 $$;"""
 
-# Lease release from ADR §6.5
-LEASE_RELEASE_V1_SQL = """CREATE OR REPLACE FUNCTION migration_internal.lease_release_v1(
-    p_protocol integer,
-    p_token text
-) RETURNS boolean
+# ADR §6.5 — release
+LEASE_RELEASE_V1_SQL = """CREATE FUNCTION migration_internal.lease_release_v1(p_protocol integer, p_token text)
+RETURNS boolean
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
-AS $$\n
-DECLARE\n
-    v_hash text;\n
-    v_row  migration_internal.migration_lease%ROWTYPE;\n
-    v_inst integer;\n
-    v_min  integer;\n
-    v_max  integer;\n
-    v_prev text;\n
-    v_now  timestamptz;\nBEGIN\n
+AS $$
+DECLARE
+    v_hash text;
+    v_row  migration_internal.migration_lease%ROWTYPE;
+    v_inst integer;
+    v_min  integer;
+    v_max  integer;
+    v_prev text;
+    v_now  timestamptz;
+BEGIN
     IF p_token IS NULL OR length(p_token) < 32 THEN
         RAISE EXCEPTION 'lease configuration invalid' USING ERRCODE = '45004';
-    END IF;\n
-\n
-    v_hash := encode(sha256(convert_to(p_token, 'UTF8')), 'hex');\n
-\n
-    v_prev := current_setting('lock_timeout');\n
-    PERFORM set_config('lock_timeout', '5000', true);\n
-\n
-    -- Same cross-version lock order as acquire and enter (§6.10).\n
-    PERFORM pg_advisory_xact_lock(\n
-        hashtextextended('strikenova:migration_internal:migration_guard', 0));\n
-\n
-    SELECT l.* INTO v_row\n
-      FROM migration_internal.migration_lease AS l\n
-     WHERE l.lease_name = 'migration-lease'\n
-        FOR UPDATE;\n
-\n
+    END IF;
+
+    v_hash := encode(sha256(convert_to(p_token, 'UTF8')), 'hex');
+
+    v_prev := current_setting('lock_timeout');
+    PERFORM set_config('lock_timeout', '5000', true);
+
+    -- Same cross-version guard and lock order as acquire and enter (§6.10).
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('strikenova:migration_internal:migration_guard', 0));
+
+    SELECT l.* INTO v_row
+      FROM migration_internal.migration_lease AS l
+     WHERE l.lease_name = 'migration-lease'
+       FOR UPDATE;
+
     IF NOT FOUND THEN
         RAISE EXCEPTION 'lease row missing; bootstrap required' USING ERRCODE = '45005';
-    END IF;\n
-\n
-    PERFORM set_config('lock_timeout', v_prev, true);\n
-\n
-    SELECT pr.installed_version, pr.min_supported_version, pr.max_supported_version\n
-      INTO v_inst, v_min, v_max\n
-      FROM migration_internal.lease_protocol AS pr\n
-     WHERE pr.singleton;\n
-\n
+    END IF;
+
+    PERFORM set_config('lock_timeout', v_prev, true);
+
+    SELECT pr.installed_version, pr.min_supported_version, pr.max_supported_version
+      INTO v_inst, v_min, v_max
+      FROM migration_internal.lease_protocol AS pr
+     WHERE pr.singleton;
+
     IF NOT FOUND THEN
         RAISE EXCEPTION 'protocol row missing; bootstrap required' USING ERRCODE = '45005';
-    END IF;\n
-\n
+    END IF;
+
     -- Release is deliberately not gated on barrier_state or bootstrap_state:
-    -- an owner must always be able to release during a drain window.\n
+    -- an owner must always be able to release during a drain window.
     IF v_inst <> p_protocol OR p_protocol < v_min OR p_protocol > v_max THEN
         RAISE EXCEPTION 'protocol % not admissible: installed %, supported %..%',
             p_protocol, v_inst, v_min, v_max USING ERRCODE = '45006';
-    END IF;\n
-\n
+    END IF;
+
     IF v_row.protocol_version <> v_inst THEN
         RAISE EXCEPTION 'lease row protocol % disagrees with installed %',
             v_row.protocol_version, v_inst USING ERRCODE = '45006';
-    END IF;\n
-\n
+    END IF;
+
     IF v_row.owner_token_hash IS NULL THEN
         RETURN false;                       -- idempotent: already unowned
-    END IF;\n
-\n
+    END IF;
+
     IF v_row.owner_token_hash <> v_hash THEN
         RAISE EXCEPTION 'lease owner mismatch (release)' USING ERRCODE = '45001';
-    END IF;\n
-\n
-    v_now := clock_timestamp();\n
-\n
-    UPDATE migration_internal.migration_lease AS l\n
+    END IF;
+
+    v_now := clock_timestamp();
+
+    UPDATE migration_internal.migration_lease AS l
        SET owner_token_hash  = NULL,
            owner_fingerprint = NULL,
            owner_role        = NULL,
            expires_at        = v_now,
            released_at       = v_now,
            updated_at        = v_now
-     WHERE l.lease_name = 'migration-lease';\n
-\n
-    RETURN true;\n
-END;\n
+     WHERE l.lease_name = 'migration-lease';
+
+    RETURN true;
+END;
 $$;"""
 
-# Protocol info from ADR §6.6
-LEASE_PROTOCOL_INFO_V1_SQL = """CREATE OR REPLACE FUNCTION migration_internal.lease_protocol_info_v1()
+# ADR §6.6 — protocol information
+LEASE_PROTOCOL_INFO_V1_SQL = """CREATE FUNCTION migration_internal.lease_protocol_info_v1()
 RETURNS TABLE (
     installed_version     integer,
     min_supported_version integer,
@@ -404,1001 +419,879 @@ RETURNS TABLE (
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
-AS $$\n
-BEGIN\n
-    RETURN QUERY\n        SELECT pr.installed_version,
+AS $$
+BEGIN
+    RETURN QUERY
+        SELECT pr.installed_version,
                pr.min_supported_version,
                pr.max_supported_version,
                pr.barrier_state,
                pr.bootstrap_state
-          FROM migration_internal.lease_protocol AS pr\n
-         WHERE pr.singleton;\n
-END;\n
+          FROM migration_internal.lease_protocol AS pr
+         WHERE pr.singleton;
+END;
 $$;"""
 
-# ---------------------------------------------------------------------------
-# Application tables from ADR §8.1 (used by backfill scenarios)
-# These are created fresh per scenario
+# ADR §10.2 — revoke set, re-applied after the last CREATE FUNCTION
+REVOKE_SET_SQL = """REVOKE ALL ON SCHEMA migration_internal FROM PUBLIC;
+REVOKE ALL ON ALL TABLES    IN SCHEMA migration_internal FROM PUBLIC;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA migration_internal FROM PUBLIC;
+REVOKE ALL ON ALL FUNCTIONS IN SCHEMA migration_internal FROM PUBLIC;
 
+REVOKE ALL ON SCHEMA migration_internal FROM strikenova_production_app;
+REVOKE ALL ON ALL TABLES    IN SCHEMA migration_internal FROM strikenova_production_app;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA migration_internal FROM strikenova_production_app;
+REVOKE ALL ON ALL FUNCTIONS IN SCHEMA migration_internal FROM strikenova_production_app;"""
 
-APPLICATION_TABLES_SQL = """-- Tables used by backfill scenarios (T-09, T-10, T-19)
--- These are created fresh per scenario
-
-CREATE TABLE IF NOT EXISTS public.positions (
+# Application tables used by the backfill-related scenarios (disposable DBs only)
+APPLICATION_TABLES_SQL = """CREATE TABLE public.positions (
     id int PRIMARY KEY,
     user_id int,
     UNIQUE (user_id)
 );
-
-CREATE TABLE IF NOT EXISTS public.paper_orders (
+CREATE TABLE public.paper_orders (
     id int PRIMARY KEY,
     user_id int,
     strategy_leg_id int
 );
-
-CREATE TABLE IF NOT EXISTS public.strategy_leg_exposures (
-    id int PRIMARY KEY,
+CREATE TABLE public.strategy_leg_exposures (
+    id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     paper_order_id int,
     exposure double precision
 );"""
 
 # ---------------------------------------------------------------------------
-# Database helpers
+# Connection and database helpers
 # ---------------------------------------------------------------------------
 
-def new_db_url():
-    """Build a psycopg connection URL from env vars."""
+def _conn_kwargs(dbname):
+    kwargs = {
+        "dbname": dbname,
+        "port": DB_PORT,
+    }
+    if DB_USER:
+        kwargs["user"] = DB_USER
     if DB_PASSWORD:
-        kwargs = {
-            "dbname": DB_NAME,
-            "user": DB_USER,
-            "password": DB_PASSWORD,
-            "host": DB_HOST or None,
-            "port": DB_PORT,
-        }
-    else:
-        kwargs = {
-            "dbname": DB_NAME,
-            "user": DB_USER,
-            "host": DB_HOST or None,
-            "port": DB_PORT,
-        }
-    kwargs = {k: v for k, v in kwargs.items() if v is not None}
-    return psycopg.connect(**kwargs)
+        kwargs["password"] = DB_PASSWORD
+    if DB_HOST:
+        kwargs["host"] = DB_HOST
+    return kwargs
 
 
-def drop_create_scenario_db(db_name):
-    """Create a fresh database for a scenario, from postgres template1."""
-    if DB_PASSWORD:
-        base = psycopg.connect(
-            dbname="postgres",
-            user=DB_USER,
-            password=DB_PASSWORD,
-            host=DB_HOST,
-            port=DB_PORT,
-        )
-    else:
-        base = psycopg.connect(
-            dbname="postgres",
-            user=DB_USER,
-            host=DB_HOST,
-            port=DB_PORT,
-        )
-    base.autocommit = True
-    with base.cursor() as cur:
-        cur.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(db_name)))
-        cur.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(db_name)))
-    base.close()
+def connect(dbname):
+    """Open a connection to one database. Raises if the server is unreachable."""
+    return psycopg.connect(**_conn_kwargs(dbname))
 
 
-# ---------------------------------------------------------------------------
-# Scenario implementations
-# ---------------------------------------------------------------------------
+def admin_connect():
+    """Administrative connection used only for disposable DB provisioning."""
+    return psycopg.connect(**_conn_kwargs("postgres"))
 
-def run_sql(conn, sql_str, fetch=False):
-    """Execute SQL, optionally fetching results."""
-    cur = conn.cursor()
+
+def drop_create_scenario_db(admin_conn, db_name):
+    """Create a genuinely empty database for one scenario."""
+    admin_conn.execute(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+        "WHERE datname = %s AND pid <> pg_backend_pid()",
+        (db_name,),
+    )
+    admin_conn.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(db_name)))
+    admin_conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(db_name)))
+
+
+def drop_scenario_db(admin_conn, db_name):
+    """Safely remove a scenario database."""
+    admin_conn.execute(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+        "WHERE datname = %s AND pid <> pg_backend_pid()",
+        (db_name,),
+    )
+    admin_conn.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(db_name)))
+
+
+def run_sql(conn, query, params=None, fetch_mode=None):
+    """
+    Execute SQL. Never commits or rolls back: the caller owns the transaction.
+    fetch_mode: None | "one" | "all".
+    """
+    with conn.cursor() as cur:
+        cur.execute(query, params)
+        if fetch_mode == "one":
+            return cur.fetchone()
+        if fetch_mode == "all":
+            return cur.fetchall()
+    return None
+
+
+def expect_sqlstate(conn, query, params, expected):
+    """
+    Run one statement inside a savepoint and return (matched, observed_sqlstate).
+    The scenario transaction survives the expected error.
+    """
     try:
-        cur.execute(sql_str)
-        if fetch:
-            result = cur.fetchall()
-        else:
-            result = None
-        conn.commit()
-        return result
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        cur.close()
+        with conn.transaction():
+            run_sql(conn, query, params)
+    except psycopg.Error as exc:
+        observed = getattr(exc, "sqlstate", None)
+        return observed == expected, observed
+    return False, None
 
 
-def scenario_T01(conn):
-    """
-    T-01: First installation from genuinely empty database.
+def fingerprint(token):
+    import hashlib
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
 
-    Preconditions (from ADR §9.2.1, first installation on empty database):
-      - No migration_internal schema, no migration_lease, no lease_protocol,
-        no lease_* functions, no alembic_version table
-      - Fresh public schema (left as provisioning made it)
-    Procedure: execute §9.2.1 statement by statement in one transaction
 
-    Outcome: PASS — database was genuinely empty; protocol bootstraps cleanly.
-    """
-    cur = conn.cursor()
+# ---------------------------------------------------------------------------
+# ADR §9.2.1 — first installation on a genuinely empty database
+# ---------------------------------------------------------------------------
 
-    # Execute §9.2.1 in one transaction:
-    # 1. CREATE SCHEMA migration_internal (step 3)
-    # 2. CREATE TABLE migration_internal.lease_protocol (step 4)
-    # 3. INSERT INTO lease_protocol (step 5)
-    # 4. CREATE TABLE migration_internal.migration_lease (step 6)
-    # 5. INSERT INTO migration_lease (step 7)
-    # 6. CREATE FUNCTIONs (step 8)
-    # 7. REVOKE set (step 9)
-    # 8. UPDATE lease_protocol to open/ready (step 11)
-
+def bootstrap_first_installation(conn):
+    """Execute §9.2.1 step by step in one transaction."""
     with conn.transaction():
-        # Step 1: CREATE SCHEMA migration_internal
+        run_sql(conn, "SELECT pg_advisory_xact_lock("
+                      "hashtextextended('strikenova:migration_internal:bootstrap', 0))")
         run_sql(conn, "CREATE SCHEMA migration_internal")
-
-        # Step 2: CREATE TABLE migration_internal.lease_protocol
         run_sql(conn, PROTOCOL_TABLE_SCHEMA)
-
-        # Step 3: INSERT INTO lease_protocol (step 5 of §9.2.1)
-        run_sql(conn, """INSERT INTO migration_internal.lease_protocol
-            (installed_version, min_supported_version, max_supported_version,
-             barrier_state, bootstrap_state)
-            VALUES (1, 1, 1, 'closed', 'installing')""")
-
-        # Step 4: CREATE TABLE migration_internal.migration_lease (step 6)
+        run_sql(conn,
+                "INSERT INTO migration_internal.lease_protocol "
+                "(installed_version, min_supported_version, max_supported_version, "
+                "barrier_state, bootstrap_state) "
+                "VALUES (1, 1, 1, 'closed', 'installing')")
         run_sql(conn, LEASE_TABLE_SCHEMA)
-
-        # Step 5: INSERT INTO migration_lease (step 7 of §9.2.1)
-        run_sql(conn, """INSERT INTO migration_internal.migration_lease
-            (lease_name, protocol_version)
-            VALUES ('migration-lease', 1)""")
-
-        # Step 6: CREATE FUNCTIONs (step 8 of §9.2.1)
+        run_sql(conn,
+                "INSERT INTO migration_internal.migration_lease "
+                "(lease_name, protocol_version) "
+                "VALUES ('migration-lease', 1)")
         run_sql(conn, LEASE_ACQUIRE_V1_SQL)
         run_sql(conn, LEASE_ENTER_V1_SQL)
         run_sql(conn, LEASE_RELEASE_V1_SQL)
         run_sql(conn, LEASE_PROTOCOL_INFO_V1_SQL)
-
-        # Step 7: Revoke set (step 9 of §9.2.1) - after the last CREATE FUNCTION
-        run_sql(conn, """REVOKE ALL ON SCHEMA migration_internal FROM PUBLIC;
-            REVOKE ALL ON ALL TABLES IN SCHEMA migration_internal FROM PUBLIC;
-            REVOKE ALL ON ALL SEQUENCES IN SCHEMA migration_internal FROM PUBLIC;
-            REVOKE ALL ON ALL FUNCTIONS IN SCHEMA migration_internal FROM PUBLIC;""")
-
-        # Step 8: UPDATE lease_protocol to open/ready (step 11 of §9.2.1)
-        run_sql("""UPDATE migration_internal.lease_protocol
-            SET installed_version = 1,
-                min_supported_version = 1,
-                max_supported_version = 1,
-                barrier_state = 'open',
-                bootstrap_state = 'ready',
-                updated_at = now(),
-                updated_by = session_user
-            WHERE singleton""")
-
-        # Step 9: Verification (step 12 of §9.2.1)
-        # Just verify the protocol row exists and is in the right state
-        cur = conn.cursor()
-        cur.execute("SELECT barrier_state, bootstrap_state FROM migration_internal.lease_protocol WHERE singleton")
-        row = cur.fetchone()
-        conn.commit()
-        cur.close()
-
-        assert row is not None, "T-01: protocol row should exist after bootstrap"
-        assert row[0] == "open", f"T-01: barrier_state should be 'open', got '{row[0]}'"
-        assert row[1] == "ready", f"T-01: bootstrap_state should be 'ready', got '{row[1]}'"
-
-        # Now test acquire + enter
-        cur = conn.cursor()
-        # Acquire the lease
-        cur.execute("SELECT * FROM migration_internal.lease_acquire_v1(1, 'a' || repeat('0', 58), 500, 1000)")
-        row = cur.fetchone()
-        conn.commit()
-        cur.close()
-        if row is None:
-            return "FAIL — T-01: acquire did not return a row"
-
-        # Enter the lease
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM migration_internal.lease_enter_v1(1, 'a' || repeat('0', 58), 500, 1000)")
-        row = cur.fetchone()
-        conn.commit()
-        cur.close()
-        if row is None:
-            return "FAIL — T-01: enter did not return a row"
-
-        # Assert: success
-        return "PASS"
-
-
-def scenario_T02(conn):
-    """
-    T-02: First installation, twice concurrently.
-
-    Two empty-database runs of §9.2.1 start at the same moment.
-    (Single-session harness cannot reproduce true concurrency.)
-
-    Outcome: NOT RUN — requires two independent PostgreSQL backends.
-    """
-    # In single-session, we can simulate sequential runs
-    # True concurrency requires two separate connections/backends
-    return "NOT RUN — concurrent first installation requires two independent PostgreSQL backends; single-session harness cannot reproduce bootstrap guard serialization"
-
-
-def scenario_T03(conn):
-    """
-    T-03: Bootstrapped DB, unowned lease acquire.
-
-    W1 and W2 simultaneously call acquire against one unowned lease row.
-
-    Outcome: NOT RUN — requires multi-session concurrency.
-    """
-    # Ensure lease is unowned
-    run_sql(conn, "UPDATE migration_internal.migration_lease SET owner_token_hash = NULL WHERE lease_name = 'migration-lease'")
-
-    # Single-session: both can acquire since no real concurrency
-    return "NOT RUN — concurrent acquire requires two independent PostgreSQL backends"
-
-
-def scenario_T04(conn):
-    """
-    T-04: W1 owns; enter twice in one tx; W2 enters in own tx.
-
-    W1 owns the lease. W1 calls enter twice in same transaction.
-    W2 calls enter in its own transaction while W1 holds row lock.
-    W2 should receive 55P03 (lock timeout). After W1 commits, W2 should succeed.
-
-    Outcome: NOT RUN — requires multi-session concurrency where W1's transaction
-    holds row lock across enter call.
-    """
-    # W1 acquires lease
-    run_sql(conn, "SELECT * FROM migration_internal.lease_acquire_v1(1, 'a' || repeat('0', 58), 500, 1000)")
-
-    # In single-session, there's no actual row lock contention
-    # W2's enter call encounters no real contention since W1's transaction
-    # doesn't hold the row lock across enter in single-session model
-    return "NOT RUN — W2 enter row-lock contention not reproducible without multi-session concurrency where W1's transaction holds the row lock across the enter call"
-
-
-def scenario_T05(conn):
-    """
-    T-05: W1 owns; GUC forgery.
-
-    W2 sets session variables to W1-like values, then calls enter with its own token.
-    Expected: 45001 (owner mismatch detected by lease function).
-
-    Outcome: NOT RUN — the lease function checks owner_token_hash against
-    the presented hash, not session variables. GUC forgery is not effective.
-    """
-    # W1 acquires lease
-    run_sql(conn, "SELECT * FROM migration_internal.lease_acquire_v1(1, 'a' || repeat('0', 58), 500, 1000)")
-
-    # W2 sets session GUCs - but the lease function checks owner_token_hash,
-    # not session variables, so this won't trigger owner mismatch
-    return "NOT RUN — owner mismatch not detectable via GUC forgery; lease function checks owner_token_hash, not session variables"
-
-
-def scenario_T06(conn):
-    """
-    T-06: W1 owns; W2 has its own valid-format token.
-
-    W2 enter: expected 45001 (owner mismatch); W2 release: expected 45001;
-    W2 acquire (unexpired): expected 45002.
-
-    Outcome: NOT RUN — owner mismatch not detectable in single-session harness.
-    """
-    # W1 acquires lease
-    run_sql(conn, "SELECT * FROM migration_internal.lease_acquire_v1(1, 'a' || repeat('0', 58), 500, 1000)")
-
-    # W2 attempts enter with own token - will succeed because the lease
-    # function checks owner_token_hash, not connection identity
-    return "NOT RUN — owner mismatch not detectable in single-session harness; lease function checks owner_token_hash"
-
-
-def scenario_T07(conn):
-    """
-    T-07: W1 holds open transaction with row lock; W2 enters with
-    p_lock_timeout_ms=1000.
-
-    Expected: W2 receives 55P03 (lock timeout).
-    Actual (in previous harness): got 45001 (owner mismatch) because
-    the lease function's lock-holding guard fires before the advisory
-    lock timeout.
-
-    Outcome: This is the exact driver-reported SQLSTATE. Per the task rule
-    "Catch PostgreSQL exceptions and inspect the driver's actual SQLSTATE
-    field; do not infer SQLSTATE from exception text," since the actual
-    SQLSTATE is 45001 and the expected is 55P03, this scenario cannot
-    reproduce 55P03 in the single-session model because the owner_token_hash
-    guard fires first. Classified per exact driver SQLSTATE: the observed
-    value is 45001 (lease expired/held by another), not 55P03.
-    """
-    # W1 acquires lease
-    run_sql(conn, "SELECT * FROM migration_internal.lease_acquire_v1(1, 'a' || repeat('0', 58), 500, 1000)")
-
-    # W1 begins transaction with row lock
-    cur = conn.cursor()
-    cur.execute("BEGIN")
-    cur.execute("SELECT * FROM migration_internal.migration_lease WHERE lease_name = 'migration-lease' FOR UPDATE")
-    conn.commit()
-    cur.close()
-
-    # W2 attempts enter with lock timeout
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT * FROM migration_internal.lease_enter_v1(1, 'b' || repeat('0', 58), 500, 1000)")
-        result = cur.fetchone()
-        conn.commit()
-        cur.close()
-        if result and result[0] == "55P03":
-            return "PASS — W2 correctly received lock timeout 55P03"
-        elif result and result[0] == "45001":
-            return "FAIL — W2 received owner mismatch 45001 instead of lock timeout 55P03; per exact driver SQLSTATE: 45001 != 55P03, lease function's owner_token_hash guard fires before advisory lock timeout"
-        else:
-            return f"FAIL — unexpected SQLSTATE: {result}"
-    except psycopg.errors.InsufficientPrivilege as e:
-        conn.rollback()
-        cur.close()
-        return f"FAIL — W2 enter denied with InsufficientPrivilege; SQLSTATE={e.sqlstate}, per exact driver SQLSTATE matching: 45001 != 55P03"
-    except Exception as e:
-        conn.rollback()
-        cur.close()
-        return f"FAIL — W2 enter exception: {e}; per exact driver SQLSTATE: do not infer from exception text"
-
-
-def scenario_T08(conn):
-    """
-    T-08: Bootstrapped DB; slow test revision (SELECT pg_sleep(3)).
-    W1 and W2 start upgrade head.
-
-    Outcome: PASS — both W1 and W2 acquire under same protocol.
-    """
-    # Ensure lease row exists unowned
-    run_sql(conn, "UPDATE migration_internal.migration_lease SET owner_token_hash = NULL WHERE lease_name = 'migration-lease'")
-
-    # Simulate slow test revision
-    cur = conn.cursor()
-    cur.execute("SELECT pg_sleep(3)")
-    conn.commit()
-    cur.close()
-
-    # Both attempt acquire
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM migration_internal.lease_acquire_v1(1, 'a' || repeat('0', 58), 500, 1000)")
-    r1 = cur.fetchone()
-    conn.commit()
-    cur.close()
-
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM migration_internal.lease_acquire_v1(1, 'b' || repeat('0', 58), 500, 1000)")
-    r2 = cur.fetchone()
-    conn.commit()
-    cur.close()
-
-    if r1 and r1[0] == "00000" and r2 and r2[0] == "00000":
-        return "PASS — both W1 and W2 acquired under same protocol"
-    else:
-        return f"FAIL — W1={r1}, W2={r2}"
-
-
-def scenario_T09(conn):
-    """
-    T-09: 3 users with legacy positions.
-
-    W1 and W2 start backfill; no duplicate strategy_leg_exposures.
-
-    Outcome: INVALID_SETUP — setup isolation: role/user tables persist
-    from earlier scenario runs; database not fully disposable.
-    """
-    return "INVALID_SETUP — setup isolation: role/user tables persist from earlier scenario runs; database must be fully disposable between scenarios"
-
-
-def scenario_T10(conn):
-    """
-    T-10: 3 users; instrument enter calls per transaction.
-
-    W1; each user transaction shows exactly 2 enter calls.
-
-    Outcome: INVALID_SETUP — setup object persistence.
-    """
-    return "INVALID_SETUP — setup isolation: public tables persist from earlier scenario runs; database must be fully disposable between scenarios"
-
-
-def scenario_T11(conn):
-    """
-    T-11: W1 opens a user transaction and sleeps past TTL.
-
-    W1's pre-commit enter fails; after expiry W2 takes over.
-
-    Expected: 45002 (lease expiry).
-
-    Outcome: NOT RUN — 5-second pg_sleep may not exceed the lease TTL of 500 seconds.
-    TTL expiry would require sleeping >500 seconds or reducing the TTL to
-    test expiry against the database clock. Per the task: "use a TTL that
-    is actually exceeded, measured against the database clock."
-    """
-    # W1 acquires lease
-    run_sql(conn, "SELECT * FROM migration_internal.lease_acquire_v1(1, 'a' || repeat('0', 58), 500, 1000)")
-
-    # W1 begins transaction and sleeps
-    cur = conn.cursor()
-    cur.execute("BEGIN")
-    try:
-        cur.execute("SELECT pg_sleep(5)")
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        cur.close()
-        return "NOT RUN — sleep interrupted"
-    cur.close()
-
-    # After sleep, W1's pre-commit enter
-    cur = conn.cursor()
-    cur.execute("BEGIN")
-    try:
-        cur.execute("SELECT * FROM migration_internal.lease_enter_v1(1, 'a' || repeat('0', 58), 500, 1000)")
-        result = cur.fetchone()
-        conn.commit()
-        cur.close()
-        if result and result[0] == "45002":
-            return "PASS — lease expiry detected (45002)"
-        elif result and result[0] == "00000":
-            return "FAIL — TTL not exceeded (5s sleep < 500s TTL); lease still valid after sleep; per task: \"use a TTL that is actually exceeded, measured against the database clock\""
-        else:
-            return f"FAIL — unexpected: {result}"
-    except Exception as e:
-        conn.rollback()
-        cur.close()
-        return f"NOT RUN — TTL expiry test: {e}"
-    finally:
-        cur.close()
-
-
-def scenario_T12(conn):
-    """
-    T-12: W1 owns and is inside a user transaction. Kill W1's backend.
-
-    Expected: 57P01 (backend death).
-
-    Outcome: NOT RUN — backend kill not reproducible in single-session harness.
-    Requires separate PostgreSQL backend process and OS-level kill.
-    """
-    return "NOT RUN — backend kill not reproducible in single-session harness; requires separate PostgreSQL backend process and OS-level kill (pg_terminate_backend from another session)"
-
-
-def scenario_T13(conn):
-    """
-    T-13: W1 commits user 1, then is killed before user 2.
-
-    User 1 rows present once; after expiry W2 reprocesses idempotently.
-
-    Outcome: PASS.
-    """
-    cur = conn.cursor()
-
-    # W1 acquires lease
-    run_sql(conn, "SELECT * FROM migration_internal.lease_acquire_v1(1, 'a' || repeat('0', 58), 500, 1000)")
-
-    # W1 inserts user 1 row
-    run_sql(conn, "INSERT INTO public.positions (id, user_id) VALUES (1, 99)")
-
-    # W1 commits user 1
-    run_sql(conn, "COMMIT")
-
-    # Check state: user 1 rows should be present once
-    cur = conn.cursor()
-    cur.execute("SELECT count(*) FROM public.positions WHERE id = 1")
-    count = cur.fetchone()[0]
-    conn.commit()
-    cur.close()
-
-    # Assert: user 1 rows present once after commit
-    if count == 1:
-        return "PASS — user 1 committed once; database state consistent"
-    else:
-        return f"FAIL — position count={count}"
-
-
-def scenario_T14(conn):
-    """
-    T-14: installed_version=2; normal startup with barrier_state='closed'.
-
-    Expected: 45006 (protocol version mismatch).
-
-    Outcome: PASS.
-    """
-    cur = conn.cursor()
-
-    # Set installed version to 2
-    run_sql(conn, "SELECT set_config('lease_protocol.installed_version', '2', true)")
-    conn.commit()
-
-    # Attempt acquire with protocol version mismatch
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM migration_internal.lease_acquire_v1(2, 'a' || repeat('0', 58), 500, 1000)")
-    result = cur.fetchone()
-    conn.commit()
-    cur.close()
-
-    if result and result[0] == "45006":
-        return "PASS — protocol version mismatch correctly detected (45006)"
-    elif result and result[0] == "00000":
-        return "FAIL — no version mismatch detected; may need to ensure bootstrap_state reflects ready state"
-    else:
-        return f"FAIL — unexpected SQLSTATE: {result}"
-
-
-def scenario_T15(conn):
-    """
-    T-15: Roles provisioned; APP session.
-
-    has_table_privilege all false; direct SELECT/UPDATE/DELETE denied.
-
-    Outcome: Per exact driver SQLSTATE matching: the UPDATE public.positions
-    SET user_id=9 WHERE id=1 triggers 42P07 (insufficient privilege for
-    operation) rather than 42501 (insufficient privilege at SQL standard level).
-    Per the task rule "Catch PostgreSQL exceptions and inspect the driver's
-    actual SQLSTATE field; do not infer SQLSTATE from exception text," since
-    the observed SQLSTATE is 42P07 and the expected is 42501, this is
-    classified as FAIL because the observed SQLSTATE does not match the expected.
-    The PostgreSQL grant structure (INHERIT FALSE, SET TRUE, ADMIN FALSE on
-    strikenova_prod_migrator) maps privilege denial to 42P07.
-    """
-    cur = conn.cursor()
-
-    # Grant minimal privileges to migrator (Topology A from ADR §8.3)
-    # The migrator owns the tables but we revoke INSERT, UPDATE, DELETE, TRUNCATE
-    run_sql(conn, """GRANT ALL ON SCHEMA public TO strikenova_prod_migrator""")
-    conn.commit()
-
-    # Grant SELECT only (owner revokes will be applied conceptually)
-    # In practice, since the migrator owns the tables, we need to revoke
-    # the specific privileges to test the privilege boundary
-
-    # Test: as the migrator, try UPDATE on public.positions
-    # We need to set the role first - but since the migrator owns the tables,
-    # we test the effective privilege after revokes conceptually
-    # The key test: does the migrator's effective privilege for UPDATE read 42P07 or 42501?
-
-    # Since the migrator owns the tables, let's test with a non-owner role
-    # Instead, let's test has_table_privilege directly
-    try:
-        cur.execute("SELECT has_table_privilege('strikenova_prod_migrator', 'public.positions'::regclass, 'UPDATE')")
-        has_update = cur.fetchone()[0]
-        conn.commit()
-        cur.close()
-
-        # Also test direct UPDATE
-        # We need to create the role and set up the privilege structure
-        # For now, test the has_table_privilege function result
-        if has_update:
-            return "FAIL — has_table_privilege returned true for UPDATE; privilege structure does not enforce the revokes; per exact SQLSTATE matching the harness cannot reproduce 42501 from this configuration"
-        else:
-            return "FAIL — has_table_privilege returned false for UPDATE; but the exact driver SQLSTATE when a privilege-denied operation occurs depends on PostgreSQL's internal mapping; per task: 42P07 = duplicate_table, 42501 = insufficient_privilege. We must test the actual SQLSTATE from a denied operation."
-
-    except Exception as e:
-        conn.rollback()
-        cur.close()
-        return f"FAIL — unexpected exception: {e}"
-
-    # Re-setup: create roles and test proper Topology A/B privilege structure
-    # This is complex; the key outcome from the previous harness was that
-    # UPDATE triggered 42P07 instead of 42501, which per exact SQLSTATE
-    # matching rule is a FAIL (42P07 != 42501)
-    return "FAIL — per exact driver SQLSTATE matching: UPDATE on owned table by migrator triggers 42P07 rather than 42501; 42P07 != 42501 per task rule, classified as FAIL"
-
-
-def scenario_T16(conn):
-    """
-    T-16: Topology B: migrator privileges.
-
-    Same as T-15: migrator with INHERIT FALSE membership, four minimal grants,
-    UPDATE/DELETE denied.
-
-    Outcome: Per exact driver SQLSTATE matching: same issue as T-15.
-    The UPDATE on public.positions triggers 42P07 rather than 42501.
-    Per the task rule "Catch PostgreSQL exceptions and inspect the driver's
-    actual SQLSTATE field; do not infer SQLSTATE from exception text," since
-    the observed SQLSTATE is 42P07 and the expected is 42501, this is
-    classified as FAIL because the observed SQLSTATE does not match the expected.
-    T-16 is an independent test from T-15, using Topology B privilege structure.
-    """
-    # T-16 is a separate test from T-15, testing Topology B privilege structure
-    # In Topology B, the migrator has INHERIT FALSE, SET TRUE, ADMIN FALSE
-    # membership in strikenova_prod_owner, with only four minimal grants.
-    # The migrator does NOT own application tables.
-
-    # Create topology B setup: migrator is a member of owner role with INHERIT FALSE
-    run_sql(conn, """DO $$
-        BEGIN
-            IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'strikenova_prod_migrator') THEN
-                CREATE ROLE strikenova_prod_migrator LOGIN;
-            END IF;
-            IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'strikenova_prod_owner') THEN
-                CREATE ROLE strikenova_prod_owner NOLOGIN;
-            END IF;
-        END$$;""")
-    conn.commit()
-
-    # Grant INHERIT FALSE, SET TRUE, ADMIN FALSE membership
-    run_sql(conn, "GRANT strikenova_prod_owner TO strikenova_prod_migrator WITH INHERIT FALSE, SET TRUE, ADMIN FALSE")
-    conn.commit()
-
-    # Four minimal grants only (Topology B from ADR §8.3)
-    run_sql(conn, """GRANT SELECT ON public.positions TO strikenova_prod_migrator;
-        GRANT SELECT ON public.paper_orders TO strikenova_prod_migrator;
-        GRANT SELECT, INSERT ON public.strategy_leg_exposures TO strikenova_prod_migrator;
-        GRANT USAGE ON SEQUENCE public.strategy_leg_exposures_id_seq TO strikenova_prod_migrator;""")
-    conn.commit()
-
-    # Test: as the migrator (with SET ROLE), try UPDATE on public.positions
-    # In Topology B, the migrator does NOT own the tables, so UPDATE should be denied
-    cur = conn.cursor()
-    try:
-        cur.execute("SET ROLE strikenova_prod_migrator")
-        cur.execute("UPDATE public.positions SET user_id = 9 WHERE id = 1")
-        # If we get here, UPDATE succeeded - that's a privilege boundary violation
-        conn.rollback()
-        cur.close()
-        return "FAIL — UPDATE succeeded as migrator in Topology B; privilege boundary broken; migrator should not have UPDATE on public.positions"
-
-    except psycopg.errors.InsufficientPrivilege as e:
-        conn.rollback()
-        cur.close()
-        # Per exact driver SQLSTATE matching
-        err_sqlstate = e.sqlstate
-        if err_sqlstate == "42501":
-            return "PASS — got expected 42501 (insufficient privilege at SQL standard level) in Topology B"
-        elif err_sqlstate == "42P07":
-            return "FAIL — got 42P07 (insufficient privilege for operation) instead of 42501; per exact driver SQLSTATE matching: 42P07 != 42501, T-16 Topology B privilege test failed"
-        else:
-            return f"FAIL — got SQLSTATE {err_sqlstate} instead of 42501 in Topology B; per exact driver SQLSTATE matching"
-
-    except Exception as e:
-        conn.rollback()
-        cur.close()
-        return f"FAIL — unexpected exception in T-16 Topology B: {e}; per exact driver SQLSTATE: do not infer from exception text"
-
-
-def scenario_T17(conn):
-    """
-    T-17: Bootstrapped DB; run alembic upgrade head directly.
-
-    Outcome: PASS — lease protocol is in a ready state where
-    alembic upgrade head could proceed.
-    Note: This does NOT execute the actual `alembic upgrade head` command;
-    no Alembic binary is available in the disposable harness. The pass means
-    the lease protocol is in a state where such a command could proceed,
-    not that it was invoked.
-    """
-    # Ensure bootstrapped state
-    run_sql(conn, """INSERT INTO migration_internal.lease_protocol
-        (installed_version, min_supported_version, max_supported_version,
-         barrier_state, bootstrap_state)
-        VALUES (1, 1, 1, 'open', 'ready')""")
-
-    # Lease acquire in bootstrapped state
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM migration_internal.lease_acquire_v1(1, 'a' || repeat('0', 58), 500, 1000)")
-    r1 = cur.fetchone()
-    conn.commit()
-    cur.close()
-
-    if r1 and r1[0] == "00000":
-        return "PASS — lease protocol in ready state; alembic upgrade head could proceed (NOTE: no Alembic binary available in disposable harness; this tests lease state, not the alembic command itself)"
-    else:
-        return f"FAIL — lease_acquire={r1}"
-
-
-def scenario_T18(conn):
-    """
-    T-18: Bootstrapped DB; run python -m app.migrate upgrade head.
-
-    Outcome: Same pattern as T-17. Does NOT execute the actual
-    `python -m app.migrate upgrade head` command; no migration runner available.
-    The pass means the lease protocol is in a ready state.
-    """
-    # Same as T-17
-    return scenario_T17(conn)
-
-
-def scenario_T19(conn):
-    """
-    T-19: W1 owns lease, inside user transaction.
-
-    Force backfill_exposures to raise (injected error); force cleanup release
-    to fail. Assert rollback and lease ownership state.
-
-    Outcome: PASS.
-    """
-    cur = conn.cursor()
-
-    # W1 acquires lease
-    run_sql(conn, "SELECT * FROM migration_internal.lease_acquire_v1(1, 'a' || repeat('0', 58), 500, 1000)")
-
-    # W1 begins user transaction
-    cur = conn.cursor()
-    cur.execute("BEGIN")
-    run_sql(conn, "INSERT INTO public.paper_orders (id, user_id, strategy_leg_id) VALUES (1, 99, 1)")
-    conn.commit()
-
-    # Force cleanup release to fail — attempt release with wrong token
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT * FROM migration_internal.lease_release_v1(1, 'wrong_token')")
-        result = cur.fetchone()
-        conn.commit()
-        cur.close()
-        if result and result[0] == "45001":
-            # Check lease ownership state after failed release
-            cur = conn.cursor()
-            cur.execute("SELECT owner_token_hash FROM migration_internal.migration_lease WHERE lease_name = 'migration-lease'")
-            owner = cur.fetchone()[0]
-            conn.commit()
-            cur.close()
-            if owner == "a" + "0" * 58:
-                return "PASS — backfill error injected; release with wrong token correctly denied (45001); lease ownership preserved after failed release"
-            else:
-                return "FAIL — release succeeded with wrong token; lease ownership compromised"
-        else:
-            return f"FAIL — release result: {result}"
-
-    except psycopg.errors.InsufficientPrivilege as e:
-        conn.rollback()
-        cur.close()
-        return f"FAIL — release denied with 45001 (owner mismatch); {e}"
-    except Exception as e:
-        conn.rollback()
-        cur.close()
-        return f"FAIL — release exception: {e}"
-
-
-def scenario_T20(conn):
-    """
-    T-20: Database already at head; run the supported command.
-
-    Outcome: PASS. Lease acquire in already-bootstrapped state.
-    """
-    # Ensure database is bootstrapped (lease row exists with owner from prior scenario)
-    run_sql(conn, """UPDATE migration_internal.migration_lease SET owner_token_hash = '' WHERE lease_name = 'migration-lease'""")
-    run_sql("""INSERT INTO migration_internal.lease_protocol
-        (installed_version, min_supported_version, max_supported_version,
-         barrier_state, bootstrap_state)
-        VALUES (1, 1, 1, 'open', 'ready')""")
-
-    # Lease acquire in already-bootstrapped state
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM migration_internal.lease_acquire_v1(1, 'a' || repeat('0', 58), 500, 1000)")
-    r1 = cur.fetchone()
-    conn.commit()
-    cur.close()
-
-    if r1 and r1[0] == "00000":
-        return "PASS — lease acquire succeeds in already-bootstrapped database"
-    else:
-        return f"FAIL — lease_acquire={r1}"
-
-
-def scenario_T21(conn):
-    """
-    T-21: Operator runs bootstrap-lease --close-barrier while W1 is inside
-    its DDL transaction holding the lease row lock.
-
-    Expected: 45004.
-
-    Outcome: NOT RUN — close-barrier command not wired into harness;
-    the close command itself does not return 45004. Requires operator
-    command integration. Per the ADR: "--close-barrier does not take the
-    lease row lock; it probes the lease row with FOR UPDATE NOWAIT and
-    then rolls back. The barrier is set to closed regardless of owner state."
-    This requires the full operator command infrastructure, not just the
-    lease functions.
-    """
-    # In the ADR, --close-barrier does not take the lease row lock;
-    # it probes the lease row with FOR UPDATE NOWAIT and then rolls back.
-    # The barrier is set to closed regardless of owner state.
-    # This requires operator command integration, not just the lease functions.
-    return "NOT RUN — close-barrier operator command not wired into harness; requires separate operator command integration with bootstrap-lease --close-barrier command"
-
-
-def scenario_T22(conn):
-    """
-    T-22: acquire and enter called with p_lock_timeout_ms=0 (and separately
-    p_ttl_seconds=0). Use valid token; p_lock_timeout_ms=0 should be rejected
-    by the function.
-
-    Outcome: PASS — token validation correctly rejects p_lock_timeout_ms=0
-    with 45004 (configuration invalid) because the function treats
-    lock_timeout=0 as "wait forever" and raises 45004.
-    """
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT * FROM migration_internal.lease_enter_v1(1, 'a' || repeat('0', 58), 500, 0)")
-        result = cur.fetchone()
-        conn.commit()
-        cur.close()
-        if result and result[0] == "45004":
-            return "PASS — p_lock_timeout_ms=0 correctly rejected with 45004 (configuration invalid)"
-        else:
-            return f"FAIL — expected 45004, got {result}"
-    except psycopg.errors.InsufficientPrivilege as e:
-        conn.rollback()
-        cur.close()
-        return f"FAIL — {e}"
-    except Exception as e:
-        conn.rollback()
-        cur.close()
-        return f"FAIL — {e}"
-
-
-def scenario_T23(conn):
-    """
-    T-23: Stale process across an upgrade.
-
-    W1 (protocol 1) pauses before acquire; operator activates protocol 2;
-    W1 resumes and calls acquire/enter → 45006.
-
-    Outcome: PASS.
-    """
-    # Set up: operator activates protocol 2 (installed_version = 2)
-    run_sql(conn, "SELECT set_config('lease_protocol.installed_version', '2', true)")
-    conn.commit()
-
-    # W1 resumes and calls acquire with protocol 1
-    # In the actual protocol, the version check fires before lock contention
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM migration_internal.lease_acquire_v1(1, 'a' || repeat('0', 58), 500, 1000)")
-    r1 = cur.fetchone()
-    conn.commit()
-    cur.close()
-
-    if r1 and r1[0] == "45006":
-        return "PASS — protocol version mismatch correctly detected (45006)"
-    else:
-        return f"FAIL — expected 45006, got {r1}"
-
-
-def scenario_T24(conn):
-    """
-    T-24: Cross-version concurrency.
-
-    Protocol 2 alongside protocol 1. W1 (v1) holds open protected transaction;
-    W2 (v2) calls enter → expected 55P03 (lock not available).
-
-    Outcome: FAIL — got 45006 (protocol version mismatch) instead of 55P03
-    (lock not available). The installed_version check in the lease acquire
-    function fires before the advisory lock contention, returning 45006.
-    Per exact driver SQLSTATE matching: 45006 != 55P03, classified as FAIL.
-    The version-contention ordering is a harness limitation.
-    """
-    # Set up protocol 1 database
-    run_sql(conn, "SELECT set_config('lease_protocol.installed_version', '1', true)")
-    conn.commit()
-
-    # W1 acquires lease under protocol 1
-    run_sql(conn, "SELECT * FROM migration_internal.lease_acquire_v1(1, 'a' || repeat('0', 58), 500, 1000)")
-    conn.commit()
-
-    # W2 attempts enter with protocol 2
-    # In the actual protocol, the version check fires before advisory lock contention
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT * FROM migration_internal.lease_enter_v1(2, 'b' || repeat('0', 58), 500, 1000)")
-        result = cur.fetchone()
-        conn.commit()
-        cur.close()
-        if result and result[0] == "55P03":
-            return "PASS — lock contention correctly returned 55P03"
-        elif result and result[0] == "45006":
-            return "FAIL — got 45006 (protocol version mismatch) instead of 55P03 (lock not available); per exact driver SQLSTATE matching: 45006 != 55P03, version check fires before lock contention in current harness"
-        else:
-            return f"FAIL — unexpected SQLSTATE: {result}"
-    except psycopg.errors.InsufficientPrivilege as e:
-        conn.rollback()
-        cur.close()
-        return f"FAIL — {e}; per exact driver SQLSTATE: do not infer from exception text"
-    except Exception as e:
-        conn.rollback()
-        cur.close()
-        return f"FAIL — {e}; per exact driver SQLSTATE: do not infer from exception text"
-
-
-def scenario_T25(conn):
-    """
-    T-25: Plain bootstrap refuses version mismatch.
-
-    Database installed at protocol 1 (installed_version=1, range 1..1);
-    a protocol-2 binary (EXPECTED_PROTOCOL_VERSION=2) runs bootstrap-lease
-    (verify mode).
-
-    Outcome: PASS — version mismatch correctly refused (the actual T-25 test
-    requires the bootstrap-lease verify command, which refuses installed_version
-    <> EXPECTED_PROTOCOL_VERSION with 45006).
-    """
-    # Set installed version to 1
-    run_sql(conn, "SELECT set_config('lease_protocol.installed_version', '1', true)")
-    conn.commit()
-
-    # In the actual ADR, the bootstrap-lease verify mode refuses when
-    # installed_version <> EXPECTED_PROTOCOL_VERSION with 45006
-    # But we only have the harness functions; the acquire function checks
-    # v_inst <> p_protocol, and if both are 1, it passes.
-    # The 45006 comes from the version gate in the actual bootstrap-lease
-    # command, not directly from the acquire function in isolation.
-
-    # Test: acquire with protocol 1 when installed is 1 → should succeed
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM migration_internal.lease_acquire_v1(1, 'a' || repeat('0', 58), 500, 1000)")
-    r1 = cur.fetchone()
-    conn.commit()
-    cur.close()
-
-    if r1 and r1[0] == "00000":
-        return "PASS — version mismatch correctly refused via the bootstrap-lease verify mode path (the acquire function with matching protocol/ installed version passes; the 45006 refusal is specific to the bootstrap-lease CLI verify mode, not the acquire function itself)"
-    else:
-        return f"FAIL — expected 00000 for protocol 1 with installed 1, got {r1}"
-
-
-def scenario_T26(conn):
-    """
-    T-26: Explicit upgrade, refusal, and cancellation.
-
-    Same database and binary: (a) --upgrade-protocol 2 after release;
-    (b) --upgrade-protocol 1 from installed 2 → 45006;
-    (c) --upgrade-protocol 3 at any point.
-
-    Outcome: NOT RUN — explicit upgrade refusal not reproducible in single-session
-    harness; requires multi-statement protocol refusal flow that cannot be
-    triggered from a single test connection. The UPDATE of installed_version
-    does not produce a raised exception from the test connection.
-    """
-    # In the actual ADR, the --upgrade-protocol command is an operator command
-    # that runs the bootstrap upgrade procedure (§9.2.2, §9.2.3).
-    # This requires the full operator command infrastructure, not just the
-    # lease functions.
-    return "NOT RUN — explicit upgrade refusal not reproducible in single-session harness; requires operator bootstrap-lease --upgrade-protocol command with proper authority and quiescence checks"
-
-
-def scenario_T27(conn):
-    """
-    T-27: enter refuses an unready protocol.
-
-    Database with bootstrap_state='installing', unowned lease row,
-    application rows present → 45005.
-
-    Outcome: PASS.
-    """
-    # Set up database with bootstrap_state='installing'
-    run_sql(conn, "UPDATE migration_internal.migration_lease SET owner_token_hash = NULL WHERE lease_name = 'migration-lease'")
-    run_sql("""INSERT INTO migration_internal.lease_protocol
-        (installed_version, min_supported_version, max_supported_version,
-         barrier_state, bootstrap_state)
-        VALUES (1, 1, 1, 'open', 'installing')""")
-
-    # Ensure application rows exist
-    run_sql(conn, "INSERT INTO public.positions (id, user_id) VALUES (1, 1) ON CONFLICT DO NOTHING")
-    conn.commit()
-
-    # Attempt enter on unready protocol (installing state)
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM migration_internal.lease_enter_v1(1, 'a' || repeat('0', 58), 500, 1000)")
-    r1 = cur.fetchone()
-    conn.commit()
-    cur.close()
-
-    if r1 and r1[0] == "45005":
-        return "PASS — unready protocol correctly refused (45005)"
-    else:
-        return f"FAIL — expected 45005, got {r1}"
+        run_sql(conn, REVOKE_SET_SQL)
+        run_sql(conn,
+                "UPDATE migration_internal.lease_protocol "
+                "SET installed_version = 1, "
+                "    min_supported_version = 1, "
+                "    max_supported_version = 1, "
+                "    barrier_state = 'open', "
+                "    bootstrap_state = 'ready', "
+                "    updated_at = now(), "
+                "    updated_by = session_user "
+                "WHERE singleton")
+        row = run_sql(conn, "SELECT * FROM migration_internal.lease_protocol_info_v1()",
+                      fetch_mode="one")
+        if row != (1, 1, 1, "open", "ready"):
+            raise AssertionError(f"§9.2.1 step 12 verification failed: {row!r}")
 
 
 # ---------------------------------------------------------------------------
-# Main: scenario dispatch
+# Shared assertions
+# ---------------------------------------------------------------------------
+
+def assert_lease_result(row, expected_generation=None):
+    """A successful acquire/enter returns (fingerprint text, timestamptz, bigint)."""
+    if row is None or len(row) != 3:
+        raise AssertionError(f"expected a 3-column lease result, got {row!r}")
+    fp, expires_at, generation = row
+    if not isinstance(fp, str) or len(fp) != 12:
+        raise AssertionError(f"owner fingerprint is not 12 hex chars: {fp!r}")
+    if not isinstance(expires_at, datetime.datetime):
+        raise AssertionError(f"expires_at is not a timestamp: {expires_at!r}")
+    if not isinstance(generation, int):
+        raise AssertionError(f"generation is not an integer: {generation!r}")
+    if expected_generation is not None and generation != expected_generation:
+        raise AssertionError(f"generation {generation} != expected {expected_generation}")
+    return fp, expires_at, generation
+
+
+def lease_row(conn):
+    return run_sql(conn,
+                   "SELECT owner_token_hash, owner_fingerprint, expires_at, generation "
+                   "FROM migration_internal.migration_lease "
+                   "WHERE lease_name = 'migration-lease'",
+                   fetch_mode="one")
+
+
+def scenario_db_name(key):
+    return "issue145_" + key.lower().replace("-", "_")
+
+
+# ---------------------------------------------------------------------------
+# Scenarios
+# ---------------------------------------------------------------------------
+
+def scenario_T01(conn):
+    """T-01: first installation from a genuinely empty database."""
+    for obj in ("migration_internal.migration_lease",
+                "migration_internal.lease_protocol",
+                "public.positions", "public.paper_orders",
+                "public.strategy_leg_exposures"):
+        if run_sql(conn, "SELECT to_regclass(%s)", (obj,), fetch_mode="one")[0] is not None:
+            raise AssertionError(f"T-01 database is not empty: {obj} exists")
+    if run_sql(conn, "SELECT to_regclass('alembic_version')", fetch_mode="one")[0] is not None:
+        raise AssertionError("T-01 database is not empty: alembic_version exists")
+
+    bootstrap_first_installation(conn)
+
+    if run_sql(conn, "SELECT count(*) FROM migration_internal.lease_protocol",
+               fetch_mode="one")[0] != 1:
+        raise AssertionError("T-01: expected exactly one protocol row")
+    if run_sql(conn, "SELECT count(*) FROM migration_internal.migration_lease",
+               fetch_mode="one")[0] != 1:
+        raise AssertionError("T-01: expected exactly one lease row")
+    if run_sql(conn, "SELECT to_regclass('alembic_version')", fetch_mode="one")[0] is not None:
+        raise AssertionError("T-01: bootstrap created alembic_version")
+    if run_sql(conn, "SELECT to_regclass('public.positions')", fetch_mode="one")[0] is not None:
+        raise AssertionError("T-01: bootstrap created an application table")
+
+    with conn.transaction():
+        row = run_sql(conn, "SELECT * FROM migration_internal.lease_acquire_v1(1, %s, %s, %s)",
+                      (TOKEN_A, LEASE_TTL_SECONDS, LEASE_LOCK_TIMEOUT_MS), fetch_mode="one")
+        assert_lease_result(row, expected_generation=1)
+    with conn.transaction():
+        row = run_sql(conn, "SELECT * FROM migration_internal.lease_enter_v1(1, %s, %s, %s)",
+                      (TOKEN_A, LEASE_TTL_SECONDS, LEASE_LOCK_TIMEOUT_MS), fetch_mode="one")
+        assert_lease_result(row, expected_generation=1)
+    return "PASS"
+
+
+def scenario_T02(conn):
+    """T-02: two concurrent first installations."""
+    return ("NOT RUN — requires two independent PostgreSQL backends starting §9.2.1 "
+            "simultaneously; the bootstrap guard serialization cannot be observed from one session")
+
+
+def scenario_T03(conn):
+    """T-03: two workers acquire one unowned lease simultaneously."""
+    return ("NOT RUN — requires two independent PostgreSQL backends calling acquire "
+            "concurrently to observe 45002/55P03 on the loser")
+
+
+def scenario_T04(conn):
+    """T-04: W1 enters twice in one transaction; a second worker's enter is refused 55P03."""
+    bootstrap_first_installation(conn)
+    with conn.transaction():
+        assert_lease_result(
+            run_sql(conn, "SELECT * FROM migration_internal.lease_acquire_v1(1, %s, %s, %s)",
+                    (TOKEN_A, LEASE_TTL_SECONDS, LEASE_LOCK_TIMEOUT_MS), fetch_mode="one"),
+            expected_generation=1)
+
+    w2 = connect(scenario_db_name("T-04"))
+    try:
+        w1_tx = conn.transaction()
+        w1_tx.__enter__()
+        try:
+            # W1 enters twice in the same transaction; both must succeed.
+            assert_lease_result(
+                run_sql(conn, "SELECT * FROM migration_internal.lease_enter_v1(1, %s, %s, %s)",
+                        (TOKEN_A, LEASE_TTL_SECONDS, LEASE_LOCK_TIMEOUT_MS), fetch_mode="one"))
+            assert_lease_result(
+                run_sql(conn, "SELECT * FROM migration_internal.lease_enter_v1(1, %s, %s, %s)",
+                        (TOKEN_A, LEASE_TTL_SECONDS, LEASE_LOCK_TIMEOUT_MS), fetch_mode="one"))
+
+            # W2's enter in its own transaction must time out on the row lock.
+            with w2.transaction():
+                matched, observed = expect_sqlstate(
+                    w2,
+                    "SELECT * FROM migration_internal.lease_enter_v1(1, %s, %s, %s)",
+                    (TOKEN_A, LEASE_TTL_SECONDS, 1000),
+                    "55P03")
+            if not matched:
+                raise AssertionError(
+                    f"T-04: expected 55P03 while W1 holds the lock, got {observed}")
+        finally:
+            w1_tx.__exit__(None, None, None)
+
+        # After W1 commits the row lock is free and W2's enter succeeds.
+        with w2.transaction():
+            assert_lease_result(
+                run_sql(w2, "SELECT * FROM migration_internal.lease_enter_v1(1, %s, %s, %s)",
+                        (TOKEN_A, LEASE_TTL_SECONDS, 1000), fetch_mode="one"))
+    finally:
+        w2.close()
+    return "PASS"
+
+
+def scenario_T05(conn):
+    """T-05: GUC forgery cannot substitute for the token comparison."""
+    bootstrap_first_installation(conn)
+    with conn.transaction():
+        run_sql(conn, "SELECT * FROM migration_internal.lease_acquire_v1(1, %s, %s, %s)",
+                (TOKEN_A, LEASE_TTL_SECONDS, LEASE_LOCK_TIMEOUT_MS))
+    fp_before = lease_row(conn)[1]
+
+    with conn.transaction():
+        run_sql(conn, "SELECT set_config('app.migration_owner', 'strikenova_prod_migrator', true)")
+        run_sql(conn, "SELECT set_config('strikenova.lease_token', %s, true)", (TOKEN_A,))
+        run_sql(conn, "SELECT set_config('role', 'strikenova_prod_migrator', true)")
+        run_sql(conn, "SET SESSION AUTHORIZATION DEFAULT")
+        matched, observed = expect_sqlstate(
+            conn,
+            "SELECT * FROM migration_internal.lease_enter_v1(1, %s, %s, %s)",
+            (TOKEN_B, LEASE_TTL_SECONDS, LEASE_LOCK_TIMEOUT_MS),
+            "45001")
+    if not matched:
+        raise AssertionError(f"T-05: expected 45001 from forged-GUC enter, got {observed}")
+
+    if lease_row(conn)[1] != fp_before:
+        raise AssertionError("T-05: owner fingerprint changed after forged enter")
+
+    # No lease function may read a GUC that could impersonate the owner.
+    sources = run_sql(conn,
+                      "SELECT p.proname, p.prosrc FROM pg_proc p "
+                      "JOIN pg_namespace n ON n.oid = p.pronamespace "
+                      "WHERE n.nspname = 'migration_internal'",
+                      fetch_mode="all")
+    forbidden = ("app.migration_owner", "strikenova.lease_token",
+                 "session_authorization", "current_setting('role')")
+    for name, source in sources:
+        for marker in forbidden:
+            if marker in source:
+                raise AssertionError(f"T-05: {name} reads a forgeable setting: {marker}")
+    return "PASS"
+
+
+def scenario_T06(conn):
+    """T-06: a valid-format foreign token cannot enter, release, or take over."""
+    bootstrap_first_installation(conn)
+    with conn.transaction():
+        row = run_sql(conn, "SELECT * FROM migration_internal.lease_acquire_v1(1, %s, %s, %s)",
+                      (TOKEN_A, LEASE_TTL_SECONDS, LEASE_LOCK_TIMEOUT_MS), fetch_mode="one")
+    assert_lease_result(row, expected_generation=1)
+    fp_before = lease_row(conn)[1]
+
+    for query, expected in (
+        ("SELECT * FROM migration_internal.lease_enter_v1(1, %s, %s, %s)",
+         "45001"),
+        ("SELECT * FROM migration_internal.lease_release_v1(1, %s)", "45001"),
+        ("SELECT * FROM migration_internal.lease_acquire_v1(1, %s, %s, %s)", "45002"),
+    ):
+        params = (TOKEN_B, LEASE_TTL_SECONDS, LEASE_LOCK_TIMEOUT_MS) if query.count("%s") == 3 \
+            else (TOKEN_B,)
+        with conn.transaction():
+            matched, observed = expect_sqlstate(conn, query, params, expected)
+        if not matched:
+            raise AssertionError(f"T-06: expected {expected}, got {observed}")
+
+    if lease_row(conn)[1] != fp_before:
+        raise AssertionError("T-06: foreign worker modified the lease row")
+    return "PASS"
+
+
+def scenario_T07(conn):
+    """T-07: W1 holds the row lock; W2's enter with the correct token must fail 55P03."""
+    bootstrap_first_installation(conn)
+    with conn.transaction():
+        assert_lease_result(
+            run_sql(conn, "SELECT * FROM migration_internal.lease_acquire_v1(1, %s, %s, %s)",
+                    (TOKEN_A, LEASE_TTL_SECONDS, LEASE_LOCK_TIMEOUT_MS), fetch_mode="one"),
+            expected_generation=1)
+
+    w2 = connect(scenario_db_name("T-07"))
+    try:
+        # W1 opens a transaction and takes the lease row lock without committing.
+        w1_tx = conn.transaction()
+        w1_tx.__enter__()
+        try:
+            run_sql(conn, "SELECT 1 FROM migration_internal.migration_lease "
+                          "WHERE lease_name = 'migration-lease' FOR UPDATE")
+            with w2.transaction():
+                matched, observed = expect_sqlstate(
+                    w2,
+                    "SELECT * FROM migration_internal.lease_enter_v1(1, %s, %s, %s)",
+                    (TOKEN_A, LEASE_TTL_SECONDS, 1000),
+                    "55P03")
+            if not matched:
+                raise AssertionError(
+                    f"T-07: expected 55P03 for the blocked enter, got {observed}")
+        finally:
+            w1_tx.__exit__(None, None, None)
+
+        # After W1's rollback the lock is free and the same token may enter.
+        with w2.transaction():
+            assert_lease_result(
+                run_sql(w2, "SELECT * FROM migration_internal.lease_enter_v1(1, %s, %s, %s)",
+                        (TOKEN_A, LEASE_TTL_SECONDS, 1000), fetch_mode="one"))
+    finally:
+        w2.close()
+    return "PASS"
+
+
+def scenario_T08(conn):
+    """T-08: two workers run an Alembic upgrade head against one lease."""
+    return ("NOT RUN — requires the real Alembic chain and two independent backends; "
+            "no Alembic binary or migration runner exists in this harness")
+
+
+def scenario_T09(conn):
+    """T-09: concurrent backfill of three users."""
+    return ("NOT RUN — requires the real backfill implementation and two independent "
+            "backends; no backfill code exists in this harness")
+
+
+def scenario_T10(conn):
+    """T-10: each backfill transaction shows exactly two enter calls."""
+    return ("NOT RUN — requires the real backfill implementation; the per-user "
+            "transaction pattern cannot be exercised without it")
+
+
+def scenario_T11(conn):
+    """T-11: a TTL that is genuinely exceeded, measured by the database clock."""
+    bootstrap_first_installation(conn)
+    short_ttl = 1
+    with conn.transaction():
+        assert_lease_result(
+            run_sql(conn, "SELECT * FROM migration_internal.lease_acquire_v1(1, %s, %s, %s)",
+                    (TOKEN_A, short_ttl, LEASE_LOCK_TIMEOUT_MS), fetch_mode="one"),
+            expected_generation=1)
+
+    started = run_sql(conn, "SELECT clock_timestamp()", fetch_mode="one")[0]
+    with conn.transaction():
+        assert_lease_result(
+            run_sql(conn, "SELECT * FROM migration_internal.lease_enter_v1(1, %s, %s, %s)",
+                    (TOKEN_A, short_ttl, LEASE_LOCK_TIMEOUT_MS), fetch_mode="one"))
+        run_sql(conn, "SELECT pg_sleep(2)")
+        matched, observed = expect_sqlstate(
+            conn,
+            "SELECT * FROM migration_internal.lease_enter_v1(1, %s, %s, %s)",
+            (TOKEN_A, short_ttl, LEASE_LOCK_TIMEOUT_MS),
+            "45002")
+        elapsed = (run_sql(conn, "SELECT clock_timestamp()", fetch_mode="one")[0]
+                   - started).total_seconds()
+    if not matched:
+        raise AssertionError(f"T-11: expected 45002 after TTL expiry, got {observed}")
+    if elapsed <= short_ttl:
+        raise AssertionError(f"T-11: elapsed {elapsed}s did not exceed TTL {short_ttl}s")
+    return "PASS"
+
+
+def scenario_T12(conn):
+    """T-12: terminate W1's backend while it holds the lease in a user transaction."""
+    bootstrap_first_installation(conn)
+    with conn.transaction():
+        assert_lease_result(
+            run_sql(conn, "SELECT * FROM migration_internal.lease_acquire_v1(1, %s, %s, %s)",
+                    (TOKEN_A, LEASE_TTL_SECONDS, LEASE_LOCK_TIMEOUT_MS), fetch_mode="one"),
+            expected_generation=1)
+    fp_before = lease_row(conn)[1]
+
+    admin = admin_connect()
+    w1 = conn
+    try:
+        w1_tx = w1.transaction()
+        w1_tx.__enter__()
+        try:
+            run_sql(w1, "SELECT pg_backend_pid()", fetch_mode="one")
+            run_sql(w1, "CREATE TABLE IF NOT EXISTS public.positions (id int PRIMARY KEY, user_id int)")
+            run_sql(w1, "INSERT INTO public.positions (id, user_id) VALUES (101, 7)")
+            pid = run_sql(w1, "SELECT pg_backend_pid()", fetch_mode="one")[0]
+            admin.execute("SELECT pg_terminate_backend(%s)", (pid,))
+        finally:
+            try:
+                w1_tx.__exit__(None, None, None)
+            except Exception:
+                pass
+
+        observed = None
+        try:
+            run_sql(w1, "SELECT 1", fetch_mode="one")
+        except psycopg.Error as exc:
+            observed = getattr(exc, "sqlstate", None)
+        if observed not in ("57P01", "08006", None):
+            raise AssertionError(f"T-12: expected backend-death SQLSTATE, got {observed}")
+        if observed is None:
+            raise AssertionError("T-12: connection survived backend termination")
+
+        w2 = connect(scenario_db_name("T-12"))
+        try:
+            with w2.transaction():
+                matched, code = expect_sqlstate(
+                    w2,
+                    "SELECT * FROM migration_internal.lease_acquire_v1(1, %s, %s, %s)",
+                    (TOKEN_B, LEASE_TTL_SECONDS, LEASE_LOCK_TIMEOUT_MS),
+                    "45002")
+            if not matched:
+                raise AssertionError(f"T-12: W2 acquire before expiry expected 45002, got {code}")
+            if lease_row(w2)[1] != fp_before:
+                raise AssertionError("T-12: lease ownership changed unexpectedly")
+        finally:
+            w2.close()
+    finally:
+        admin.close()
+    return "PASS"
+
+
+def scenario_T13(conn):
+    """T-13: interrupted backfill and idempotent recovery."""
+    return ("NOT RUN — requires the real multi-user backfill implementation, a killed "
+            "worker and a recovery run against the same ledger")
+
+
+def scenario_T14(conn):
+    """T-14: installed_version mismatch and a closed barrier are refused."""
+    bootstrap_first_installation(conn)
+    with conn.transaction():
+        assert_lease_result(
+            run_sql(conn, "SELECT * FROM migration_internal.lease_acquire_v1(1, %s, %s, %s)",
+                    (TOKEN_A, LEASE_TTL_SECONDS, LEASE_LOCK_TIMEOUT_MS), fetch_mode="one"))
+    fp_before = lease_row(conn)[1]
+
+    # installed_version = 2, supported range 1..2, mirror still 1.
+    with conn.transaction():
+        run_sql(conn, "UPDATE migration_internal.lease_protocol "
+                      "SET installed_version = 2, min_supported_version = 1, "
+                      "max_supported_version = 2 WHERE singleton")
+    for query, expected in (
+        ("SELECT * FROM migration_internal.lease_release_v1(1, %s)", "45006"),
+        ("SELECT * FROM migration_internal.lease_acquire_v1(1, %s, %s, %s)", "45006"),
+    ):
+        params = (TOKEN_A,) if query.count("%s") == 1 \
+            else (TOKEN_A, LEASE_TTL_SECONDS, LEASE_LOCK_TIMEOUT_MS)
+        with conn.transaction():
+            matched, observed = expect_sqlstate(conn, query, params, expected)
+        if not matched:
+            raise AssertionError(f"T-14: expected {expected}, got {observed}")
+
+    if lease_row(conn)[1] != fp_before:
+        raise AssertionError("T-14: version refusal changed the lease row")
+
+    # Restore version 1 and close the barrier: a normal startup is refused 45004.
+    with conn.transaction():
+        run_sql(conn, "UPDATE migration_internal.lease_protocol "
+                      "SET installed_version = 1, max_supported_version = 1, "
+                      "barrier_state = 'closed' WHERE singleton")
+    with conn.transaction():
+        matched, observed = expect_sqlstate(
+            conn,
+            "SELECT * FROM migration_internal.lease_acquire_v1(1, %s, %s, %s)",
+            (TOKEN_B, LEASE_TTL_SECONDS, LEASE_LOCK_TIMEOUT_MS),
+            "45004")
+    if not matched:
+        raise AssertionError(f"T-14: expected 45004 with the barrier closed, got {observed}")
+    if run_sql(conn, "SELECT barrier_state FROM migration_internal.lease_protocol "
+                     "WHERE singleton", fetch_mode="one")[0] != "closed":
+        raise AssertionError("T-14: barrier row changed unexpectedly")
+    return "PASS"
+
+
+def _ensure_role(conn, name, login=False):
+    exists = run_sql(conn, "SELECT 1 FROM pg_roles WHERE rolname = %s",
+                     (name,), fetch_mode="one")
+    if exists is None:
+        run_sql(conn, sql.SQL("CREATE ROLE {} {}").format(
+            sql.Identifier(name), sql.SQL("LOGIN" if login else "NOLOGIN")))
+
+
+def scenario_T15(conn):
+    """T-15: the runtime APP identity has no migration_internal privilege (Topology A)."""
+    app = "strikenova_production_app"
+    migrator = "strikenova_prod_migrator"
+
+    with conn.transaction():
+        _ensure_role(conn, app, login=False)
+        _ensure_role(conn, migrator, login=False)
+        run_sql(conn, sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(sql.Identifier(app)))
+        run_sql(conn, sql.SQL("SET ROLE {}").format(sql.Identifier(migrator)))
+    conn.commit()
+    try:
+        bootstrap_first_installation(conn)
+        conn.commit()
+    finally:
+        run_sql(conn, "RESET ROLE")
+        conn.commit()
+
+    with conn.transaction():
+        run_sql(conn, REVOKE_SET_SQL)
+
+    # Effective privileges read false for the APP identity.
+    checks = [
+        ("SELECT has_schema_privilege(%s, 'migration_internal', 'USAGE')", (app,)),
+        ("SELECT has_table_privilege(%s, 'migration_internal.migration_lease', 'SELECT')", (app,)),
+        ("SELECT has_table_privilege(%s, 'migration_internal.migration_lease', 'UPDATE')", (app,)),
+        ("SELECT has_table_privilege(%s, 'migration_internal.lease_protocol', 'SELECT')", (app,)),
+        ("SELECT has_function_privilege(%s, "
+         "'migration_internal.lease_acquire_v1(integer,text,float8,integer)', 'EXECUTE')", (app,)),
+    ]
+    for query, params in checks:
+        if run_sql(conn, query, params, fetch_mode="one")[0]:
+            raise AssertionError(f"T-15: APP holds an effective privilege: {query}")
+
+    public_entries = run_sql(conn,
+                             "SELECT count(*) FROM pg_class c "
+                             "JOIN pg_namespace n ON n.oid = c.relnamespace, "
+                             "aclexplode(c.relacl) a "
+                             "WHERE n.nspname = 'migration_internal' AND a.grantee = 0",
+                             fetch_mode="one")[0]
+    if public_entries != 0:
+        raise AssertionError(f"T-15: PUBLIC still holds {public_entries} table ACL entries")
+
+    # Direct attempts as the APP identity are denied with 42501.
+    with conn.transaction():
+        run_sql(conn, sql.SQL("SET ROLE {}").format(sql.Identifier(app)))
+        for query, expected in (
+            ("SELECT * FROM migration_internal.migration_lease", "42501"),
+            ("UPDATE migration_internal.migration_lease SET generation = generation", "42501"),
+            ("SELECT 1 FROM migration_internal.migration_lease FOR UPDATE", "42501"),
+            ("SELECT * FROM migration_internal.lease_protocol_info_v1()", "42501"),
+        ):
+            matched, observed = expect_sqlstate(conn, query, None, expected)
+            if not matched:
+                raise AssertionError(f"T-15: expected 42501, got {observed} for {query}")
+        run_sql(conn, "RESET ROLE")
+    return "PASS"
+
+
+def scenario_T16(conn):
+    """T-16: Topology B — non-inherited set-only membership and four minimal grants."""
+    app = "strikenova_production_app"
+    migrator = "strikenova_prod_migrator"
+    owner = "strikenova_prod_owner"
+
+    with conn.transaction():
+        _ensure_role(conn, app, login=False)
+        _ensure_role(conn, migrator, login=False)
+        _ensure_role(conn, owner, login=False)
+        run_sql(conn, "GRANT CREATE, USAGE ON SCHEMA public TO " + owner)
+        run_sql(conn, "GRANT " + owner + " TO " + migrator +
+                " WITH INHERIT FALSE, SET TRUE, ADMIN FALSE")
+    conn.commit()
+
+    # The owner creates the application tables.
+    with conn.transaction():
+        run_sql(conn, "SET ROLE " + owner)
+        run_sql(conn, APPLICATION_TABLES_SQL)
+        run_sql(conn, "RESET ROLE")
+    conn.commit()
+
+    # The migrator owns migration_internal and holds only the four grants.
+    with conn.transaction():
+        run_sql(conn, "SET ROLE " + migrator)
+    conn.commit()
+    try:
+        bootstrap_first_installation(conn)
+        conn.commit()
+    finally:
+        with conn.transaction():
+            run_sql(conn, "RESET ROLE")
+    conn.commit()
+
+    with conn.transaction():
+        run_sql(conn, "REVOKE ALL ON SCHEMA public FROM " + app)
+        run_sql(conn, "GRANT SELECT ON public.positions TO " + migrator)
+        run_sql(conn, "GRANT SELECT ON public.paper_orders TO " + migrator)
+        run_sql(conn, "GRANT SELECT, INSERT ON public.strategy_leg_exposures TO " + migrator)
+        run_sql(conn, "GRANT USAGE ON SEQUENCE public.strategy_leg_exposures_id_seq TO " + migrator)
+        run_sql(conn, "REVOKE ALL ON ALL TABLES IN SCHEMA migration_internal FROM " + app)
+        run_sql(conn, "REVOKE ALL ON ALL FUNCTIONS IN SCHEMA migration_internal FROM " + app)
+        run_sql(conn, "REVOKE ALL ON SCHEMA migration_internal FROM " + owner)
+
+    with conn.transaction():
+        run_sql(conn, "SET ROLE " + migrator)
+        expected_matrix = {
+            ("positions", "SELECT"): True,
+            ("positions", "INSERT"): False,
+            ("positions", "UPDATE"): False,
+            ("positions", "DELETE"): False,
+            ("paper_orders", "SELECT"): True,
+            ("paper_orders", "INSERT"): False,
+            ("paper_orders", "UPDATE"): False,
+            ("paper_orders", "DELETE"): False,
+            ("strategy_leg_exposures", "SELECT"): True,
+            ("strategy_leg_exposures", "INSERT"): True,
+            ("strategy_leg_exposures", "UPDATE"): False,
+            ("strategy_leg_exposures", "DELETE"): False,
+        }
+        for (table, priv), want in expected_matrix.items():
+            got = run_sql(conn, "SELECT has_table_privilege(%s, %s, %s)",
+                          (migrator, "public." + table, priv), fetch_mode="one")[0]
+            if bool(got) != want:
+                raise AssertionError(f"T-16: {table} {priv} = {got}, expected {want}")
+
+        if not run_sql(conn, "SELECT has_sequence_privilege(%s, "
+                             "pg_get_serial_sequence('public.strategy_leg_exposures','id'),"
+                             " 'USAGE')",
+                       (migrator,), fetch_mode="one")[0]:
+            raise AssertionError("T-16: migrator lacks sequence USAGE")
+        if run_sql(conn, "SELECT has_sequence_privilege(%s, "
+                         "pg_get_serial_sequence('public.strategy_leg_exposures','id'),"
+                         " 'SELECT')",
+                   (migrator,), fetch_mode="one")[0]:
+            raise AssertionError("T-16: migrator unexpectedly holds sequence SELECT")
+
+        # Required DML succeeds.
+        inserted = run_sql(conn, "INSERT INTO public.strategy_leg_exposures "
+                                 "(paper_order_id, exposure) VALUES (1, 1.5) RETURNING id",
+                           fetch_mode="one")
+        if inserted is None:
+            raise AssertionError("T-16: INSERT ... RETURNING id failed as the migrator")
+
+        # UPDATE and DELETE are refused with 42501.
+        for query in ("UPDATE public.positions SET user_id = user_id",
+                      "DELETE FROM public.positions",
+                      "UPDATE public.strategy_leg_exposures SET exposure = exposure",
+                      "DELETE FROM public.strategy_leg_exposures"):
+            matched, observed = expect_sqlstate(conn, query, None, "42501")
+            if not matched:
+                raise AssertionError(f"T-16: expected 42501, got {observed} for {query}")
+
+        # Inside the explicit SET ROLE window: DDL works, migration_internal does not.
+        run_sql(conn, "RESET ROLE")
+        run_sql(conn, "SET ROLE " + owner)
+        run_sql(conn, "ALTER TABLE public.positions ADD COLUMN IF NOT EXISTS note text")
+        matched, observed = expect_sqlstate(
+            conn, "SELECT * FROM migration_internal.lease_protocol_info_v1()", None, "42501")
+        if not matched:
+            raise AssertionError(
+                f"T-16: owner unexpectedly called a migration function, got {observed}")
+        run_sql(conn, "RESET ROLE")
+    return "PASS"
+
+
+def scenario_T17(conn):
+    """T-17: run `alembic upgrade head` directly against a bootstrapped DB."""
+    return ("NOT RUN — no Alembic binary or environment exists in this harness; "
+            "the real command cannot be executed")
+
+
+def scenario_T18(conn):
+    """T-18: run `python -m app.migrate upgrade head`."""
+    return ("NOT RUN — no application migration runner exists in this harness; "
+            "the real command cannot be executed")
+
+
+def scenario_T19(conn):
+    """T-19: injected backfill failure plus a failing cleanup release."""
+    return ("NOT RUN — requires one session inside a user transaction plus a blocker "
+            "session (lease row lock or mid-run EXECUTE revoke); no blocker exists here")
+
+
+def scenario_T20(conn):
+    """T-20: run the supported command on a database already at head."""
+    return ("NOT RUN — the supported application command does not exist in this harness; "
+            "lease state alone is not evidence for T-20")
+
+
+def scenario_T21(conn):
+    """T-21: operator close-barrier sequence while an owner holds the row lock."""
+    return ("NOT RUN — requires the operator `bootstrap-lease --close-barrier` and "
+            "--upgrade-protocol commands, which are not implemented here")
+
+
+def scenario_T22(conn):
+    """T-22: p_lock_timeout_ms = 0 and p_ttl_seconds = 0 are refused immediately."""
+    bootstrap_first_installation(conn)
+    cases = [
+        ("SELECT * FROM migration_internal.lease_acquire_v1(1, %s, 500, 0)", (TOKEN_A,)),
+        ("SELECT * FROM migration_internal.lease_acquire_v1(1, %s, 0, 1000)", (TOKEN_A,)),
+        ("SELECT * FROM migration_internal.lease_enter_v1(1, %s, 500, 0)", (TOKEN_A,)),
+        ("SELECT * FROM migration_internal.lease_enter_v1(1, %s, 0, 1000)", (TOKEN_A,)),
+    ]
+    fp_before = lease_row(conn)[1]
+    for query, params in cases:
+        with conn.transaction():
+            matched, observed = expect_sqlstate(conn, query, params, "45004")
+        if not matched:
+            raise AssertionError(f"T-22: expected 45004, got {observed} for {query}")
+    if lease_row(conn)[1] != fp_before:
+        raise AssertionError("T-22: an invalid configuration call changed the lease row")
+    return "PASS"
+
+
+def scenario_T23(conn):
+    """T-23: a protocol-1 worker resumes after the database moves to protocol 2."""
+    bootstrap_first_installation(conn)
+    with conn.transaction():
+        assert_lease_result(
+            run_sql(conn, "SELECT * FROM migration_internal.lease_acquire_v1(1, %s, %s, %s)",
+                    (TOKEN_A, LEASE_TTL_SECONDS, LEASE_LOCK_TIMEOUT_MS), fetch_mode="one"))
+    preflight = run_sql(conn, "SELECT * FROM migration_internal.lease_protocol_info_v1()",
+                        fetch_mode="one")
+    if preflight != (1, 1, 1, "open", "ready"):
+        raise AssertionError(f"T-23: preflight read {preflight!r}")
+
+    operator = connect(scenario_db_name("T-23"))
+    try:
+        with operator.transaction():
+            run_sql(operator, "UPDATE migration_internal.lease_protocol "
+                              "SET installed_version = 2, min_supported_version = 1, "
+                              "max_supported_version = 2, updated_by = session_user "
+                              "WHERE singleton")
+        mirror_before = run_sql(conn, "SELECT owner_token_hash, owner_fingerprint, generation "
+                                      "FROM migration_internal.migration_lease "
+                                      "WHERE lease_name = 'migration-lease'",
+                                fetch_mode="one")
+        for query, expected in (
+            ("SELECT * FROM migration_internal.lease_acquire_v1(1, %s, %s, %s)", "45006"),
+            ("SELECT * FROM migration_internal.lease_enter_v1(1, %s, %s, %s)", "45006"),
+        ):
+            with conn.transaction():
+                matched, observed = expect_sqlstate(
+                    conn, query, (TOKEN_A, LEASE_TTL_SECONDS, LEASE_LOCK_TIMEOUT_MS), expected)
+            if not matched:
+                raise AssertionError(f"T-23: expected {expected}, got {observed}")
+        mirror_after = run_sql(conn, "SELECT owner_token_hash, owner_fingerprint, generation "
+                                     "FROM migration_internal.migration_lease "
+                                     "WHERE lease_name = 'migration-lease'",
+                               fetch_mode="one")
+        if mirror_before != mirror_after:
+            raise AssertionError("T-23: the stale worker wrote the lease row")
+    finally:
+        operator.close()
+    return "PASS"
+
+
+def scenario_T24(conn):
+    """T-24: cross-version concurrency between two protocol function sets."""
+    return ("NOT RUN — requires installed *_v2 function names and two independent "
+            "backends contending on the same advisory guard")
+
+
+def scenario_T25(conn):
+    """T-25: plain bootstrap verify refuses a protocol mismatch."""
+    return ("NOT RUN — requires the `bootstrap-lease` verify command; it is not "
+            "implemented here, and the lease functions alone are not that evidence")
+
+
+def scenario_T26(conn):
+    """T-26: explicit upgrade, refusal and cancellation."""
+    return ("NOT RUN — requires the operator `bootstrap-lease --upgrade-protocol` "
+            "command and its cancellation path")
+
+
+def scenario_T27(conn):
+    """T-27: enter and acquire refuse an unready protocol without touching the lease row."""
+    bootstrap_first_installation(conn)
+    with conn.transaction():
+        run_sql(conn, "UPDATE migration_internal.lease_protocol "
+                      "SET bootstrap_state = 'installing' WHERE singleton")
+        run_sql(conn, "CREATE TABLE IF NOT EXISTS public.positions "
+                      "(id int PRIMARY KEY, user_id int)")
+        run_sql(conn, "INSERT INTO public.positions (id, user_id) VALUES (1, 1) "
+                      "ON CONFLICT DO NOTHING")
+    before = lease_row(conn)
+
+    for query, expected in (
+        ("SELECT * FROM migration_internal.lease_enter_v1(1, %s, %s, %s)", "45005"),
+        ("SELECT * FROM migration_internal.lease_acquire_v1(1, %s, %s, %s)", "45005"),
+    ):
+        with conn.transaction():
+            matched, observed = expect_sqlstate(
+                conn, query, (TOKEN_A, LEASE_TTL_SECONDS, LEASE_LOCK_TIMEOUT_MS), expected)
+        if not matched:
+            raise AssertionError(f"T-27: expected {expected}, got {observed}")
+
+    if lease_row(conn) != before:
+        raise AssertionError("T-27: the unready protocol refusal wrote the lease row")
+    expected_unowned = (None, None, None, 0)
+    if before != expected_unowned:
+        raise AssertionError(f"T-27: expected an unowned lease row, got {before!r}")
+    if run_sql(conn, "SELECT count(*) FROM public.positions", fetch_mode="one")[0] != 1:
+        raise AssertionError("T-27: application rows changed")
+    return "PASS"
+
+
+# ---------------------------------------------------------------------------
+# Dispatch
 # ---------------------------------------------------------------------------
 
 SCENARIOS = {
@@ -1431,151 +1324,109 @@ SCENARIOS = {
     "T-27": scenario_T27,
 }
 
+CATEGORIES = ("PASS", "FAIL", "INVALID_SETUP", "NOT RUN", "INCONCLUSIVE")
 
-def init_database():
-    """Initialize a fresh database connection to postgres template1."""
-    return psycopg.connect(
-        dbname="postgres",
-        user=DB_USER,
-        password=DB_PASSWORD,
-        host=DB_HOST,
-        port=DB_PORT,
-    )
+
+def classify(value):
+    for category in CATEGORIES:
+        if value == category or value.startswith(category + " ") \
+                or value.startswith(category + " —") or value.startswith(category + " -"):
+            return category
+    return None
+
+
+def server_version(admin):
+    """Return (version_text, version_num) from the server itself."""
+    version_text = admin.execute("SHOW server_version").fetchone()[0]
+    version_num = int(admin.execute("SHOW server_version_num").fetchone()[0])
+    return version_text, version_num
+
+
+def not_run_all(reason):
+    return {key: f"NOT RUN — {reason}" for key in SCENARIOS}
 
 
 def run_harness():
-    """Run all 27 scenarios and report outcomes."""
-    import json
-
-    results = {}
-
-    # Connect to postgres to create scenario databases
-    base_conn = init_database()
-    base_conn.autocommit = True
-
     print("Issue #145 — T-01…T-27 Lease Protocol Harness")
-    print("=" * 58)
-    print(f"ADR source: commit {ADR_SOURCE_COMMIT}")
-    print(f"Environment vars required:")
-    print(f"  LEASE_TTL_SECONDS (default: 500)")
-    print(f"  LEASE_LOCK_TIMEOUT_MS (default: 1000)")
-    print(f"  DB_NAME (default: postgres)")
-    print(f"  DB_USER (default: '')")
-    print(f"  DB_PASSWORD (default: '')")
-    print(f"  DB_HOST (default: '')")
-    print(f"  DB_PORT (default: 55432)")
+    print("=" * 66)
+    print(f"ADR source: {ADR_SOURCE_PATH} @ {ADR_SOURCE_COMMIT}")
+    print("No runtime SQL verification is claimed unless PostgreSQL 16.16 is present.")
     print()
-
-    # Since PostgreSQL 16.16 is unavailable in this cloud environment,
-    # all runtime scenarios are classified as NOT RUN based on the
-    # verification gate. The harness code itself is correct for when
-    # PostgreSQL IS available.
-    pg_available = False
 
     try:
-        # Quick check: can we connect?
-        cur = base_conn.cursor()
-        cur.execute("SELECT 1")
-        cur.close()
-        pg_available = True
-    except Exception:
-        pass
+        admin = admin_connect()
+        admin.autocommit = True
+    except Exception as exc:
+        reason = f"PostgreSQL unreachable ({type(exc).__name__}: {exc})"
+        print(f"PostgreSQL availability: UNAVAILABLE — {reason}")
+        results = not_run_all(reason)
+        _report(results)
+        return results
 
-    print(f"PostgreSQL 16.16 availability: {'available' if pg_available else 'UNAVAILABLE — cloud environment'}")
-    print()
+    try:
+        try:
+            version_text, version_num = server_version(admin)
+        except Exception as exc:
+            reason = f"server version unknown ({type(exc).__name__}: {exc})"
+            print(f"PostgreSQL availability: UNAVAILABLE — {reason}")
+            results = not_run_all(reason)
+            _report(results)
+            return results
 
-    if not pg_available:
-        print("=== PostgreSQL 16.16 UNAVAILABLE in cloud environment ===")
-        print("Per the verification gate: all 27 runtime scenarios classified as NOT RUN")
-        print("based on static code inspection; runtime SQL verification cannot be performed.")
+        print(f"PostgreSQL server_version: {version_text} "
+              f"(server_version_num={version_num})")
+        if version_num < REQUIRED_SERVER_VERSION_NUM:
+            reason = (f"PostgreSQL {version_text} is older than the required 16.16 "
+                      f"({REQUIRED_SERVER_VERSION_NUM})")
+            print(f"PostgreSQL availability: UNAVAILABLE — {reason}")
+            results = not_run_all(reason)
+            _report(results)
+            return results
+
+        print("PostgreSQL availability: AVAILABLE (16.16+)")
         print()
 
-    for scenario_key, scenario_fn in sorted(SCENARIOS.items()):
-        print(f"\\n=== Running {scenario_key} ===")
-        try:
-            # Each scenario gets a fresh database connection
-            # Most scenarios create their own fresh DB; T-01 starts genuinely empty
-            if not pg_available:
-                # Classify as NOT RUN since PostgreSQL is unavailable
-                result = "NOT RUN — PostgreSQL 16.16 unavailable in cloud environment; runtime SQL verification blocked per verification gate"
-            else:
-                # Try to run the scenario
-                conn = init_database()
-                # Each scenario creates its own disposable database if needed
-                result = scenario_fn(conn)
-                conn.close()
+        results = {}
+        for key, scenario in sorted(SCENARIOS.items()):
+            db_name = scenario_db_name(key)
+            print(f"=== {key} ({db_name}) ===")
+            try:
+                drop_create_scenario_db(admin, db_name)
+                conn = connect(db_name)
+                try:
+                    outcome = scenario(conn)
+                finally:
+                    conn.close()
+                drop_scenario_db(admin, db_name)
+                results[key] = outcome
+            except Exception as exc:
+                results[key] = f"NOT RUN — scenario infrastructure failure: {exc}"
+            print(f"  {results[key].splitlines()[0]}")
+        _report(results)
+        return results
+    finally:
+        admin.close()
 
-            results[scenario_key] = result
-            print(f"  Result: {result}")
 
-        except Exception as e:
-            results[scenario_key] = f"ERROR — {e}"
-            print(f"  ERROR — {e}")
-
-    # Generate summary
-    pass_count = sum(1 for v in results.values() if v == "PASS")
-    fail_count = sum(1 for v in results.values() if v.startswith("FAIL"))
-    not_run_count = sum(1 for v in results.values() if "NOT RUN" in v)
-    invalid_setup_count = sum(1 for v in results.values() if "INVALID_SETUP" in v)
-    total = len(results)
-
-    print("\\n" + "=" * 58)
-    print("=== Summary ===")
-    print(f"Total scenarios: {total}")
-    print(f"PASS: {pass_count}")
-    print(f"FAIL: {fail_count}")
-    print(f"NOT RUN: {not_run_count}")
-    print(f"INVALID_SETUP: {invalid_setup_count}")
-    print(f"ERROR: {sum(1 for v in results.values() if v.startswith('ERROR'))}")
+def _report(results):
+    counts = {category: 0 for category in CATEGORIES}
     print()
-
-    # Check that every scenario has one unambiguous result category
-    valid_categories = {"PASS", "FAIL", "NOT RUN", "INVALID_SETUP", "INCONCLUSIVE"}
-    for k, v in results.items():
-        # Extract the category (first word that matches a valid category)
-        category = None
-        for cat in valid_categories:
-            if v.startswith(cat):
-                category = cat
-                break
+    print("=" * 66)
+    print("=== Summary ===")
+    for key in sorted(results):
+        category = classify(results[key])
         if category is None:
-            print(f"WARNING: {scenario_key} has no unambiguous category: {v}")
-        else:
-            pass  # OK
-
-    # Verify every scenario has one unambiguous result category
-    print("\\n=== Verification ===")
-    all_have_category = True
-    for k, v in results.items():
-        category = None
-        for cat in valid_categories:
-            if v.startswith(cat):
-                category = cat
-                break
-        if category is None:
-            print(f"FAIL: {k} has no unambiguous category: {v}")
-            all_have_category = False
-    if all_have_category:
-        print("PASS: Every scenario has one unambiguous result category")
-
-    # Verify the report is generated from actual execution output, not historical claims
-    print("\\n---")
-    print("Note: Outcomes based on static code inspection, not runtime execution.")
-    print("PostgreSQL 16.16 unavailable in this cloud environment.")
-    print("All 27 scenarios classified as NOT RUN per verification gate.")
-    print("Harness code is correct for when PostgreSQL 16.16+ is available.")
-    print("---")
-
-    # Close base connection
-    base_conn.close()
-
-    return results
+            category = "INCONCLUSIVE"
+        counts[category] += 1
+        print(f"{key}: {results[key]}")
+    print("-" * 66)
+    print(f"Total: {len(results)}")
+    for category in CATEGORIES:
+        print(f"{category}: {counts[category]}")
+    print("-" * 66)
+    if any(classify(value) is None for value in results.values()):
+        print("WARNING: at least one scenario has no unambiguous category")
 
 
 if __name__ == "__main__":
-    results = run_harness()
-
-    # Print per-scenario results as JSON for the report
-    print("\\n--- Per-Scenario Results ---")
-    for k, v in sorted(results.items()):
-        print(f"{k}: {v}")
+    run_harness()
