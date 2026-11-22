@@ -68,6 +68,10 @@ class TestGuardedTargetIdentity:
         values = {
             "DATABASE_URL": self.RUNTIME,
             "STRIKENOVA_MIGRATION_DATABASE_URL": self.MIGRATOR,
+            # ADR-018 §8.1 names both identities: the URLs must connect as
+            # exactly these roles, not merely as two different logins.
+            "STRIKENOVA_MIGRATOR_ROLE": "strikenova_migrator",
+            "STRIKENOVA_RUNTIME_ROLE": "strikenova_app",
         }
         values.update(overrides)
         return Settings(**values)
@@ -92,6 +96,43 @@ class TestGuardedTargetIdentity:
             resolved = assert_guarded_migration_configuration()
         assert resolved.startswith("postgresql+psycopg://strikenova_migrator:")
         assert resolved.endswith("@db.example:5432/options")
+
+    def test_migration_login_must_be_the_configured_migrator(self):
+        """A login that merely differs from the runtime login is not enough."""
+        self._assert_refused(
+            self._settings(
+                STRIKENOVA_MIGRATION_DATABASE_URL=(
+                    "postgresql://postgres:migrator-secret@db.example:5432/options"
+                )
+            ),
+            "not the configured migration identity 'strikenova_migrator'",
+        )
+
+    def test_runtime_login_must_be_the_configured_runtime_identity(self):
+        self._assert_refused(
+            self._settings(
+                DATABASE_URL=(
+                    "postgresql://someone_else:runtime-secret@db.example:5432/options"
+                )
+            ),
+            "not the configured runtime identity 'strikenova_app'",
+        )
+
+    def test_unnamed_migration_role_is_refused(self):
+        self._assert_refused(
+            self._settings(STRIKENOVA_MIGRATOR_ROLE="   "),
+            "STRIKENOVA_MIGRATOR_ROLE is not configured",
+        )
+
+    def test_unconfigured_runtime_role_does_not_constrain_the_runtime_login(self):
+        settings_obj = self._settings(
+            DATABASE_URL=(
+                "postgresql://another_runtime:runtime-secret@db.example:5432/options"
+            ),
+            STRIKENOVA_RUNTIME_ROLE="",
+        )
+        with patch("app.db.settings", settings_obj):
+            assert assert_guarded_migration_configuration()
 
     def test_same_login_with_a_different_password_is_refused(self):
         self._assert_refused(

@@ -187,9 +187,16 @@ class TestConfigurationValidation:
 class TestFailClosedIdentityRules:
     RUNTIME = "postgresql://runtime:pw@h:5432/app"
     MIGRATOR = "postgresql://migrator:pw@h:5432/app"
+    # ADR-018 §8.1 names both identities, so the URL logins must be exactly
+    # these roles and not merely different from each other.
+    ROLES = {"STRIKENOVA_MIGRATOR_ROLE": "migrator", "STRIKENOVA_RUNTIME_ROLE": "runtime"}
 
     def test_postgres_runtime_requires_a_migration_url(self, monkeypatch):
-        monkeypatch.setattr(db_module, "settings", Settings(DATABASE_URL=self.RUNTIME))
+        monkeypatch.setattr(
+            db_module,
+            "settings",
+            Settings(DATABASE_URL=self.RUNTIME, **self.ROLES),
+        )
         with pytest.raises(lease.LeaseError) as exc:
             db_module.assert_guarded_migration_configuration()
         assert exc.value.sqlstate == "45004"
@@ -201,6 +208,7 @@ class TestFailClosedIdentityRules:
             Settings(
                 DATABASE_URL=self.RUNTIME,
                 STRIKENOVA_MIGRATION_DATABASE_URL=self.RUNTIME,
+                **self.ROLES,
             ),
         )
         with pytest.raises(lease.LeaseError) as exc:
@@ -214,6 +222,7 @@ class TestFailClosedIdentityRules:
             Settings(
                 DATABASE_URL=self.RUNTIME,
                 STRIKENOVA_MIGRATION_DATABASE_URL=self.MIGRATOR,
+                **self.ROLES,
             ),
         )
         url = db_module.assert_guarded_migration_configuration()

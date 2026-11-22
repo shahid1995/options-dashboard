@@ -1195,6 +1195,27 @@ def _membership_grants(conn: Connection, role: str) -> list[str]:
     ]
 
 
+def _incoming_members(conn: Connection, role: str) -> list[str]:
+    """Roles allowed to inherit from or ``SET ROLE`` to ``role``.
+
+    The outgoing matrix alone is not the whole membership model: another login
+    granted membership in the migration identity (Topology A) or in the owner
+    role (Topology B) can assume those privileges without any change to the
+    migrator, the runtime role or the grants this verifier inspects.
+    """
+    return [
+        row.rolname
+        for row in conn.execute(
+            text(
+                "SELECT r.rolname FROM pg_auth_members m "
+                "JOIN pg_roles r ON r.oid = m.member "
+                "WHERE m.roleid = cast(:role AS regrole) ORDER BY r.rolname"
+            ),
+            {"role": role},
+        )
+    ]
+
+
 def verify_application_privileges(
     conn: Connection,
     *,
@@ -1210,15 +1231,17 @@ def verify_application_privileges(
     write, so a wrong matrix can never reach the backfill.
 
     Checks, in both topologies: role attributes (no SUPERUSER, CREATEROLE,
-    CREATEDB, BYPASSRLS or REPLICATION on any identity; the owner is NOLOGIN
-    and the runtime is a LOGIN), object ownership, the full effective
-    migrator and runtime table matrix (including REFERENCES and TRIGGER) and
-    the sequence matrix, Topology B's single non-inherited set-only membership
-    (or Topology A's absence of any membership), zero membership paths from
-    the runtime or the owner to any other role, effective privileges on
-    ``migration_internal`` for both the runtime and the owner, the runtime
-    identity's inability to create objects in ``public``, and schema-scoped
-    default privileges bound to the actual object creator.
+    CREATEDB, BYPASSRLS or REPLICATION on any identity; the migrator and the
+    runtime are LOGIN roles and the owner is NOLOGIN), the incoming membership
+    model (no other role may inherit or assume the migrator; in Topology B the
+    migrator is the owner's only approved member), object ownership, the full
+    effective migrator and runtime table matrix (including REFERENCES and
+    TRIGGER) and the sequence matrix, Topology B's single non-inherited
+    set-only membership (or Topology A's absence of any membership), zero
+    membership paths from the runtime or the owner to any other role, effective
+    privileges on ``migration_internal`` for both the runtime and the owner, the
+    runtime identity's inability to create objects in ``public``, and
+    schema-scoped default privileges bound to the actual object creator.
     """
     problems: list[str] = []
     owner_role = (owner_role or "").strip() or None
@@ -1241,6 +1264,11 @@ def verify_application_privileges(
         problems.extend(
             _role_attribute_problems(migrator, f"migration identity {migrator_role}")
         )
+        if not migrator.rolcanlogin:
+            problems.append(
+                f"migration identity {migrator_role} is not a LOGIN role; "
+                "ADR §8.1 requires a dedicated LOGIN migration identity"
+            )
     runtime = roles.get(runtime_role) if runtime_role else None
     if runtime_role and runtime is None:
         problems.append(f"runtime identity {runtime_role!r} does not exist")
@@ -1307,6 +1335,27 @@ def verify_application_privileges(
             "Topology A requires no role membership for the migration identity; "
             f"found {[m.rolname for m in memberships]}"
         )
+
+    # Incoming membership closes the other direction: a login granted the
+    # migrator (any topology) or the owner (Topology B) can inherit or assume
+    # those identities without altering a single grant above.
+    incoming_migrator = _incoming_members(conn, migrator_role)
+    if incoming_migrator:
+        problems.append(
+            f"roles {incoming_migrator} are members of the migration identity "
+            f"{migrator_role}; ADR §8.3 allows no other role to inherit or "
+            "assume it"
+        )
+    if owner_role:
+        unexpected_owner_members = [
+            member for member in _incoming_members(conn, owner_role) if member != migrator_role
+        ]
+        if unexpected_owner_members:
+            problems.append(
+                f"roles {unexpected_owner_members} are members of the owner role "
+                f"{owner_role}; Topology B allows exactly one member, the "
+                f"migration identity {migrator_role}"
+            )
 
     if runtime_role:
         for elevated in [migrator_role] + ([owner_role] if owner_role else []):
@@ -1795,7 +1844,22 @@ def bootstrap_lease(
 
 
 def _assert_migrator_identity(conn: Connection, migrator_role: str) -> None:
-    current = conn.exec_driver_sql("SELECT current_user").scalar()
+    """Prove the bootstrap connection is the configured migration identity.
+
+    ``session_user`` is what the server authenticated — it cannot be changed
+    by ``SET ROLE`` or an inherited membership — so it, not only
+    ``current_user``, must be the migrator. Otherwise a login that can assume
+    the migrator role could bootstrap as it.
+    """
+    session_user, current = conn.exec_driver_sql(
+        "SELECT session_user, current_user"
+    ).one()
+    if session_user != migrator_role:
+        raise LeaseError(
+            SQLSTATE_CONFIG,
+            f"bootstrap must run as {migrator_role!r}; the connection's "
+            f"session_user is {session_user!r}",
+        )
     if current != migrator_role:
         raise LeaseError(
             SQLSTATE_CONFIG,

@@ -1726,13 +1726,14 @@ def test_verifier_refuses_owner_migration_internal_access(pg_ready):
 
 
 def test_bad_privilege_matrix_aborts_the_guarded_upgrade(pg_topology_a):
-    """The verifier is enforced by the real migration path, not only by tests."""
+    """An invalid identity is refused by the real path, before any lease work."""
     _bootstrap(pg_topology_a)
     db_module._run_alembic_migrations()
     # An accidental table grant is corrected by the §8.3 revokes that every
     # upgrade re-applies, so it cannot demonstrate enforcement. A superuser
-    # attribute is not something the DDL path repairs, and it makes the
-    # effective matrix unprovable.
+    # attribute is not something the DDL path repairs, it makes the effective
+    # matrix unprovable, and the connection-identity guard refuses it before
+    # the lease is acquired — the refusal moved earlier on purpose.
     _admin_exec(
         pg_topology_a, f"ALTER ROLE {pg_topology_a.migrator_role} SUPERUSER"
     )
@@ -1742,7 +1743,7 @@ def test_bad_privilege_matrix_aborts_the_guarded_upgrade(pg_topology_a):
             "a bad application privilege matrix must abort the guarded upgrade"
         )
     output = result.stdout + result.stderr
-    if "45004" not in output or "application privilege verification failed" not in output:
+    if "45004" not in output or "has SUPERUSER" not in output:
         raise AssertionError(f"unexpected refusal output: {output[-2000:]}")
 
 
@@ -2137,3 +2138,194 @@ def test_two_process_startup_contends_on_the_advisory_guard_lock(pg_topology_a):
                 proc.kill()
                 proc.communicate(timeout=30)
         blocker.close()
+
+
+# ---------------------------------------------------------------------------
+# Actual connection identity (ADR-018 §8.1): the session, not just the URL
+# ---------------------------------------------------------------------------
+
+
+def _login_url(prov: support.Provisioned, role: str, password: str) -> str:
+    from sqlalchemy.engine import make_url
+
+    return make_url(prov.admin_url).set(
+        username=role, password=password, database=prov.database
+    ).render_as_string(hide_password=False)
+
+
+def _create_login(prov: support.Provisioned, suffix: str) -> tuple[str, str]:
+    """Create an ordinary LOGIN role in the disposable server; return its URL."""
+    import secrets
+
+    role = f"{prov.prefix}_{suffix}"
+    password = secrets.token_hex(16)
+    _admin_exec(prov, f"CREATE ROLE {role} LOGIN PASSWORD '{password}'")
+    return role, _login_url(prov, role, password)
+
+
+def _startup_state(prov: support.Provisioned) -> dict:
+    """Lease ownership/generation, schema version and application data.
+
+    Read over the disposable admin connection: the Topology B migrator is not
+    granted ``alembic_version``, and the observation itself must not depend on
+    the privileges under test.
+    """
+    with _admin(prov) as conn:
+        version = conn.execute(
+            "SELECT version_num FROM public.alembic_version"
+        ).fetchone()
+        positions = conn.execute("SELECT count(*) FROM public.positions").fetchone()[0]
+    return {
+        "lease": _lease_row(prov),
+        "alembic_version": version[0] if version else None,
+        "positions": int(positions),
+        "exposures": _exposure_counts(prov),
+    }
+
+
+def _assert_startup_refused(
+    prov: support.Provisioned, migration_url: str, *fragments: str
+) -> str:
+    """Run the real startup path with a wrong migration login and prove no work."""
+    before = _startup_state(prov)
+    result = run_module(
+        prov,
+        ["app.migrate", "upgrade", "head"],
+        STRIKENOVA_MIGRATION_DATABASE_URL=migration_url,
+    )
+    output = result.stdout + result.stderr
+    if result.returncode == 0:
+        raise AssertionError(f"startup must refuse the wrong identity: {output[-2000:]}")
+    if "45004" not in output:
+        raise AssertionError(f"expected SQLSTATE 45004 in the refusal: {output[-2000:]}")
+    for fragment in fragments:
+        if fragment not in output:
+            raise AssertionError(
+                f"expected {fragment!r} in the refusal output: {output[-2000:]}"
+            )
+    after = _startup_state(prov)
+    if after != before:
+        raise AssertionError(f"a refused startup changed state: {before} -> {after}")
+    return output
+
+
+def test_startup_refuses_the_superuser_login_before_any_work(pg_ready):
+    """The admin/superuser login is not the configured migrator."""
+    _assert_startup_refused(
+        pg_ready,
+        pg_ready.admin_database_url,
+        "not the configured migration identity",
+    )
+
+
+def test_startup_refuses_an_unrelated_login_before_any_work(pg_ready):
+    role, url = _create_login(pg_ready, "outsider")
+    try:
+        _assert_startup_refused(
+            pg_ready, url, "not the configured migration identity"
+        )
+    finally:
+        _admin_exec(pg_ready, f"DROP ROLE IF EXISTS {role}")
+
+
+def test_startup_refuses_a_login_holding_migrator_membership(pg_ready):
+    """Membership must not let another login pass as the migrator."""
+    from sqlalchemy import create_engine
+
+    role, url = _create_login(pg_ready, "member")
+    _admin_exec(
+        pg_ready,
+        f"GRANT {pg_ready.migrator_role} TO {role} WITH INHERIT TRUE, SET TRUE",
+    )
+    try:
+        _assert_startup_refused(
+            pg_ready, url, "not the configured migration identity"
+        )
+        # The membership does not help even when the login elevates itself:
+        # session_user still names the unapproved login, so the session check
+        # refuses before any statement of the migration path can run.
+        engine = create_engine(db_module.normalize_database_url(url))
+        try:
+            with engine.connect() as conn:
+                conn.exec_driver_sql(f"SET ROLE {pg_ready.migrator_role}")
+                with pytest.raises(LeaseError) as exc:
+                    db_module._assert_migration_session_identity(
+                        conn, stage="the membership test connection"
+                    )
+        finally:
+            engine.dispose()
+        _assert_sqlstate(exc, "45004")
+        message = str(exc.value)
+        if "session_user" not in message or role not in message:
+            raise AssertionError(f"unexpected identity refusal: {message}")
+    finally:
+        _admin_exec(pg_ready, f"REVOKE {pg_ready.migrator_role} FROM {role}")
+        _admin_exec(pg_ready, f"DROP ROLE IF EXISTS {role}")
+
+
+def test_startup_refuses_a_superuser_migration_role(pg_ready):
+    """A URL naming the migrator is still refused if that role is a superuser."""
+    _admin_exec(pg_ready, f"ALTER ROLE {pg_ready.migrator_role} SUPERUSER")
+    _assert_startup_refused(pg_ready, pg_ready.migrator_url, "has SUPERUSER")
+
+
+def test_session_identity_accepts_the_migrator_connection(pg_ready_a):
+    engine = _application_check_connection(pg_ready_a)
+    try:
+        with engine.connect() as conn:
+            db_module._assert_migration_session_identity(
+                conn, stage="the positive control connection"
+            )
+    finally:
+        engine.dispose()
+
+
+def test_verifier_refuses_a_non_login_migration_identity(pg_ready):
+    role = f"{pg_ready.prefix}_nologin"
+    _admin_exec(pg_ready, f"CREATE ROLE {role} NOLOGIN")
+    try:
+        engine = _application_check_connection(pg_ready)
+        try:
+            with engine.connect() as conn, pytest.raises(LeaseError) as exc:
+                lease_mod.verify_application_privileges(
+                    conn,
+                    migrator_role=role,
+                    runtime_role=pg_ready.app_role,
+                    owner_role=None,
+                )
+        finally:
+            engine.dispose()
+        _assert_sqlstate(exc, "45004")
+        if "is not a LOGIN role" not in str(exc.value):
+            raise AssertionError(f"unexpected refusal: {exc.value}")
+    finally:
+        _admin_exec(pg_ready, f"DROP ROLE IF EXISTS {role}")
+
+
+def test_verifier_refuses_unexpected_incoming_migrator_membership(pg_ready_a):
+    """Topology A: no second role may inherit or assume the migrator."""
+    role, _ = _create_login(pg_ready_a, "inheritor")
+    _admin_exec(pg_ready_a, f"GRANT {pg_ready_a.migrator_role} TO {role}")
+    try:
+        _expect_application_refusal(
+            pg_ready_a,
+            f"roles ['{role}'] are members of the migration identity "
+            f"{pg_ready_a.migrator_role}",
+        )
+    finally:
+        _admin_exec(pg_ready_a, f"REVOKE {pg_ready_a.migrator_role} FROM {role}")
+        _admin_exec(pg_ready_a, f"DROP ROLE IF EXISTS {role}")
+
+
+def test_verifier_refuses_unexpected_incoming_owner_membership(pg_ready):
+    """Topology B: the migrator is the owner role's only approved member."""
+    role, _ = _create_login(pg_ready, "co_owner")
+    _admin_exec(pg_ready, f"GRANT {pg_ready.owner_role} TO {role}")
+    try:
+        _expect_application_refusal(
+            pg_ready,
+            f"roles ['{role}'] are members of the owner role {pg_ready.owner_role}",
+        )
+    finally:
+        _admin_exec(pg_ready, f"REVOKE {pg_ready.owner_role} FROM {role}")
+        _admin_exec(pg_ready, f"DROP ROLE IF EXISTS {role}")

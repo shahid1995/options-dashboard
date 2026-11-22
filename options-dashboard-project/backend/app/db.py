@@ -513,6 +513,45 @@ def _same_endpoint(runtime: _MigrationTarget, migration: _MigrationTarget) -> bo
     return False
 
 
+def _configured_migration_role() -> str:
+    """The configured dedicated migration identity (fail closed when unnamed)."""
+    role = (getattr(settings, "STRIKENOVA_MIGRATOR_ROLE", "") or "").strip()
+    if not role:
+        raise _config_error(
+            "STRIKENOVA_MIGRATOR_ROLE is not configured: the migration login "
+            "cannot be proven to be the intended identity without a role name"
+        )
+    return role
+
+
+def _assert_configured_identities(
+    runtime: _MigrationTarget, migration: _MigrationTarget
+) -> None:
+    """The URL logins must be exactly the identities the settings name.
+
+    ADR-018 separates two *named* identities. "Differs from the runtime login"
+    is a weaker contract: an unrelated login, a shared admin login or a
+    superuser that merely differs from the runtime role satisfies separation
+    while executing migrations as the wrong principal. The URLs are therefore
+    bound to ``STRIKENOVA_MIGRATOR_ROLE`` (always) and to
+    ``STRIKENOVA_RUNTIME_ROLE`` (when configured) here, before an engine, a
+    connection, a lease or any DDL exists.
+    """
+    migrator_role = _configured_migration_role()
+    if migration.role != migrator_role:
+        raise _config_error(
+            "STRIKENOVA_MIGRATION_DATABASE_URL connects as "
+            f"{migration.role!r}, not the configured migration identity "
+            f"{migrator_role!r}"
+        )
+    runtime_role = (getattr(settings, "STRIKENOVA_RUNTIME_ROLE", "") or "").strip()
+    if runtime_role and runtime.role != runtime_role:
+        raise _config_error(
+            f"DATABASE_URL connects as {runtime.role!r}, not the configured "
+            f"runtime identity {runtime_role!r}"
+        )
+
+
 def assert_guarded_migration_configuration(
     runtime_url: str | None = None,
     migration_url: str | None = None,
@@ -528,11 +567,16 @@ def assert_guarded_migration_configuration(
        separation;
     3. the database name is identical;
     4. the endpoint (``host:port``) is identical, or is declared equivalent in
-       ``STRIKENOVA_MIGRATION_TARGET_ALIASES``.
+       ``STRIKENOVA_MIGRATION_TARGET_ALIASES``;
+    5. the migration login *is* ``STRIKENOVA_MIGRATOR_ROLE`` and the runtime
+       login *is* ``STRIKENOVA_RUNTIME_ROLE`` where that is configured — being
+       different from each other is not the same as being the named identities.
 
-    A URL that cannot be parsed into all four attributes fails here, before an
-    engine, a connection, a lease or any DDL exists. SQLite keeps its
-    historical single-process, single-identity behaviour.
+    A URL that cannot be parsed into all attributes fails here, before an
+    engine, a connection, a lease or any DDL exists. This proves what the
+    configuration *asks for*; :func:`_assert_migration_session_identity` and
+    the engine connection guard prove what the server actually authenticated.
+    SQLite keeps its historical single-process, single-identity behaviour.
     """
     runtime_url = runtime_url or _runtime_url_from_settings()
     migration_url = migration_url or _migration_engine_url()
@@ -583,6 +627,7 @@ def assert_guarded_migration_configuration(
             "proven equivalent route in STRIKENOVA_MIGRATION_TARGET_ALIASES "
             "rather than assuming one"
         )
+    _assert_configured_identities(runtime, migration)
     return migration_url
 
 
@@ -722,6 +767,114 @@ def _verify_logical_target(migration_engine) -> None:
         )
 
 
+#: Identity evidence read from every migration connection: the login the
+#: server authenticated (``session_user``), the role the session currently runs
+#: as (``current_user``, which ``SET ROLE`` and inherited memberships change),
+#: and that login's role attributes. A URL login proves what the configuration
+#: requests; only this proves what the connection actually is.
+_MIGRATION_IDENTITY_SQL = (
+    "SELECT session_user, current_user, r.rolcanlogin, r.rolsuper, "
+    "r.rolcreaterole, r.rolcreatedb, r.rolbypassrls, r.rolreplication "
+    "FROM pg_roles r WHERE r.rolname = session_user"
+)
+
+#: Role attributes a migration identity must never carry (ADR-018 §8.1).
+_MIGRATION_FORBIDDEN_ATTRIBUTES: tuple[tuple[int, str], ...] = (
+    (3, "SUPERUSER"),
+    (4, "CREATEROLE"),
+    (5, "CREATEDB"),
+    (6, "BYPASSRLS"),
+    (7, "REPLICATION"),
+)
+
+
+def _migration_identity_problems(observed, migrator_role: str, *, stage: str) -> list[str]:
+    """Problems with one live connection's identity evidence (none == proven).
+
+    ``observed`` is one :data:`_MIGRATION_IDENTITY_SQL` row: the server's
+    ``session_user``/``current_user`` and the session login's role attributes.
+    Topology B may elevate ``current_user`` to the NOLOGIN owner inside the
+    approved DDL window, so callers check this outside that window; the
+    session login itself must be the configured migrator at every point.
+    """
+    if observed is None:
+        message = (
+            f"{stage}: the connection's session login is not a role in pg_roles, "
+            "so its identity cannot be proven"
+        )
+        return [message]
+    session_user, current_user = observed[0], observed[1]
+    problems: list[str] = []
+    if session_user != migrator_role:
+        problems.append(
+            f"{stage}: the connection's session_user is {session_user!r}, not the "
+            f"configured migration identity {migrator_role!r}"
+        )
+    if current_user != migrator_role:
+        problems.append(
+            f"{stage}: the connection is operating as current_user "
+            f"{current_user!r}, not the configured migration identity "
+            f"{migrator_role!r}"
+        )
+    if not observed[2]:
+        problems.append(
+            f"{stage}: the migration identity {migrator_role!r} is not a LOGIN role"
+        )
+    for index, name in _MIGRATION_FORBIDDEN_ATTRIBUTES:
+        if observed[index]:
+            problems.append(
+                f"{stage}: the migration identity {migrator_role!r} has {name}"
+            )
+    return problems
+
+
+def _assert_migration_session_identity(conn, *, stage: str) -> None:
+    """Fail closed unless this live connection is the configured migrator.
+
+    Called before the lease is acquired (via the engine guard), after
+    ``RESET ROLE`` and before the §8.3 verification, and before the startup
+    backfill writes. It never repairs or connects elsewhere: it reads the
+    server's own view of the session and refuses with SQLSTATE ``45004``.
+    """
+    observed = conn.exec_driver_sql(_MIGRATION_IDENTITY_SQL).one_or_none()
+    problems = _migration_identity_problems(
+        observed, _configured_migration_role(), stage=stage
+    )
+    if problems:
+        raise _config_error("; ".join(problems))
+
+
+def _install_migration_identity_guard(engine_) -> None:
+    """Verify every DBAPI connection the migration engine opens.
+
+    Sampling one connection would let a different pooled connection run the
+    lease, the DDL or a backfill transaction under another identity. The
+    listener is registered before the engine's first connection and raises
+    SQLSTATE ``45004`` while the connection is still being created, so a
+    wrong identity can never execute a statement on the migration path.
+    """
+    from sqlalchemy import event
+
+    migrator_role = _configured_migration_role()
+
+    @event.listens_for(engine_, "connect")
+    def _verify_connected_identity(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute(_MIGRATION_IDENTITY_SQL)
+            observed = cursor.fetchone()
+        finally:
+            cursor.close()
+            dbapi_connection.rollback()
+        problems = _migration_identity_problems(
+            observed,
+            migrator_role,
+            stage="the migration engine's new connection",
+        )
+        if problems:
+            raise _config_error("; ".join(problems))
+
+
 def _migration_engine():
     """Build, verify and return the engine for the dedicated migration identity."""
     url = assert_guarded_migration_configuration()
@@ -735,6 +888,7 @@ def _migration_engine():
     )
     try:
         if not url.startswith("sqlite"):
+            _install_migration_identity_guard(engine_)
             _verify_logical_target(engine_)
     except BaseException:
         engine_.dispose()
@@ -892,6 +1046,14 @@ def _verify_application_privileges(conn) -> None:
     """Run the read-only ADR §8.3 application privilege verifier."""
     from app._migration_lease import verify_application_privileges
 
+    # Topology B's owner window must already be closed here: the DDL run calls
+    # this after RESET ROLE, and the backfill run calls it before its first
+    # write. Proving the session and current role again is what shows the
+    # elevation did not outlive the window and that the verification (and the
+    # backfill that follows it) executes as the configured migrator.
+    _assert_migration_session_identity(
+        conn, stage="before the §8.3 application privilege verification"
+    )
     verify_application_privileges(
         conn,
         migrator_role=settings.STRIKENOVA_MIGRATOR_ROLE,
