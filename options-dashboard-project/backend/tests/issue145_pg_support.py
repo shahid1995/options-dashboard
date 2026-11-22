@@ -248,10 +248,44 @@ def provision_schema_ready(
     try:
         install_lease(prov)
         run_guarded_upgrade(prov)
+        grant_importer_write_privileges(prov)
     except BaseException:
         drop(prov)
         raise
     return prov
+
+
+def grant_importer_write_privileges(prov: Provisioned) -> None:
+    """Re-grant the legacy importer's write privileges on a disposable database.
+
+    ``python -m app.migrate upgrade head`` deliberately leaves Topology A in
+    the ADR §8.3 shape: the migrator *owns* ``positions`` and ``paper_orders``
+    but has had INSERT/UPDATE/DELETE/TRUNCATE revoked, because a production
+    startup only reads them. The rehearsals that use this helper are
+    **importer** tests — they copy legacy SQLite rows into those tables as the
+    migration identity — so they explicitly re-grant exactly the privileges
+    the importer needs.
+
+    This is a documented, test-only concession on a throwaway database: the
+    application never re-grants, the startup backfill runs restricted, and the
+    §8.3 matrix itself is asserted by
+    ``test_issue145_application_integration.py``.
+    """
+    if prov.owner_role:
+        raise RuntimeError(
+            "the importer grants assume Topology A (the migrator owns the "
+            "application tables); Topology B uses grant_backfill_privileges"
+        )
+    with psycopg.connect(prov.migrator_url, autocommit=True) as conn:
+        conn.execute(
+            f'GRANT INSERT, UPDATE, DELETE, TRUNCATE ON TABLE '
+            f'public."positions", public."paper_orders", '
+            f'public."strategy_leg_exposures" TO "{prov.migrator_role}"'
+        )
+        conn.execute(
+            f'GRANT ALL ON SEQUENCE public."strategy_leg_exposures_id_seq" '
+            f'TO "{prov.migrator_role}"'
+        )
 
 
 def grant_backfill_privileges(prov: Provisioned) -> None:
@@ -259,7 +293,8 @@ def grant_backfill_privileges(prov: Provisioned) -> None:
     if not prov.owner_role:
         raise RuntimeError(
             "the §8.3 backfill grants are a Topology B operation: in Topology A "
-            "the migration identity already owns the application tables"
+            "the migration identity owns the application tables and the guarded "
+            "upgrade already applied the §8.3 Topology A restrictions"
         )
     with psycopg.connect(prov.admin_database_url, autocommit=True) as conn:
         conn.execute(

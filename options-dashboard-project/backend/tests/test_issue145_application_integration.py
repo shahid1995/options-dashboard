@@ -113,6 +113,19 @@ def pg_ready(pg, monkeypatch):
     return pg
 
 
+@pytest.fixture
+def pg_ready_a(pg_topology_a):
+    """Topology A after the guarded chain, without the Topology B grants.
+
+    The §8.3 Topology A restrictions are applied by the guarded migration
+    itself, so nothing here may re-grant anything: the fixture is the exact
+    privilege state the production startup leaves behind for the backfill.
+    """
+    _bootstrap(pg_topology_a)
+    db_module._run_alembic_migrations()
+    return pg_topology_a
+
+
 def _engine(prov: support.Provisioned):
     return db_module._migration_engine()
 
@@ -966,6 +979,134 @@ def test_topology_a_creator_objects_are_runtime_usable(pg_topology_a):
             f"Topology A runtime privileges: sequence_usage={sequence_usage} "
             f"truncate={truncate} create_on_public={create_on_public}"
         )
+
+
+def _migrator_privilege_matrix(prov: support.Provisioned) -> dict:
+    """Effective table/sequence privileges of the migration identity."""
+    with psycopg.connect(prov.migrator_url) as conn:
+        rows = conn.execute(
+            "SELECT c.relname, p.priv, has_table_privilege(current_user, c.oid, p.priv) "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "CROSS JOIN (VALUES ('SELECT'),('INSERT'),('UPDATE'),('DELETE'),"
+            "('TRUNCATE')) AS p(priv) "
+            "WHERE n.nspname = 'public' "
+            "AND c.relname IN ('positions','paper_orders','strategy_leg_exposures')"
+        ).fetchall()
+        sequence = conn.execute(
+            "SELECT pg_get_serial_sequence('public.strategy_leg_exposures','id')"
+        ).fetchone()[0]
+        sequence_usage, sequence_select = conn.execute(
+            "SELECT has_sequence_privilege(current_user, %s, 'USAGE'), "
+            "has_sequence_privilege(current_user, %s, 'SELECT')",
+            (sequence, sequence),
+        ).fetchone()
+    matrix = {(table, privilege): bool(effective) for table, privilege, effective in rows}
+    matrix[("sequence", "USAGE")] = bool(sequence_usage)
+    matrix[("sequence", "SELECT")] = bool(sequence_select)
+    return matrix
+
+
+def test_topology_a_restricted_privilege_matrix(pg_ready_a):
+    """ADR §8.3 Topology A: the owner's ordinary privileges are revoked.
+
+    The migrator owns these objects, yet PostgreSQL 16 applies the revokes to
+    the owner's own ACL, so the effective matrix is the §8.2 minimum and the
+    denied statements fail ``42501`` for the owner itself.
+    """
+    expected = {
+        ("positions", "SELECT"): True,
+        ("positions", "INSERT"): False,
+        ("positions", "UPDATE"): False,
+        ("positions", "DELETE"): False,
+        ("positions", "TRUNCATE"): False,
+        ("paper_orders", "SELECT"): True,
+        ("paper_orders", "INSERT"): False,
+        ("paper_orders", "UPDATE"): False,
+        ("paper_orders", "DELETE"): False,
+        ("paper_orders", "TRUNCATE"): False,
+        ("strategy_leg_exposures", "SELECT"): True,
+        ("strategy_leg_exposures", "INSERT"): True,
+        ("strategy_leg_exposures", "UPDATE"): False,
+        ("strategy_leg_exposures", "DELETE"): False,
+        ("strategy_leg_exposures", "TRUNCATE"): False,
+        ("sequence", "USAGE"): True,
+        ("sequence", "SELECT"): False,
+    }
+    matrix = _migrator_privilege_matrix(pg_ready_a)
+    for key, wanted in expected.items():
+        if matrix.get(key) is not wanted:
+            raise AssertionError(
+                f"Topology A migrator privilege {key} = {matrix.get(key)}, expected {wanted}"
+            )
+
+    with psycopg.connect(pg_ready_a.migrator_url) as conn:
+        # The allowed reads really work for the owning migrator.
+        conn.execute("SELECT count(*) FROM public.positions").fetchone()
+        conn.execute("SELECT count(*) FROM public.paper_orders").fetchone()
+        conn.execute("SELECT count(*) FROM public.strategy_leg_exposures").fetchone()
+        conn.rollback()
+        denied = (
+            "INSERT INTO public.positions SELECT * FROM public.positions",
+            "UPDATE public.positions SET status = 'closed'",
+            "DELETE FROM public.positions",
+            "TRUNCATE public.positions",
+            "INSERT INTO public.paper_orders SELECT * FROM public.paper_orders",
+            "UPDATE public.paper_orders SET status = 'FILLED'",
+            "DELETE FROM public.paper_orders",
+            "TRUNCATE public.paper_orders",
+            "UPDATE public.strategy_leg_exposures SET order_id = order_id",
+            "DELETE FROM public.strategy_leg_exposures",
+            "TRUNCATE public.strategy_leg_exposures",
+            "SELECT last_value FROM public.strategy_leg_exposures_id_seq",
+        )
+        for statement in denied:
+            with pytest.raises(psycopg.Error) as exc:
+                conn.execute(statement)
+            state = _psycopg_sqlstate(exc.value)
+            if state != "42501":
+                raise AssertionError(f"{statement!r} gave {state}, expected 42501")
+            conn.rollback()
+        # USAGE alone authorizes nextval, which INSERT … RETURNING id needs.
+        conn.execute("SELECT nextval('public.strategy_leg_exposures_id_seq')").fetchone()
+        conn.rollback()
+
+
+def test_topology_a_restricted_backfill_completes(pg_ready_a):
+    """The real startup backfill succeeds under the restricted owner."""
+    support.seed_legacy_users(pg_ready_a.admin_database_url, users=3)
+
+    # init_db() re-runs the guarded chain (the restrictions are re-applied) and
+    # then the protected per-user backfill as the same restricted identity.
+    db_module.init_db()
+    counts = _exposure_counts(pg_ready_a)
+    if counts != {f"issue145-user-{u}": 1 for u in (1, 2, 3)}:
+        raise AssertionError(f"unexpected exposure ledger after backfill: {counts}")
+
+    support.seed_legacy_users(pg_ready_a.admin_database_url, users=1, start_user=4)
+    db_module.init_db()
+    counts = _exposure_counts(pg_ready_a)
+    if counts != {f"issue145-user-{u}": 1 for u in (1, 2, 3, 4)}:
+        raise AssertionError(f"later upgrade changed the backfill result: {counts}")
+
+    # A subsequent upgrade must not silently restore the owner's privileges.
+    matrix = _migrator_privilege_matrix(pg_ready_a)
+    for key in (
+        ("positions", "INSERT"),
+        ("positions", "UPDATE"),
+        ("positions", "DELETE"),
+        ("positions", "TRUNCATE"),
+        ("paper_orders", "INSERT"),
+        ("strategy_leg_exposures", "UPDATE"),
+        ("strategy_leg_exposures", "DELETE"),
+        ("sequence", "SELECT"),
+    ):
+        if matrix.get(key) is not False:
+            raise AssertionError(
+                f"after a later upgrade the migrator regained {key} "
+                f"({matrix.get(key)})"
+            )
+    if matrix.get(("strategy_leg_exposures", "INSERT")) is not True:
+        raise AssertionError("the backfill lost INSERT on strategy_leg_exposures")
 
 
 def test_topology_b_owner_role_shape_and_default_privileges(pg_ready):

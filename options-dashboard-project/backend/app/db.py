@@ -294,7 +294,7 @@ def get_db():
 
 
 def resolve_migration_database_url(explicit_url: str | None = None) -> str:
-    """Resolve the database URL for an Alembic invocation (ADR-016/ADR-017).
+    """Resolve the candidate database URL for an Alembic invocation.
 
     Precedence (PR #107 review contract):
 
@@ -302,13 +302,17 @@ def resolve_migration_database_url(explicit_url: str | None = None) -> str:
        alembic.ini / CLI-configured value passed in by ``alembic/env.py``);
        the highest-priority, intentional operator override.
     2. ``STRIKENOVA_MIGRATION_DATABASE_URL`` — the dedicated migration
-       identity, so a standalone ``alembic upgrade head`` runs under the
-       same higher-privilege creator role as application-startup
-       migrations (future tables then receive the runtime default
-       privileges automatically).
-    3. ``DATABASE_URL`` — the runtime URL (historical single-identity
-       behavior).
+       identity.
+    3. ``DATABASE_URL`` — the runtime URL.
     4. The local SQLite file when nothing is configured.
+
+    This resolver only *proposes* a URL; it is not the policy boundary.
+    :func:`assert_guarded_migration_configuration` is, and it fails closed
+    (``45004``) when ``DATABASE_URL`` is PostgreSQL and
+    ``STRIKENOVA_MIGRATION_DATABASE_URL`` is missing or resolves to the same
+    database identity. The fallback in step 3 therefore cannot produce an
+    unguarded PostgreSQL migration: it only serves SQLite, which keeps its
+    historical single-process, single-identity behaviour.
 
     Blank/whitespace values are treated as unset at every level, and every
     resolved URL passes through :func:`normalize_database_url` exactly like
@@ -332,10 +336,13 @@ def resolve_migration_database_url(explicit_url: str | None = None) -> str:
 def _migration_engine_url() -> str:
     """Resolve the URL used by Alembic migrations.
 
-    Identity separation (ADR-016): migrations may run under a dedicated
-    higher-privilege identity via ``STRIKENOVA_MIGRATION_DATABASE_URL``.
-    When unset, migrations use the runtime ``DATABASE_URL``/engine exactly
-    as before (single-identity deployments are unaffected).
+    Identity separation (ADR-017/018): on PostgreSQL every migration runs
+    under the dedicated migration identity named by
+    ``STRIKENOVA_MIGRATION_DATABASE_URL``. Single-identity deployment is no
+    longer supported for PostgreSQL: a missing or identical migration
+    identity is refused by :func:`assert_guarded_migration_configuration`
+    with SQLSTATE ``45004`` rather than silently reusing the runtime URL.
+    SQLite keeps the historical single-process path.
 
     Delegates to :func:`resolve_migration_database_url` so the startup path
     and the standalone Alembic CLI resolve URLs identically.
@@ -464,6 +471,70 @@ def _reset_owner_role(conn) -> None:
         )
 
 
+#: ADR §8.3 Topology A: the ordinary privileges the migration identity must
+#: NOT keep on the application objects the startup backfill touches, once the
+#: Alembic chain has created them. The migrator owns those objects, and
+#: PostgreSQL 16 lets an owner revoke its own ordinary privileges — the
+#: revoke is effective and a later INSERT/UPDATE/DELETE fails ``42501`` even
+#: for the owner. Ownership still permits ``ALTER``/``DROP``: those are
+#: inherent ownership powers, not ordinary privileges, and no revoke can
+#: remove them (ADR §8.4 and D-2 therefore govern who owns the tables).
+_TOPOLOGY_A_RESTRICTED_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("positions", ("INSERT", "UPDATE", "DELETE", "TRUNCATE")),
+    ("paper_orders", ("INSERT", "UPDATE", "DELETE", "TRUNCATE")),
+    ("strategy_leg_exposures", ("UPDATE", "DELETE", "TRUNCATE")),
+)
+
+#: ADR §8.3 Topology A: tables whose ``id`` sequence is restricted to
+#: ``USAGE`` only (``REVOKE ALL`` then ``GRANT USAGE``), so ``nextval`` works
+#: for ``INSERT … RETURNING id`` while ``SELECT`` on the sequence does not.
+_TOPOLOGY_A_RESTRICTED_SEQUENCES: tuple[str, ...] = ("strategy_leg_exposures",)
+
+
+def apply_migrator_privilege_restrictions(conn) -> int:
+    """Apply the ADR §8.3 Topology A restrictions to the migration identity.
+
+    Called inside the protected DDL transaction, after Alembic has created (or
+    re-created) the application objects and before the protected backfill, so
+    the restriction is committed together with the schema and is re-applied by
+    every later ``upgrade head`` instead of silently disappearing. Topology B
+    does not use this path: its objects are owned by the separate owner role
+    and its privileges come from the §8.3 grants.
+
+    Returns the number of objects whose privileges were restricted. Only
+    ordinary table/sequence privileges are revoked (see
+    ``_TOPOLOGY_A_RESTRICTED_TABLES``): the migrator keeps its inherent
+    ownership powers to ``ALTER``/``DROP`` those objects, and it could grant
+    the privileges back to itself — these revokes bound accident, not intent.
+    """
+    owner_role = (getattr(settings, "STRIKENOVA_OWNER_ROLE", "") or "").strip()
+    if owner_role:
+        return 0
+    migrator_role = (settings.STRIKENOVA_MIGRATOR_ROLE or "").strip()
+    if not migrator_role:
+        return 0
+    migrator = _quote_role(migrator_role)
+    restricted = 0
+    for table, privileges in _TOPOLOGY_A_RESTRICTED_TABLES:
+        relation = f"public.{_quote_role(table)}"
+        if conn.exec_driver_sql(f"SELECT to_regclass('{relation}')").scalar() is None:
+            continue
+        conn.exec_driver_sql(
+            f"REVOKE {', '.join(privileges)} ON TABLE {relation} FROM {migrator}"
+        )
+        restricted += 1
+    for table in _TOPOLOGY_A_RESTRICTED_SEQUENCES:
+        sequence = conn.exec_driver_sql(
+            f"SELECT pg_get_serial_sequence('public.{table}', 'id')"
+        ).scalar()
+        if not sequence:
+            continue
+        conn.exec_driver_sql(f"REVOKE ALL ON SEQUENCE {sequence} FROM {migrator}")
+        conn.exec_driver_sql(f"GRANT USAGE ON SEQUENCE {sequence} TO {migrator}")
+        restricted += 1
+    return restricted
+
+
 def _run_guarded_migrations(
     alembic_cfg,
     command,
@@ -499,6 +570,16 @@ def _run_guarded_migrations(
                 # Only reached on success: an exception rolls the whole
                 # transaction back, so the elevation cannot outlive it.
                 _reset_owner_role(conn)
+                # ADR §8.3 Topology A: bound the migration identity's ordinary
+                # privileges before the backfill runs, in the same transaction
+                # as the DDL and on every upgrade (never just the first one).
+                restricted = apply_migrator_privilege_restrictions(conn)
+                if restricted:
+                    logger.info(
+                        "ADR §8.3 Topology A: restricted %d application object(s) "
+                        "for the migration identity",
+                        restricted,
+                    )
                 lease.enter(conn)  # refresh immediately before COMMIT
         logger.info("Alembic migrations applied successfully under the lease")
 

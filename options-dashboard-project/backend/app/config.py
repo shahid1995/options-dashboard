@@ -104,11 +104,13 @@ class Settings(BaseSettings):
     # a VM, local rehearsal).
     STRIKENOVA_ENV: str = ""
 
-    # ADR-016 (optional identity separation): when set, Alembic migrations
-    # run under this dedicated higher-privilege identity instead of the
-    # runtime DATABASE_URL production identity. The runtime identity can then
-    # be restricted to DML (no schema ownership/DDL). Leave unset for
-    # single-identity deployments (behavior identical to the historical model).
+    # ADR-017/018 (mandatory identity separation on PostgreSQL): the URL for
+    # the dedicated migration identity. It is REQUIRED whenever DATABASE_URL
+    # is PostgreSQL and must resolve to a different database identity; a
+    # missing value or one equal to DATABASE_URL fails closed with SQLSTATE
+    # 45004 (app.db.assert_guarded_migration_configuration). There is no
+    # single-identity PostgreSQL fallback. SQLite keeps its historical
+    # single-process behaviour and ignores this setting.
     STRIKENOVA_MIGRATION_DATABASE_URL: str | None = None
 
     # ADR-017 (migration lease): the transactional lease that guarantees only

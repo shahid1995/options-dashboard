@@ -55,11 +55,55 @@ There is exactly one switch, and the default is Topology A:
 In both topologies the runtime role receives DML and sequence `USAGE` on new
 application objects through **schema-scoped** defaults (`IN SCHEMA public`). A
 *global* default privilege would also cover `migration_internal` and is a
-verification failure (`45004`). Because an object's owner inherently holds every
-privilege on it, the §8.3 revoke set is only meaningful for the migrator under
-Topology B: under Topology A the migrator owns the tables and can therefore
-always alter or drop them. Neither topology grants the runtime role anything
-beyond DML.
+verification failure (`45004`). Neither topology grants the runtime role
+anything beyond DML.
+
+### 2.2 The two privilege models in detail
+
+**Topology A (default) — the migrator owns, and its ordinary privileges are
+revoked.** The migrator creates and owns `positions`, `paper_orders`,
+`strategy_leg_exposures` and their sequences. Ownership alone would let the
+migration identity write and delete anything it owns, so the guarded migration
+applies the ADR §8.3 restrictions **inside the same protected DDL transaction**,
+after Alembic and `RESET ROLE`, and before the pre-commit `enter`:
+
+```sql
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON public.positions              FROM <migrator>;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON public.paper_orders           FROM <migrator>;
+REVOKE UPDATE, DELETE, TRUNCATE          ON public.strategy_leg_exposures FROM <migrator>;
+REVOKE ALL                               ON SEQUENCE public.strategy_leg_exposures_id_seq FROM <migrator>;
+GRANT  USAGE                             ON SEQUENCE public.strategy_leg_exposures_id_seq TO   <migrator>;
+```
+
+PostgreSQL 16 **does** apply these revokes to the object owner's own ACL: after
+the chain, `UPDATE public.positions` and `DELETE FROM public.strategy_leg_exposures`
+fail `42501` **for the owning migrator**, while `SELECT` everywhere,
+`INSERT` on `strategy_leg_exposures`, and sequence `USAGE` remain. The revokes
+are re-applied on **every** later `upgrade head` (the code runs them inside the
+same transaction as the DDL), so a subsequent migration cannot silently restore
+the privileges.
+
+What the revokes cannot remove is ownership itself. The owner always keeps
+inherent object-definition powers — it can `ALTER` or `DROP` its own tables and
+grant an ordinary privilege back to itself. Those are not ordinary DML
+privileges and are deliberately **not** represented as such: the §8.3 revokes
+bound accident, while ADR §8.4 and D-2 govern who owns the tables.
+
+**Topology B — ownership is separated and reached only through `SET ROLE`.**
+The `NOLOGIN` owner creates the objects inside the explicit window; the migrator
+holds no inherited rights at all. Its privileges come from four explicit
+grants and the effective matrix is identical to Topology A:
+
+```sql
+GRANT SELECT         ON public.positions              TO <migrator>;
+GRANT SELECT         ON public.paper_orders           TO <migrator>;
+GRANT SELECT, INSERT ON public.strategy_leg_exposures TO <migrator>;
+GRANT USAGE          ON SEQUENCE public.strategy_leg_exposures_id_seq TO <migrator>;
+```
+
+The backfill never elevates: `RESET ROLE` happens before the post-migration
+callback. The elevation exists only so Alembic's DDL can `ALTER` owner-owned
+objects, and it is verified (`current_user`) at both ends.
 
 ## 3. Transaction and connection boundaries
 
@@ -134,7 +178,9 @@ CLI and startup use the **migration** identity, never the runtime identity.
 5. `python -m app.migrate upgrade head` — lease + full Alembic chain in one
    transaction; in Topology B the DDL runs inside a verified
    `SET ROLE strikenova_prod_owner` / `RESET ROLE` window, in Topology A there
-   is no role window at all.
+   is no role window and the §8.3 restrictions (§2.2) are applied before the
+   transaction commits. No manual revoke step is needed, and re-running the
+   command re-applies them.
 6. Apply the ADR-018 §8.3 grants to the runtime role and start the app.
 
 On a genuinely empty database the migrator must not assume the runtime grants
@@ -247,7 +293,10 @@ instance class before enabling a real cutover.
   ownership of migration objects; no `CREATE` on schema `public`.
 * Migrator: in Topology B `SET`-only membership in the owner role, no
   `INHERIT`, no superuser, and no default privileges of its own; in Topology A
-  it owns the application objects it creates.
+  it owns the application objects it creates **and** holds only the §8.3
+  restricted ordinary privileges on them (`SELECT` on `positions` and
+  `paper_orders`, `SELECT`+`INSERT` on `strategy_leg_exposures`, sequence
+  `USAGE` only).
 * Default ACLs are inspected globally (`pg_default_acl`) and for
   `migration_internal`; a global default that would grant PUBLIC or the runtime
   role access to the schema is a verification failure.
@@ -268,11 +317,12 @@ version and no residual PUBLIC entries.
 
 | Suite | Scope | Result |
 | --- | --- | --- |
-| `tests/test_issue145_application_integration.py` | real PG 16.16: concurrent `init_db()`, single connection, killed worker, injected failure, CLI, barrier, protocol, expiry, privileges, both ownership topologies, schema-ACL positive/negative controls, timing | 22 passed |
-| `tests/test_migration_serialization.py` | DB-free protocol/config/retirement contract, including the timeout-below-TTL rule and its boundaries | 46 passed |
-| `tests/test_db_migration.py`, `test_alembic_*.py`, `test_day5_alembic_authority.py`, `test_migration_identity_separation.py`, `test_leg_exposure.py` | SQLite chain, FK behavior, identity separation, exposure idempotency | 135 passed |
+| `tests/test_issue145_application_integration.py` | real PG 16.16: concurrent `init_db()`, single connection, killed worker, injected failure, CLI, barrier, protocol, expiry, privileges, both ownership topologies, the Topology A §8.3 matrix and its restricted backfill, schema-ACL positive/negative controls, timing | 24 passed |
+| `tests/test_migration_serialization.py` | DB-free protocol/config/retirement contract, the timeout-below-TTL rule and its boundaries, and the CI log gate's negative controls | 55 passed |
+| `tests/test_db_migration.py`, `test_alembic_*.py`, `test_day5_alembic_authority.py`, `test_migration_identity_separation.py`, `test_leg_exposure.py` | SQLite chain, FK behavior, identity separation, exposure idempotency | 144 passed (regression suite total) |
 | `PostgreSQL compatibility` suite (9 modules: compatibility, importer, failure injection, large rehearsal, hardening, Day 5/6) | disposable PG 16.16 schemas built only through `python -m app.migrate upgrade head` | 122 passed |
 | `.github/workflows/issue145-application-pg16.yml` | the two suites above on a pinned `postgres@sha256:3950ad…` 16.16 service, exact `server_version_num = 160016` gate, evidence upload, cleanup | see PR #146 checks |
+| `scripts/pytest_gate.py` | gates **both** suites independently: missing log or exit code, failed/errored test, any skipped test, missing pass summary, or fewer passes than the exact minimum all fail the job | 24 / 144 minimums; negative controls in `TestPytestGate` |
 
 Local verification used PGDG 16.16 server binaries extracted into the workspace
 (the container socket was unavailable in that environment); CI uses the pinned
@@ -286,8 +336,12 @@ digest. Both report `server_version_num = 160016`.
 * The compatibility and importer rehearsals build their schema as Topology A
   and perform the data import as the migration identity; they do not re-prove
   the runtime-identity boundary (that lives in the integration suite).
-* Topology A cannot revoke table privileges from its own creator: an object's
-  owner always holds them. §8.3 revokes are therefore a Topology B control.
+* Topology A revokes the migrator's ordinary table/sequence privileges (§2.2)
+  and PostgreSQL 16 applies them to the owner's own ACL. Inherent ownership
+  powers remain: the migrator can still `ALTER`/`DROP` its own objects or
+  grant a privilege back, which is why ownership separation (Topology B) and
+  ADR §8.4/D-2 still matter. This is a real limitation of the Topology A
+  model, not of the revoke statements.
 * The TTL/timing measurement is synthetic and single-host (§7).
 * No production/Neon/Render change is part of this work: no live roles, grants,
   environment variables or cutover were touched.

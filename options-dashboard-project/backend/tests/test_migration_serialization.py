@@ -10,6 +10,9 @@ retirement of the renewal-thread design.
 from __future__ import annotations
 
 import inspect
+import pathlib
+import subprocess
+import sys
 
 import pytest
 from pydantic import ValidationError
@@ -276,3 +279,99 @@ class TestRetiredDesign:
         monkeypatch.setattr(db_module, "_run_guarded_migrations", forbidden)
         hermetic_init_db()
         assert calls == []
+
+
+class TestPytestGate:
+    """The CI gate over both pytest logs must fail closed (ADR-017 completion).
+
+    These are deterministic negative controls over synthetic logs: no real test
+    is skipped, altered or re-run to produce them.
+    """
+
+    SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "pytest_gate.py"
+
+    def _run(self, tmp_path, log_text, *, rc="0", minimum=22, log_name="suite.log"):
+        log = tmp_path / log_name
+        if log_text is not None:
+            log.write_text(log_text, encoding="utf-8")
+        rc_file = tmp_path / "suite.rc"
+        if rc is not None:
+            rc_file.write_text(rc, encoding="utf-8")
+        return subprocess.run(
+            [
+                sys.executable,
+                str(self.SCRIPT),
+                "--suite",
+                f"unit|{minimum}|{log}|{rc_file}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    def test_real_summary_passes(self, tmp_path):
+        result = self._run(tmp_path, "22 passed, 1 warning in 29.34s\n")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "unit: 22 passed" in result.stdout
+
+    def test_all_skipped_log_fails(self, tmp_path):
+        result = self._run(tmp_path, "22 skipped, 3 warnings in 4.10s\n")
+        assert result.returncode == 1
+        assert "skipped" in result.stdout
+
+    def test_missing_summary_fails(self, tmp_path):
+        result = self._run(tmp_path, "collected 0 items\n\nno tests ran in 0.01s\n")
+        assert result.returncode == 1
+        assert "no 'N passed' summary" in result.stdout
+
+    def test_failed_test_fails_even_with_passes(self, tmp_path):
+        result = self._run(tmp_path, "21 passed, 1 failed in 12.0s\n")
+        assert result.returncode == 1
+        assert "failed" in result.stdout
+
+    def test_non_zero_exit_code_fails(self, tmp_path):
+        result = self._run(tmp_path, "22 passed in 12.0s\n", rc="1")
+        assert result.returncode == 1
+        assert "pytest exited 1" in result.stdout
+
+    def test_missing_exit_code_fails(self, tmp_path):
+        result = self._run(tmp_path, "22 passed in 12.0s\n", rc=None)
+        assert result.returncode == 1
+        assert "no recorded pytest exit code" in result.stdout
+
+    def test_low_pass_count_fails(self, tmp_path):
+        result = self._run(tmp_path, "21 passed in 12.0s\n", minimum=22)
+        assert result.returncode == 1
+        assert "only 21 test(s) passed" in result.stdout
+
+    def test_missing_log_fails(self, tmp_path):
+        result = self._run(tmp_path, None)
+        assert result.returncode == 1
+        assert "no pytest log" in result.stdout
+
+    def test_regression_suite_is_gated_independently(self, tmp_path):
+        """A green integration log must not mask a broken regression log."""
+        good = tmp_path / "integration.log"
+        good.write_text("22 passed in 20.0s\n", encoding="utf-8")
+        good_rc = tmp_path / "integration.rc"
+        good_rc.write_text("0", encoding="utf-8")
+        bad = tmp_path / "regression.log"
+        bad.write_text("135 skipped in 20.0s\n", encoding="utf-8")
+        bad_rc = tmp_path / "regression.rc"
+        bad_rc.write_text("0", encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(self.SCRIPT),
+                "--suite",
+                f"integration|22|{good}|{good_rc}",
+                "--suite",
+                f"regression|141|{bad}|{bad_rc}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 1
+        assert "integration: 22 passed" in result.stdout
+        assert "regression: 135 skipped" in result.stdout
