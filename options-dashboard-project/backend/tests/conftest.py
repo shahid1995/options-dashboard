@@ -7,6 +7,10 @@ os.environ.setdefault("UPSTOX_REDIRECT_URI", "http://localhost:8000/auth/callbac
 os.environ.setdefault("FRONTEND_URL", "http://localhost:3000")
 os.environ.setdefault("TOKEN_ENCRYPTION_KEY", "test-encryption-key-for-dev-only")
 
+# There is deliberately no unleased-Alembic opt-in: PostgreSQL schemas in
+# tests are built through ``python -m app.migrate upgrade head`` under the
+# ADR-017 lease (see tests/issue145_pg_support.py).
+
 import pytest
 
 from app.services import token_store

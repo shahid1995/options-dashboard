@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -19,11 +18,11 @@ sys.path.insert(0, str(TOOLS_DIR))
 from migrate_sqlite_to_postgres import (  # noqa: E402
     SKIP_TABLES,
     migrate_database,
-    normalize_url,
     verify_databases,
 )
 from app.identity import BrokerConnection, User  # noqa: E402
 from app.models import GexSnapshot  # noqa: E402
+from tests import issue145_pg_support as support  # noqa: E402
 
 DATASET_USERS = 20
 GEX_ROWS_PER_USER = 500
@@ -32,11 +31,36 @@ MAX_REHEARSAL_SECONDS = 60.0
 
 
 def _prepare_schema(engine) -> None:
+    """Build the SQLite source schema.
+
+    The PostgreSQL target is migrated exclusively by
+    ``python -m app.migrate upgrade head`` (see the ``postgres_engine``
+    fixture); ``alembic/env.py`` refuses an unleased PostgreSQL run.
+    """
+    if engine.dialect.name != "sqlite":
+        raise RuntimeError(
+            "PostgreSQL schemas are built by the guarded migration CLI, not by "
+            "a direct Alembic run (ADR-017)"
+        )
     cfg = Config(str(ROOT / "alembic.ini"))
     cfg.set_main_option("script_location", str(ROOT / "alembic"))
     cfg.set_main_option("sqlalchemy.url", str(engine.url))
     cfg.attributes["connectable"] = engine
     command.upgrade(cfg, "head")
+
+
+@pytest.fixture(scope="module")
+def postgres_engine():
+    """Disposable PostgreSQL target, migrated by the guarded CLI (Topology A)."""
+    if support.admin_url() is None:
+        pytest.skip(f"{support.ADMIN_ENV} is not configured (disposable PostgreSQL 16.16)")
+    prov = support.provision_schema_ready()
+    engine = support.migrator_engine(prov)
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+        support.drop(prov)
 
 
 def _clear_postgres_target(engine) -> None:
@@ -121,21 +145,17 @@ def _populate_large_dataset(engine) -> None:
         session.close()
 
 
-def test_large_realistic_rehearsal_migrates_and_verifies_without_data_loss(tmp_path):
-    raw_url = os.getenv("TEST_DATABASE_URL")
-    if not raw_url:
-        pytest.skip("TEST_DATABASE_URL is not configured")
-
+def test_large_realistic_rehearsal_migrates_and_verifies_without_data_loss(
+    tmp_path, postgres_engine
+):
     sqlite_path = tmp_path / "large-rehearsal.db"
     sqlite_engine = create_engine(
         f"sqlite:///{sqlite_path}",
         connect_args={"check_same_thread": False},
     )
-    postgres_engine = create_engine(normalize_url(raw_url), pool_pre_ping=True)
     try:
         _prepare_schema(sqlite_engine)
         _populate_large_dataset(sqlite_engine)
-        _prepare_schema(postgres_engine)
         _clear_postgres_target(postgres_engine)
 
         with sqlite_engine.connect() as conn:

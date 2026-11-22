@@ -24,12 +24,19 @@ Founder acceptance.
 
 ## Runtime topology
 
-5. **Production topology is Vercel (frontend) → Render (backend) →
-   CockroachDB (production database).** Railway references are historical and
-   must not be presented as current production truth.
+5. **Production topology is Vercel (frontend) → Render (backend) → Neon
+   PostgreSQL (accepted strategic production database, ADR-019).** Neon
+   provisioning, live role/grant configuration, Render changes and production
+   cutover are separate founder-authorized work and are **not** complete;
+   nothing in this repository may assume they have happened. CockroachDB is
+   retired (ADR-019); CockroachDB evidence in historical documents is
+   historical record, never current target configuration, and Railway
+   references are historical too.
 6. **Database portability is preserved.** Local development on SQLite,
-   PostgreSQL-compatible CI, CockroachDB-validated production target. No code
-   path may depend on a single vendor dialect where portability exists today.
+   PostgreSQL-compatible CI, and a PostgreSQL 16 production target (Neon).
+   No code path may depend on a single vendor dialect where portability exists
+   today; the ADR-017 lease is deliberately PostgreSQL-only and a CockroachDB
+   migration path is refused rather than run unguarded.
 6a. **Production database configuration is fail-closed.** The
    provider-neutral production signal is `STRIKENOVA_ENV=production`. The
    legacy Railway-era markers (`RAILWAY_ENVIRONMENT`,
@@ -90,29 +97,42 @@ Founder acceptance.
     explicitly authorizes them.
 20. **Credentials are invisible to agents.** Never read, print, copy, decode,
     or expose credential files (including `.strikenova_gh_token`).
-6c. **Runtime and migration database identities are separable.** Alembic
-   runs under the identity from `STRIKENOVA_MIGRATION_DATABASE_URL` when
-   set; otherwise under the runtime credential (legacy behavior). The
-   runtime identity must never require cluster administration, and the
-   migration identity must never be the normal serving credential (ADR-016).
+6c. **Runtime and migration database identities are distinct and both are
+   mandatory on PostgreSQL.** Alembic and the startup backfill run under the
+   identity from `STRIKENOVA_MIGRATION_DATABASE_URL`; there is **no fallback**
+   to the runtime credential. On PostgreSQL a missing migration URL, or one
+   that resolves to the same database identity as `DATABASE_URL`, fails closed
+   (`45004`). The runtime identity must never require cluster administration,
+   and the migration identity must never be the normal serving credential
+   (ADR-016/ADR-017/ADR-018). SQLite keeps its single-identity local path.
 6d. **Migrations are serialized.** Only one process may execute the Alembic
    chain at a time; concurrent application startups must wait, take over an
    expired lease, or fail closed — never execute the same DDL concurrently.
    The lock must work on an empty database and under the migration identity,
-   and must never require runtime DDL/owner privileges (ADR-017). The lease
-   configuration must keep the renewal interval strictly below the TTL:
-   `MIGRATION_LOCK_TTL_SECONDS >= 2` with renewal every `max(1.0, TTL/3)`,
-   enforced at the configuration boundary. The manual operator CLI path
-   (`alembic upgrade head` run out-of-band) remains outside the application
-   lock by design (ADR-017 Residual); it resolves its database with the
-   same identity precedence as startup migrations (explicit operator URL >
-   `STRIKENOVA_MIGRATION_DATABASE_URL` > `DATABASE_URL`), so it must be run
-   under the migration identity unless an explicit operator URL is
-   intentionally supplied.
-6e. **Future application tables carry runtime DML by default.** In the
-   production database `strikenova`, default privileges bound to the
-   migration/creator role (`ALTER DEFAULT PRIVILEGES FOR ROLE
-   strikenova_prod_migrator IN SCHEMA public`) grant the runtime role
+   and must never require runtime DDL/owner privileges (ADR-017/018). The
+   implemented lease has no renewal thread: ownership is the lease row lock
+   itself, so a live owner cannot lose the lease while its transaction is
+   open, and a dead owner's transaction is aborted by the server. The lease
+   TTL only bounds how long another process waits before it may take over an
+   abandoned row. `MIGRATION_LEASE_TTL_SECONDS`, `MIGRATION_LEASE_WAIT_SECONDS`
+   and `MIGRATION_LEASE_LOCK_TIMEOUT_MS` are validated at the configuration
+   boundary, and the TTL is derived from measured backfill timing
+   (runbook §7), not guessed.
+6e. **The migration path is guarded, and the guard is verified.** On
+   PostgreSQL the lease and the Alembic DDL share one physical connection and
+   one transaction; `alembic/env.py` refuses a PostgreSQL connection that did
+   not arrive through the lease. A bare `alembic upgrade head` fails closed,
+   and `python -m app.migrate upgrade head` is the only supported path. The
+   migration URL must exist and must differ from the runtime URL; equal or
+   missing identities fail closed (`45004`). Verification
+   (`python -m app.migrate bootstrap-lease --verify`) reports state and never
+   changes installed protocol versions; upgrades use
+   `--upgrade-protocol N`, never a direct `UPDATE installed_version`.
+6f. **Future application tables carry runtime DML by default.** Default
+   privileges are bound to the role that actually creates application objects
+   and are **schema-scoped** (`... IN SCHEMA public`), never global: in
+   Topology B that creator is `strikenova_prod_owner`, in Topology A it is the
+   migrator itself. They grant the runtime role
    `strikenova_production_app` SELECT / INSERT / UPDATE / DELETE on future
    tables and USAGE on future sequences, so a migration that creates
    objects never requires a follow-up manual grant for the serving

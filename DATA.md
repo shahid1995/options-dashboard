@@ -17,14 +17,17 @@ schema.
 | Environment | Database | Driver | Notes |
 |---|---|---|---|
 | Local development | SQLite (`sqlite://` / file) | built-in | Default when `DATABASE_URL` unset; zero external services |
-| CI | PostgreSQL 16 (service container) | `postgresql+psycopg` | `PostgreSQL compatibility` workflow gate |
-| Production | **CockroachDB Cloud** | `cockroachdb+psycopg` (+ `sqlalchemy-cockroachdb`) | Runtime-validated; Alembic migrations apply cleanly |
+| CI | PostgreSQL 16.16 (pinned service container) | `postgresql+psycopg` | `PostgreSQL compatibility` and Issue #145 application-integration gates |
+| Production (accepted target) | **Neon PostgreSQL 16** (ADR-019) | `postgresql+psycopg` | Strategic target only: not provisioned by this work, no cutover performed |
+| Production (historical) | CockroachDB Cloud (retired) | `cockroachdb+psycopg` | Retired by ADR-019; evidence retained as historical record, not active target |
 
 Portability is an invariant ([`INVARIANTS.md`](INVARIANTS.md) §6): engine
 construction is `DATABASE_URL`-driven (`backend/app/db.py`), and no
 production code path may depend on a single vendor dialect where portability
-exists today. Railway-era PostgreSQL assumptions in historical documents are
-superseded — production is CockroachDB.
+exists today. **Neon PostgreSQL is the accepted strategic production database
+(ADR-019); CockroachDB is retired.** Neon provisioning, live role/grant
+configuration and cutover are separate founder-authorized work and have not
+happened, so no document may present them as complete.
 
 ## 3. Data domains
 
@@ -35,6 +38,7 @@ superseded — production is CockroachDB.
 | Paper trading | positions, executions, journal, templates (`app/models.py`) | Server-authoritative balances and P&L |
 | Market data | option chains, candles, Greeks, GEX snapshots/history | Tier-1 backfill + live ingestion (Phases 7.x) |
 | Broker sync | `app/broker_sync/` | Ingestion pipeline models |
+| Migration serialization | `migration_internal.migration_lease`, `migration_internal.lease_protocol`, four `SECURITY DEFINER` lease functions | ADR-017 PostgreSQL row-lock lease. Schema, tables and functions are owned by the migration identity; PUBLIC and the runtime role hold no schema USAGE/CREATE, table or function privileges, and no global default privilege grants them access. `migration_internal` contains no application data. |
 | Durable jobs | `BackgroundJob` (`background_jobs`, `app/models.py`) | Day 47 queue domain: idempotency key (unique), status, attempt count, lease owner/expiry, run-after, dead-letter reason. One row per idempotency key; terminal rows re-armed in place; `DEAD_LETTERED` rows retained for inspection. While a job runs, the worker's heartbeat extends `lease_expires_at` by the effective lease every ~lease/3 via the ownership-checked `renew_lease` (separate session per renewal); both RUNNING-exit transitions (success/failure) persist through the serialization-retry boundary on fresh sessions. Schema owned by Alembic (`d47aa0000001`) |
 | Historical data governance | `HistoricalDatasetGovernance`, `HistoricalIngestionRun` | Day 48 catalog/manifest for provenance, source entitlement, usage, redistribution, immutability, recomputation dependencies, completeness/checkpoint snapshots and retention policy. Policy snapshots are append-only audit context; current catalog state remains editable by controlled administration. |
 | Templates | `StrategyTemplate` (+legs) | User-owned reusable strategy blueprints |
@@ -97,22 +101,29 @@ Alembic revisions) therefore automatically carry runtime DML/USAGE. The
 runtime identity gains no CREATE/ALTER/DROP/TRUNCATE/ownership/admin through
 this mechanism. **The defaults do not follow a creator-role change:** if
 migrations ever run under a different role, re-apply the defaults for that
-role as part of the change (Invariant 6e, ADR-018). Do not revoke these rows
+role as part of the change (Invariant 6f, ADR-018). Do not revoke these rows
 while the migrator-creator model is in force.
 
-**Migration serialization.** The single-row lease table `_migration_lock`
-(ADR-017) is owned by `strikenova_prod_migrator`; the lock must be free
-(`locked_by IS NULL`) outside an active migration. The lease TTL must be
->= 2 seconds (`MIGRATION_LOCK_TTL_SECONDS`, default 120; renewal interval
-`max(1.0, TTL/3)` — configuration rejects smaller values). The manual
-operator CLI path (`alembic upgrade head`) remains outside the application
-lock (ADR-017 Residual). It resolves its database with the same precedence
-as startup migrations — explicit operator `sqlalchemy.url`, then
-`STRIKENOVA_MIGRATION_DATABASE_URL` (the migration identity), then
-`DATABASE_URL` — so a standalone CLI run must use the migration identity
-(`strikenova_prod_migrator`) unless an explicit operator URL is
-intentionally supplied; running it under the DML-only runtime identity
-would create future tables that lack the runtime default privileges.
+**Migration serialization.** The ADR-017/018 lease lives in its own schema
+`migration_internal`, owned by `strikenova_prod_owner`, and consists of the
+single-row `migration_lease` table plus the `lease_protocol` control row and
+the `SECURITY DEFINER` function set (`acquire_lease`, `enter_lease`,
+`release_lease`; `search_path=pg_catalog`; no `PUBLIC` EXECUTE). Outside an
+active migration the lease row is unowned (`owner_token_hash IS NULL`) and the
+barrier is `open`; `bootstrap_state` is `ready` only after a verified
+bootstrap. Only the SHA-256 of the 256-bit owner token is stored. Nobody —
+including the runtime role — gets `USAGE` on `migration_internal`, and the
+schema's default ACLs grant nothing. The renewal thread is retired: ownership
+is the lease row lock, `MIGRATION_LEASE_TTL_SECONDS` (default 300) bounds
+recovery of an abandoned row, and
+`MIGRATION_LEASE_WAIT_SECONDS`/`MIGRATION_LEASE_LOCK_TIMEOUT_MS` bound
+admission. `python -m app.migrate` is the only supported migration path; a
+bare `alembic upgrade head` fails closed. Operating detail:
+`docs/ADR-017-018-IMPLEMENTATION-RUNBOOK.md`. A standalone CLI run must use
+the migration identity (`strikenova_prod_migrator`) unless an explicit
+operator URL is intentionally supplied; running it under the DML-only runtime
+identity would create future tables that lack the runtime default privileges,
+and on PostgreSQL the unguarded path is refused outright.
 
 ## 6. Historical data architecture
 

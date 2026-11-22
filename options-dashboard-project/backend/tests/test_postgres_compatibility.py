@@ -1,51 +1,72 @@
 from __future__ import annotations
 
-import os
 from datetime import datetime, timezone
-from pathlib import Path
 
 import pytest
-from alembic import command
-from alembic.config import Config
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db import Base, normalize_database_url
 from app.identity import BrokerConnection, User
 from app.models import GexSnapshot
-
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def _postgres_test_url() -> str:
-    raw = os.getenv("TEST_DATABASE_URL")
-    if not raw:
-        pytest.skip("TEST_DATABASE_URL is not configured")
-    url = normalize_database_url(raw)
-    if not url.startswith("postgresql+psycopg://"):
-        pytest.fail("TEST_DATABASE_URL must resolve to the psycopg 3 SQLAlchemy dialect")
-    return url
+from tests import issue145_pg_support as support
 
 
-@pytest.fixture(scope="session")
-def postgres_engine():
-    url = _postgres_test_url()
-    engine = create_engine(url, pool_pre_ping=True)
+@pytest.fixture(scope="module")
+def postgres_target():
+    """A disposable PostgreSQL database whose schema was built the supported way.
 
-    with engine.connect() as connection:
-        assert connection.execute(text("SELECT 1")).scalar_one() == 1
-
-    alembic_cfg = Config(str(ROOT / "alembic.ini"))
-    alembic_cfg.set_main_option("script_location", str(ROOT / "alembic"))
-    alembic_cfg.set_main_option("sqlalchemy.url", url)
-    alembic_cfg.attributes["connectable"] = engine
-    command.upgrade(alembic_cfg, "head")
-
+    The schema comes from ``python -m app.migrate upgrade head`` under the
+    migration identity (Topology A): a bare ``alembic upgrade head`` is
+    refused on PostgreSQL and no test may bypass that guard.
+    """
+    if support.admin_url() is None:
+        pytest.skip(f"{support.ADMIN_ENV} is not configured (disposable PostgreSQL 16.16)")
+    prov = support.provision_schema_ready()
     try:
+        yield prov
+    finally:
+        support.drop(prov)
+
+
+@pytest.fixture(scope="module")
+def postgres_engine(postgres_target):
+    engine = support.migrator_engine(postgres_target)
+    try:
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT 1")).scalar_one() == 1
         yield engine
     finally:
         engine.dispose()
+
+
+def test_schema_is_built_by_the_guarded_migration_path(postgres_target, postgres_engine):
+    """The fixture proves the lease and the Alembic chain both ran."""
+    with postgres_engine.connect() as connection:
+        revision = connection.execute(text("SELECT version_num FROM alembic_version")).scalar()
+        protocol = connection.execute(
+            text(
+                "SELECT installed_version, bootstrap_state, barrier_state "
+                "FROM migration_internal.lease_protocol"
+            )
+        ).one()
+        owner = connection.execute(
+                text(
+                    "SELECT current_user = :role AS is_creator, "
+                    " (SELECT tableowner FROM pg_tables "
+                    "   WHERE schemaname='public' AND tablename='positions') AS positions_owner"
+                ),
+                {"role": postgres_target.migrator_role},
+            ).one()
+    assert revision
+    assert (protocol.installed_version, protocol.bootstrap_state, protocol.barrier_state) == (
+        1,
+        "ready",
+        "open",
+    )
+    assert owner.is_creator is True
+    assert owner.positions_owner == postgres_target.migrator_role
 
 
 def test_postgres_url_normalization():

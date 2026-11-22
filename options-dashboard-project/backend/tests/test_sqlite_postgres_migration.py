@@ -24,19 +24,23 @@ from tools.migrate_sqlite_to_postgres import (
 )
 from app.identity import BrokerConnection, User
 from app.models import GexSnapshot
+from tests import issue145_pg_support as support
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def postgres_url() -> str:
-    import os
-    raw = os.getenv("TEST_DATABASE_URL")
-    if not raw:
-        pytest.skip("TEST_DATABASE_URL is not configured")
-    return normalize_url(raw)
-
-
 def prepare_schema(engine) -> None:
+    """Build the SQLite source schema.
+
+    The PostgreSQL target is migrated exclusively by
+    ``python -m app.migrate upgrade head`` (see the ``postgres_engine``
+    fixture); ``alembic/env.py`` refuses an unleased PostgreSQL run.
+    """
+    if engine.dialect.name != "sqlite":
+        raise RuntimeError(
+            "PostgreSQL schemas are built by the guarded migration CLI, not by "
+            "a direct Alembic run (ADR-017)"
+        )
     cfg = Config(str(ROOT / "alembic.ini"))
     cfg.set_main_option("script_location", str(ROOT / "alembic"))
     cfg.set_main_option("sqlalchemy.url", str(engine.url))
@@ -118,16 +122,20 @@ def test_sequence_reset_sql_uses_pg_sequence_functions():
     assert "id" in sql
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def postgres_engine():
-    engine = create_engine(postgres_url(), pool_pre_ping=True)
-    with engine.connect() as connection:
-        assert connection.execute(text("SELECT 1")).scalar_one() == 1
-    prepare_schema(engine)
+    """Disposable PostgreSQL target, migrated by the guarded CLI (Topology A)."""
+    if support.admin_url() is None:
+        pytest.skip(f"{support.ADMIN_ENV} is not configured (disposable PostgreSQL 16.16)")
+    prov = support.provision_schema_ready()
+    engine = support.migrator_engine(prov)
     try:
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT 1")).scalar_one() == 1
         yield engine
     finally:
         engine.dispose()
+        support.drop(prov)
 
 
 def _column_fingerprint_differences(sqlite_engine, postgres_engine, tables):
