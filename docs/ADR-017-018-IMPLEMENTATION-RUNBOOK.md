@@ -235,7 +235,7 @@ CLI and startup use the **migration** identity, never the runtime identity.
    `STRIKENOVA_MIGRATION_TARGET_ALIASES`; otherwise the second URL is refused.
 3. Create the schema-scoped default privileges for the creator role
    (`STRIKENOVA_OWNER_ROLE` if set, else the migrator) in schema `public`:
-   `SELECT/INSERT/UPDATE/DELETE ON TABLES` and `USAGE/SELECT ON SEQUENCES` to
+   `SELECT/INSERT/UPDATE/DELETE ON TABLES` and `USAGE` **only** on sequences to
    the runtime role. Do **not** create a global (`ALTER DEFAULT PRIVILEGES`
    without `IN SCHEMA`) entry.
 4. `python -m app.migrate bootstrap-lease` — creates the schema, tables,
@@ -404,7 +404,7 @@ statements the code issued) and refuses with `45004` when any of these fail:
 | Migrator table matrix (`has_table_privilege`, one privilege at a time) | `SELECT` on `positions`/`paper_orders`; `SELECT, INSERT` on `strategy_leg_exposures`; no `UPDATE`/`DELETE`/`TRUNCATE`/`REFERENCES`/`TRIGGER` anywhere | identical |
 | Migrator sequence | `USAGE` true, `SELECT` false, `UPDATE` false | identical |
 | Runtime matrix | `SELECT/INSERT/UPDATE/DELETE` on all three; no `TRUNCATE`, `REFERENCES` or `TRIGGER` | identical |
-| Runtime sequence / schema | sequence `USAGE`, no sequence `UPDATE`; no `USAGE`/`CREATE` on `migration_internal`, no table or function privilege there; no effective `CREATE` on schema `public` | identical |
+| Runtime sequence / schema | sequence `USAGE` true, `SELECT` false, `UPDATE` false; no `USAGE`/`CREATE` on `migration_internal`, no table or function privilege there; no effective `CREATE` on schema `public` | identical |
 | Runtime membership | no membership at all (not only not migrator/owner): any granted role is an unreviewed privilege path | identical |
 | Owner membership | — | none at all, and `pg_has_role(owner, migrator, 'MEMBER')` false; no effective `USAGE`/`CREATE`/`EXECUTE` on `migration_internal` |
 | Default ACLs | bound to the actual creator (`migrator` in A, `owner` in B), `IN SCHEMA public`, table `SELECT/INSERT/UPDATE/DELETE` + sequence `USAGE` for the runtime role; no `<global>` entry and nothing to PUBLIC | identical |
@@ -425,7 +425,10 @@ sequence `UPDATE` for the runtime, `INHERIT TRUE` membership, `LOGIN` owner,
 runtime `CREATE` on `public`, runtime `CREATEDB`/`CREATEROLE`/`BYPASSRLS`,
 owner `CREATEROLE`/`CREATEDB`, owner or runtime membership of an intermediate
 role, a transitive path into `migration_internal`, a revoked runtime default
-privilege) and assert `45004` with the specific message; the valid Topology A
+privilege, an excess runtime default (`TRUNCATE`, `REFERENCES`/`TRIGGER` on
+future tables; `SELECT`/`UPDATE` on future sequences) and excess privileges on
+the existing exposure sequence) and assert `45004` with the specific message;
+the valid Topology A
 and Topology B installations pass. `test_bad_privilege_matrix_aborts_the_guarded_upgrade`
 and `test_guarded_upgrade_refuses_runtime_public_create` prove the enforcement
 path itself refuses an installation the DDL cannot repair. PostgreSQL refuses
@@ -443,12 +446,12 @@ rather than reasoned about.
 
 | Suite | Scope | Result |
 | --- | --- | --- |
-| `tests/test_issue145_application_integration.py` | real PG 16.16: concurrent `init_db()`, single connection, killed worker, injected failure, CLI, barrier, protocol, expiry, privileges, both ownership topologies, the Topology A §8.3 matrix and its restricted backfill, schema-ACL positive/negative controls, timing, **the §8.1 application privilege verifier (both topologies plus eighteen negative/positive controls)**, **deterministic `system_identifier` identity evidence with its explicit fallback**, **a deterministic two-process contention proof observed through `pg_stat_activity`/`pg_locks`** | 55 passed |
+| `tests/test_issue145_application_integration.py` | real PG 16.16: concurrent `init_db()`, single connection, killed worker, injected failure, CLI, barrier, protocol, expiry, privileges, both ownership topologies, the Topology A §8.3 matrix and its restricted backfill, schema-ACL positive/negative controls, timing, **the §8.1 application privilege verifier (both topologies plus its negative/positive controls, including every default-privilege overgrant direction and excess privileges on the existing exposure sequence)**, **deterministic `system_identifier` identity evidence with its narrowed fallback (documented refusal only; unexpected errors fail closed)**, **a deterministic two-process contention proof observed through `pg_stat_activity`/`pg_locks`, which asserts the advisory guard lock and explicitly not the lease row lock** | 63 passed |
 | `tests/test_migration_serialization.py` | DB-free protocol/config/retirement contract, the timeout-below-TTL rule and its boundaries, and the CI log gate's negative controls | 55 passed |
 | `tests/test_db_migration.py`, `test_alembic_*.py`, `test_day5_alembic_authority.py`, `test_migration_identity_separation.py`, `test_leg_exposure.py` | SQLite chain, FK behavior, identity separation (**including the 12-target §8.1 URL contract: accepted pair, same-login, different database, different endpoint, declared alias, alias port mismatch, Neon pooled route, SQLite and CockroachDB migration targets, blank/malformed URLs, malformed alias configuration, no-password-in-errors**), exposure idempotency | 156 passed (regression suite total) |
 | `PostgreSQL compatibility` suite (9 modules: compatibility, importer, failure injection, large rehearsal, hardening, Day 5/6) | disposable PG 16.16 schemas built only through `python -m app.migrate upgrade head` | 122 passed |
 | `.github/workflows/issue145-application-pg16.yml` | the two suites above on a pinned `postgres@sha256:3950ad…` 16.16 service, exact `server_version_num = 160016` gate, evidence upload, cleanup | see PR #146 checks |
-| `scripts/pytest_gate.py` | gates **both** suites independently: missing log or exit code, failed/errored test, any skipped test, missing pass summary, or fewer passes than the exact minimum all fail the job | 55 / 156 minimums; negative controls in `TestPytestGate` |
+| `scripts/pytest_gate.py` | gates **both** suites independently: missing log or exit code, failed/errored test, any skipped test, missing pass summary, or fewer passes than the exact minimum all fail the job | 63 / 156 minimums; negative controls in `TestPytestGate` |
 
 Local verification used PGDG 16.16 server binaries extracted into the workspace
 (the container socket was unavailable in that environment); CI uses the pinned
@@ -462,13 +465,19 @@ digest. Both report `server_version_num = 160016`.
 * The two-process startup proof (§9) is deterministic for *contention*: the
 test blocks the first worker's DDL transaction and observes the second
 worker waiting, then releases it. It is not a stress test and does not
-claim to measure throughput or a real deployment's timing.
+claim to measure throughput or a real deployment's timing. It asserts the
+advisory guard lock specifically — `lease_enter_v1` takes
+`pg_advisory_xact_lock` before the lease row `FOR UPDATE`, so a queued
+second worker never reaches the row lock. The test deliberately does not
+claim row-lock contention.
 * The endpoint-equivalence proof covers same-host URLs and explicitly
 declared aliases only. When `pg_control_system()` is readable (the stock
 PostgreSQL 16 default) the alias is proven by the cluster's
-`system_identifier`, which is deterministic. When a provider revokes it, the
-proof degrades to the probabilistic fingerprint (database name, postmaster
-start time, database OID) and logs that it did; a declaration for two
+`system_identifier`, which is deterministic. The weaker fingerprint is used
+only when PostgreSQL reports `42501` (the documented revocation) or `42883`
+(the function is absent), and the degradation is logged; every other
+database error fails closed instead of degrading. When the fallback is in
+use, a declaration for two
 unrelated clusters that coincidentally share those three values is then not
 defended against. No provider API is queried, so nothing here proves that a
 pooled route terminates at the same *project* rather than a same-named

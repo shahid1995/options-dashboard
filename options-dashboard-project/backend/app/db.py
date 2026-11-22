@@ -586,24 +586,46 @@ def assert_guarded_migration_configuration(
     return migration_url
 
 
+#: SQLSTATEs that mean "this installation does not let this role read
+#: ``pg_control_system()``": ``insufficient_privilege`` when the function's
+#: PUBLIC EXECUTE has been revoked (the documented hardening) and
+#: ``undefined_function`` when the server does not provide it at all. They are
+#: the only conditions under which weaker identity evidence is acceptable.
+_IDENTITY_FALLBACK_SQLSTATES = frozenset({"42501", "42883"})
+
+
 def _cluster_system_identifier(conn) -> str | None:
     """Read the cluster's ``system_identifier`` when the role may execute it.
 
     ``pg_control_system()`` is created with the default function ACL
     (``=X/<owner>``, i.e. PUBLIC EXECUTE) on stock PostgreSQL 16, so an
-    ordinary LOGIN role reads it without superuser. PostgreSQL does document
-    that a hardened installation may revoke it, so a refusal returns ``None``
-    instead of raising: the caller then falls back to the probabilistic
-    fingerprint and says so.
+    ordinary LOGIN role reads it without superuser. PostgreSQL documents that
+    a hardened installation may revoke it; that refusal, and a server without
+    the function, return ``None`` so the caller can fall back to the
+    probabilistic fingerprint and say so.
+
+    Every other failure — a lost connection, a timeout, a permissions error on
+    another object, a malformed query — raises instead of returning ``None``.
+    Treating an unexpected database error as "the function is unavailable"
+    would silently downgrade deterministic identity evidence.
     """
     from sqlalchemy.exc import DBAPIError
+
+    from app._migration_lease import sqlstate_of
 
     try:
         return conn.exec_driver_sql(
             "SELECT system_identifier::text FROM pg_control_system()"
         ).scalar()
-    except DBAPIError:
-        return None
+    except DBAPIError as exc:
+        state = sqlstate_of(exc)
+        if state in _IDENTITY_FALLBACK_SQLSTATES:
+            return None
+        raise _config_error(
+            "cannot read pg_control_system().system_identifier from one of the "
+            f"connections (SQLSTATE {state or 'none'}); refusing to fall back to "
+            "the probabilistic cluster fingerprint on an unexpected database error"
+        ) from None
 
 
 def _logical_target_signature(conn) -> tuple:

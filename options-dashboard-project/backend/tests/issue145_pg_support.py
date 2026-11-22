@@ -174,7 +174,7 @@ def provision(url: str | None = None, *, topology: str = TOPOLOGY_B) -> Provisio
             )
             conn.execute(
                 f"ALTER DEFAULT PRIVILEGES FOR ROLE {creator} IN SCHEMA public "
-                f"GRANT USAGE, SELECT ON SEQUENCES TO {prov.app_role}"
+                f"GRANT USAGE ON SEQUENCES TO {prov.app_role}"
             )
     except BaseException:
         drop(prov)

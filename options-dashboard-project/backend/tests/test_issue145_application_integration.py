@@ -1394,7 +1394,7 @@ def _verify_application_matrix(prov: support.Provisioned) -> None:
         engine.dispose()
 
 
-def _expect_application_refusal(prov: support.Provisioned, fragment: str) -> None:
+def _expect_application_refusal(prov: support.Provisioned, fragment: str) -> str:
     engine = _application_check_connection(prov)
     try:
         with engine.connect() as conn, pytest.raises(LeaseError) as exc:
@@ -1410,6 +1410,7 @@ def _expect_application_refusal(prov: support.Provisioned, fragment: str) -> Non
     message = str(exc.value)
     if fragment not in message:
         raise AssertionError(f"expected {fragment!r} in the refusal, got: {message}")
+    return message
 
 
 def _admin_exec(prov: support.Provisioned, statement: str) -> None:
@@ -1480,6 +1481,76 @@ def test_verifier_refuses_missing_runtime_default_privileges(pg_ready_a):
     )
     _expect_application_refusal(
         pg_ready_a, "missing runtime table privileges ['DELETE']"
+    )
+
+
+def test_verifier_refuses_runtime_default_truncate(pg_ready_a):
+    """A future application table must not inherit runtime TRUNCATE."""
+    _admin_exec(
+        pg_ready_a,
+        "ALTER DEFAULT PRIVILEGES FOR ROLE "
+        f"{pg_ready_a.migrator_role} IN SCHEMA public GRANT TRUNCATE ON TABLES "
+        f"TO {pg_ready_a.app_role}",
+    )
+    _expect_application_refusal(
+        pg_ready_a, "excess table privileges ['TRUNCATE']"
+    )
+
+
+def test_verifier_refuses_runtime_default_references_and_trigger(pg_ready_a):
+    """Future tables must not inherit REFERENCES or TRIGGER either."""
+    for privilege in ("REFERENCES", "TRIGGER"):
+        _admin_exec(
+            pg_ready_a,
+            "ALTER DEFAULT PRIVILEGES FOR ROLE "
+            f"{pg_ready_a.migrator_role} IN SCHEMA public GRANT {privilege} "
+            f"ON TABLES TO {pg_ready_a.app_role}",
+        )
+    message = _expect_application_refusal(
+        pg_ready_a, "excess table privileges ['REFERENCES', 'TRIGGER']"
+    )
+    if "REFERENCES" not in message or "TRIGGER" not in message:
+        raise AssertionError(f"both overgrants must be named: {message}")
+
+
+def test_verifier_refuses_runtime_default_sequence_select(pg_ready_a):
+    """A future sequence must not inherit runtime SELECT (last_value)."""
+    _admin_exec(
+        pg_ready_a,
+        "ALTER DEFAULT PRIVILEGES FOR ROLE "
+        f"{pg_ready_a.migrator_role} IN SCHEMA public GRANT SELECT ON SEQUENCES "
+        f"TO {pg_ready_a.app_role}",
+    )
+    _expect_application_refusal(
+        pg_ready_a, "excess sequence privileges ['SELECT']"
+    )
+
+
+def test_verifier_refuses_runtime_default_sequence_update(pg_ready_a):
+    """A future sequence must not inherit runtime UPDATE (setval)."""
+    _admin_exec(
+        pg_ready_a,
+        "ALTER DEFAULT PRIVILEGES FOR ROLE "
+        f"{pg_ready_a.migrator_role} IN SCHEMA public GRANT UPDATE ON SEQUENCES "
+        f"TO {pg_ready_a.app_role}",
+    )
+    _expect_application_refusal(
+        pg_ready_a, "excess sequence privileges ['UPDATE']"
+    )
+
+
+def test_verifier_refuses_runtime_sequence_select_on_the_exposure_sequence(
+    pg_ready_a,
+):
+    """The existing exposure sequence is USAGE-only for the runtime too."""
+    _admin_exec(
+        pg_ready_a,
+        "GRANT SELECT ON SEQUENCE public.strategy_leg_exposures_id_seq "
+        f"TO {pg_ready_a.app_role}",
+    )
+    _expect_application_refusal(
+        pg_ready_a,
+        f"{pg_ready_a.app_role} has SELECT on the exposure id sequence",
     )
 
 
@@ -1757,6 +1828,86 @@ def test_logical_target_refuses_a_different_cluster_identifier(
     assert "cluster identifiers" in str(exc.value)
 
 
+class _SqlstateError(Exception):
+    """Minimal DBAPI error carrying the SQLSTATE the verifier inspects."""
+
+    def __init__(self, sqlstate: str):
+        super().__init__(sqlstate)
+        self.sqlstate = sqlstate
+
+
+class _FailingConnection:
+    """Connection whose identity query always raises a chosen SQLSTATE."""
+
+    def __init__(self, sqlstate: str):
+        self._sqlstate = sqlstate
+
+    def exec_driver_sql(self, statement):
+        from sqlalchemy.exc import DBAPIError
+
+        raise DBAPIError(
+            statement, {}, _SqlstateError(self._sqlstate), connection_invalidated=False
+        )
+
+
+def test_cluster_identifier_only_degrades_for_documented_refusals():
+    """42501 (revoked) and 42883 (absent function) are the fallback cases."""
+    for state in ("42501", "42883"):
+        if db_module._cluster_system_identifier(_FailingConnection(state)) is not None:
+            raise AssertionError(f"SQLSTATE {state} must use the documented fallback")
+
+
+def test_cluster_identifier_unexpected_error_fails_closed():
+    """A connection failure must never be read as "the function is unavailable"."""
+    with pytest.raises(LeaseError) as exc:
+        db_module._cluster_system_identifier(_FailingConnection("08006"))
+    _assert_sqlstate(exc, "45004")
+    message = str(exc.value)
+    if "08006" not in message or "refusing to fall back" not in message:
+        raise AssertionError(f"unexpected refusal message: {message}")
+
+
+def test_logical_target_warns_when_the_identifier_is_revoked(pg_ready_a, caplog):
+    """The real documented refusal degrades loudly and still proves the target."""
+    from sqlalchemy import create_engine
+
+    caplog.set_level(logging.WARNING, logger="app.db")
+    _admin_exec(
+        pg_ready_a,
+        "REVOKE EXECUTE ON FUNCTION pg_control_system() FROM PUBLIC",
+    )
+    try:
+        probe = create_engine(
+            db_module.normalize_database_url(pg_ready_a.migrator_url)
+        )
+        try:
+            with probe.connect() as conn:
+                if db_module._cluster_system_identifier(conn) is not None:
+                    raise AssertionError(
+                        "a revoked pg_control_system() must not return an identifier"
+                    )
+        finally:
+            probe.dispose()
+
+        engine = create_engine(
+            db_module.normalize_database_url(pg_ready_a.migrator_url)
+        )
+        try:
+            db_module._verify_logical_target(engine)
+        finally:
+            engine.dispose()
+    finally:
+        _admin_exec(
+            pg_ready_a,
+            "GRANT EXECUTE ON FUNCTION pg_control_system() TO PUBLIC",
+        )
+    if not any(
+        "system_identifier is not readable" in record.getMessage()
+        for record in caplog.records
+    ):
+        raise AssertionError("the weaker-evidence warning was not logged")
+
+
 def test_logical_target_falls_back_explicitly_without_the_identifier(
     pg_ready_a, monkeypatch, caplog
 ):
@@ -1818,15 +1969,43 @@ def _wait_for(conn, predicate, *, deadline: float, description: str):
     raise AssertionError(f"timed out waiting for {description}")
 
 
-def test_two_process_startup_contends_on_lease_row_lock(pg_topology_a):
-    """Deterministic overlap: A holds the lease, B is observed waiting on it.
+def _guard_key(conn) -> int:
+    """The unsigned 64-bit key ``pg_advisory_xact_lock`` is given.
 
-    The test takes ``ACCESS EXCLUSIVE`` on ``strategy_leg_exposures`` before
-    either worker starts. Worker A's protected DDL transaction (the §8.3
-    revokes) blocks on that lock while it already holds the lease row lock;
-    worker B then reaches admission and is observed *by PostgreSQL* waiting on
-    a lock. Only then is the test lock released, so the overlap is proven
-    rather than hoped for by starting two processes quickly.
+    ``pg_locks`` renders a 64-bit advisory key as an unsigned ``(classid << 32)
+    | objid`` pair, while ``hashtextextended`` returns a signed bigint, so the
+    expected value is folded into the same unsigned range.
+    """
+    key = conn.execute(
+        "SELECT hashtextextended("
+        "'strikenova:migration_internal:migration_guard', 0)"
+    ).fetchone()[0]
+    return key % (1 << 64)
+
+
+def _advisory_granted(conn, pid: int, key: int, *, granted: bool) -> int:
+    return conn.execute(
+        "SELECT count(*) FROM pg_locks l WHERE l.pid = %s "
+        "AND l.locktype = 'advisory' AND l.granted = %s "
+        "AND (l.classid::bigint::numeric * 4294967296) "
+        "+ l.objid::bigint::numeric = %s",
+        (pid, granted, key),
+    ).fetchone()[0]
+
+
+def test_two_process_startup_contends_on_the_advisory_guard_lock(pg_topology_a):
+    """Deterministic overlap: A holds the guard, B is observed queued on it.
+
+    ``lease_enter_v1`` takes the transaction-scoped advisory lock on the
+    migration guard key *before* it selects the lease row ``FOR UPDATE``, so
+    the guard — not the row lock — is what makes a second worker wait. The
+    test takes ``ACCESS EXCLUSIVE`` on ``strategy_leg_exposures`` before either
+    worker starts: worker A's protected DDL transaction (the §8.3 revokes)
+    blocks on that table lock while it already holds both the advisory guard
+    and the lease row lock; worker B is then observed *by PostgreSQL* with an
+    ungranted advisory lock on that exact key and with no lock relationship to
+    ``migration_internal.migration_lease`` at all, which is what proves the
+    documented ordering instead of merely "some lock".
     """
     pg = pg_topology_a
     _bootstrap(pg)
@@ -1892,26 +2071,43 @@ def test_two_process_startup_contends_on_lease_row_lock(pg_topology_a):
             )
 
             # Positive, simultaneous observations: A still alive and holding an
-            # open transaction, B waiting on a lock (not merely running).
+            # open transaction, B waiting on the advisory guard (not merely
+            # running), and A holding both locks it takes before the DDL.
             if a.poll() is not None:
                 raise AssertionError("worker A finished before the overlap was observed")
-            waiting = observer.execute(
-                "SELECT count(*) FROM pg_locks l WHERE l.pid = %s AND NOT l.granted",
-                (row_b[0],),
-            ).fetchone()[0]
-            if not waiting:
+            pid_a = _activity(observer, "sn145_worker_a")[0]
+            pid_b = row_b[0]
+            key = _guard_key(observer)
+
+            if not _advisory_granted(observer, pid_b, key, granted=False):
                 raise AssertionError(
-                    "worker B reported a Lock wait but holds no ungranted lock"
+                    "worker B is not waiting on the transaction-scoped advisory "
+                    "guard lock"
+                )
+            if not _advisory_granted(observer, pid_a, key, granted=True):
+                raise AssertionError(
+                    "worker A does not hold the advisory guard lock that "
+                    "serialises admission"
                 )
             hold = observer.execute(
                 "SELECT count(*) FROM pg_locks l WHERE l.pid = %s "
                 "AND l.relation = 'migration_internal.migration_lease'::regclass "
                 "AND l.granted",
-                (_activity(observer, "sn145_worker_a")[0],),
+                (pid_a,),
             ).fetchone()[0]
             if not hold:
                 raise AssertionError(
                     "worker A did not hold the migration_lease row lock while B waited"
+                )
+            row_locks_b = observer.execute(
+                "SELECT count(*) FROM pg_locks l WHERE l.pid = %s "
+                "AND l.relation = 'migration_internal.migration_lease'::regclass",
+                (pid_b,),
+            ).fetchone()[0]
+            if row_locks_b:
+                raise AssertionError(
+                    "worker B already holds or requested a migration_lease row "
+                    "lock; the documented order is advisory guard first"
                 )
 
         # Only now let A finish; B must then proceed on its own.

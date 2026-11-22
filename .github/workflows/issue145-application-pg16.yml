@@ -77,6 +77,7 @@ jobs:
           cache: pip
           cache-dependency-path: |
             options-dashboard-project/backend/requirements.lock
+            options-dashboard-project/backend/requirements-py313.lock
             options-dashboard-project/backend/requirements.txt
             options-dashboard-project/backend/requirements-dev.txt
 
@@ -166,7 +167,7 @@ jobs:
           # silently dropping coverage lowers the count and fails the job
           # until the workflow is updated deliberately.
           python scripts/pytest_gate.py \
-            --suite "integration|55|issue145-application.log|issue145-application.rc" \
+            --suite "integration|63|issue145-application.log|issue145-application.rc" \
             --suite "regression|156|issue145-regression.log|issue145-regression.rc"
 
       - name: Drop leftover test databases and roles

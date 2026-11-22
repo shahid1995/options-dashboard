@@ -932,6 +932,11 @@ _APP_MIGRATOR_MATRIX: dict[str, frozenset[str]] = {
 _APP_RUNTIME_MATRIX: frozenset[str] = frozenset(
     {"SELECT", "INSERT", "UPDATE", "DELETE"}
 )
+#: ADR §8.3 gives the runtime identity ``USAGE`` on sequences and nothing
+#: more: ``USAGE`` authorises ``nextval``/``currval``, ``SELECT`` would expose
+#: ``last_value`` and ``UPDATE`` would authorise ``setval``.
+_APP_RUNTIME_SEQUENCE_MATRIX: frozenset[str] = frozenset({"USAGE"})
+_APP_SEQUENCE_PRIVILEGES: tuple[str, ...] = ("USAGE", "SELECT", "UPDATE")
 _APP_SEQUENCE_TABLE = "strategy_leg_exposures"
 _APP_SCHEMA = "public"
 
@@ -993,6 +998,13 @@ def _privilege_matrix(
 
 
 def _sequence_problems(conn: Connection, role: str, *, label: str) -> list[str]:
+    """Enforce the ADR §8.3 sequence matrix: ``USAGE`` and nothing else.
+
+    Both identities are held to the same matrix. ``USAGE`` is what an
+    ``INSERT ... RETURNING id`` needs; ``SELECT`` would additionally expose
+    ``last_value`` and ``UPDATE`` would authorise ``setval``, so either one is
+    sequence control that neither identity is granted.
+    """
     problems: list[str] = []
     sequence = conn.execute(
         text("SELECT pg_get_serial_sequence(:qualified, 'id')"),
@@ -1000,32 +1012,27 @@ def _sequence_problems(conn: Connection, role: str, *, label: str) -> list[str]:
     ).scalar()
     if not sequence:
         return [f"{_APP_SCHEMA}.{_APP_SEQUENCE_TABLE} has no id sequence"]
-    usage = conn.execute(
-        text("SELECT has_sequence_privilege(:role, :seq, 'USAGE')"),
-        {"role": role, "seq": sequence},
-    ).scalar()
-    select = conn.execute(
-        text("SELECT has_sequence_privilege(:role, :seq, 'SELECT')"),
-        {"role": role, "seq": sequence},
-    ).scalar()
-    update = conn.execute(
-        text("SELECT has_sequence_privilege(:role, :seq, 'UPDATE')"),
-        {"role": role, "seq": sequence},
-    ).scalar()
-    if label == "migrator":
-        if not usage:
-            problems.append(f"{role} has no USAGE on the exposure id sequence")
-        if select:
+    effective = {
+        privilege: bool(
+            conn.execute(
+                text("SELECT has_sequence_privilege(:role, :seq, :priv)"),
+                {"role": role, "seq": sequence, "priv": privilege},
+            ).scalar()
+        )
+        for privilege in _APP_SEQUENCE_PRIVILEGES
+    }
+    if not effective["USAGE"]:
+        problems.append(
+            f"{label} role {role} has no USAGE on the exposure id sequence"
+        )
+    for forbidden in sorted(
+        set(_APP_SEQUENCE_PRIVILEGES) - _APP_RUNTIME_SEQUENCE_MATRIX
+    ):
+        if effective[forbidden]:
             problems.append(
-                f"{role} has SELECT on the exposure id sequence; ADR §8.3 allows USAGE only"
+                f"{label} role {role} has {forbidden} on the exposure id "
+                "sequence; ADR §8.3 allows USAGE only"
             )
-        if update:
-            problems.append(f"{role} has UPDATE on the exposure id sequence")
-    else:
-        if not usage:
-            problems.append(f"{role} has no USAGE on the exposure id sequence")
-        if update:
-            problems.append(f"{role} has UPDATE on the exposure id sequence")
     return problems
 
 
@@ -1112,16 +1119,41 @@ def _application_default_acl_problems(
             table_privileges.add(row.privilege_type)
         elif row.defaclobjtype == "S":
             sequence_privileges.add(row.privilege_type)
+        else:
+            problems.append(
+                f"default ACL for {creator} in {scope} grants runtime "
+                f"{row.privilege_type} on object type {row.defaclobjtype!r}; "
+                "ADR §8.3 defines default privileges for tables and sequences only"
+            )
+    # Both directions fail closed: a missing default leaves the runtime unable
+    # to use the next application table, and an excess default (TRUNCATE,
+    # REFERENCES or TRIGGER on tables; SELECT or UPDATE on sequences) grants a
+    # future object a privilege the accepted matrix never approved.
     missing_tables = _APP_RUNTIME_MATRIX - table_privileges
     if missing_tables:
         problems.append(
             f"default ACL for {creator} in {_APP_SCHEMA} is missing runtime "
             f"table privileges {sorted(missing_tables)}"
         )
-    if "USAGE" not in sequence_privileges:
+    excess_tables = table_privileges - _APP_RUNTIME_MATRIX
+    if excess_tables:
+        problems.append(
+            f"default ACL for {creator} in {_APP_SCHEMA} grants the runtime "
+            f"excess table privileges {sorted(excess_tables)}; ADR §8.3 allows "
+            "SELECT, INSERT, UPDATE, DELETE only"
+        )
+    missing_sequences = _APP_RUNTIME_SEQUENCE_MATRIX - sequence_privileges
+    if missing_sequences:
         problems.append(
             f"default ACL for {creator} in {_APP_SCHEMA} is missing runtime "
-            "sequence USAGE"
+            f"sequence privileges {sorted(missing_sequences)}"
+        )
+    excess_sequences = sequence_privileges - _APP_RUNTIME_SEQUENCE_MATRIX
+    if excess_sequences:
+        problems.append(
+            f"default ACL for {creator} in {_APP_SCHEMA} grants the runtime "
+            f"excess sequence privileges {sorted(excess_sequences)}; ADR §8.3 "
+            "allows sequence USAGE only"
         )
     return problems
 
