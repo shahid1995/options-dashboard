@@ -87,12 +87,12 @@ jobs:
           # version they declare.
           python -m pip install --upgrade --only-binary :all: "pip==26.3"
           # Every declared version in both files is an exact pin and the
-          # install is binary-only, so pip runs no build script. Transitive
-          # resolution is the remaining gap a full hash-locked lockfile would
-          # close; that is tracked separately and not suppressed here, only
-          # this rule's "unlocked" classification of a pinned -r install.
+          # install is binary-only, so pip runs no build script. A hash-locked
+          # lockfile (the only thing that also pins transitives for this
+          # platform) is a separate, repo-wide change; the workflow does not
+          # pretend otherwise by hiding the SaaS sensor's `-r` finding.
           python -m pip install --only-binary :all: --upgrade \
-            -r requirements.txt -r requirements-dev.txt  # NOSONAR
+            -r requirements.txt -r requirements-dev.txt
 
       - name: Configure disposable PostgreSQL connection
         env:

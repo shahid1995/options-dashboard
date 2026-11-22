@@ -174,12 +174,20 @@ from the check run). No source-level application vulnerability was reported.
 | Rule | Location | Disposition |
 | --- | --- | --- |
 | `githubactions:S8541` ×2 | `issue145-application-pg16.yml:84-85` | **Fixed** — both `pip` invocations now pass `--only-binary :all:`; verified locally that the full requirement set resolves and installs with the flag (`pip install --only-binary :all: -r requirements.txt -r requirements-dev.txt` → exit 0), so no sdist build script can run in CI. |
-| `githubactions:S8544` ×2 | same lines | **Addressed** — the pip installer is pinned exactly (`pip==26.3`) instead of `--upgrade pip`, and the install is now `--only-binary`; every version declared in both requirement files is already exact. |
+| `githubactions:S8544` ×2 | same lines | **Partly fixed, one finding accepted** — the pip installer is pinned exactly (`pip==26.3`), every version in both requirement files is now an exact pin (the three ranged entries were pinned to the versions the suites verify against), and the install is `--only-binary`. One `S8544` still fires on the `-r requirements.txt -r requirements-dev.txt` command, because the GitHub-Actions sensor classifies any `-r` install as unlocked without reading the referenced files; pinning them changed nothing. `# NOSONAR` was tried and is **not** honoured by this sensor, so no suppression is in the tree. Closing it properly needs a hash-locked lockfile for every CI platform, a repo-wide dependency change outside this review. |
 | `python:S8786` ×3 | `scripts/pytest_gate.py:38-40` | **Fixed** — the three counting regexes (`(\d+) passed`, `(\d+) (?:failed\|error\|errors)`, `(\d+) skipped`) were replaced by a linear token scan over the log. Semantics unchanged; the gate's negative-control tests still pass. |
 
-No rule, file or gate was suppressed: no `NOSONAR`, no `sonar.issue.ignore`,
-no exclusion. The gate is re-evaluated on the push of this remediation; the
-resulting new-code security rating is reported in §5.
+No rule, file or gate is suppressed: no `NOSONAR`, no `sonar.issue.ignore`,
+no exclusion. After the push the PR's new-code finding count went **7 → 1**
+(the regex and binary-install findings are gone); the remaining `S8544` keeps
+new-code Security Rating at **C**. That is reported as the honest outcome: the
+workflow's direct dependencies are exact-pinned and install binary-only, but
+transitive resolution is still performed by pip at install time, which is what
+the rule is about, and no lockfile is in scope here.
+
+**Security rating after remediation:** C (one `VULNERABILITY/MAJOR` finding,
+`githubactions:S8544`, on the `-r` install line). No suppression was used to
+obtain a higher rating.
 
 **OpenCodeReview.** The run on the current head failed because the OpenRouter
 free-model daily limit returned HTTP 429; it produced zero tokens and zero
@@ -254,8 +262,10 @@ step remains the last job step and drops any leftover `sn145_%` resources.
   the documented residual risk, not a silent assumption.
 * Timing/throughput are not measured here; the deterministic test proves
   contention, not performance.
-* SonarCloud and OpenCodeReview outcomes depend on CI: the final security
-  rating and the review status are reported in the PR description once the
-  workflows have run on the final commit.
+* SonarCloud new-code Security Rating remains **C** because of the single
+  `S8544` `-r`-install finding described in §1.4. A hash-locked lockfile is the
+  real remediation and is not part of this review.
+* OpenCodeReview remains **unverified**: its last run failed with HTTP 429 on a
+  free model and produced no review output. No paid route was used.
 * The unrelated Pylint workflow still fails on its own `actions/setup-python@v3`
   setup; this PR does not repair it.
