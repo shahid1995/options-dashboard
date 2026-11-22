@@ -144,12 +144,26 @@ STRIKENOVA_MIGRATION_TARGET_ALIASES=ep-x-pooler.eu.aws.neon.tech=ep-x.eu.aws.neo
 Declarations are validated, not trusted: both names must be literal hosts,
 distinct, and the ports must match. A declaration alone is not proof, so after
 the static check `_verify_logical_target` opens both URLs and compares what the
-server reports — `current_database()`, `pg_postmaster_start_time()` and the
-`pg_database` OID of the connected database — and refuses (`45004`) when they
-differ. Two routes that reach one cluster and one database agree on all three;
-a second cluster, a replica of another database or a pooled route to a
-different project does not. There is no implicit `-pooler` suffix heuristic and
-no wildcard: an undeclared different host is a different database.
+server reports, and refuses (`45004`) when they differ.
+
+The primary evidence is **deterministic**: `pg_control_system().system_identifier`,
+the 64-bit value PostgreSQL generates in `initdb`. It is stable across restarts,
+identical for every connection to one cluster (primaries and their replicas),
+and different for any other cluster. It is readable without superuser on stock
+PostgreSQL 16: the function is created with the default function ACL, which
+grants `EXECUTE` to `PUBLIC` (`=X/<owner>`), so both the runtime and the
+migration LOGIN read it directly. PostgreSQL documents that a hardened
+installation may revoke it; when either connection cannot read it, the check
+falls back to the probabilistic fingerprint below and logs a warning naming the
+fallback, so the weaker evidence is never presented as the stronger one.
+
+The fallback fingerprint is `current_database()`, `pg_postmaster_start_time()`
+and the `pg_database` OID of the connected database. Two routes that reach one
+cluster and one database agree on all three; a second cluster, a replica of
+another database or a pooled route to a different project almost certainly does
+not, but these values are not a cluster identity. There is no implicit
+`-pooler` suffix heuristic and no wildcard: an undeclared different host is a
+different database.
 
 This connection-time proof runs in `_migration_engine()`, so every caller
 (`app.migrate` commands, startup migration, tests) fails before
@@ -384,14 +398,15 @@ statements the code issued) and refuses with `45004` when any of these fail:
 | Check | Topology A | Topology B |
 | --- | --- | --- |
 | Ownership of `positions`, `paper_orders`, `strategy_leg_exposures` | the migrator | the NOLOGIN owner |
-| Migrator role attributes | not superuser, no CREATEROLE/CREATEDB | same |
-| Owner role | absent (a membership row is a failure) | exists, NOLOGIN, not superuser |
+| Role attributes | no SUPERUSER, CREATEROLE, CREATEDB, BYPASSRLS or REPLICATION on any identity; the runtime is a LOGIN | same, plus the owner is NOLOGIN |
+| Owner role | absent (a membership row is a failure) | exists, NOLOGIN, no elevated attributes |
 | Migrator membership | none at all | exactly one row to the owner: `INHERIT FALSE, SET TRUE, ADMIN FALSE` |
-| Migrator table matrix (`has_table_privilege`, one privilege at a time) | `SELECT` on `positions`/`paper_orders`; `SELECT, INSERT` on `strategy_leg_exposures`; no `UPDATE`/`DELETE`/`TRUNCATE` anywhere | identical |
+| Migrator table matrix (`has_table_privilege`, one privilege at a time) | `SELECT` on `positions`/`paper_orders`; `SELECT, INSERT` on `strategy_leg_exposures`; no `UPDATE`/`DELETE`/`TRUNCATE`/`REFERENCES`/`TRIGGER` anywhere | identical |
 | Migrator sequence | `USAGE` true, `SELECT` false, `UPDATE` false | identical |
-| Runtime matrix | `SELECT/INSERT/UPDATE/DELETE` on all three, no `TRUNCATE` | identical |
-| Runtime sequence / schema | sequence `USAGE`; no `USAGE`/`CREATE` on `migration_internal`, no table or function privilege there | identical |
-| Runtime membership | not a member of migrator or owner (direct or transitive) | identical |
+| Runtime matrix | `SELECT/INSERT/UPDATE/DELETE` on all three; no `TRUNCATE`, `REFERENCES` or `TRIGGER` | identical |
+| Runtime sequence / schema | sequence `USAGE`, no sequence `UPDATE`; no `USAGE`/`CREATE` on `migration_internal`, no table or function privilege there; no effective `CREATE` on schema `public` | identical |
+| Runtime membership | no membership at all (not only not migrator/owner): any granted role is an unreviewed privilege path | identical |
+| Owner membership | — | none at all, and `pg_has_role(owner, migrator, 'MEMBER')` false; no effective `USAGE`/`CREATE`/`EXECUTE` on `migration_internal` |
 | Default ACLs | bound to the actual creator (`migrator` in A, `owner` in B), `IN SCHEMA public`, table `SELECT/INSERT/UPDATE/DELETE` + sequence `USAGE` for the runtime role; no `<global>` entry and nothing to PUBLIC | identical |
 
 The two enforcement points are the reason the aliasing/`SET ROLE` ordering is
@@ -399,25 +414,41 @@ documented in §2.2: Topology B's four grants are installed inside the verified
 owner window before `RESET ROLE`, so the backfill's effective identity is the
 restricted migrator by construction, not by provisioning luck.
 
+Topology A's restriction step revokes `REFERENCES` and `TRIGGER` as well as
+the ordinary `INSERT`/`UPDATE`/`DELETE`/`TRUNCATE` set, so the verifier's
+stricter matrix and what the migration actually installs converge instead of
+diverging.
+
 Negative controls in the integration suite deliberately install each invalid
 state (superuser migrator, excessive `UPDATE`/`DELETE`, sequence `SELECT`,
-`INHERIT TRUE` membership, `LOGIN` owner, an extra membership path, runtime
-access to `migration_internal`, a revoked runtime default privilege) and
-assert `45004` with the specific message; the valid Topology A and Topology B
-installations pass. `test_bad_privilege_matrix_aborts_the_guarded_upgrade`
-proves the enforcement path itself refuses an installation the DDL cannot
-repair.
+sequence `UPDATE` for the runtime, `INHERIT TRUE` membership, `LOGIN` owner,
+runtime `CREATE` on `public`, runtime `CREATEDB`/`CREATEROLE`/`BYPASSRLS`,
+owner `CREATEROLE`/`CREATEDB`, owner or runtime membership of an intermediate
+role, a transitive path into `migration_internal`, a revoked runtime default
+privilege) and assert `45004` with the specific message; the valid Topology A
+and Topology B installations pass. `test_bad_privilege_matrix_aborts_the_guarded_upgrade`
+and `test_guarded_upgrade_refuses_runtime_public_create` prove the enforcement
+path itself refuses an installation the DDL cannot repair. PostgreSQL refuses
+the direct `GRANT <migrator> TO <owner>` cycle (the migrator is already a member
+of the owner), which is why the owner's `pg_has_role(..., 'MEMBER')` check is
+defence-in-depth and the constructible case is tested through an intermediate
+role.
+
+The privilege model itself remains bounded: the verifier reads what
+PostgreSQL reports *now*, so a role that could grant itself privileges later
+(superuser, CREATEROLE, or Topology A ownership of the objects) is refused
+rather than reasoned about.
 
 ## 9. Evidence
 
 | Suite | Scope | Result |
 | --- | --- | --- |
-| `tests/test_issue145_application_integration.py` | real PG 16.16: concurrent `init_db()`, single connection, killed worker, injected failure, CLI, barrier, protocol, expiry, privileges, both ownership topologies, the Topology A §8.3 matrix and its restricted backfill, schema-ACL positive/negative controls, timing, **the §8.1 application privilege verifier (both topologies plus nine negative controls)**, **a deterministic two-process contention proof observed through `pg_stat_activity`/`pg_locks`** | 37 passed |
+| `tests/test_issue145_application_integration.py` | real PG 16.16: concurrent `init_db()`, single connection, killed worker, injected failure, CLI, barrier, protocol, expiry, privileges, both ownership topologies, the Topology A §8.3 matrix and its restricted backfill, schema-ACL positive/negative controls, timing, **the §8.1 application privilege verifier (both topologies plus eighteen negative/positive controls)**, **deterministic `system_identifier` identity evidence with its explicit fallback**, **a deterministic two-process contention proof observed through `pg_stat_activity`/`pg_locks`** | 55 passed |
 | `tests/test_migration_serialization.py` | DB-free protocol/config/retirement contract, the timeout-below-TTL rule and its boundaries, and the CI log gate's negative controls | 55 passed |
 | `tests/test_db_migration.py`, `test_alembic_*.py`, `test_day5_alembic_authority.py`, `test_migration_identity_separation.py`, `test_leg_exposure.py` | SQLite chain, FK behavior, identity separation (**including the 12-target §8.1 URL contract: accepted pair, same-login, different database, different endpoint, declared alias, alias port mismatch, Neon pooled route, SQLite and CockroachDB migration targets, blank/malformed URLs, malformed alias configuration, no-password-in-errors**), exposure idempotency | 156 passed (regression suite total) |
 | `PostgreSQL compatibility` suite (9 modules: compatibility, importer, failure injection, large rehearsal, hardening, Day 5/6) | disposable PG 16.16 schemas built only through `python -m app.migrate upgrade head` | 122 passed |
 | `.github/workflows/issue145-application-pg16.yml` | the two suites above on a pinned `postgres@sha256:3950ad…` 16.16 service, exact `server_version_num = 160016` gate, evidence upload, cleanup | see PR #146 checks |
-| `scripts/pytest_gate.py` | gates **both** suites independently: missing log or exit code, failed/errored test, any skipped test, missing pass summary, or fewer passes than the exact minimum all fail the job | 37 / 156 minimums; negative controls in `TestPytestGate` |
+| `scripts/pytest_gate.py` | gates **both** suites independently: missing log or exit code, failed/errored test, any skipped test, missing pass summary, or fewer passes than the exact minimum all fail the job | 55 / 156 minimums; negative controls in `TestPytestGate` |
 
 Local verification used PGDG 16.16 server binaries extracted into the workspace
 (the container socket was unavailable in that environment); CI uses the pinned
@@ -433,10 +464,15 @@ test blocks the first worker's DDL transaction and observes the second
 worker waiting, then releases it. It is not a stress test and does not
 claim to measure throughput or a real deployment's timing.
 * The endpoint-equivalence proof covers same-host URLs and explicitly
-declared aliases only. No provider API is queried, so a declaration for two
-unrelated hosts whose clusters coincidentally share a postmaster start time
-and database OID is not defended against; that combination is the documented
-residual risk of the alias mechanism.
+declared aliases only. When `pg_control_system()` is readable (the stock
+PostgreSQL 16 default) the alias is proven by the cluster's
+`system_identifier`, which is deterministic. When a provider revokes it, the
+proof degrades to the probabilistic fingerprint (database name, postmaster
+start time, database OID) and logs that it did; a declaration for two
+unrelated clusters that coincidentally share those three values is then not
+defended against. No provider API is queried, so nothing here proves that a
+pooled route terminates at the same *project* rather than a same-named
+cluster.
 * The compatibility and importer rehearsals build their schema as Topology A
   and perform the data import as the migration identity; they do not re-prove
   the runtime-identity boundary (that lives in the integration suite).

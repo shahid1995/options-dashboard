@@ -1507,6 +1507,153 @@ def test_verifier_refuses_runtime_membership_of_owner(pg_ready):
     )
 
 
+def test_verifier_refuses_runtime_create_on_public(pg_ready_a):
+    _admin_exec(
+        pg_ready_a, f"GRANT CREATE ON SCHEMA public TO {pg_ready_a.app_role}"
+    )
+    _expect_application_refusal(
+        pg_ready_a,
+        f"runtime role {pg_ready_a.app_role} effectively has CREATE on schema public",
+    )
+
+
+def test_verifier_refuses_runtime_createdb(pg_ready_a):
+    _admin_exec(pg_ready_a, f"ALTER ROLE {pg_ready_a.app_role} CREATEDB")
+    _expect_application_refusal(
+        pg_ready_a, f"runtime identity {pg_ready_a.app_role} has CREATEDB"
+    )
+
+
+def test_verifier_refuses_runtime_createrole(pg_ready_a):
+    _admin_exec(pg_ready_a, f"ALTER ROLE {pg_ready_a.app_role} CREATEROLE")
+    _expect_application_refusal(
+        pg_ready_a, f"runtime identity {pg_ready_a.app_role} has CREATEROLE"
+    )
+
+
+def test_verifier_refuses_runtime_bypassrls(pg_ready_a):
+    _admin_exec(pg_ready_a, f"ALTER ROLE {pg_ready_a.app_role} BYPASSRLS")
+    _expect_application_refusal(
+        pg_ready_a, f"runtime identity {pg_ready_a.app_role} has BYPASSRLS"
+    )
+
+
+def test_verifier_refuses_runtime_sequence_update(pg_ready_a):
+    _admin_exec(
+        pg_ready_a,
+        "GRANT UPDATE ON SEQUENCE public.strategy_leg_exposures_id_seq "
+        f"TO {pg_ready_a.app_role}",
+    )
+    _expect_application_refusal(
+        pg_ready_a,
+        f"{pg_ready_a.app_role} has UPDATE on the exposure id sequence",
+    )
+
+
+def test_verifier_refuses_runtime_membership_of_any_role(pg_ready_a):
+    """A membership outside migrator/owner is still an unreviewed path."""
+    _admin_exec(
+        pg_ready_a, f"GRANT pg_read_all_data TO {pg_ready_a.app_role}"
+    )
+    _expect_application_refusal(
+        pg_ready_a,
+        f"runtime role {pg_ready_a.app_role} is a member of pg_read_all_data",
+    )
+
+
+def test_verifier_refuses_transitive_migration_schema_access(pg_ready_a):
+    """Access reached only through an intermediate role is still caught."""
+    bridge = f"{pg_ready_a.app_role}_bridge"
+    _admin_exec(pg_ready_a, f"CREATE ROLE {bridge} NOLOGIN")
+    _admin_exec(
+        pg_ready_a, f"GRANT USAGE ON SCHEMA migration_internal TO {bridge}"
+    )
+    _admin_exec(pg_ready_a, f"GRANT {bridge} TO {pg_ready_a.app_role}")
+    try:
+        _expect_application_refusal(
+            pg_ready_a,
+            f"runtime role {pg_ready_a.app_role} effectively has USAGE on migration_internal",
+        )
+    finally:
+        _admin_exec(
+            pg_ready_a, f"REVOKE USAGE ON SCHEMA migration_internal FROM {bridge}"
+        )
+        _admin_exec(pg_ready_a, f"DROP ROLE {bridge}")
+
+
+def test_verifier_refuses_owner_membership_of_migrator(pg_ready):
+    """PostgreSQL refuses the direct cycle; the verifier still states the rule.
+
+    ``GRANT migrator TO owner`` cannot exist while ``migrator`` is a member of
+    ``owner``: PostgreSQL rejects circular membership. The verifier's
+    ``pg_has_role(owner, migrator, 'MEMBER')`` check is therefore
+    defence-in-depth against a produced/imported state, and the constructible
+    equivalent — owner reachable into migration privileges through an
+    intermediate role — is the test below it.
+    """
+    import psycopg
+
+    with _admin(pg_ready) as conn, pytest.raises(psycopg.Error) as exc:
+        conn.execute(
+            f"GRANT {pg_ready.migrator_role} TO {pg_ready.owner_role}"
+        )
+    assert "is a member of" in str(exc.value)
+    _verify_application_matrix(pg_ready)
+
+
+def test_verifier_refuses_owner_membership_path(pg_ready):
+    """An intermediate role is enough to give the owner unintended access."""
+    bridge = f"{pg_ready.owner_role}_bridge"
+    _admin_exec(pg_ready, f"CREATE ROLE {bridge} NOLOGIN")
+    _admin_exec(
+        pg_ready, f"GRANT USAGE ON SCHEMA migration_internal TO {bridge}"
+    )
+    _admin_exec(pg_ready, f"GRANT {bridge} TO {pg_ready.owner_role}")
+    try:
+        _expect_application_refusal(
+            pg_ready,
+            f"owner role {pg_ready.owner_role} is a member of {bridge}",
+        )
+    finally:
+        _admin_exec(
+            pg_ready, f"REVOKE USAGE ON SCHEMA migration_internal FROM {bridge}"
+        )
+        _admin_exec(pg_ready, f"DROP ROLE {bridge}")
+
+
+def test_verifier_refuses_owner_membership_of_unintended_role(pg_ready):
+    _admin_exec(pg_ready, f"GRANT pg_read_all_data TO {pg_ready.owner_role}")
+    _expect_application_refusal(
+        pg_ready,
+        f"owner role {pg_ready.owner_role} is a member of pg_read_all_data",
+    )
+
+
+def test_verifier_refuses_owner_createrole(pg_ready):
+    _admin_exec(pg_ready, f"ALTER ROLE {pg_ready.owner_role} CREATEROLE")
+    _expect_application_refusal(
+        pg_ready, f"owner role {pg_ready.owner_role} has CREATEROLE"
+    )
+
+
+def test_verifier_refuses_owner_createdb(pg_ready):
+    _admin_exec(pg_ready, f"ALTER ROLE {pg_ready.owner_role} CREATEDB")
+    _expect_application_refusal(
+        pg_ready, f"owner role {pg_ready.owner_role} has CREATEDB"
+    )
+
+
+def test_verifier_refuses_owner_migration_internal_access(pg_ready):
+    _admin_exec(
+        pg_ready,
+        f"GRANT USAGE ON SCHEMA migration_internal TO {pg_ready.owner_role}",
+    )
+    _expect_application_refusal(
+        pg_ready,
+        f"owner role {pg_ready.owner_role} effectively has USAGE on migration_internal",
+    )
+
+
 def test_bad_privilege_matrix_aborts_the_guarded_upgrade(pg_topology_a):
     """The verifier is enforced by the real migration path, not only by tests."""
     _bootstrap(pg_topology_a)
@@ -1526,6 +1673,107 @@ def test_bad_privilege_matrix_aborts_the_guarded_upgrade(pg_topology_a):
     output = result.stdout + result.stderr
     if "45004" not in output or "application privilege verification failed" not in output:
         raise AssertionError(f"unexpected refusal output: {output[-2000:]}")
+
+
+# ---------------------------------------------------------------------------
+# Cluster identity: deterministic system_identifier evidence
+# ---------------------------------------------------------------------------
+
+
+def test_both_identities_read_one_cluster_system_identifier(pg_ready_a):
+    """Deterministic identity needs no superuser: both roles read the same id."""
+    from sqlalchemy import create_engine
+
+    migrator = create_engine(db_module.normalize_database_url(pg_ready_a.migrator_url))
+    runtime = create_engine(db_module.normalize_database_url(pg_ready_a.app_url))
+    try:
+        with migrator.connect() as conn:
+            migration_signature = db_module._logical_target_signature(conn)
+        with runtime.connect() as conn:
+            runtime_signature = db_module._logical_target_signature(conn)
+    finally:
+        migrator.dispose()
+        runtime.dispose()
+
+    if not migration_signature[3] or not runtime_signature[3]:
+        raise AssertionError(
+            "both identities must read pg_control_system().system_identifier on "
+            f"stock PostgreSQL 16; got {migration_signature[3]!r} and "
+            f"{runtime_signature[3]!r}"
+        )
+    assert migration_signature == runtime_signature
+
+
+def test_guarded_upgrade_refuses_runtime_public_create(pg_topology_a):
+    """The real startup path refuses to commit an invalid runtime schema grant."""
+    _bootstrap(pg_topology_a)
+    db_module._run_alembic_migrations()
+    _admin_exec(
+        pg_topology_a,
+        f"GRANT CREATE ON SCHEMA public TO {pg_topology_a.app_role}",
+    )
+    result = support.run_cli(pg_topology_a, "upgrade", "head")
+    if result.returncode == 0:
+        raise AssertionError(
+            "a runtime CREATE on public must abort the guarded upgrade"
+        )
+    output = result.stdout + result.stderr
+    if "45004" not in output or "application privilege verification failed" not in output:
+        raise AssertionError(f"unexpected refusal output: {output[-2000:]}")
+
+
+def test_logical_target_verification_uses_the_cluster_identifier(
+    pg_ready_a, caplog
+):
+    """The real guarded path takes the deterministic branch, not the fallback."""
+    caplog.set_level(logging.WARNING, logger="app.db")
+    engine = db_module._migration_engine()
+    try:
+        assert not [
+            record
+            for record in caplog.records
+            if "system_identifier" in record.getMessage()
+        ]
+    finally:
+        engine.dispose()
+
+
+def test_logical_target_refuses_a_different_cluster_identifier(
+    pg_ready_a, monkeypatch
+):
+    from sqlalchemy import create_engine
+
+    values = iter(["7710572404024957629", "7710894975794810555"])
+    monkeypatch.setattr(
+        db_module, "_cluster_system_identifier", lambda conn: next(values)
+    )
+    engine = create_engine(db_module.normalize_database_url(pg_ready_a.migrator_url))
+    try:
+        with pytest.raises(LeaseError) as exc:
+            db_module._verify_logical_target(engine)
+    finally:
+        engine.dispose()
+    _assert_sqlstate(exc, "45004")
+    assert "cluster identifiers" in str(exc.value)
+
+
+def test_logical_target_falls_back_explicitly_without_the_identifier(
+    pg_ready_a, monkeypatch, caplog
+):
+    """A revoked pg_control_system() degrades loudly, not silently."""
+    from sqlalchemy import create_engine
+
+    monkeypatch.setattr(db_module, "_cluster_system_identifier", lambda conn: None)
+    caplog.set_level(logging.WARNING, logger="app.db")
+    engine = create_engine(db_module.normalize_database_url(pg_ready_a.migrator_url))
+    try:
+        db_module._verify_logical_target(engine)
+    finally:
+        engine.dispose()
+    assert any(
+        "system_identifier is not readable" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 # ---------------------------------------------------------------------------

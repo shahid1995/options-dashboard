@@ -76,23 +76,23 @@ jobs:
           # requirement invalidates it; no secrets or database state are cached.
           cache: pip
           cache-dependency-path: |
+            options-dashboard-project/backend/requirements.lock
             options-dashboard-project/backend/requirements.txt
             options-dashboard-project/backend/requirements-dev.txt
 
       - name: Install backend dependencies
         run: |
           # Binary-only installs (no sdist build scripts run) and an exact pip
-          # pin: the workflows never execute package build code, and the
-          # installer version is reproducible. Both requirement files pin every
-          # version they declare.
+          # pin: the workflow never executes package build code, and the
+          # installer version is reproducible.
           python -m pip install --upgrade --only-binary :all: "pip==26.3"
-          # Every declared version in both files is an exact pin and the
-          # install is binary-only, so pip runs no build script. A hash-locked
-          # lockfile (the only thing that also pins transitives for this
-          # platform) is a separate, repo-wide change; the workflow does not
-          # pretend otherwise by hiding the SaaS sensor's `-r` finding.
-          python -m pip install --only-binary :all: --upgrade \
-            -r requirements.txt -r requirements-dev.txt
+          # requirements.lock is the full resolved closure of requirements.txt
+          # + requirements-dev.txt for CPython 3.12/Linux x86_64, with every
+          # version pinned and every file of that version hashed. Hash-checking
+          # mode makes pip refuse any artifact it did not verify, and it fails
+          # closed if the lock and the requirements files ever diverge.
+          python -m pip install --only-binary :all: --require-hashes \
+            -r requirements.lock
 
       - name: Configure disposable PostgreSQL connection
         env:
@@ -166,7 +166,7 @@ jobs:
           # silently dropping coverage lowers the count and fails the job
           # until the workflow is updated deliberately.
           python scripts/pytest_gate.py \
-            --suite "integration|37|issue145-application.log|issue145-application.rc" \
+            --suite "integration|55|issue145-application.log|issue145-application.rc" \
             --suite "regression|156|issue145-regression.log|issue145-regression.rc"
 
       - name: Drop leftover test databases and roles

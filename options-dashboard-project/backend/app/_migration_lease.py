@@ -918,6 +918,11 @@ _APP_TABLE_PRIVILEGES: tuple[str, ...] = (
     "UPDATE",
     "DELETE",
     "TRUNCATE",
+    # Not part of the §8.3 matrix, but an examined privilege nonetheless:
+    # REFERENCES allows a foreign key onto the table and TRIGGER allows a
+    # trigger to be attached, both of which are unintended write paths.
+    "REFERENCES",
+    "TRIGGER",
 )
 _APP_MIGRATOR_MATRIX: dict[str, frozenset[str]] = {
     "positions": frozenset({"SELECT"}),
@@ -1019,6 +1024,8 @@ def _sequence_problems(conn: Connection, role: str, *, label: str) -> list[str]:
     else:
         if not usage:
             problems.append(f"{role} has no USAGE on the exposure id sequence")
+        if update:
+            problems.append(f"{role} has UPDATE on the exposure id sequence")
     return problems
 
 
@@ -1119,6 +1126,43 @@ def _application_default_acl_problems(
     return problems
 
 
+def _role_attribute_problems(row, label: str) -> list[str]:
+    """Role attributes no identity in the §8.3 topology may carry.
+
+    CREATEROLE/CREATEDB/BYPASSRLS/REPLICATION are read here because each of
+    them is an escape from the matrix the grants express: CREATEROLE can grant
+    itself the migrator, CREATEDB can host a second schema, BYPASSRLS defeats
+    row security and REPLICATION can read the WAL.
+    """
+    problems: list[str] = []
+    if row.rolsuper:
+        problems.append(f"{label} is a superuser")
+    for attribute, name in (
+        ("rolcreaterole", "CREATEROLE"),
+        ("rolcreatedb", "CREATEDB"),
+        ("rolbypassrls", "BYPASSRLS"),
+        ("rolreplication", "REPLICATION"),
+    ):
+        if getattr(row, attribute):
+            problems.append(f"{label} has {name}")
+    return problems
+
+
+def _membership_grants(conn: Connection, role: str) -> list[str]:
+    """Roles ``role`` is a member of, directly (transitivity included by PG)."""
+    return [
+        row.rolname
+        for row in conn.execute(
+            text(
+                "SELECT r.rolname FROM pg_auth_members m "
+                "JOIN pg_roles r ON r.oid = m.roleid "
+                "WHERE m.member = cast(:role AS regrole) ORDER BY r.rolname"
+            ),
+            {"role": role},
+        )
+    ]
+
+
 def verify_application_privileges(
     conn: Connection,
     *,
@@ -1133,12 +1177,16 @@ def verify_application_privileges(
     the pre-commit ``enter``, and again before the first startup backfill
     write, so a wrong matrix can never reach the backfill.
 
-    Checks, in both topologies: role attributes (no superuser), object
-    ownership, the effective migrator and runtime table/sequence matrices,
-    Topology B's single non-inherited set-only membership (or Topology A's
-    absence of any membership), the runtime identity's zero access to
-    ``migration_internal``, and schema-scoped default privileges bound to the
-    actual object creator.
+    Checks, in both topologies: role attributes (no SUPERUSER, CREATEROLE,
+    CREATEDB, BYPASSRLS or REPLICATION on any identity; the owner is NOLOGIN
+    and the runtime is a LOGIN), object ownership, the full effective
+    migrator and runtime table matrix (including REFERENCES and TRIGGER) and
+    the sequence matrix, Topology B's single non-inherited set-only membership
+    (or Topology A's absence of any membership), zero membership paths from
+    the runtime or the owner to any other role, effective privileges on
+    ``migration_internal`` for both the runtime and the owner, the runtime
+    identity's inability to create objects in ``public``, and schema-scoped
+    default privileges bound to the actual object creator.
     """
     problems: list[str] = []
     owner_role = (owner_role or "").strip() or None
@@ -1147,7 +1195,8 @@ def verify_application_privileges(
         row.rolname: row
         for row in conn.execute(
             text(
-                "SELECT rolname, rolsuper, rolcanlogin, rolcreaterole, rolcreatedb "
+                "SELECT rolname, rolsuper, rolcanlogin, rolcreaterole, rolcreatedb, "
+                "       rolbypassrls, rolreplication "
                 "FROM pg_roles WHERE rolname = ANY(:roles)"
             ),
             {"roles": [migrator_role] + ([runtime_role] if runtime_role else []) + ([owner_role] if owner_role else [])},
@@ -1157,18 +1206,21 @@ def verify_application_privileges(
     if migrator is None:
         problems.append(f"migration identity {migrator_role!r} does not exist")
     else:
-        if migrator.rolsuper:
-            problems.append(f"migration identity {migrator_role} is a superuser")
-        if migrator.rolcreaterole or migrator.rolcreatedb:
-            problems.append(
-                f"migration identity {migrator_role} has role/database creation "
-                "attributes beyond the ADR §8.3 contract"
-            )
+        problems.extend(
+            _role_attribute_problems(migrator, f"migration identity {migrator_role}")
+        )
     runtime = roles.get(runtime_role) if runtime_role else None
     if runtime_role and runtime is None:
         problems.append(f"runtime identity {runtime_role!r} does not exist")
-    elif runtime is not None and runtime.rolsuper:
-        problems.append(f"runtime identity {runtime_role} is a superuser")
+    elif runtime is not None:
+        problems.extend(
+            _role_attribute_problems(runtime, f"runtime identity {runtime_role}")
+        )
+        if not runtime.rolcanlogin:
+            problems.append(
+                f"runtime identity {runtime_role} is not a LOGIN role; it could "
+                "not serve application traffic"
+            )
 
     expected_owner = owner_role or migrator_role
     if owner_role:
@@ -1176,12 +1228,13 @@ def verify_application_privileges(
         if owner is None:
             problems.append(f"owner role {owner_role!r} does not exist")
         else:
+            problems.extend(
+                _role_attribute_problems(owner, f"owner role {owner_role}")
+            )
             if owner.rolcanlogin:
                 problems.append(
                     f"owner role {owner_role} is a LOGIN role; Topology B requires NOLOGIN"
                 )
-            if owner.rolsuper:
-                problems.append(f"owner role {owner_role} is a superuser")
 
     # Membership matrix: Topology B exactly one non-inherited, set-only row;
     # Topology A none at all. Any other membership is an unintended elevation
@@ -1232,6 +1285,55 @@ def verify_application_privileges(
                 problems.append(
                     f"runtime role {runtime_role} is a member of {elevated}"
                 )
+        # No membership at all, not only none in migrator/owner: any other
+        # membership (pg_read_all_data, a team role, a second owner) is an
+        # unreviewed privilege path, direct or transitive.
+        for granted in _membership_grants(conn, runtime_role):
+            problems.append(
+                f"runtime role {runtime_role} is a member of {granted}"
+            )
+        if conn.execute(
+            text("SELECT has_schema_privilege(:role, 'public', 'CREATE')"),
+            {"role": runtime_role},
+        ).scalar():
+            problems.append(
+                f"runtime role {runtime_role} effectively has CREATE on schema public"
+            )
+
+    if owner_role:
+        for granted in _membership_grants(conn, owner_role):
+            problems.append(
+                f"owner role {owner_role} is a member of {granted}; Topology B "
+                "allows no membership path from the owner"
+            )
+        if conn.execute(
+            text("SELECT pg_has_role(:owner, :migrator, 'MEMBER')"),
+            {"owner": owner_role, "migrator": migrator_role},
+        ).scalar():
+            problems.append(
+                f"owner role {owner_role} can reach the migrator role "
+                f"{migrator_role}"
+            )
+        for privilege in ("USAGE", "CREATE"):
+            if conn.execute(
+                text("SELECT has_schema_privilege(:owner, :schema, :priv)"),
+                {"owner": owner_role, "schema": SCHEMA, "priv": privilege},
+            ).scalar():
+                problems.append(
+                    f"owner role {owner_role} effectively has {privilege} on {SCHEMA}"
+                )
+        for row in conn.execute(
+            text(
+                "SELECT p.proname FROM pg_proc p "
+                "JOIN pg_namespace n ON n.oid = p.pronamespace "
+                "WHERE n.nspname = :schema "
+                "  AND has_function_privilege(:owner, p.oid, 'EXECUTE')"
+            ),
+            {"owner": owner_role, "schema": SCHEMA},
+        ):
+            problems.append(
+                f"owner role {owner_role} has EXECUTE on {SCHEMA}.{row.proname}"
+            )
 
     _, ownership_problems = _application_ownership(conn, expected_owner)
     problems.extend(ownership_problems)
@@ -1255,10 +1357,11 @@ def verify_application_privileges(
                     problems.append(
                         f"runtime role has no {privilege} on {_APP_SCHEMA}.{table}"
                     )
-            if runtime_matrix.get("TRUNCATE"):
-                problems.append(
-                    f"runtime role has TRUNCATE on {_APP_SCHEMA}.{table}"
-                )
+            for forbidden in ("TRUNCATE", "REFERENCES", "TRIGGER"):
+                if runtime_matrix.get(forbidden):
+                    problems.append(
+                        f"runtime role has {forbidden} on {_APP_SCHEMA}.{table}"
+                    )
 
     problems.extend(_sequence_problems(conn, migrator_role, label="migrator"))
     if runtime_role:
