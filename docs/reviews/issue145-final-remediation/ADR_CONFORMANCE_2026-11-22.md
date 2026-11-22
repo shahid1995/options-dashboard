@@ -200,12 +200,20 @@ Render, production, staging or live role/grant touched.
 | YAML parse of both workflows | clean |
 | `ruff check` (0.17.6) on the changed files | 32 findings, all pre-existing style rules on lines untouched by this change (the repository configures no ruff profile); `scripts/pytest_gate.py` itself is clean |
 
-### Final-commit CI evidence
+### CI evidence for the code commit (`840e4f1`)
 
 | Workflow | Event | Run | Result |
 | --- | --- | --- | --- |
 | Issue #145 ADR-017/018 application integration (PostgreSQL 16.16) | pull_request | [44993700695](https://github.com/shahid1995/options-dashboard/actions/runs/44993700695) | success — gate step 10 passed |
 | PostgreSQL compatibility | pull_request | [44993700707](https://github.com/shahid1995/options-dashboard/actions/runs/44993700707) | success |
+
+Evidence here is pinned to the commit that produced it, never to the branch
+head, because the head legitimately moves. While this report was being written
+the branch advanced from `840e4f1` → `01574c8` (this report, documentation
+only) → `3785469` (CI-only hardening by the founder: per-ref concurrency, pip
+caching, credential scoping). Both workflows were re-run on `3785469` and
+passed: application integration run `44993950117`, PostgreSQL compatibility run
+`44993950031`. Commits that only change Markdown cannot alter these results.
 
 The application job's steps 8 and 9 are the two suites and step 10 is the new
 gate, followed by cleanup (step 11) and the sanitized evidence upload (step 12),

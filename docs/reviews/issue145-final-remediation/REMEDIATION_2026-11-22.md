@@ -231,8 +231,13 @@ green.
 * **Concurrent first-ever bootstrap** of a genuinely empty database is covered by
   a dedicated contention test accepting `55P03`, not by a claimed proof of two
   simultaneous first installations.
-* **Topology A cannot revoke privileges from its own creator**; §8.3 is a
-  Topology B control (documented in the runbook).
+* **Superseded by the ADR conformance round:** the earlier claim that Topology A
+  cannot revoke privileges from its own creator was wrong. PostgreSQL 16 applies
+  a `REVOKE` to the owner's own ACL, and the guarded migration now enforces the
+  §8.3 Topology A matrix in both topologies; only inherent ownership powers
+  (`ALTER`/`DROP`, re-granting) remain. See
+  [`ADR_CONFORMANCE_2026-11-22.md`](ADR_CONFORMANCE_2026-11-22.md) and runbook
+  §2.2.
 * **This report's own commit** re-runs both workflows; its results are visible in
   PR #146's checks. The code evidence above is pinned to `3390234` / `e065194`.
 * **PR #146 remains Draft and is not approved for merge.** Independent acceptance
