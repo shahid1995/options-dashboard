@@ -5,7 +5,8 @@
 `docs/ADR-017-018-POSTGRES-LEASE-DESIGN.md`
 **Baseline commit:** `1e4719c`
 **Status:** implementation and verification complete; evidence below is pinned
-to the commits that produced it.
+to the commits that produced it. Final commit: `ebe8f02` (implementation
+`e1f677f`, dependency pins `a076686`, CI evidence in §3.1).
 
 This report answers the four independent-review findings (P1 target identity,
 P1 privilege enforcement, P2 deterministic contention, security-gate triage).
@@ -235,6 +236,24 @@ Counts are deliberate: 24 → 37 integration (13 new) and 144 → 156 regression
 (12 new). No threshold was lowered, no test was skipped and no assertion was
 weakened; the two exact minimums in `pytest_gate.py` and the workflow were
 updated together with the tests.
+
+### 3.1 CI evidence on the final commit
+
+CI ran on `ebe8f02` (the last commit of this remediation; `e1f677f` is the
+implementation commit and `a076686` the dependency pins):
+
+| Workflow | Run | Result |
+| --- | --- | --- |
+| `issue145-application-pg16.yml` — PostgreSQL 16.16 application lease integration | [44997762874](https://github.com/shahid1995/options-dashboard/actions/runs/44997762874) | success (gate: 37 integration / 156 regression) |
+| `postgres-compatibility.yml` — Backend PostgreSQL compatibility | [44997762785](https://github.com/shahid1995/options-dashboard/actions/runs/44997762785) | success (122 passed, 0 skipped) |
+| SonarCloud Code Analysis | [PR #146 dashboard](https://sonarcloud.io/dashboard?id=shahid1995_options-dashboard&pullRequest=146) | failure — new-code Security Rating C, 1 open finding (§1.4) |
+| OpenCodeReview Analysis | run 44997760889 | failure — HTTP 429 on the free model, zero tokens, no comments |
+| semgrep / Snyk / Vercel | — | success |
+
+Both PostgreSQL workflows checked out and tested `ebe8f02` itself. Earlier
+runs on `1e4719c` (before this remediation) remain the historical baseline:
+the integration workflow and the compatibility workflow were green there with
+24 / 144 minimums.
 
 The deterministic contention test was run repeatedly as part of the full
 suite; it fails closed by timeout if the second worker is not observed

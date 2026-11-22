@@ -1,5 +1,11 @@
 # ADR-017/018 conformance corrections after the remediation review
 
+> **Superseded in part.** The independent review that followed this report
+> found that the target-identity check and the application privilege matrix
+> were still test-only, and that the two-process startup proof did not observe
+> overlap. See `REVIEW_REMEDIATION_2026-11-22.md` in this directory for the
+> remediation, the enforcement call sites and the final evidence.
+
 **Date:** 2026-11-22
 **PR:** #146 — **Draft, open, unmerged** (https://github.com/shahid1995/options-dashboard/pull/146)
 **Branch:** `issue-145-fix`
