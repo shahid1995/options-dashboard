@@ -1,5 +1,11 @@
 name: PostgreSQL compatibility
 
+# Credentials here are disposable and scoped to a single CI run. The PostgreSQL
+# service is an ephemeral container on a GitHub-hosted runner with no persistent
+# volume, and the password is derived from the run id and run attempt. It cannot
+# reach Neon, Render, staging or production, and it is destroyed with the runner.
+# The value is masked in logs by the first step; no persistent secret is used.
+
 on:
   push:
     paths:
@@ -10,10 +16,19 @@ on:
       - "options-dashboard-project/backend/**"
       - ".github/workflows/postgres-compatibility.yml"
 
+permissions:
+  contents: read
+
+env:
+  PG_SERVICE_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}-pgcompat
+  ISSUE145_PG_ADMIN_URL: postgresql://postgres:${{ github.run_id }}-${{ github.run_attempt }}-pgcompat@127.0.0.1:5432/postgres
+  TEST_DATABASE_URL: postgresql+psycopg://postgres:${{ github.run_id }}-${{ github.run_attempt }}-pgcompat@127.0.0.1:5432/strikenova_test
+
 jobs:
   postgres-compatibility:
     name: Backend PostgreSQL compatibility
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     services:
       postgres:
@@ -22,7 +37,7 @@ jobs:
         image: postgres@sha256:3950ad7c3148ca2175ef1b6c36c9efbf78957ae8fbe8b3a5d7c35af50500382f
         env:
           POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
+          POSTGRES_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}-pgcompat
           POSTGRES_DB: strikenova_test
         ports:
           - 5432:5432
@@ -40,6 +55,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Mask disposable PostgreSQL credentials
+        run: echo "::add-mask::$PG_SERVICE_PASSWORD"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -49,8 +67,6 @@ jobs:
         run: python -m pip install --upgrade pip && python -m pip install -r requirements-dev.txt
 
       - name: Require PostgreSQL 16.16 exactly
-        env:
-          ISSUE145_PG_ADMIN_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
         run: |
           python - <<'PY'
           import os
@@ -73,9 +89,6 @@ jobs:
       # so the gate step below can always run; the gate is what decides the
       # job outcome.
       - name: Run PostgreSQL compatibility and migration safety tests
-        env:
-          TEST_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/strikenova_test
-          ISSUE145_PG_ADMIN_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
         run: |
           set +e
           python -m pytest -q -rs \
@@ -135,8 +148,6 @@ jobs:
 
       - name: Drop leftover test databases and roles
         if: always()
-        env:
-          ISSUE145_PG_ADMIN_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
         run: |
           python - <<'PY'
           import os

@@ -29,6 +29,12 @@ on:
       - feat/strikenova-day35-portfolio-intelligence
   workflow_dispatch:
 
+concurrency:
+  # One run per workflow + ref: a newer push to the same branch or PR cancels
+  # the stale run instead of stacking another PostgreSQL service container.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -66,6 +72,12 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          # Key the pip cache on both dependency declarations so a changed
+          # requirement invalidates it; no secrets or database state are cached.
+          cache: pip
+          cache-dependency-path: |
+            options-dashboard-project/backend/requirements.txt
+            options-dashboard-project/backend/requirements-dev.txt
 
       - name: Install backend dependencies
         run: |
