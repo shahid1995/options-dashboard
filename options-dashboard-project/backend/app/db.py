@@ -364,67 +364,293 @@ def _is_postgres_url(url: str) -> bool:
     return url.split(":", 1)[0].startswith(("postgres", "cockroachdb"))
 
 
-def _database_identity(url: str) -> tuple:
-    """Return the identity attributes that must differ between roles.
+@dataclass(frozen=True)
+class _MigrationTarget:
+    """One parsed PostgreSQL endpoint: role, host, port and database.
 
-    Passwords are deliberately excluded: they are not part of the identity
-    comparison and must never appear in a log or exception.
+    Passwords are deliberately absent: they are not identity attributes, a
+    different password is not a different identity, and no value of this
+    dataclass may ever appear in a log or exception.
+    """
+
+    backend: str
+    role: str
+    host: str
+    port: int
+    database: str
+
+    @property
+    def endpoint(self) -> tuple[str, int]:
+        return (self.host, self.port)
+
+
+def _config_error(message: str):
+    from app._migration_lease import LeaseError, SQLSTATE_CONFIG
+
+    return LeaseError(SQLSTATE_CONFIG, message)
+
+
+def _parse_migration_target(url: str, *, label: str) -> _MigrationTarget:
+    """Parse a URL into a :class:`_MigrationTarget`, failing closed.
+
+    A malformed, blank, partial or non-PostgreSQL URL is refused with SQLSTATE
+    45004. The raised message names only the setting and the failing attribute:
+    the URL itself (which may carry a password) is never embedded.
     """
     from sqlalchemy.engine import make_url
 
-    parsed = make_url(url)
-    return (
-        parsed.get_backend_name(),
-        parsed.username,
-        parsed.host,
-        parsed.port,
-        parsed.database,
-    )
+    value = (url or "").strip()
+    if not value:
+        raise _config_error(f"{label} is not configured")
+    try:
+        parsed = make_url(value)
+    except Exception as exc:  # noqa: BLE001 - never echo the URL in the error
+        raise _config_error(
+            f"{label} is not a usable SQLAlchemy database URL ({type(exc).__name__})"
+        ) from None
+
+    backend = parsed.get_backend_name()
+    if backend in ("postgres", "postgresql"):
+        backend = "postgresql"
+    if backend != "postgresql":
+        # SQLite/CockroachDB and every other dialect are not alternative
+        # PostgreSQL migration targets (ADR-018; CockroachDB is retired).
+        raise _config_error(
+            f"{label} targets the {backend!r} dialect; the ADR-017 lease and the "
+            "ADR-018 identity separation are PostgreSQL-only"
+        )
+
+    role = (parsed.username or "").strip()
+    host = (parsed.host or "").strip().rstrip(".").lower()
+    database = (parsed.database or "").strip()
+    try:
+        port = int(parsed.port or 5432)
+    except (TypeError, ValueError):
+        raise _config_error(f"{label} has a non-numeric port") from None
+
+    if not host:
+        raise _config_error(f"{label} does not name a PostgreSQL host")
+    if not database:
+        raise _config_error(f"{label} does not name a PostgreSQL database")
+    if not role:
+        raise _config_error(
+            f"{label} does not name a PostgreSQL login; an anonymous or "
+            "implicit identity cannot be proven distinct"
+        )
+    if not (0 < port <= 65535):
+        raise _config_error(f"{label} has an out-of-range port")
+    return _MigrationTarget(backend, role, host, port, database)
+
+
+def _declared_endpoint_aliases() -> dict[str, set[str]]:
+    """Parse ``STRIKENOVA_MIGRATION_TARGET_ALIASES`` into equivalence sets.
+
+    The setting is a comma-separated list of explicit ``hostA=hostB`` pairs,
+    e.g. a Neon pooled route and its direct route for the *same* endpoint. It
+    is an explicit operator declaration, never an implicit suffix heuristic:
+    without a declaration, different host strings are different targets.
+
+    Each pair is validated (both hosts present, distinct, no empty entries)
+    and malformed configuration fails closed with SQLSTATE 45004 rather than
+    being ignored.
+    """
+    raw = (getattr(settings, "STRIKENOVA_MIGRATION_TARGET_ALIASES", "") or "").strip()
+    groups: dict[str, set[str]] = {}
+    if not raw:
+        return groups
+
+    parent: dict[str, str] = {}
+
+    def find(host: str) -> str:
+        parent.setdefault(host, host)
+        while parent[host] != host:
+            parent[host] = parent[parent[host]]
+            host = parent[host]
+        return host
+
+    for entry in raw.split(","):
+        item = entry.strip()
+        if not item:
+            continue
+        if item.count("=") != 1:
+            raise _config_error(
+                "STRIKENOVA_MIGRATION_TARGET_ALIASES entries must be 'hostA=hostB' pairs"
+            )
+        left, right = (part.strip().rstrip(".").lower() for part in item.split("="))
+        if not left or not right or left == right:
+            raise _config_error(
+                "STRIKENOVA_MIGRATION_TARGET_ALIASES must declare two distinct, "
+                "non-empty hosts per entry"
+            )
+        if any(ch in left + right for ch in "*/ ") or not left or not right:
+            raise _config_error(
+                "STRIKENOVA_MIGRATION_TARGET_ALIASES must name literal hosts, "
+                "not patterns or wildcards"
+            )
+        root_left, root_right = find(left), find(right)
+        if root_left != root_right:
+            parent[root_right] = root_left
+
+    for host in parent:
+        groups.setdefault(find(host), set()).add(host)
+    return groups
+
+
+def _same_endpoint(runtime: _MigrationTarget, migration: _MigrationTarget) -> bool:
+    """Prove the two URLs address the same logical PostgreSQL endpoint.
+
+    Identical ``host:port`` is accepted directly. A different host is accepted
+    only when it is declared equivalent through
+    ``STRIKENOVA_MIGRATION_TARGET_ALIASES``; the declaration is checked for a
+    matching port, and the connection-time check in
+    :func:`_verify_logical_target` then proves both routes reach one cluster.
+    """
+    if runtime.endpoint == migration.endpoint:
+        return True
+    for members in _declared_endpoint_aliases().values():
+        if runtime.host in members and migration.host in members:
+            return runtime.port == migration.port
+    return False
 
 
 def assert_guarded_migration_configuration(
     runtime_url: str | None = None,
     migration_url: str | None = None,
 ) -> str:
-    """Fail closed on an unsafe PostgreSQL migration configuration (ADR §8.1).
+    """Fail closed unless the migration login serves the runtime database.
 
-    On PostgreSQL the migration identity must be explicit
-    (``STRIKENOVA_MIGRATION_DATABASE_URL``) and must not resolve to the same
-    database identity as the runtime ``DATABASE_URL``. SQLite keeps its
-    single-process, single-identity behaviour.
+    ADR-018 §8.1 requires two *distinct* identities for *one* logical
+    database. The stored ``DATABASE_URL`` and ``STRIKENOVA_MIGRATION_DATABASE_URL``
+    are therefore checked on four independent properties:
+
+    1. both are PostgreSQL (SQLite/CockroachDB are never migration targets);
+    2. the two logins differ — a different password for the same login is not
+       separation;
+    3. the database name is identical;
+    4. the endpoint (``host:port``) is identical, or is declared equivalent in
+       ``STRIKENOVA_MIGRATION_TARGET_ALIASES``.
+
+    A URL that cannot be parsed into all four attributes fails here, before an
+    engine, a connection, a lease or any DDL exists. SQLite keeps its
+    historical single-process, single-identity behaviour.
     """
     runtime_url = runtime_url or _runtime_url_from_settings()
     migration_url = migration_url or _migration_engine_url()
 
     if not runtime_url or not _is_postgres_url(runtime_url):
+        if _is_postgres_url(migration_url or ""):
+            raise _config_error(
+                "STRIKENOVA_MIGRATION_DATABASE_URL is PostgreSQL while "
+                "DATABASE_URL is not: a migration identity without a PostgreSQL "
+                "runtime database has no proven target"
+            )
         return migration_url
 
-    explicit = (getattr(settings, "STRIKENOVA_MIGRATION_DATABASE_URL", None) or "").strip()
+    explicit = (
+        getattr(settings, "STRIKENOVA_MIGRATION_DATABASE_URL", None) or ""
+    ).strip()
     if not explicit:
-        from app._migration_lease import LeaseError, SQLSTATE_CONFIG
-
-        raise LeaseError(
-            SQLSTATE_CONFIG,
+        raise _config_error(
             "STRIKENOVA_MIGRATION_DATABASE_URL is required when DATABASE_URL is "
-            "PostgreSQL: the runtime identity must never execute migrations",
+            "PostgreSQL: the runtime identity must never execute migrations"
         )
 
-    explicit_url = normalize_database_url(explicit)
-    if _database_identity(explicit_url) == _database_identity(runtime_url):
-        from app._migration_lease import LeaseError, SQLSTATE_CONFIG
+    runtime = _parse_migration_target(runtime_url, label="DATABASE_URL")
+    migration = _parse_migration_target(
+        normalize_database_url(explicit), label="STRIKENOVA_MIGRATION_DATABASE_URL"
+    )
+    # Validate any declared equivalence eagerly, even when the endpoints
+    # already match: a malformed declaration is a configuration error, not
+    # something to ignore until it happens to matter.
+    _declared_endpoint_aliases()
 
-        raise LeaseError(
-            SQLSTATE_CONFIG,
-            "the migration and runtime identities resolve to the same database "
-            "identity; refusing to run migrations as the runtime role",
+    if migration.role == runtime.role:
+        raise _config_error(
+            "the migration and runtime URLs name the same PostgreSQL login "
+            f"({migration.role!r}); a different password is not identity "
+            "separation"
+        )
+    if migration.database != runtime.database:
+        raise _config_error(
+            "the migration and runtime URLs name different PostgreSQL databases "
+            f"({migration.database!r} vs {runtime.database!r}); the migration "
+            "login must serve the runtime database"
+        )
+    if not _same_endpoint(runtime, migration):
+        raise _config_error(
+            "the migration and runtime URLs address different PostgreSQL "
+            f"endpoints (ports {migration.port} vs {runtime.port}); declare a "
+            "proven equivalent route in STRIKENOVA_MIGRATION_TARGET_ALIASES "
+            "rather than assuming one"
         )
     return migration_url
 
 
+def _logical_target_signature(conn) -> tuple:
+    """Read the server-side identity of the cluster/database a connection sees."""
+    return tuple(
+        conn.exec_driver_sql(
+            "SELECT current_database(), pg_postmaster_start_time()::text, "
+            "(SELECT oid FROM pg_database WHERE datname = current_database())"
+        ).one()
+    )
+
+
+def _verify_logical_target(migration_engine) -> None:
+    """Prove, from the server, that both URLs reach one cluster and database.
+
+    The static check compares what the URLs *say*. This check compares what the
+    server *is*: two connections that report the same database name, the same
+    postmaster start time and the same ``pg_database`` OID are served by one
+    PostgreSQL cluster. It runs after the static check and before the engine is
+    returned, so no caller can acquire the lease, run DDL or bootstrap on an
+    unproven target.
+
+    Errors raised here never include a URL: only the failing attribute and the
+    observation are reported.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import NullPool
+
+    runtime_url = _runtime_url_from_settings()
+    if not runtime_url or not _is_postgres_url(runtime_url):
+        raise _config_error(
+            "cannot prove the migration target: a PostgreSQL DATABASE_URL is "
+            "required to compare the runtime and migration connections"
+        )
+    expected_database = _parse_migration_target(
+        runtime_url, label="DATABASE_URL"
+    ).database
+
+    with migration_engine.connect() as conn:
+        observed = _logical_target_signature(conn)
+        conn.rollback()
+
+    runtime_engine = create_engine(runtime_url, poolclass=NullPool, pool_pre_ping=True)
+    try:
+        with runtime_engine.connect() as conn:
+            runtime_observed = _logical_target_signature(conn)
+            conn.rollback()
+    finally:
+        runtime_engine.dispose()
+
+    if observed[0] != expected_database:
+        raise _config_error(
+            "the migration connection reports database "
+            f"{observed[0]!r}, not the runtime database {expected_database!r}"
+        )
+    if observed != runtime_observed:
+        raise _config_error(
+            "the migration and runtime connections do not belong to the same "
+            "PostgreSQL cluster/database (database, postmaster start time or "
+            "database OID differ); refusing to migrate a different target"
+        )
+
+
 def _migration_engine():
-    """Build (and return) the engine for the dedicated migration identity."""
+    """Build, verify and return the engine for the dedicated migration identity."""
     url = assert_guarded_migration_configuration()
-    return create_engine(
+    engine_ = create_engine(
         url,
         poolclass=None,
         pool_pre_ping=True,
@@ -432,6 +658,13 @@ def _migration_engine():
         max_overflow=2,
         pool_timeout=30,
     )
+    try:
+        if not url.startswith("sqlite"):
+            _verify_logical_target(engine_)
+    except BaseException:
+        engine_.dispose()
+        raise
+    return engine_
 
 
 def _quote_role(role: str) -> str:
@@ -535,6 +768,55 @@ def apply_migrator_privilege_restrictions(conn) -> int:
     return restricted
 
 
+def apply_migrator_backfill_grants(conn) -> int:
+    """ADR §8.3 Topology B: install the migrator's four application grants.
+
+    Runs inside the verified ``SET ROLE`` owner window, because only the owner
+    may grant on its own objects. ``GRANT`` is idempotent, so every later
+    ``upgrade head`` converges on the same matrix instead of relying on
+    out-of-band provisioning. In Topology A this is a no-op (returns 0): the
+    migrator already owns the objects and the §8.3 revokes bound them.
+
+    Returns the number of statements executed. This is the migration writing
+    the intended privileges, not a verifier repairing a bad installation.
+    """
+    owner_role = (getattr(settings, "STRIKENOVA_OWNER_ROLE", "") or "").strip()
+    migrator_role = (settings.STRIKENOVA_MIGRATOR_ROLE or "").strip()
+    if not owner_role or not migrator_role:
+        return 0
+    current = conn.exec_driver_sql("SELECT current_user").scalar()
+    if current != owner_role:
+        from app._migration_lease import LeaseError, SQLSTATE_CONFIG
+
+        raise LeaseError(
+            SQLSTATE_CONFIG,
+            f"the §8.3 Topology B grants require the owner window "
+            f"(current_user={current!r}, expected {owner_role!r})",
+        )
+    migrator = _quote_role(migrator_role)
+    statements = (
+        f"GRANT SELECT ON TABLE public.\"positions\" TO {migrator}",
+        f"GRANT SELECT ON TABLE public.\"paper_orders\" TO {migrator}",
+        f"GRANT SELECT, INSERT ON TABLE public.\"strategy_leg_exposures\" TO {migrator}",
+        f"GRANT USAGE ON SEQUENCE public.\"strategy_leg_exposures_id_seq\" TO {migrator}",
+    )
+    for statement in statements:
+        conn.exec_driver_sql(statement)
+    return len(statements)
+
+
+def _verify_application_privileges(conn) -> None:
+    """Run the read-only ADR §8.3 application privilege verifier."""
+    from app._migration_lease import verify_application_privileges
+
+    verify_application_privileges(
+        conn,
+        migrator_role=settings.STRIKENOVA_MIGRATOR_ROLE,
+        runtime_role=getattr(settings, "STRIKENOVA_RUNTIME_ROLE", None),
+        owner_role=(getattr(settings, "STRIKENOVA_OWNER_ROLE", "") or "").strip() or None,
+    )
+
+
 def _run_guarded_migrations(
     alembic_cfg,
     command,
@@ -569,6 +851,14 @@ def _run_guarded_migrations(
                 command.upgrade(alembic_cfg, "head")
                 # Only reached on success: an exception rolls the whole
                 # transaction back, so the elevation cannot outlive it.
+                # Topology B installs the migrator's four §8.3 grants while
+                # the owner window is still open (only the owner may grant).
+                granted = apply_migrator_backfill_grants(conn)
+                if granted:
+                    logger.info(
+                        "ADR §8.3 Topology B: installed %d migrator grant(s)",
+                        granted,
+                    )
                 _reset_owner_role(conn)
                 # ADR §8.3 Topology A: bound the migration identity's ordinary
                 # privileges before the backfill runs, in the same transaction
@@ -580,6 +870,12 @@ def _run_guarded_migrations(
                         "for the migration identity",
                         restricted,
                     )
+                # The privilege topology is ENFORCED, not merely tested: the
+                # effective matrix is read back from the catalogs after the
+                # DDL and the topology step, inside the same transaction, and
+                # before the protected transaction may commit or the backfill
+                # may start. A mismatch aborts the whole migration.
+                _verify_application_privileges(conn)
                 lease.enter(conn)  # refresh immediately before COMMIT
         logger.info("Alembic migrations applied successfully under the lease")
 
@@ -674,6 +970,10 @@ def run_startup_backfill(work: MigrationWork) -> None:
         return
 
     with work.engine.connect() as conn:
+        # Fail closed before the first backfill write: the effective matrix is
+        # re-read from the catalogs, never assumed from the DDL transaction.
+        _verify_application_privileges(conn)
+        conn.rollback()
         user_ids = [
             row[0]
             for row in conn.execute(

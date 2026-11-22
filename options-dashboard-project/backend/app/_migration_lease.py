@@ -903,6 +903,375 @@ def _default_acl_problems(
     return problems
 
 
+#: ADR §8.3 application objects and the ordinary privileges the *migration*
+#: identity may hold on them. Everything else in ``_APP_TABLE_PRIVILEGES`` is a
+#: violation; ownership (Topology A) or the owner role (Topology B) is checked
+#: separately.
+_APP_TABLES: tuple[str, ...] = (
+    "positions",
+    "paper_orders",
+    "strategy_leg_exposures",
+)
+_APP_TABLE_PRIVILEGES: tuple[str, ...] = (
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "TRUNCATE",
+)
+_APP_MIGRATOR_MATRIX: dict[str, frozenset[str]] = {
+    "positions": frozenset({"SELECT"}),
+    "paper_orders": frozenset({"SELECT"}),
+    "strategy_leg_exposures": frozenset({"SELECT", "INSERT"}),
+}
+_APP_RUNTIME_MATRIX: frozenset[str] = frozenset(
+    {"SELECT", "INSERT", "UPDATE", "DELETE"}
+)
+_APP_SEQUENCE_TABLE = "strategy_leg_exposures"
+_APP_SCHEMA = "public"
+
+
+def _application_ownership(
+    conn: Connection, expected_owner: str
+) -> tuple[dict[str, str], list[str]]:
+    owners: dict[str, str] = {}
+    problems: list[str] = []
+    rows = conn.execute(
+        text(
+            "SELECT c.relname, c.relowner::regrole::text AS owner "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = :schema AND c.relkind = 'r' "
+            "  AND c.relname = ANY(:tables)"
+        ),
+        {"schema": _APP_SCHEMA, "tables": list(_APP_TABLES)},
+    )
+    for row in rows:
+        owners[row.relname] = row.owner
+    for table in _APP_TABLES:
+        owner = owners.get(table)
+        if owner is None:
+            problems.append(f"{_APP_SCHEMA}.{table} is missing")
+        elif owner != expected_owner:
+            problems.append(
+                f"{_APP_SCHEMA}.{table} is owned by {owner}, expected {expected_owner}"
+            )
+    return owners, problems
+
+
+def _privilege_matrix(
+    conn: Connection, role: str, table: str
+) -> dict[str, bool]:
+    """Effective table privileges of ``role``, one privilege at a time.
+
+    ``has_table_privilege(role, oid, 'SELECT,INSERT')`` answers "any of", which
+    is not the question the ADR §8.3 matrix asks, so each privilege is read
+    separately.
+    """
+    relation = conn.execute(
+        text(
+            "SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = :schema AND c.relname = :table"
+        ),
+        {"schema": _APP_SCHEMA, "table": table},
+    ).scalar()
+    if relation is None:
+        return {}
+    return {
+        privilege: bool(
+            conn.execute(
+                text("SELECT has_table_privilege(:role, :oid, :priv)"),
+                {"role": role, "oid": relation, "priv": privilege},
+            ).scalar()
+        )
+        for privilege in _APP_TABLE_PRIVILEGES
+    }
+
+
+def _sequence_problems(conn: Connection, role: str, *, label: str) -> list[str]:
+    problems: list[str] = []
+    sequence = conn.execute(
+        text("SELECT pg_get_serial_sequence(:qualified, 'id')"),
+        {"qualified": f"{_APP_SCHEMA}.{_APP_SEQUENCE_TABLE}"},
+    ).scalar()
+    if not sequence:
+        return [f"{_APP_SCHEMA}.{_APP_SEQUENCE_TABLE} has no id sequence"]
+    usage = conn.execute(
+        text("SELECT has_sequence_privilege(:role, :seq, 'USAGE')"),
+        {"role": role, "seq": sequence},
+    ).scalar()
+    select = conn.execute(
+        text("SELECT has_sequence_privilege(:role, :seq, 'SELECT')"),
+        {"role": role, "seq": sequence},
+    ).scalar()
+    update = conn.execute(
+        text("SELECT has_sequence_privilege(:role, :seq, 'UPDATE')"),
+        {"role": role, "seq": sequence},
+    ).scalar()
+    if label == "migrator":
+        if not usage:
+            problems.append(f"{role} has no USAGE on the exposure id sequence")
+        if select:
+            problems.append(
+                f"{role} has SELECT on the exposure id sequence; ADR §8.3 allows USAGE only"
+            )
+        if update:
+            problems.append(f"{role} has UPDATE on the exposure id sequence")
+    else:
+        if not usage:
+            problems.append(f"{role} has no USAGE on the exposure id sequence")
+    return problems
+
+
+def _runtime_migration_internal_problems(
+    conn: Connection, runtime_role: str
+) -> list[str]:
+    problems: list[str] = []
+    for privilege in ("USAGE", "CREATE"):
+        effective = conn.execute(
+            text("SELECT has_schema_privilege(:role, :schema, :priv)"),
+            {"role": runtime_role, "schema": SCHEMA, "priv": privilege},
+        ).scalar()
+        if effective:
+            problems.append(
+                f"runtime role {runtime_role} effectively has {privilege} on {SCHEMA}"
+            )
+    for row in conn.execute(
+        text(
+            "SELECT c.relname, p.priv "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "CROSS JOIN (VALUES ('SELECT'),('INSERT'),('UPDATE'),('DELETE')) AS p(priv) "
+            "WHERE n.nspname = :schema AND c.relkind = 'r' "
+            "  AND has_table_privilege(:role, c.oid, p.priv)"
+        ),
+        {"schema": SCHEMA, "role": runtime_role},
+    ):
+        problems.append(
+            f"runtime role {runtime_role} has {row.priv} on {SCHEMA}.{row.relname}"
+        )
+    for row in conn.execute(
+        text(
+            "SELECT p.proname FROM pg_proc p "
+            "JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE n.nspname = :schema AND has_function_privilege(:role, p.oid, 'EXECUTE')"
+        ),
+        {"schema": SCHEMA, "role": runtime_role},
+    ):
+        problems.append(
+            f"runtime role {runtime_role} has EXECUTE on {SCHEMA}.{row.proname}"
+        )
+    return problems
+
+
+def _application_default_acl_problems(
+    conn: Connection, creator: str, runtime_role: str | None
+) -> list[str]:
+    """Require schema-scoped defaults on the actual creator for the runtime role."""
+    problems: list[str] = []
+    runtime_oid = _role_oid(conn, runtime_role) if runtime_role else None
+    table_privileges: set[str] = set()
+    sequence_privileges: set[str] = set()
+    rows = conn.execute(
+        text(
+            "SELECT CASE WHEN d.defaclnamespace = 0 THEN '<global>' "
+            "            ELSE d.defaclnamespace::regnamespace::text END AS scope, "
+            "       d.defaclobjtype, a.grantee, a.privilege_type "
+            "FROM pg_default_acl d CROSS JOIN LATERAL aclexplode(d.defaclacl) a "
+            "WHERE d.defaclrole = cast(:creator AS regrole)"
+        ),
+        {"creator": creator},
+    )
+    for row in rows:
+        scope = row.scope
+        if scope == "<global>":
+            problems.append(
+                f"default ACL for {creator} is global (`<global>`, {row.defaclobjtype}); "
+                "ADR §9.4 requires IN SCHEMA public so migration_internal never inherits it"
+            )
+            continue
+        if int(row.grantee) == 0:
+            problems.append(
+                f"default ACL for {creator} in {scope} grants {row.privilege_type} to PUBLIC"
+            )
+            continue
+        if runtime_oid is None or int(row.grantee) != runtime_oid:
+            continue
+        if scope != _APP_SCHEMA:
+            problems.append(
+                f"default ACL for {creator} in {scope} grants runtime "
+                f"{row.privilege_type}; only {_APP_SCHEMA} may carry runtime defaults"
+            )
+            continue
+        if row.defaclobjtype == "r":
+            table_privileges.add(row.privilege_type)
+        elif row.defaclobjtype == "S":
+            sequence_privileges.add(row.privilege_type)
+    missing_tables = _APP_RUNTIME_MATRIX - table_privileges
+    if missing_tables:
+        problems.append(
+            f"default ACL for {creator} in {_APP_SCHEMA} is missing runtime "
+            f"table privileges {sorted(missing_tables)}"
+        )
+    if "USAGE" not in sequence_privileges:
+        problems.append(
+            f"default ACL for {creator} in {_APP_SCHEMA} is missing runtime "
+            "sequence USAGE"
+        )
+    return problems
+
+
+def verify_application_privileges(
+    conn: Connection,
+    *,
+    migrator_role: str,
+    runtime_role: str | None,
+    owner_role: str | None = None,
+) -> None:
+    """Enforce the ADR §8.3 application privilege topology (fail closed).
+
+    Read-only: this function never grants, revokes, repairs or creates. It runs
+    inside the protected DDL transaction after the topology step and before
+    the pre-commit ``enter``, and again before the first startup backfill
+    write, so a wrong matrix can never reach the backfill.
+
+    Checks, in both topologies: role attributes (no superuser), object
+    ownership, the effective migrator and runtime table/sequence matrices,
+    Topology B's single non-inherited set-only membership (or Topology A's
+    absence of any membership), the runtime identity's zero access to
+    ``migration_internal``, and schema-scoped default privileges bound to the
+    actual object creator.
+    """
+    problems: list[str] = []
+    owner_role = (owner_role or "").strip() or None
+
+    roles = {
+        row.rolname: row
+        for row in conn.execute(
+            text(
+                "SELECT rolname, rolsuper, rolcanlogin, rolcreaterole, rolcreatedb "
+                "FROM pg_roles WHERE rolname = ANY(:roles)"
+            ),
+            {"roles": [migrator_role] + ([runtime_role] if runtime_role else []) + ([owner_role] if owner_role else [])},
+        )
+    }
+    migrator = roles.get(migrator_role)
+    if migrator is None:
+        problems.append(f"migration identity {migrator_role!r} does not exist")
+    else:
+        if migrator.rolsuper:
+            problems.append(f"migration identity {migrator_role} is a superuser")
+        if migrator.rolcreaterole or migrator.rolcreatedb:
+            problems.append(
+                f"migration identity {migrator_role} has role/database creation "
+                "attributes beyond the ADR §8.3 contract"
+            )
+    runtime = roles.get(runtime_role) if runtime_role else None
+    if runtime_role and runtime is None:
+        problems.append(f"runtime identity {runtime_role!r} does not exist")
+    elif runtime is not None and runtime.rolsuper:
+        problems.append(f"runtime identity {runtime_role} is a superuser")
+
+    expected_owner = owner_role or migrator_role
+    if owner_role:
+        owner = roles.get(owner_role)
+        if owner is None:
+            problems.append(f"owner role {owner_role!r} does not exist")
+        else:
+            if owner.rolcanlogin:
+                problems.append(
+                    f"owner role {owner_role} is a LOGIN role; Topology B requires NOLOGIN"
+                )
+            if owner.rolsuper:
+                problems.append(f"owner role {owner_role} is a superuser")
+
+    # Membership matrix: Topology B exactly one non-inherited, set-only row;
+    # Topology A none at all. Any other membership is an unintended elevation
+    # path and fails closed.
+    memberships = conn.execute(
+        text(
+            "SELECT r.rolname, m.inherit_option, m.set_option, m.admin_option "
+            "FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.roleid "
+            "WHERE m.member = cast(:migrator AS regrole)"
+        ),
+        {"migrator": migrator_role},
+    ).fetchall()
+    if owner_role:
+        if len(memberships) != 1 or memberships[0].rolname != owner_role:
+            problems.append(
+                f"Topology B requires exactly one membership of {owner_role} for "
+                f"{migrator_role}; found {[(m.rolname) for m in memberships]}"
+            )
+        else:
+            row = memberships[0]
+            if row.inherit_option:
+                problems.append(
+                    f"membership {owner_role} -> {migrator_role} is INHERIT TRUE; "
+                    "it would grant owner privileges to the backfill identity"
+                )
+            if not row.set_option:
+                problems.append(
+                    f"membership {owner_role} -> {migrator_role} is SET FALSE; "
+                    "the verified SET ROLE DDL window could not work"
+                )
+            if row.admin_option:
+                problems.append(
+                    f"membership {owner_role} -> {migrator_role} is ADMIN TRUE; "
+                    "ADR §8.3 requires ADMIN FALSE"
+                )
+    elif memberships:
+        problems.append(
+            "Topology A requires no role membership for the migration identity; "
+            f"found {[m.rolname for m in memberships]}"
+        )
+
+    if runtime_role:
+        for elevated in [migrator_role] + ([owner_role] if owner_role else []):
+            if conn.execute(
+                text("SELECT pg_has_role(:runtime, :elevated, 'MEMBER')"),
+                {"runtime": runtime_role, "elevated": elevated},
+            ).scalar():
+                problems.append(
+                    f"runtime role {runtime_role} is a member of {elevated}"
+                )
+
+    _, ownership_problems = _application_ownership(conn, expected_owner)
+    problems.extend(ownership_problems)
+
+    for table in _APP_TABLES:
+        matrix = _privilege_matrix(conn, migrator_role, table)
+        if not matrix:
+            continue
+        expected = _APP_MIGRATOR_MATRIX[table]
+        for privilege, effective in matrix.items():
+            wanted = privilege in expected
+            if effective is not wanted:
+                problems.append(
+                    f"migrator {privilege} on {_APP_SCHEMA}.{table} is {effective}, "
+                    f"expected {wanted} (ADR §8.3)"
+                )
+        if runtime_role:
+            runtime_matrix = _privilege_matrix(conn, runtime_role, table)
+            for privilege in _APP_RUNTIME_MATRIX:
+                if not runtime_matrix.get(privilege):
+                    problems.append(
+                        f"runtime role has no {privilege} on {_APP_SCHEMA}.{table}"
+                    )
+            if runtime_matrix.get("TRUNCATE"):
+                problems.append(
+                    f"runtime role has TRUNCATE on {_APP_SCHEMA}.{table}"
+                )
+
+    problems.extend(_sequence_problems(conn, migrator_role, label="migrator"))
+    if runtime_role:
+        problems.extend(_sequence_problems(conn, runtime_role, label="runtime"))
+        problems.extend(_runtime_migration_internal_problems(conn, runtime_role))
+
+    problems.extend(
+        _application_default_acl_problems(conn, expected_owner, runtime_role)
+    )
+
+    _problems_raise(problems, "ADR §8.3 application privilege verification failed")
+
+
 def _row_problems(conn: Connection, expected_version: int) -> list[str]:
     problems: list[str] = []
     protocol_rows = conn.execute(

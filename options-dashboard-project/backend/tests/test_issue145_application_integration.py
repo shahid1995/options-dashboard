@@ -1365,3 +1365,331 @@ def test_measure_per_user_backfill_timing(pg_ready, monkeypatch, capsys):
     counts = _exposure_counts(pg_ready)
     if set(counts.values()) != {positions_per_user}:
         raise AssertionError(f"timing run wrote the wrong ledger: {counts}")
+
+
+# ---------------------------------------------------------------------------
+# ADR §8.3 application privilege verifier (positive and negative controls)
+# ---------------------------------------------------------------------------
+
+
+def _application_check_connection(prov: support.Provisioned):
+    """SQLAlchemy connection for the read-only verifier, as production uses."""
+    from sqlalchemy import create_engine
+
+    return create_engine(db_module.normalize_database_url(prov.migrator_url))
+
+
+def _verify_application_matrix(prov: support.Provisioned) -> None:
+    """Run the read-only verifier the enforcement path runs."""
+    engine = _application_check_connection(prov)
+    try:
+        with engine.connect() as conn:
+            lease_mod.verify_application_privileges(
+                conn,
+                migrator_role=prov.migrator_role,
+                runtime_role=prov.app_role,
+                owner_role=prov.owner_role or None,
+            )
+    finally:
+        engine.dispose()
+
+
+def _expect_application_refusal(prov: support.Provisioned, fragment: str) -> None:
+    engine = _application_check_connection(prov)
+    try:
+        with engine.connect() as conn, pytest.raises(LeaseError) as exc:
+            lease_mod.verify_application_privileges(
+                conn,
+                migrator_role=prov.migrator_role,
+                runtime_role=prov.app_role,
+                owner_role=prov.owner_role or None,
+            )
+    finally:
+        engine.dispose()
+    _assert_sqlstate(exc, "45004")
+    message = str(exc.value)
+    if fragment not in message:
+        raise AssertionError(f"expected {fragment!r} in the refusal, got: {message}")
+
+
+def _admin_exec(prov: support.Provisioned, statement: str) -> None:
+    with _admin(prov) as conn:
+        conn.execute(statement)
+
+
+def test_application_privilege_verifier_accepts_topology_a(pg_ready_a):
+    _verify_application_matrix(pg_ready_a)
+
+
+def test_application_privilege_verifier_accepts_topology_b(pg_ready):
+    _verify_application_matrix(pg_ready)
+
+
+def test_verifier_refuses_migrator_superuser(pg_ready_a):
+    _admin_exec(pg_ready_a, f"ALTER ROLE {pg_ready_a.migrator_role} SUPERUSER")
+    _expect_application_refusal(pg_ready_a, "is a superuser")
+
+
+def test_verifier_refuses_excessive_migrator_update(pg_ready_a):
+    _admin_exec(
+        pg_ready_a,
+        f"GRANT UPDATE ON TABLE public.positions TO {pg_ready_a.migrator_role}",
+    )
+    _expect_application_refusal(
+        pg_ready_a, "migrator UPDATE on public.positions is True"
+    )
+
+
+def test_verifier_refuses_excessive_sequence_select(pg_ready_a):
+    _admin_exec(
+        pg_ready_a,
+        "GRANT SELECT ON SEQUENCE public.strategy_leg_exposures_id_seq "
+        f"TO {pg_ready_a.migrator_role}",
+    )
+    _expect_application_refusal(
+        pg_ready_a, "has SELECT on the exposure id sequence"
+    )
+
+
+def test_verifier_refuses_extra_membership_elevation_path(pg_ready_a):
+    _admin_exec(
+        pg_ready_a,
+        f"GRANT {pg_ready_a.migrator_role} TO {pg_ready_a.app_role}",
+    )
+    _expect_application_refusal(
+        pg_ready_a, f"runtime role {pg_ready_a.app_role} is a member"
+    )
+
+
+def test_verifier_refuses_runtime_migration_internal_access(pg_ready_a):
+    _admin_exec(
+        pg_ready_a,
+        f"GRANT USAGE ON SCHEMA migration_internal TO {pg_ready_a.app_role}",
+    )
+    _expect_application_refusal(
+        pg_ready_a, f"runtime role {pg_ready_a.app_role} effectively has USAGE"
+    )
+
+
+def test_verifier_refuses_missing_runtime_default_privileges(pg_ready_a):
+    _admin_exec(
+        pg_ready_a,
+        "ALTER DEFAULT PRIVILEGES FOR ROLE "
+        f"{pg_ready_a.migrator_role} IN SCHEMA public REVOKE DELETE ON TABLES "
+        f"FROM {pg_ready_a.app_role}",
+    )
+    _expect_application_refusal(
+        pg_ready_a, "missing runtime table privileges ['DELETE']"
+    )
+
+
+def test_verifier_refuses_topology_b_inheriting_membership(pg_ready):
+    _admin_exec(
+        pg_ready,
+        f"GRANT {pg_ready.owner_role} TO {pg_ready.migrator_role} "
+        "WITH INHERIT TRUE, SET TRUE, ADMIN FALSE",
+    )
+    _expect_application_refusal(pg_ready, "INHERIT TRUE")
+
+
+def test_verifier_refuses_topology_b_login_owner(pg_ready):
+    _admin_exec(pg_ready, f"ALTER ROLE {pg_ready.owner_role} LOGIN")
+    _expect_application_refusal(pg_ready, "Topology B requires NOLOGIN")
+
+
+def test_verifier_refuses_runtime_membership_of_owner(pg_ready):
+    _admin_exec(
+        pg_ready,
+        f"GRANT {pg_ready.owner_role} TO {pg_ready.app_role}",
+    )
+    _expect_application_refusal(
+        pg_ready, f"runtime role {pg_ready.app_role} is a member of {pg_ready.owner_role}"
+    )
+
+
+def test_bad_privilege_matrix_aborts_the_guarded_upgrade(pg_topology_a):
+    """The verifier is enforced by the real migration path, not only by tests."""
+    _bootstrap(pg_topology_a)
+    db_module._run_alembic_migrations()
+    # An accidental table grant is corrected by the §8.3 revokes that every
+    # upgrade re-applies, so it cannot demonstrate enforcement. A superuser
+    # attribute is not something the DDL path repairs, and it makes the
+    # effective matrix unprovable.
+    _admin_exec(
+        pg_topology_a, f"ALTER ROLE {pg_topology_a.migrator_role} SUPERUSER"
+    )
+    result = support.run_cli(pg_topology_a, "upgrade", "head")
+    if result.returncode == 0:
+        raise AssertionError(
+            "a bad application privilege matrix must abort the guarded upgrade"
+        )
+    output = result.stdout + result.stderr
+    if "45004" not in output or "application privilege verification failed" not in output:
+        raise AssertionError(f"unexpected refusal output: {output[-2000:]}")
+
+
+# ---------------------------------------------------------------------------
+# Deterministic two-process startup contention (PostgreSQL-observed)
+# ---------------------------------------------------------------------------
+
+
+def _with_application_name(url: str, name: str) -> str:
+    from sqlalchemy.engine import make_url
+
+    return (
+        make_url(url)
+        .update_query_dict({"application_name": name})
+        .render_as_string(hide_password=False)
+    )
+
+
+def _startup_env(prov: support.Provisioned, name: str) -> dict[str, str]:
+    return prov.env(
+        STRIKENOVA_OWNER_ROLE=settings.STRIKENOVA_OWNER_ROLE,
+        DATABASE_URL=_with_application_name(prov.app_url, name),
+        STRIKENOVA_MIGRATION_DATABASE_URL=_with_application_name(
+            prov.migrator_url, name
+        ),
+    )
+
+
+def _activity(conn, name: str):
+    return conn.execute(
+        "SELECT pid, state, wait_event_type, wait_event, query "
+        "FROM pg_stat_activity WHERE application_name = %s",
+        (name,),
+    ).fetchone()
+
+
+def _wait_for(conn, predicate, *, deadline: float, description: str):
+    while time.monotonic() < deadline:
+        row = predicate()
+        if row:
+            return row
+        time.sleep(0.02)
+    raise AssertionError(f"timed out waiting for {description}")
+
+
+def test_two_process_startup_contends_on_lease_row_lock(pg_topology_a):
+    """Deterministic overlap: A holds the lease, B is observed waiting on it.
+
+    The test takes ``ACCESS EXCLUSIVE`` on ``strategy_leg_exposures`` before
+    either worker starts. Worker A's protected DDL transaction (the §8.3
+    revokes) blocks on that lock while it already holds the lease row lock;
+    worker B then reaches admission and is observed *by PostgreSQL* waiting on
+    a lock. Only then is the test lock released, so the overlap is proven
+    rather than hoped for by starting two processes quickly.
+    """
+    pg = pg_topology_a
+    _bootstrap(pg)
+    db_module._run_alembic_migrations()
+    support.seed_legacy_users(pg.admin_database_url, users=2)
+
+    worker = "from app.db import init_db; init_db()"
+    env = _startup_env(pg, "sn145_worker_a")
+    env_b = _startup_env(pg, "sn145_worker_b")
+
+    blocker = psycopg.connect(pg.admin_database_url, autocommit=True)
+    procs: list[subprocess.Popen] = []
+    try:
+        blocker.execute("BEGIN")
+        blocker.execute(
+            "LOCK TABLE public.strategy_leg_exposures IN ACCESS EXCLUSIVE MODE"
+        )
+
+        a = subprocess.Popen(
+            [sys.executable, "-c", worker],
+            cwd=os.getcwd(),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        procs.append(a)
+        deadline = time.monotonic() + 90
+        with psycopg.connect(pg.admin_database_url, autocommit=True) as observer:
+            _wait_for(
+                observer,
+                lambda: (
+                    row
+                    if (row := _activity(observer, "sn145_worker_a"))
+                    and row[2] == "Lock"
+                    else None
+                ),
+                deadline=deadline,
+                description="worker A to block while holding the lease",
+            )
+
+            b = subprocess.Popen(
+                [sys.executable, "-c", worker],
+                cwd=os.getcwd(),
+                env=env_b,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            procs.append(b)
+
+            row_b = _wait_for(
+                observer,
+                lambda: (
+                    row
+                    if (row := _activity(observer, "sn145_worker_b"))
+                    and row[2] == "Lock"
+                    and row[1] == "active"
+                    else None
+                ),
+                deadline=deadline,
+                description="worker B to wait on a database lock",
+            )
+
+            # Positive, simultaneous observations: A still alive and holding an
+            # open transaction, B waiting on a lock (not merely running).
+            if a.poll() is not None:
+                raise AssertionError("worker A finished before the overlap was observed")
+            waiting = observer.execute(
+                "SELECT count(*) FROM pg_locks l WHERE l.pid = %s AND NOT l.granted",
+                (row_b[0],),
+            ).fetchone()[0]
+            if not waiting:
+                raise AssertionError(
+                    "worker B reported a Lock wait but holds no ungranted lock"
+                )
+            hold = observer.execute(
+                "SELECT count(*) FROM pg_locks l WHERE l.pid = %s "
+                "AND l.relation = 'migration_internal.migration_lease'::regclass "
+                "AND l.granted",
+                (_activity(observer, "sn145_worker_a")[0],),
+            ).fetchone()[0]
+            if not hold:
+                raise AssertionError(
+                    "worker A did not hold the migration_lease row lock while B waited"
+                )
+
+        # Only now let A finish; B must then proceed on its own.
+        blocker.execute("COMMIT")
+
+        outputs = []
+        for proc in procs:
+            stdout, stderr = proc.communicate(timeout=240)
+            outputs.append(stdout + stderr)
+            if proc.returncode != 0:
+                raise AssertionError(
+                    f"startup worker failed rc={proc.returncode}: {(stdout + stderr)[-2000:]}"
+                )
+        for output in outputs:
+            if "23505" in output:
+                raise AssertionError("startup workers reported SQLSTATE 23505")
+
+        counts = _exposure_counts(pg)
+        if counts != {f"issue145-user-{u}": 1 for u in (1, 2)}:
+            raise AssertionError(f"unexpected exposure ledger after contention: {counts}")
+        unowned, _, _, _ = _lease_row(pg)
+        if not unowned:
+            raise AssertionError("the lease was left owned after both workers exited")
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate(timeout=30)
+        blocker.close()

@@ -81,8 +81,13 @@ jobs:
 
       - name: Install backend dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt -r requirements-dev.txt
+          # Binary-only installs (no sdist build scripts run) and an exact pip
+          # pin: the workflows never execute package build code, and the
+          # installer version is reproducible. Both requirement files pin every
+          # version they declare.
+          python -m pip install --upgrade --only-binary :all: "pip==26.3"
+          python -m pip install --only-binary :all: --upgrade \
+            -r requirements.txt -r requirements-dev.txt
 
       - name: Configure disposable PostgreSQL connection
         env:
@@ -156,8 +161,8 @@ jobs:
           # silently dropping coverage lowers the count and fails the job
           # until the workflow is updated deliberately.
           python scripts/pytest_gate.py \
-            --suite "integration|24|issue145-application.log|issue145-application.rc" \
-            --suite "regression|144|issue145-regression.log|issue145-regression.rc"
+            --suite "integration|37|issue145-application.log|issue145-application.rc" \
+            --suite "regression|156|issue145-regression.log|issue145-regression.rc"
 
       - name: Drop leftover test databases and roles
         if: always()

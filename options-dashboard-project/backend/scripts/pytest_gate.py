@@ -6,8 +6,8 @@ script makes that decision, for **every** suite, from the two artifacts CI
 actually produced:
 
     python scripts/pytest_gate.py \
-        --suite 'integration|24|issue145-application.log|issue145-application.rc' \
-        --suite 'regression|144|issue145-regression.log|issue145-regression.rc'
+        --suite 'integration|37|issue145-application.log|issue145-application.rc' \
+        --suite 'regression|156|issue145-regression.log|issue145-regression.rc'
 
 A suite passes only when all of the following hold:
 
@@ -32,12 +32,25 @@ from __future__ import annotations
 
 import argparse
 import pathlib
-import re
 import sys
 
-PASSED = re.compile(r"(\d+) passed")
-FAILED = re.compile(r"(\d+) (?:failed|error|errors)")
-SKIPPED = re.compile(r"(\d+) skipped")
+
+def _counts(text: str, words: tuple[str, ...]) -> list[str]:
+    """Find every ``N <word>`` count in one linear pass over the log.
+
+    A linear token scan rather than a regular expression: the previous
+    patterns were reported by static analysis as super-linear (S8786), and
+    the log is untrusted CI input. Semantics are unchanged: each summary
+    line such as ``1 failed, 24 passed in 3.2s`` yields the numbers that
+    immediately precede the requested words.
+    """
+    found: list[str] = []
+    for line in text.splitlines():
+        tokens = line.replace(",", " ").split()
+        for index, token in enumerate(tokens):
+            if index and token in words and tokens[index - 1].isdigit():
+                found.append(tokens[index - 1])
+    return found
 
 
 class Suite:
@@ -80,13 +93,13 @@ def check(suite: Suite, errors: list[str]) -> int | None:
         return None
     text = suite.log.read_text(encoding="utf-8", errors="replace")
 
-    failed = FAILED.findall(text)
+    failed = _counts(text, ("failed", "error", "errors"))
     if failed:
         fail(f"{', '.join(f + ' failed/errored test(s)' for f in failed)}")
-    skipped = SKIPPED.findall(text)
+    skipped = _counts(text, ("skipped",))
     if skipped:
         fail(f"{', '.join(s + ' skipped test(s)' for s in skipped)}")
-    passed = PASSED.findall(text)
+    passed = _counts(text, ("passed",))
     if not passed:
         fail("the log has no 'N passed' summary")
         return None
