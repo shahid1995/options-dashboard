@@ -122,15 +122,36 @@ Fixed by adding `options-dashboard-project/backend/requirements.lock`:
 
 Verified locally in a clean virtualenv: the hash-checked install succeeds and the resulting environment imports FastAPI, SQLAlchemy, psycopg, Alembic and pytest at the pinned versions. Hash-checking mode fails closed if the lock and the requirement files ever diverge, and refuses any artifact whose bytes were not verified.
 
-No `NOSONAR`, no exclusion, no weakened check. The remaining rating is reported as CI reports it.
+No `NOSONAR`, no exclusion, no weakened check.
+
+**Result on this commit:** the SonarCloud code-analysis check passes, the quality
+gate is `OK`, and the PR reports **0 new issues** with
+`new_security_rating = 1` (**A**) — the `S8544` finding is gone because the
+install is now genuinely hash-locked, not because it was hidden.
 
 ### OpenCodeReview
 
-Still **unverified**. The last run failed on OpenRouter HTTP 429 and produced no review; no permitted free route was available in this pass. CodeRabbit is skipped because reviews are disabled for this PR's base. Neither is reported as passed.
+Still **unverified**. The `OpenCodeReview Analysis` job failed again on this
+commit at its "Run OpenCodeReview" step and produced no review comments; the
+check run carries two annotations whose text the public API would not return
+(rate-limited), and the last observed cause was OpenRouter HTTP 429. CodeRabbit
+is `SKIPPED` because reviews are disabled for this PR's base. Neither is
+reported as passed.
 
 ---
 
-## 5. Boundaries honoured
+## 5. CI evidence for commit `6bf3d7f`
+
+| Workflow | Run | Result |
+| --- | --- | --- |
+| `issue145-application-pg16.yml` (PostgreSQL 16.16 lease integration) | [44999840930](https://github.com/shahid1995/options-dashboard/actions/runs/44999840930) | success — hash-locked install, gate 55 integration / 156 regression |
+| `postgres-compatibility.yml` | [44999840852](https://github.com/shahid1995/options-dashboard/actions/runs/44999840852) | success — 122 passed, 0 skipped |
+| SonarCloud Code Analysis | [PR #146 dashboard](https://sonarcloud.io/dashboard?id=shahid1995_options-dashboard&pullRequest=146) | success — gate OK, 0 new issues, new security rating A |
+| semgrep / Snyk / Vercel | — | success |
+| OpenCodeReview Analysis | [44999837542](https://github.com/shahid1995/options-dashboard/actions/runs/44999837542) | **failure, no review produced — unverified** |
+| CodeRabbit | — | skipped (reviews disabled for the base branch) |
+
+## 6. Boundaries honoured
 
 * Branch re-fetched and verified at `f56f99c…` before any edit; no other agent's worktree was written to.
 * Only disposable PostgreSQL 16.16 (PGDG binaries, `127.0.0.1:55432` plus a throwaway second cluster used solely to prove the identifier differs).
@@ -138,6 +159,9 @@ Still **unverified**. The last run failed on OpenRouter HTTP 429 and produced no
 * No live role/grant/credential/provider change.
 * PR #146 left open, Draft and unmerged; PR #149 untouched.
 
-## 6. Final commit
+## 7. Final commit
 
-See the PR #146 head for the exact SHA of this pass; the evidence table above is the local result of that commit.
+The evidence above is the result of `6bf3d7f6422930029b6a3ef1d19d31bd6b402fd4`. This
+report was committed on top of it so the recorded numbers name the commit that
+produced them; the branch head of `issue-145-fix` is that follow-up commit.
+PR #146 is left **open, Draft and unmerged**; PR #149 is untouched.
