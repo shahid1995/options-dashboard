@@ -1,5 +1,12 @@
 # Issue #145 — final ADR-018 privilege and target-identity acceptance pass
 
+> **Historical.** This report records the `6bf3d7f` pass. The current head's
+> evidence, including the privilege-matrix overgrant closure, the narrowed
+> identity fallback, the Python 3.13 hash-locked install and the `63` test
+> count, is in
+> [`REVIEW_ACCEPTANCE_PRIVILEGE_MATRIX_2026-11-22.md`](REVIEW_ACCEPTANCE_PRIVILEGE_MATRIX_2026-11-22.md).
+> Its `55`/`integration|55` figures are superseded.
+
 **Branch:** `issue-145-fix` · **PR:** [#146](https://github.com/shahid1995/options-dashboard/pull/146) (Draft, open, unmerged)
 **Starting HEAD:** `f56f99c6a4267528833662bf73e05b65d5051aea`
 **Scope:** the four remaining independent-review concerns. No ADR redesign, no Neon/Render/production contact, no role, grant, credential or provider change outside disposable PostgreSQL 16.16.
