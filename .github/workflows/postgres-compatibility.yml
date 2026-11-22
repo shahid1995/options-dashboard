@@ -2,9 +2,13 @@ name: PostgreSQL compatibility
 
 # Credentials here are disposable and scoped to a single CI run. The PostgreSQL
 # service is an ephemeral container on a GitHub-hosted runner with no persistent
-# volume, and the password is derived from the run id and run attempt. It cannot
-# reach Neon, Render, staging or production, and it is destroyed with the runner.
-# The value is masked in logs by the first step; no persistent secret is used.
+# volume; the password is derived from the run id and attempt and dies with the
+# runner. It cannot reach Neon, Render, staging or production.
+#
+# The runner's own container-init line echoes the service env before any step
+# runs, so the value is not treated as a persistent secret. Every value a step
+# could print is masked as soon as it is derived, and no static password is
+# committed.
 
 on:
   push:
@@ -18,11 +22,6 @@ on:
 
 permissions:
   contents: read
-
-env:
-  PG_SERVICE_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}-pgcompat
-  ISSUE145_PG_ADMIN_URL: postgresql://postgres:${{ github.run_id }}-${{ github.run_attempt }}-pgcompat@127.0.0.1:5432/postgres
-  TEST_DATABASE_URL: postgresql+psycopg://postgres:${{ github.run_id }}-${{ github.run_attempt }}-pgcompat@127.0.0.1:5432/strikenova_test
 
 jobs:
   postgres-compatibility:
@@ -55,8 +54,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Mask disposable PostgreSQL credentials
-        run: echo "::add-mask::$PG_SERVICE_PASSWORD"
+      - name: Configure disposable PostgreSQL credentials
+        run: |
+          # Derive the run-scoped credential from the default runner identity so
+          # the literal never lands in a step's env block, then mask it before
+          # any step can print it. The service container uses the same value.
+          pg_password="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-pgcompat"
+          echo "::add-mask::${pg_password}"
+          {
+            echo "ISSUE145_PG_ADMIN_URL=postgresql://postgres:${pg_password}@127.0.0.1:5432/postgres"
+            echo "TEST_DATABASE_URL=postgresql+psycopg://postgres:${pg_password}@127.0.0.1:5432/strikenova_test"
+          } >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@v5
