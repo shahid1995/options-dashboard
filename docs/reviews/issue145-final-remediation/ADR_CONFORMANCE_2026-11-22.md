@@ -211,9 +211,31 @@ Evidence here is pinned to the commit that produced it, never to the branch
 head, because the head legitimately moves. While this report was being written
 the branch advanced from `840e4f1` → `01574c8` (this report, documentation
 only) → `3785469` (CI-only hardening by the founder: per-ref concurrency, pip
-caching, credential scoping). Both workflows were re-run on `3785469` and
-passed: application integration run `44993950117`, PostgreSQL compatibility run
-`44993950031`. Commits that only change Markdown cannot alter these results.
+caching, credential scoping). Both workflows were re-run on `3785469` at that
+time and passed: application integration run `44993950117`, PostgreSQL
+compatibility run `44993950031`. Commits that only change Markdown cannot alter
+these results.
+
+### Current branch head (`f4418ea`) — latest evidence
+
+Two founder CI commits also landed after the runs above:
+`3785469` (per-ref concurrency group, pip cache keyed on both requirement
+files, credential scoping) and `f4418ea` (derive the disposable PostgreSQL
+password from the run identity inside the configure step instead of job-level
+`env`). Neither touches application code, migrations, tests or the gate, and
+both suites were re-run on the current head:
+
+| Workflow | Event | Commit | Run | Result |
+| --- | --- | --- | --- | --- |
+| Issue #145 ADR-017/018 application integration (PostgreSQL 16.16) | pull_request | `f4418ea` | [44994279677](https://github.com/shahid1995/options-dashboard/actions/runs/44994279677) | success |
+| PostgreSQL compatibility | pull_request | `f4418ea` | [44994279759](https://github.com/shahid1995/options-dashboard/actions/runs/44994279759) | success |
+
+Pass counts are unchanged on that head because the gate is the one enforced in
+the workflow: the job only succeeds when the integration log reports at least
+**24** passes, the regression log at least **144**, with no failures and no
+skips. The historical trail above (`840e4f1` with runs `44993700695` and
+`44993700707`, then `3785469` with runs `44993950117` and `44993950031`) is kept
+unchanged.
 
 The application job's steps 8 and 9 are the two suites and step 10 is the new
 gate, followed by cleanup (step 11) and the sanitized evidence upload (step 12),

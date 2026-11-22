@@ -6,8 +6,8 @@ script makes that decision, for **every** suite, from the two artifacts CI
 actually produced:
 
     python scripts/pytest_gate.py \
-        --suite 'integration|22|issue145-application.log|issue145-application.rc' \
-        --suite 'regression|141|issue145-regression.log|issue145-regression.rc'
+        --suite 'integration|24|issue145-application.log|issue145-application.rc' \
+        --suite 'regression|144|issue145-regression.log|issue145-regression.rc'
 
 A suite passes only when all of the following hold:
 
