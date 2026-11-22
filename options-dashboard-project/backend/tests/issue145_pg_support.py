@@ -140,38 +140,45 @@ def provision(url: str | None = None, *, topology: str = TOPOLOGY_B) -> Provisio
     prov = Provisioned(url, prefix, topology)
     creator = prov.owner_role or prov.migrator_role
 
-    with psycopg.connect(url, autocommit=True) as conn:
-        if prov.owner_role:
-            conn.execute(f"CREATE ROLE {prov.owner_role} NOLOGIN")
-        conn.execute(
-            f"CREATE ROLE {prov.migrator_role} LOGIN PASSWORD '{prov.migrator_password}'"
-        )
-        conn.execute(f"CREATE ROLE {prov.app_role} LOGIN PASSWORD '{prov.app_password}'")
-        conn.execute(f"CREATE DATABASE {prov.database} OWNER {prov.migrator_role}")
+    # A half-provisioned database/role set must never survive a failed setup:
+    # without this, a raise between the two blocks would leak resources that no
+    # fixture could ever drop (it never received the Provisioned object).
+    try:
+        with psycopg.connect(url, autocommit=True) as conn:
+            if prov.owner_role:
+                conn.execute(f"CREATE ROLE {prov.owner_role} NOLOGIN")
+            conn.execute(
+                f"CREATE ROLE {prov.migrator_role} LOGIN PASSWORD '{prov.migrator_password}'"
+            )
+            conn.execute(f"CREATE ROLE {prov.app_role} LOGIN PASSWORD '{prov.app_password}'")
+            conn.execute(f"CREATE DATABASE {prov.database} OWNER {prov.migrator_role}")
 
-    with psycopg.connect(prov.admin_database_url, autocommit=True) as conn:
-        if prov.owner_role:
+        with psycopg.connect(prov.admin_database_url, autocommit=True) as conn:
+            if prov.owner_role:
+                conn.execute(
+                    f"GRANT CREATE, USAGE ON SCHEMA public TO {prov.owner_role}"
+                )
+                conn.execute(
+                    f"GRANT {prov.owner_role} TO {prov.migrator_role} "
+                    "WITH INHERIT FALSE, SET TRUE, ADMIN FALSE"
+                )
+            conn.execute(f"GRANT USAGE ON SCHEMA public TO {prov.app_role}")
+            # The runtime identity is a DML identity only: no schema DDL.
+            conn.execute(f"REVOKE CREATE ON SCHEMA public FROM {prov.app_role}")
+            # Application tables created by the creator role are usable by the
+            # runtime identity with ordinary DML only (ADR-018). Schema-scoped
+            # on purpose: a global default would also cover migration_internal.
             conn.execute(
-                f"GRANT CREATE, USAGE ON SCHEMA public TO {prov.owner_role}"
+                f"ALTER DEFAULT PRIVILEGES FOR ROLE {creator} IN SCHEMA public "
+                f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {prov.app_role}"
             )
             conn.execute(
-                f"GRANT {prov.owner_role} TO {prov.migrator_role} "
-                "WITH INHERIT FALSE, SET TRUE, ADMIN FALSE"
+                f"ALTER DEFAULT PRIVILEGES FOR ROLE {creator} IN SCHEMA public "
+                f"GRANT USAGE, SELECT ON SEQUENCES TO {prov.app_role}"
             )
-        conn.execute(f"GRANT USAGE ON SCHEMA public TO {prov.app_role}")
-        # The runtime identity is a DML identity only: no schema DDL.
-        conn.execute(f"REVOKE CREATE ON SCHEMA public FROM {prov.app_role}")
-        # Application tables created by the creator role are usable by the
-        # runtime identity with ordinary DML only (ADR-018). Schema-scoped on
-        # purpose: a global default would also cover migration_internal.
-        conn.execute(
-            f"ALTER DEFAULT PRIVILEGES FOR ROLE {creator} IN SCHEMA public "
-            f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {prov.app_role}"
-        )
-        conn.execute(
-            f"ALTER DEFAULT PRIVILEGES FOR ROLE {creator} IN SCHEMA public "
-            f"GRANT USAGE, SELECT ON SEQUENCES TO {prov.app_role}"
-        )
+    except BaseException:
+        drop(prov)
+        raise
     return prov
 
 
