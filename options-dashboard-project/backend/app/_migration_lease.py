@@ -732,6 +732,7 @@ def verify_installation(
         problems.append(f"unexpected functions in {SCHEMA}: {sorted(unknown)}")
 
     problems.extend(_acl_problems(conn, runtime_role))
+    problems.extend(_schema_acl_problems(conn, runtime_role))
     problems.extend(_default_acl_problems(conn, migrator_role, runtime_role))
     problems.extend(_row_problems(conn, expected_version))
 
@@ -770,16 +771,7 @@ def _acl_problems(conn: Connection, runtime_role: str | None) -> list[str]:
             f"{SCHEMA}.{row.proname} grants {row.privilege_type} to grantee {row.grantee}"
         )
 
-    # schema USAGE for the runtime role
     if runtime_oid is not None:
-        usage = conn.execute(
-            text(
-                "SELECT has_schema_privilege(:runtime, :schema, 'USAGE')"
-            ),
-            {"runtime": runtime_role, "schema": SCHEMA},
-        ).scalar()
-        if usage:
-            problems.append(f"runtime role {runtime_role} has USAGE on {SCHEMA}")
         for row in conn.execute(
             text(
                 "SELECT c.relname, p.priv, "
@@ -804,6 +796,82 @@ def _acl_problems(conn: Connection, runtime_role: str | None) -> list[str]:
         ):
             if row.effective:
                 problems.append(f"runtime role has EXECUTE on {row.proname}")
+    return problems
+
+
+def _schema_acl_problems(conn: Connection, runtime_role: str | None) -> list[str]:
+    """Verify ``pg_namespace.nspacl`` on the migration schema (ADR §9.3).
+
+    The schema is the outermost boundary: a PUBLIC ``USAGE`` grant would make
+    the lease objects reachable, and a ``CREATE`` grant would let an
+    unprivileged identity plant objects inside it. Both the stored ACL (with
+    ``acldefault('n', nspowner)`` for an untouched schema) and the effective
+    privilege path — inheritance, membership and superuser status included —
+    are checked, so a grant to a role the runtime identity inherits through is
+    caught as well.
+    """
+    problems: list[str] = []
+    schema = conn.execute(
+        text(
+            "SELECT n.nspowner::regrole::text AS owner, n.nspacl IS NULL AS implicit_acl "
+            "FROM pg_namespace n WHERE n.nspname = :schema"
+        ),
+        {"schema": SCHEMA},
+    ).first()
+    if schema is None:
+        return [f"schema {SCHEMA} is missing"]
+
+    runtime_oid = _role_oid(conn, runtime_role) if runtime_role else None
+    for row in conn.execute(
+        text(
+            "SELECT a.grantee, a.privilege_type "
+            "FROM pg_namespace n "
+            "CROSS JOIN LATERAL aclexplode("
+            "  coalesce(n.nspacl, acldefault('n', n.nspowner))) a "
+            "WHERE n.nspname = :schema AND (a.grantee = 0 OR a.grantee = :runtime_oid)"
+        ),
+        {"schema": SCHEMA, "runtime_oid": runtime_oid or -1},
+    ):
+        grantee = "PUBLIC" if int(row.grantee) == 0 else str(runtime_role)
+        problems.append(
+            f"schema {SCHEMA} grants {row.privilege_type} to {grantee}"
+        )
+
+    if runtime_role:
+        for privilege in ("USAGE", "CREATE"):
+            effective = conn.execute(
+                text("SELECT has_schema_privilege(:runtime, :schema, :priv)"),
+                {"runtime": runtime_role, "schema": SCHEMA, "priv": privilege},
+            ).scalar()
+            if effective:
+                problems.append(
+                    f"runtime role {runtime_role} effectively has {privilege} on {SCHEMA}"
+                )
+
+        for row in conn.execute(
+            text(
+                "SELECT rolname, rolsuper FROM pg_roles "
+                "WHERE rolname = :runtime  OR oid = "
+                "  (SELECT nspowner FROM pg_namespace WHERE nspname = :schema)"
+            ),
+            {"runtime": runtime_role, "schema": SCHEMA},
+        ):
+            if row.rolname == runtime_role and row.rolsuper:
+                problems.append(f"runtime role {runtime_role} is a superuser")
+
+        owner_reach = conn.execute(
+            text(
+                "SELECT n.nspowner::regrole::text FROM pg_namespace n "
+                "WHERE n.nspname = :schema "
+                "  AND pg_has_role(:runtime, n.nspowner, 'MEMBER')"
+            ),
+            {"runtime": runtime_role, "schema": SCHEMA},
+        ).first()
+        if owner_reach is not None:
+            problems.append(
+                f"runtime role {runtime_role} is a member of {SCHEMA} owner "
+                f"{owner_reach[0]}"
+            )
     return problems
 
 

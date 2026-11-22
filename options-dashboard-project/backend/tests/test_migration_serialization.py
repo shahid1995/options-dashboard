@@ -135,10 +135,50 @@ class TestConfigurationValidation:
     def test_defaults_are_bounded_and_consistent(self):
         s = Settings(DATABASE_URL="postgresql://r@h/db")
         assert s.MIGRATION_LEASE_TTL_SECONDS == 300
+        assert s.MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS == 150000
         assert 1 <= s.MIGRATION_LEASE_LOCK_TIMEOUT_MS <= 600000
-        assert 1 <= s.MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS < (
+        assert s.MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS < (
             s.MIGRATION_LEASE_TTL_SECONDS * 1000
         )
+
+    def test_statement_timeout_below_the_ttl_is_accepted(self):
+        s = Settings(
+            DATABASE_URL="postgresql://r@h/db",
+            MIGRATION_LEASE_TTL_SECONDS=300,
+            MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS=299999,
+        )
+        assert s.MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS == 299999
+
+    def test_statement_timeout_equal_to_the_ttl_is_rejected(self):
+        with pytest.raises(ValidationError, match="strictly below"):
+            Settings(
+                DATABASE_URL="postgresql://r@h/db",
+                MIGRATION_LEASE_TTL_SECONDS=300,
+                MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS=300000,
+            )
+
+    def test_statement_timeout_above_the_ttl_is_rejected(self):
+        with pytest.raises(ValidationError, match="strictly below"):
+            Settings(
+                DATABASE_URL="postgresql://r@h/db",
+                MIGRATION_LEASE_TTL_SECONDS=300,
+                MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS=300001,
+            )
+
+    @pytest.mark.parametrize("timeout", [0, -1, -150000])
+    def test_non_positive_statement_timeout_is_rejected(self, timeout):
+        with pytest.raises(
+            ValidationError, match="MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS must be positive"
+        ):
+            Settings(
+                DATABASE_URL="postgresql://r@h/db",
+                MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS=timeout,
+            )
+
+    @pytest.mark.parametrize("ttl", [0, -1, 0.0005])
+    def test_non_positive_ttl_is_rejected_by_the_cross_field_rule_too(self, ttl):
+        with pytest.raises(ValidationError):
+            Settings(DATABASE_URL="postgresql://r@h/db", MIGRATION_LEASE_TTL_SECONDS=ttl)
 
 
 class TestFailClosedIdentityRules:

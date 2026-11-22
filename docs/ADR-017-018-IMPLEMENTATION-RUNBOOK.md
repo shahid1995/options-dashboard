@@ -29,7 +29,7 @@ the old behavioural workflow are removed; the new evidence is listed in §9.
 | --- | --- | --- | --- |
 | `DATABASE_URL` | yes | — | Serving identity (`strikenova_production_app`) |
 | `STRIKENOVA_MIGRATION_DATABASE_URL` | **yes on PostgreSQL** | — | Migration identity (`strikenova_prod_migrator`). Startup and every CLI command fail closed without it |
-| `STRIKENOVA_OWNER_ROLE` | no | `strikenova_prod_owner` | Object owner; migrator holds non-inherited `SET`-only membership |
+| `STRIKENOVA_OWNER_ROLE` | no | **empty** (Topology A) | Topology B only: `NOLOGIN` object owner; the migrator then holds non-inherited `SET`-only membership. Set it to e.g. `strikenova_prod_owner` to activate Topology B |
 | `STRIKENOVA_MIGRATOR_ROLE` | no | `strikenova_prod_migrator` | Migration/backfill login |
 | `STRIKENOVA_RUNTIME_ROLE` | no | `strikenova_production_app` | Serving login; must have no migration access |
 | `MIGRATION_LEASE_TTL_SECONDS` | no | `300` | Bound on recovery of an abandoned lease row (measured, §7) |
@@ -42,6 +42,24 @@ Validation is enforced at the settings boundary (positive, bounded integers;
 statement timeout strictly below the TTL). Identities are compared after URL
 normalization, so `postgres://`, `postgresql://` and `+psycopg` spellings of the
 same endpoint are detected as equal and refused (`45004`).
+
+### 2.1 Which topology is active
+
+There is exactly one switch, and the default is Topology A:
+
+| `STRIKENOVA_OWNER_ROLE` | Active topology | Who creates/owns application objects | Default privileges bound to |
+| --- | --- | --- | --- |
+| empty (default) | **Topology A** | the migration identity | `FOR ROLE <migrator> IN SCHEMA public` |
+| set to a role name | **Topology B** | that `NOLOGIN` owner role, reached only through the `SET ROLE` window | `FOR ROLE <owner> IN SCHEMA public` |
+
+In both topologies the runtime role receives DML and sequence `USAGE` on new
+application objects through **schema-scoped** defaults (`IN SCHEMA public`). A
+*global* default privilege would also cover `migration_internal` and is a
+verification failure (`45004`). Because an object's owner inherently holds every
+privilege on it, the §8.3 revoke set is only meaningful for the migrator under
+Topology B: under Topology A the migrator owns the tables and can therefore
+always alter or drop them. Neither topology grants the runtime role anything
+beyond DML.
 
 ## 3. Transaction and connection boundaries
 
@@ -56,7 +74,10 @@ same endpoint are detected as equal and refused (`45004`).
 * **Backfill:** user enumeration is committed first; each user then gets its
   own transaction whose first statement is `enter_lease`, followed by the
   idempotent exposure writes and a mandatory ownership refresh immediately
-  before `COMMIT`. Any ownership error rolls back that user only.
+  before `COMMIT`. Any ownership error rolls back that user only. Backfill
+  always runs as the migration identity: in Topology B the `RESET ROLE`
+  happens before the post-migration callback, so the backfill is never
+  elevated.
 * **Barrier:** `close_barrier` takes the protocol row lock, records the owner
   fingerprint it observed, sets `barrier_state='closed'`, and refuses new
   admission with `45004`. An already-admitted owner keeps working.
@@ -90,22 +111,34 @@ CLI and startup use the **migration** identity, never the runtime identity.
 
 ### 5.1 Empty database (first bootstrap)
 
-1. Provision roles (out of band, `strikenova_prod_admin`): create
-   `strikenova_prod_owner` (NOLOGIN), `strikenova_prod_migrator` (LOGIN), and
-   `strikenova_production_app` (LOGIN); grant the migrator
-   `strikenova_prod_owner` **with `SET` and no `INHERIT`**.
+1. Provision roles (out of band, an admin identity that is never used by the
+   application):
+   * **Topology B** — create `strikenova_prod_owner` (`NOLOGIN`),
+     `strikenova_prod_migrator` (`LOGIN`) and `strikenova_production_app`
+     (`LOGIN`); grant `strikenova_prod_owner` to the migrator **with
+     `INHERIT FALSE, SET TRUE`**; set `STRIKENOVA_OWNER_ROLE=strikenova_prod_owner`.
+   * **Topology A** (default) — create only `strikenova_prod_migrator`
+     (`LOGIN`) and `strikenova_production_app` (`LOGIN`); leave
+     `STRIKENOVA_OWNER_ROLE` **empty**. The migrator owns the database and
+     every object it creates.
 2. Set `DATABASE_URL` (runtime) and `STRIKENOVA_MIGRATION_DATABASE_URL`
    (migrator) to distinct identities.
-3. `python -m app.migrate bootstrap-lease` — creates the schema, tables,
-   functions and protocol row, verifies catalog shape, ACLs and default ACLs,
-   then sets `bootstrap_state='ready'`.
-4. `python -m app.migrate upgrade head` — lease + full Alembic chain in one
-   transaction, DDL executed inside a verified `SET ROLE strikenova_prod_owner`
-   / `RESET ROLE` window.
-5. Apply ADR-018 §8.3 grants to the runtime role (see §5.4) and start the app.
+3. Create the schema-scoped default privileges for the creator role
+   (`STRIKENOVA_OWNER_ROLE` if set, else the migrator) in schema `public`:
+   `SELECT/INSERT/UPDATE/DELETE ON TABLES` and `USAGE/SELECT ON SEQUENCES` to
+   the runtime role. Do **not** create a global (`ALTER DEFAULT PRIVILEGES`
+   without `IN SCHEMA`) entry.
+4. `python -m app.migrate bootstrap-lease` — creates the schema, tables,
+   functions and protocol row, verifies catalog shape, schema/table/function
+   ACLs and default ACLs, then sets `bootstrap_state='ready'`.
+5. `python -m app.migrate upgrade head` — lease + full Alembic chain in one
+   transaction; in Topology B the DDL runs inside a verified
+   `SET ROLE strikenova_prod_owner` / `RESET ROLE` window, in Topology A there
+   is no role window at all.
+6. Apply the ADR-018 §8.3 grants to the runtime role and start the app.
 
 On a genuinely empty database the migrator must not assume the runtime grants
-exist yet; the startup backfill only becomes possible after step 5.
+exist yet; the startup backfill only becomes possible after step 6.
 
 ### 5.2 Existing installation
 
@@ -160,24 +193,36 @@ Re-run `bootstrap-lease` only when the installation is genuinely absent.
 
 ## 7. Measured backfill timing and derived values
 
-Measured on the disposable PostgreSQL 16.16 instance
+Measured on a disposable PostgreSQL 16.16 instance
 (`test_measure_per_user_backfill_timing`, 50 synthetic users × 2 positions,
 idempotent upserts inside a per-user transaction with `enter` and a pre-commit
-refresh):
+refresh). Two runs are on record and both are **synthetic/single-host**; neither
+is a Neon or production performance result:
+
+| Measurement | p50 | p99 | max | Source |
+| --- | --- | --- | --- | --- |
+| Historical (earlier revision) | 4.9 ms | 35.3 ms | 35.3 ms | earlier local run, recorded in PR #146 |
+| Current implementation | 6.0 ms | 18.2 ms | 18.2 ms | local disposable 16.16 run of this revision |
 
 ```
-per-user backfill over 50 users: p50=4.9ms p99=35.3ms max=35.3ms
+per-user backfill over 50 users: p50=6.0ms p99=18.2ms max=18.2ms
 ttl=300s statement_timeout=150000ms
 ```
 
+The derivation below uses the **slower** of the two (35.3 ms), so the defaults
+stay conservative regardless of which measurement is cited.
+
 Derivation:
 
-* **TTL 300 s**: ≈ 8 500 × the measured p99. It only bounds how long a *new*
+* **TTL 300 s**: ≈ 8 500 × the slower measured p99 (35.3 ms). It only bounds how long a *new*
   process waits before taking over an abandoned row, so a wide margin costs
   nothing at normal scale while keeping a wedged deploy bounded to minutes.
-* **Statement timeout 150 s**: ≈ 4 250 × the measured p99 for one user, below
-  the TTL so a single user can never hold the lease past its own expiry, and
-  large enough for a slower production host or a user with many positions.
+* **Statement timeout 150 s**: ≈ 4 250 × the slower measured p99 for one user.
+  The configuration validator enforces it **strictly below** the TTL
+  (`MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS < MIGRATION_LEASE_TTL_SECONDS ×
+  1000`): equality and larger values are refused at the settings boundary, so
+  a single user can never hold the lease past its own expiry. It is large
+  enough for a slower production host or a user with many positions.
 * **Wait 180 s / lock timeout 10 s**: the wait budget must exceed a normal
   full-chain migration on this chain (~20 s observed end to end on the test
   instance, including backfill) with headroom for platform cold starts; the
@@ -189,29 +234,44 @@ instance class before enabling a real cutover.
 
 ## 8. Privilege boundary
 
-* `migration_internal` USAGE: owner and (via the function owner) nobody else;
-  PUBLIC and the runtime role have none.
+* `migration_internal` schema ACL: PUBLIC has neither `USAGE` nor `CREATE`, and
+  the runtime role has neither effectively (`has_schema_privilege`), checked
+  through `pg_namespace.nspacl` with `aclexplode(...)` and
+  `acldefault('n', nspowner)` so an untouched schema is judged on its implicit
+  ACL as well. The runtime role is also required to be neither a superuser nor
+  a member of the schema owner, so an inherited path cannot grant access.
 * `migration_lease` / `lease_protocol` table privileges: owner only.
 * Functions: EXECUTE to the migrator only; no PUBLIC; `SECURITY DEFINER` with
   `SET search_path = pg_catalog`.
 * Runtime role: no direct or transitive membership in migrator/owner; no
-  ownership of migration objects.
-* Migrator: `SET`-only membership in the owner role, no `INHERIT`, no superuser.
+  ownership of migration objects; no `CREATE` on schema `public`.
+* Migrator: in Topology B `SET`-only membership in the owner role, no
+  `INHERIT`, no superuser, and no default privileges of its own; in Topology A
+  it owns the application objects it creates.
 * Default ACLs are inspected globally (`pg_default_acl`) and for
   `migration_internal`; a global default that would grant PUBLIC or the runtime
   role access to the schema is a verification failure.
 
 Prohibited operations were proven to raise `42501`: direct DML on the lease
-tables, `SELECT` from the schema, `EXECUTE` of the lease functions, and
-`SET ROLE` into the owner from the runtime identity.
+  tables, `SELECT` from the schema, `EXECUTE` of the lease functions,
+  `SET ROLE` into the owner from the runtime identity, `ALTER`/`DROP`/`TRUNCATE`
+  of application tables, and `CREATE TABLE` in schema `public`.
+
+Negative controls (`test_schema_acl_verification_positive_and_negative_controls`)
+prove the verifier fails closed: a valid installation passes, granting PUBLIC
+`USAGE` or `CREATE` on `migration_internal` makes `bootstrap-lease --verify` fail
+with `45004`, granting the runtime role `USAGE` fails the same way, and after
+revoking each grant the installation verifies again with an unchanged protocol
+version and no residual PUBLIC entries.
 
 ## 9. Evidence
 
 | Suite | Scope | Result |
 | --- | --- | --- |
-| `tests/test_issue145_application_integration.py` | real PG 16.16: concurrent `init_db()`, single connection, killed worker, injected failure, CLI, barrier, protocol, expiry, privileges, default ACLs, timing | 19 passed |
-| `tests/test_migration_serialization.py` | DB-free protocol/config/retirement contract | 37 passed |
-| `tests/test_db_migration.py`, `test_alembic_*.py`, `test_day5_alembic_authority.py`, `test_migration_identity_separation.py`, `test_leg_exposure.py` | SQLite chain, FK behavior, identity separation, exposure idempotency | 89 passed |
+| `tests/test_issue145_application_integration.py` | real PG 16.16: concurrent `init_db()`, single connection, killed worker, injected failure, CLI, barrier, protocol, expiry, privileges, both ownership topologies, schema-ACL positive/negative controls, timing | 22 passed |
+| `tests/test_migration_serialization.py` | DB-free protocol/config/retirement contract, including the timeout-below-TTL rule and its boundaries | 46 passed |
+| `tests/test_db_migration.py`, `test_alembic_*.py`, `test_day5_alembic_authority.py`, `test_migration_identity_separation.py`, `test_leg_exposure.py` | SQLite chain, FK behavior, identity separation, exposure idempotency | 135 passed |
+| `PostgreSQL compatibility` suite (9 modules: compatibility, importer, failure injection, large rehearsal, hardening, Day 5/6) | disposable PG 16.16 schemas built only through `python -m app.migrate upgrade head` | 122 passed |
 | `.github/workflows/issue145-application-pg16.yml` | the two suites above on a pinned `postgres@sha256:3950ad…` 16.16 service, exact `server_version_num = 160016` gate, evidence upload, cleanup | see PR #146 checks |
 
 Local verification used PGDG 16.16 server binaries extracted into the workspace
@@ -223,6 +283,11 @@ digest. Both report `server_version_num = 160016`.
 * Concurrent first installation on a genuinely empty database is exercised with
   sequential cold starts plus a dedicated bootstrap-contention test; a
   simultaneous two-process first-ever bootstrap is not claimed as proven.
+* The compatibility and importer rehearsals build their schema as Topology A
+  and perform the data import as the migration identity; they do not re-prove
+  the runtime-identity boundary (that lives in the integration suite).
+* Topology A cannot revoke table privileges from its own creator: an object's
+  owner always holds them. §8.3 revokes are therefore a Topology B control.
 * The TTL/timing measurement is synthetic and single-host (§7).
 * No production/Neon/Render change is part of this work: no live roles, grants,
   environment variables or cutover were touched.

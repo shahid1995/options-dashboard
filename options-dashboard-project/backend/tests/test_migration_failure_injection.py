@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -17,7 +16,22 @@ from test_rehearsal_ci_database import (  # noqa: E402
     _populate_current_schema_synthetic_dataset,
     _prepare_schema,
 )
-from migrate_sqlite_to_postgres import migrate_database, normalize_url  # noqa: E402
+from migrate_sqlite_to_postgres import migrate_database  # noqa: E402
+from tests import issue145_pg_support as support  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def postgres_engine():
+    """Disposable PostgreSQL target, migrated by the guarded CLI (Topology A)."""
+    if support.admin_url() is None:
+        pytest.skip(f"{support.ADMIN_ENV} is not configured (disposable PostgreSQL 16.16)")
+    prov = support.provision_schema_ready()
+    engine = support.migrator_engine(prov)
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+        support.drop(prov)
 
 
 def _make_source_engine(tmp_path):
@@ -34,17 +48,11 @@ def _assert_target_empty(engine):
         assert conn.execute(text('SELECT COUNT(*) FROM "gex_snapshots"')).scalar_one() == 0
 
 
-def test_migration_failure_rolls_back_all_imported_rows(tmp_path):
-    raw_url = os.getenv("TEST_DATABASE_URL")
-    if not raw_url:
-        pytest.skip("TEST_DATABASE_URL is not configured")
-
+def test_migration_failure_rolls_back_all_imported_rows(tmp_path, postgres_engine):
     sqlite_engine = _make_source_engine(tmp_path)
-    postgres_engine = create_engine(normalize_url(raw_url), pool_pre_ping=True)
     try:
         _prepare_schema(sqlite_engine)
         _populate_current_schema_synthetic_dataset(sqlite_engine)
-        _prepare_schema(postgres_engine)
         _clear_postgres_target(postgres_engine)
 
         @event.listens_for(postgres_engine, "before_cursor_execute")
@@ -61,20 +69,15 @@ def test_migration_failure_rolls_back_all_imported_rows(tmp_path):
         _assert_target_empty(postgres_engine)
     finally:
         sqlite_engine.dispose()
-        postgres_engine.dispose()
 
 
-def test_migration_failure_during_later_table_rolls_back_earlier_tables(tmp_path):
-    raw_url = os.getenv("TEST_DATABASE_URL")
-    if not raw_url:
-        pytest.skip("TEST_DATABASE_URL is not configured")
-
+def test_migration_failure_during_later_table_rolls_back_earlier_tables(
+    tmp_path, postgres_engine
+):
     sqlite_engine = _make_source_engine(tmp_path)
-    postgres_engine = create_engine(normalize_url(raw_url), pool_pre_ping=True)
     try:
         _prepare_schema(sqlite_engine)
         _populate_current_schema_synthetic_dataset(sqlite_engine)
-        _prepare_schema(postgres_engine)
         _clear_postgres_target(postgres_engine)
 
         @event.listens_for(postgres_engine, "before_cursor_execute")
@@ -91,20 +94,15 @@ def test_migration_failure_during_later_table_rolls_back_earlier_tables(tmp_path
         _assert_target_empty(postgres_engine)
     finally:
         sqlite_engine.dispose()
-        postgres_engine.dispose()
 
 
-def test_migration_failure_during_sequence_repair_rolls_back_data(tmp_path):
-    raw_url = os.getenv("TEST_DATABASE_URL")
-    if not raw_url:
-        pytest.skip("TEST_DATABASE_URL is not configured")
-
+def test_migration_failure_during_sequence_repair_rolls_back_data(
+    tmp_path, postgres_engine
+):
     sqlite_engine = _make_source_engine(tmp_path)
-    postgres_engine = create_engine(normalize_url(raw_url), pool_pre_ping=True)
     try:
         _prepare_schema(sqlite_engine)
         _populate_current_schema_synthetic_dataset(sqlite_engine)
-        _prepare_schema(postgres_engine)
         _clear_postgres_target(postgres_engine)
 
         @event.listens_for(postgres_engine, "before_cursor_execute")
@@ -121,4 +119,3 @@ def test_migration_failure_during_sequence_repair_rolls_back_data(tmp_path):
         _assert_target_empty(postgres_engine)
     finally:
         sqlite_engine.dispose()
-        postgres_engine.dispose()

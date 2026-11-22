@@ -87,6 +87,9 @@ def _run_on_connection(connection, lease_guard) -> None:
     """
     is_postgres = connection.dialect.name != "sqlite"
     if is_postgres and lease_guard is None:
+        # No test-only opt-in: every PostgreSQL schema is built through
+        # ``python -m app.migrate upgrade head`` (ADR-017 §13), and no test may
+        # re-enable an unleased DDL path.
         raise RuntimeError(
             "refusing to run Alembic against PostgreSQL without the ADR-017 "
             "migration lease: use 'python -m app.migrate upgrade head'"

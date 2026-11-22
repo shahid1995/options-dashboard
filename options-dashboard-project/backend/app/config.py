@@ -1,4 +1,4 @@
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -173,6 +173,25 @@ class Settings(BaseSettings):
                 "MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS must be positive"
             )
         return v
+
+    @model_validator(mode="after")
+    def _validate_statement_timeout_below_lease_ttl(self) -> "Settings":
+        """A per-user backfill transaction must fail before ownership can expire.
+
+        The runbook rule is strict: the statement timeout must be *below* the
+        lease TTL, so equality is rejected as well. The defaults (300 s TTL,
+        150 000 ms timeout) satisfy it with a wide margin.
+        """
+        ttl_ms = self.MIGRATION_LEASE_TTL_SECONDS * 1000.0
+        if self.MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS >= ttl_ms:
+            raise ValueError(
+                "MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS "
+                f"({self.MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS} ms) must be "
+                "strictly below MIGRATION_LEASE_TTL_SECONDS * 1000 "
+                f"({ttl_ms:.0f} ms): a backfill transaction that outlives the "
+                "lease would let ownership expire mid-work"
+            )
+        return self
 
     @property
     def IS_PRODUCTION(self) -> bool:

@@ -14,11 +14,19 @@ name: Issue #145 - ADR-017/018 application integration (PostgreSQL 16.16)
 # The job fails when any assertion fails: pytest's exit status is preserved in
 # the gate step that produces the job outcome.
 
+# PR #146 targets ``feat/strikenova-day35-portfolio-intelligence``, so that base
+# branch is listed explicitly: a pull_request workflow filtered on ``main``
+# never runs for this PR. Pushes to the implementation branch and to the
+# dedicated test branch run the same job.
 on:
   push:
-    branches: [test/issue145-application-pg16]
+    branches:
+      - issue-145-fix
+      - test/issue145-application-pg16
   pull_request:
-    branches: [main]
+    branches:
+      - feat/strikenova-day35-portfolio-intelligence
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -93,20 +101,20 @@ jobs:
         env:
           STRIKENOVA_ENV: ""
         run: |
-          if python -m pytest -q \
+          set +e
+          python -m pytest -q \
               tests/test_issue145_application_integration.py \
-              --junitxml=issue145-application.xml > issue145-application.log 2>&1; then
-            echo "0" > issue145-application.rc
-          else
-            echo "$?" > issue145-application.rc
-          fi
+              --junitxml=issue145-application.xml > issue145-application.log 2>&1
+          rc=$?
+          echo "$rc" > issue145-application.rc
           exit 0
 
       - name: Migration and SQLite regression suite
         env:
           STRIKENOVA_ENV: ""
         run: |
-          if python -m pytest -q \
+          set +e
+          python -m pytest -q \
               tests/test_migration_serialization.py \
               tests/test_db_migration.py \
               tests/test_migration_identity_separation.py \
@@ -114,11 +122,9 @@ jobs:
               tests/test_alembic_single_head.py \
               tests/test_alembic_env_resolution.py \
               tests/test_day5_alembic_authority.py \
-              tests/test_leg_exposure.py > issue145-regression.log 2>&1; then
-            echo "0" > issue145-regression.rc
-          else
-            echo "$?" > issue145-regression.rc
-          fi
+              tests/test_leg_exposure.py > issue145-regression.log 2>&1
+          rc=$?
+          echo "$rc" > issue145-regression.rc
           exit 0
 
       - name: Gate on the actual test results

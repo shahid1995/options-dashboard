@@ -86,10 +86,22 @@ def pg(monkeypatch):
 
 
 @pytest.fixture
-def pg_topology_a(pg, monkeypatch):
-    """Topology A: the migrator owns what Alembic creates (ADR §8.3)."""
-    monkeypatch.setattr(settings, "STRIKENOVA_OWNER_ROLE", "")
-    return pg
+def pg_topology_a(monkeypatch):
+    """Topology A: the migrator owns what Alembic creates (ADR §8.3).
+
+    Independently provisioned: no owner role exists at all, no membership row
+    is created, and the runtime default privileges are attached to the role
+    that actually creates the objects (the migrator). Blanking the setting in
+    a Topology B fixture would not demonstrate this contract.
+    """
+    prov = support.provision(topology=support.TOPOLOGY_A)
+    _apply_settings(monkeypatch, prov)
+    if settings.STRIKENOVA_OWNER_ROLE:
+        raise AssertionError("Topology A must not configure an owner role")
+    try:
+        yield prov
+    finally:
+        support.drop(prov)
 
 
 @pytest.fixture
@@ -299,15 +311,29 @@ def test_two_concurrent_startups_serialize_and_backfill_exactly_once(pg_topology
 
     # 2. Legacy data exists; two more concurrent startups (Alembic already at
     #    head) must serialize the protected backfill and never duplicate rows.
-    support.apply_topology_a_revokes(pg)
     with psycopg.connect(pg.admin_database_url) as conn:
         owner = conn.execute(
             "SELECT c.relowner::regrole::text FROM pg_class c "
             "JOIN pg_namespace n ON n.oid=c.relnamespace "
             "WHERE n.nspname='public' AND c.relname='positions'"
         ).fetchone()[0]
+        memberships = conn.execute(
+            "SELECT count(*) FROM pg_auth_members WHERE member = "
+            "(SELECT oid FROM pg_roles WHERE rolname = %s)",
+            (pg.migrator_role,),
+        ).fetchone()[0]
+        owner_roles = conn.execute(
+            "SELECT count(*) FROM pg_roles WHERE rolname = %s",
+            (pg.owner_role or "__topology_a_has_no_owner__",),
+        ).fetchone()[0]
     if owner != pg.migrator_role:
         raise AssertionError(f"Topology A expected migrator ownership, got {owner}")
+    if memberships != 0:
+        raise AssertionError(
+            f"Topology A must have no role membership, found {memberships}"
+        )
+    if owner_roles != 0:
+        raise AssertionError("Topology A must not create a separate owner role")
     support.seed_legacy_users(pg.admin_database_url, users=3)
     _concurrent_startups(pg)
     counts = _exposure_counts(pg)
@@ -414,7 +440,10 @@ def test_backfill_failure_rolls_back_user_and_releases_lease(pg_ready, monkeypat
 
 
 def test_killed_backfill_worker_recovers_after_expiry(pg, monkeypatch, tmp_path):
+    # A short TTL is only a valid configuration when the per-user statement
+    # timeout is below it (the cross-field rule enforced by Settings).
     monkeypatch.setattr(settings, "MIGRATION_LEASE_TTL_SECONDS", 3.0)
+    monkeypatch.setattr(settings, "MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS", 2500)
     _bootstrap(pg)
     db_module._run_alembic_migrations()
     support.grant_backfill_privileges(pg)
@@ -444,7 +473,10 @@ def test_killed_backfill_worker_recovers_after_expiry(pg, monkeypatch, tmp_path)
     proc = subprocess.Popen(
         [sys.executable, str(worker)],
         cwd=os.getcwd(),
-        env=pg.env(MIGRATION_LEASE_TTL_SECONDS="3"),
+        env=pg.env(
+            MIGRATION_LEASE_TTL_SECONDS="3",
+            MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS="2500",
+        ),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -770,6 +802,16 @@ def test_runtime_identity_has_zero_access_to_migration_infrastructure(pg_ready):
             "CROSS JOIN LATERAL aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a "
             "WHERE n.nspname='migration_internal' AND a.grantee = 0"
         ).fetchone()[0]
+        schema_public_entries = conn.execute(
+            "SELECT count(*) FROM pg_namespace n CROSS JOIN LATERAL "
+            "aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) a "
+            "WHERE n.nspname='migration_internal' AND a.grantee = 0"
+        ).fetchone()[0]
+        schema_effective = conn.execute(
+            "SELECT has_schema_privilege(%s, 'migration_internal', 'USAGE'), "
+            "       has_schema_privilege(%s, 'migration_internal', 'CREATE')",
+            (pg_ready.app_role, pg_ready.app_role),
+        ).fetchone()
 
     if usage:
         raise AssertionError("the runtime role has USAGE on migration_internal")
@@ -781,6 +823,14 @@ def test_runtime_identity_has_zero_access_to_migration_infrastructure(pg_ready):
         raise AssertionError(f"the runtime role reaches {reach} role(s) transitively")
     if public_entries != 0:
         raise AssertionError(f"PUBLIC holds {public_entries} grant(s) on migration_internal")
+    if schema_public_entries != 0:
+        raise AssertionError(
+            f"PUBLIC holds {schema_public_entries} schema grant(s) on migration_internal"
+        )
+    if schema_effective != (False, False):
+        raise AssertionError(
+            f"runtime effective schema privileges are {schema_effective}, expected none"
+        )
 
 
 def test_migrator_minimum_privileges_and_owner_window(pg_ready):
@@ -845,6 +895,240 @@ def test_migrator_minimum_privileges_and_owner_window(pg_ready):
         if conn.execute("SELECT current_user").fetchone()[0] != pg_ready.migrator_role:
             raise AssertionError("RESET ROLE did not restore the migrator identity")
         conn.commit()
+
+
+def test_topology_a_creator_objects_are_runtime_usable(pg_topology_a):
+    """Topology A: the migrator creates, the runtime consumes, DDL is denied."""
+    pg = pg_topology_a
+    _bootstrap(pg)
+    db_module._run_alembic_migrations()
+
+    with psycopg.connect(pg.migrator_url) as conn:
+        conn.execute(
+            "CREATE TABLE public._topology_a_probe ("
+            "id bigserial PRIMARY KEY, value text NOT NULL)"
+        )
+        conn.commit()
+        owner = conn.execute(
+            "SELECT tableowner FROM pg_tables "
+            "WHERE schemaname='public' AND tablename='_topology_a_probe'"
+        ).fetchone()[0]
+        chain_owner = conn.execute(
+            "SELECT tableowner FROM pg_tables "
+            "WHERE schemaname='public' AND tablename='positions'"
+        ).fetchone()[0]
+    if owner != pg.migrator_role or chain_owner != pg.migrator_role:
+        raise AssertionError(
+            f"Topology A owners: probe={owner} positions={chain_owner}, "
+            f"expected {pg.migrator_role}"
+        )
+
+    with psycopg.connect(pg.app_url) as conn:
+        conn.execute("INSERT INTO public._topology_a_probe (value) VALUES ('a'), ('b')")
+        count = conn.execute("SELECT count(*) FROM public._topology_a_probe").fetchone()[0]
+        conn.execute("UPDATE public._topology_a_probe SET value = value || '!'")
+        conn.execute("DELETE FROM public._topology_a_probe WHERE id = 1")
+        conn.commit()
+        if count != 2:
+            raise AssertionError(f"runtime could not read the creator's table ({count})")
+        for statement in (
+            "ALTER TABLE public._topology_a_probe ADD COLUMN extra integer",
+            "DROP TABLE public._topology_a_probe",
+            "TRUNCATE public._topology_a_probe",
+            "CREATE TABLE public._runtime_ddl_probe (id integer)",
+            "SELECT count(*) FROM migration_internal.migration_lease",
+        ):
+            with pytest.raises(psycopg.Error) as exc:
+                conn.execute(statement)
+            if _psycopg_sqlstate(exc.value) != "42501":
+                raise AssertionError(
+                    f"{statement!r} gave {_psycopg_sqlstate(exc.value)}, expected 42501"
+                )
+            conn.rollback()
+
+    with psycopg.connect(pg.admin_database_url) as conn:
+        sequence_usage = conn.execute(
+            "SELECT has_sequence_privilege(%s, "
+            "  pg_get_serial_sequence('public._topology_a_probe','id'), 'USAGE')",
+            (pg.app_role,),
+        ).fetchone()[0]
+        truncate = conn.execute(
+            "SELECT has_table_privilege(%s, 'public._topology_a_probe', 'TRUNCATE')",
+            (pg.app_role,),
+        ).fetchone()[0]
+        create_on_public = conn.execute(
+            "SELECT has_schema_privilege(%s, 'public', 'CREATE')", (pg.app_role,)
+        ).fetchone()[0]
+        conn.execute("DROP TABLE public._topology_a_probe")
+        conn.commit()
+    if not sequence_usage or truncate or create_on_public:
+        raise AssertionError(
+            f"Topology A runtime privileges: sequence_usage={sequence_usage} "
+            f"truncate={truncate} create_on_public={create_on_public}"
+        )
+
+
+def test_topology_b_owner_role_shape_and_default_privileges(pg_ready):
+    """Topology B: NOLOGIN owner, SET-only membership, creator-scoped defaults."""
+    with psycopg.connect(pg_ready.admin_database_url) as conn:
+        role = conn.execute(
+            "SELECT rolcanlogin, rolsuper, rolcreaterole, rolcreatedb "
+            "FROM pg_roles WHERE rolname = %s",
+            (pg_ready.owner_role,),
+        ).fetchone()
+        membership = conn.execute(
+            "SELECT inherit_option, set_option, admin_option FROM pg_auth_members "
+            "WHERE roleid = (SELECT oid FROM pg_roles WHERE rolname = %s) "
+            "  AND member = (SELECT oid FROM pg_roles WHERE rolname = %s)",
+            (pg_ready.owner_role, pg_ready.migrator_role),
+        ).fetchone()
+        creator = conn.execute(
+            "SELECT tableowner FROM pg_tables "
+            "WHERE schemaname='public' AND tablename='positions'"
+        ).fetchone()[0]
+        defaults = conn.execute(
+            "SELECT d.defaclnamespace::regnamespace::text, d.defaclobjtype, "
+            "       a.grantee::regrole::text, a.privilege_type "
+            "FROM pg_default_acl d CROSS JOIN LATERAL aclexplode(d.defaclacl) a "
+            "WHERE d.defaclrole = (SELECT oid FROM pg_roles WHERE rolname = %s)",
+            (pg_ready.owner_role,),
+        ).fetchall()
+        migrator_defaults = conn.execute(
+            "SELECT count(*) FROM pg_default_acl WHERE defaclrole = "
+            "(SELECT oid FROM pg_roles WHERE rolname = %s)",
+            (pg_ready.migrator_role,),
+        ).fetchone()[0]
+
+    if role != (False, False, False, False):
+        raise AssertionError(f"owner role attributes are {role}, expected NOLOGIN-only")
+    if membership != (False, True, False):
+        raise AssertionError(
+            f"owner membership is {membership}, expected INHERIT FALSE, SET TRUE, ADMIN FALSE"
+        )
+    if creator != pg_ready.owner_role:
+        raise AssertionError(f"application objects are owned by {creator}")
+    if migrator_defaults != 0:
+        raise AssertionError("Topology B must not attach default privileges to the migrator")
+    if not defaults or {row[0] for row in defaults} != {"public"}:
+        raise AssertionError(f"default privileges are not public-scoped: {defaults}")
+    if any(row[2] != pg_ready.app_role for row in defaults):
+        raise AssertionError(f"default privileges grant to the wrong role: {defaults}")
+
+    # The owner's tables are usable by the runtime identity with DML only.
+    with psycopg.connect(pg_ready.migrator_url) as conn:
+        conn.execute(f"SET ROLE {pg_ready.owner_role}")
+        conn.execute(
+            "CREATE TABLE public._topology_b_probe ("
+            "id bigserial PRIMARY KEY, value text NOT NULL)"
+        )
+        conn.execute("RESET ROLE")
+        conn.commit()
+    try:
+        with psycopg.connect(pg_ready.app_url) as conn:
+            conn.execute("INSERT INTO public._topology_b_probe (value) VALUES ('x')")
+            total = conn.execute("SELECT count(*) FROM public._topology_b_probe").fetchone()[0]
+            conn.commit()
+            if total != 1:
+                raise AssertionError("runtime cannot use an owner-created table")
+            for statement in (
+                "ALTER TABLE public._topology_b_probe ADD COLUMN extra integer",
+                "DROP TABLE public._topology_b_probe",
+                f"SET ROLE {pg_ready.owner_role}",
+            ):
+                with pytest.raises(psycopg.Error) as exc:
+                    conn.execute(statement)
+                if _psycopg_sqlstate(exc.value) != "42501":
+                    raise AssertionError(
+                        f"{statement!r} gave {_psycopg_sqlstate(exc.value)}, expected 42501"
+                    )
+                conn.rollback()
+    finally:
+        with psycopg.connect(pg_ready.admin_database_url) as conn:
+            conn.execute("DROP TABLE IF EXISTS public._topology_b_probe")
+            conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Schema ACL positive and negative controls (ADR §9.3)
+# ---------------------------------------------------------------------------
+
+
+def _verify_refusal(pg: support.Provisioned) -> str:
+    """Run the verify mode and return the refusal message (asserting 45004)."""
+    engine = _engine(pg)
+    try:
+        with pytest.raises(LeaseError) as exc:
+            bootstrap_lease(engine, mode="verify")
+        _assert_sqlstate(exc, "45004")
+        return str(exc.value)
+    finally:
+        engine.dispose()
+
+
+def _assert_verified(pg: support.Provisioned) -> None:
+    report = _bootstrap(pg, mode="verify")
+    if report.get("installed") != "verified":
+        raise AssertionError(f"verification did not pass on a valid install: {report}")
+
+
+def test_schema_acl_verification_positive_and_negative_controls(pg):
+    _bootstrap(pg)
+    _assert_verified(pg)
+
+    # 1. PUBLIC USAGE on migration_internal must fail verification.
+    with psycopg.connect(pg.admin_database_url, autocommit=True) as conn:
+        conn.execute("GRANT USAGE ON SCHEMA migration_internal TO PUBLIC")
+    try:
+        message = _verify_refusal(pg)
+        if "USAGE" not in message or "PUBLIC" not in message:
+            raise AssertionError(f"PUBLIC USAGE refusal was not reported: {message}")
+    finally:
+        with psycopg.connect(pg.admin_database_url, autocommit=True) as conn:
+            conn.execute("REVOKE USAGE ON SCHEMA migration_internal FROM PUBLIC")
+    _assert_verified(pg)
+
+    # 2. PUBLIC CREATE on migration_internal must fail verification.
+    with psycopg.connect(pg.admin_database_url, autocommit=True) as conn:
+        conn.execute("GRANT CREATE ON SCHEMA migration_internal TO PUBLIC")
+    try:
+        message = _verify_refusal(pg)
+        if "CREATE" not in message or "PUBLIC" not in message:
+            raise AssertionError(f"PUBLIC CREATE refusal was not reported: {message}")
+    finally:
+        with psycopg.connect(pg.admin_database_url, autocommit=True) as conn:
+            conn.execute("REVOKE CREATE ON SCHEMA migration_internal FROM PUBLIC")
+
+    # 3. Runtime USAGE on migration_internal must fail verification.
+    with psycopg.connect(pg.admin_database_url, autocommit=True) as conn:
+        conn.execute(f"GRANT USAGE ON SCHEMA migration_internal TO {pg.app_role}")
+    try:
+        message = _verify_refusal(pg)
+        if pg.app_role not in message:
+            raise AssertionError(f"runtime USAGE refusal was not reported: {message}")
+    finally:
+        with psycopg.connect(pg.admin_database_url, autocommit=True) as conn:
+            conn.execute(f"REVOKE USAGE ON SCHEMA migration_internal FROM {pg.app_role}")
+
+    # 4. Restored state verifies again and the control row is unchanged.
+    _assert_verified(pg)
+    with psycopg.connect(pg.admin_database_url) as conn:
+        schema_acl = conn.execute(
+            "SELECT nspacl::text FROM pg_namespace WHERE nspname='migration_internal'"
+        ).fetchone()[0]
+        public_entries = conn.execute(
+            "SELECT count(*) FROM pg_namespace n CROSS JOIN LATERAL "
+            "aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) a "
+            "WHERE n.nspname='migration_internal' AND a.grantee = 0"
+        ).fetchone()[0]
+        runtime_schema_privs = conn.execute(
+            "SELECT has_schema_privilege(%s, 'migration_internal', 'USAGE'), "
+            "       has_schema_privilege(%s, 'migration_internal', 'CREATE')",
+            (pg.app_role, pg.app_role),
+        ).fetchone()
+    if public_entries != 0:
+        raise AssertionError(f"PUBLIC still holds schema grants: {schema_acl}")
+    if runtime_schema_privs != (False, False):
+        raise AssertionError(f"runtime schema privileges are {runtime_schema_privs}")
 
 
 # ---------------------------------------------------------------------------

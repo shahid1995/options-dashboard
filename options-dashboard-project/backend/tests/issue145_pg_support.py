@@ -12,21 +12,38 @@ roles so a run can never collide with another run on the same server.
 from __future__ import annotations
 
 import os
+import pathlib
 import secrets
+import subprocess
+import sys
 import textwrap
 
 import psycopg
 
 ADMIN_ENV = "ISSUE145_PG_ADMIN_URL"
 REQUIRED_SERVER_VERSION_NUM = 160016  # PostgreSQL 16.16 exactly
+BACKEND_DIR = pathlib.Path(__file__).resolve().parents[1]
+
+#: Topology B (ADR §8.3): a separate NOLOGIN owner role owns application
+#: objects; the migrator reaches it only through an explicit SET ROLE window.
+TOPOLOGY_B = "B"
+#: Topology A (ADR §8.3): no separate owner role exists; the migration
+#: identity itself creates and owns application objects.
+TOPOLOGY_A = "A"
+TOPOLOGIES = (TOPOLOGY_A, TOPOLOGY_B)
 
 
 class Provisioned:
-    def __init__(self, admin_url: str, prefix: str):
+    def __init__(self, admin_url: str, prefix: str, topology: str = TOPOLOGY_B):
+        if topology not in TOPOLOGIES:
+            raise ValueError(f"unknown topology {topology!r}; expected one of {TOPOLOGIES}")
         self.admin_url = admin_url
         self.prefix = prefix
+        self.topology = topology
         self.database = prefix
-        self.owner_role = f"{prefix}_owner"
+        # Topology A has no separate owner role at all: the attribute is empty
+        # so every consumer (settings, SET ROLE window) is genuinely bypassed.
+        self.owner_role = f"{prefix}_owner" if topology == TOPOLOGY_B else ""
         self.migrator_role = f"{prefix}_migrator"
         self.app_role = f"{prefix}_app"
         self.migrator_password = secrets.token_hex(16)
@@ -47,6 +64,9 @@ class Provisioned:
     def env(self, **overrides: str) -> dict[str, str]:
         """Environment for a subprocess that must use this database."""
         env = dict(os.environ)
+        # No unleased-Alembic escape hatch exists: these subprocesses must
+        # prove the guarded path is the only PostgreSQL migration path.
+        env.pop("STRIKENOVA_ALEMBIC_SCHEMA_REHEARSAL", None)
         env.update(
             {
                 "DATABASE_URL": self.app_url,
@@ -94,17 +114,35 @@ def require_pg16_16(url: str) -> None:
         )
 
 
-def provision(url: str | None = None) -> Provisioned:
-    """Create a fresh database and its three ADR-018 identities."""
+def provision(url: str | None = None, *, topology: str = TOPOLOGY_B) -> Provisioned:
+    """Create a fresh database and the identities for one ADR-018 topology.
+
+    ``topology=B`` (the founder-directed arrangement) creates a separate
+    ``NOLOGIN`` owner role and grants the migrator exactly
+    ``INHERIT FALSE, SET TRUE`` membership of it, so the owner window is the
+    only way the migrator can own a created object.
+
+    ``topology=A`` creates no owner role at all: the migrator owns the
+    database and therefore every object it creates. The two fixtures are
+    independently provisioned rather than one being derived from the other
+    by blanking a setting.
+
+    In both topologies the default privileges that let the runtime identity
+    use future application tables are scoped to ``IN SCHEMA public`` and
+    attached to the role that actually creates those tables (ADR-018), so the
+    ``migration_internal`` schema never inherits a runtime grant.
+    """
     url = url or admin_url()
     if not url:
         raise RuntimeError(f"{ADMIN_ENV} is not configured")
     require_pg16_16(url)
     prefix = "sn145_" + secrets.token_hex(5)
-    prov = Provisioned(url, prefix)
+    prov = Provisioned(url, prefix, topology)
+    creator = prov.owner_role or prov.migrator_role
 
     with psycopg.connect(url, autocommit=True) as conn:
-        conn.execute(f"CREATE ROLE {prov.owner_role} NOLOGIN")
+        if prov.owner_role:
+            conn.execute(f"CREATE ROLE {prov.owner_role} NOLOGIN")
         conn.execute(
             f"CREATE ROLE {prov.migrator_role} LOGIN PASSWORD '{prov.migrator_password}'"
         )
@@ -112,29 +150,110 @@ def provision(url: str | None = None) -> Provisioned:
         conn.execute(f"CREATE DATABASE {prov.database} OWNER {prov.migrator_role}")
 
     with psycopg.connect(prov.admin_database_url, autocommit=True) as conn:
-        conn.execute(
-            f"GRANT CREATE, USAGE ON SCHEMA public TO {prov.owner_role}"
-        )
-        conn.execute(
-            f"GRANT {prov.owner_role} TO {prov.migrator_role} "
-            "WITH INHERIT FALSE, SET TRUE, ADMIN FALSE"
-        )
+        if prov.owner_role:
+            conn.execute(
+                f"GRANT CREATE, USAGE ON SCHEMA public TO {prov.owner_role}"
+            )
+            conn.execute(
+                f"GRANT {prov.owner_role} TO {prov.migrator_role} "
+                "WITH INHERIT FALSE, SET TRUE, ADMIN FALSE"
+            )
         conn.execute(f"GRANT USAGE ON SCHEMA public TO {prov.app_role}")
-        # Application tables created by the owner are usable by the runtime
-        # identity with ordinary DML only (ADR-018).
+        # The runtime identity is a DML identity only: no schema DDL.
+        conn.execute(f"REVOKE CREATE ON SCHEMA public FROM {prov.app_role}")
+        # Application tables created by the creator role are usable by the
+        # runtime identity with ordinary DML only (ADR-018). Schema-scoped on
+        # purpose: a global default would also cover migration_internal.
         conn.execute(
-            f"ALTER DEFAULT PRIVILEGES FOR ROLE {prov.owner_role} IN SCHEMA public "
+            f"ALTER DEFAULT PRIVILEGES FOR ROLE {creator} IN SCHEMA public "
             f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {prov.app_role}"
         )
         conn.execute(
-            f"ALTER DEFAULT PRIVILEGES FOR ROLE {prov.owner_role} IN SCHEMA public "
+            f"ALTER DEFAULT PRIVILEGES FOR ROLE {creator} IN SCHEMA public "
             f"GRANT USAGE, SELECT ON SEQUENCES TO {prov.app_role}"
         )
     return prov
 
 
+def migrator_engine(prov: Provisioned):
+    """SQLAlchemy engine for the migration identity of a provisioned database."""
+    from sqlalchemy import create_engine
+
+    from app.db import normalize_database_url
+
+    return create_engine(normalize_database_url(prov.migrator_url), pool_pre_ping=True)
+
+
+def run_cli(prov: Provisioned, *args: str, timeout: int = 300) -> subprocess.CompletedProcess:
+    """Run ``python -m app.migrate ...`` against this database.
+
+    This is the supported guarded operator path. Nothing here bypasses the
+    lease or connects as the provisioned superuser.
+    """
+    env = prov.env()
+    env["PYTHONPATH"] = str(BACKEND_DIR)
+    return subprocess.run(
+        [sys.executable, "-m", "app.migrate", *args],
+        cwd=str(BACKEND_DIR),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def install_lease(prov: Provisioned) -> subprocess.CompletedProcess:
+    """Install the ADR-017 lease objects as the migration identity."""
+    result = run_cli(prov, "bootstrap-lease")
+    if result.returncode != 0:
+        raise RuntimeError(
+            "bootstrap-lease failed: " + (result.stderr or result.stdout)[-3000:]
+        )
+    return result
+
+
+def run_guarded_upgrade(prov: Provisioned) -> subprocess.CompletedProcess:
+    """Build the application schema through the guarded migration CLI."""
+    result = run_cli(prov, "upgrade", "head")
+    if result.returncode != 0:
+        raise RuntimeError(
+            "guarded upgrade head failed: " + (result.stderr or result.stdout)[-3000:]
+        )
+    return result
+
+
+def provision_schema_ready(
+    url: str | None = None, *, topology: str = TOPOLOGY_A
+) -> Provisioned:
+    """Provision a disposable database and build its schema the supported way.
+
+    Used by the PostgreSQL compatibility and SQLite -> PostgreSQL import
+    rehearsals, which need a real migrated schema but are not testing the
+    lease itself. The schema is always created by ``python -m app.migrate
+    upgrade head`` under the migration identity: a bare ``alembic upgrade
+    head`` is refused by ``alembic/env.py`` and must never be re-enabled for
+    tests.
+
+    Topology A is the default because those rehearsals then run their data
+    work as the migration identity, which owns the objects it created.
+    """
+    prov = provision(url, topology=topology)
+    try:
+        install_lease(prov)
+        run_guarded_upgrade(prov)
+    except BaseException:
+        drop(prov)
+        raise
+    return prov
+
+
 def grant_backfill_privileges(prov: Provisioned) -> None:
     """ADR §8.3 Topology B: the migrator's entire application privilege set."""
+    if not prov.owner_role:
+        raise RuntimeError(
+            "the §8.3 backfill grants are a Topology B operation: in Topology A "
+            "the migration identity already owns the application tables"
+        )
     with psycopg.connect(prov.admin_database_url, autocommit=True) as conn:
         conn.execute(
             f"GRANT SELECT ON public.positions TO {prov.migrator_role}"
@@ -151,31 +270,6 @@ def grant_backfill_privileges(prov: Provisioned) -> None:
         )
 
 
-def apply_topology_a_revokes(prov: Provisioned) -> None:
-    """ADR §8.3 Topology A: the owning migrator's effective minimum privileges."""
-    with psycopg.connect(prov.admin_database_url, autocommit=True) as conn:
-        conn.execute(
-            f"REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON public.positions "
-            f"FROM {prov.migrator_role}"
-        )
-        conn.execute(
-            f"REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON public.paper_orders "
-            f"FROM {prov.migrator_role}"
-        )
-        conn.execute(
-            f"REVOKE UPDATE, DELETE, TRUNCATE ON public.strategy_leg_exposures "
-            f"FROM {prov.migrator_role}"
-        )
-        conn.execute(
-            f"REVOKE ALL ON SEQUENCE public.strategy_leg_exposures_id_seq "
-            f"FROM {prov.migrator_role}"
-        )
-        conn.execute(
-            f"GRANT USAGE ON SEQUENCE public.strategy_leg_exposures_id_seq "
-            f"TO {prov.migrator_role}"
-        )
-
-
 def drop(prov: Provisioned) -> None:
     with psycopg.connect(prov.admin_url, autocommit=True) as conn:
         conn.execute(
@@ -184,7 +278,10 @@ def drop(prov: Provisioned) -> None:
             (prov.database,),
         )
         conn.execute(f"DROP DATABASE IF EXISTS {prov.database}")
-        for role in (prov.app_role, prov.migrator_role, prov.owner_role):
+        roles = [prov.app_role, prov.migrator_role]
+        if prov.owner_role:
+            roles.append(prov.owner_role)
+        for role in roles:
             conn.execute(f"DROP ROLE IF EXISTS {role}")
 
 

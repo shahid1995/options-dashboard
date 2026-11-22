@@ -24,12 +24,19 @@ Founder acceptance.
 
 ## Runtime topology
 
-5. **Production topology is Vercel (frontend) → Render (backend) →
-   CockroachDB (production database).** Railway references are historical and
-   must not be presented as current production truth.
+5. **Production topology is Vercel (frontend) → Render (backend) → Neon
+   PostgreSQL (accepted strategic production database, ADR-019).** Neon
+   provisioning, live role/grant configuration, Render changes and production
+   cutover are separate founder-authorized work and are **not** complete;
+   nothing in this repository may assume they have happened. CockroachDB is
+   retired (ADR-019); CockroachDB evidence in historical documents is
+   historical record, never current target configuration, and Railway
+   references are historical too.
 6. **Database portability is preserved.** Local development on SQLite,
-   PostgreSQL-compatible CI, CockroachDB-validated production target. No code
-   path may depend on a single vendor dialect where portability exists today.
+   PostgreSQL-compatible CI, and a PostgreSQL 16 production target (Neon).
+   No code path may depend on a single vendor dialect where portability exists
+   today; the ADR-017 lease is deliberately PostgreSQL-only and a CockroachDB
+   migration path is refused rather than run unguarded.
 6a. **Production database configuration is fail-closed.** The
    provider-neutral production signal is `STRIKENOVA_ENV=production`. The
    legacy Railway-era markers (`RAILWAY_ENVIRONMENT`,
@@ -90,11 +97,14 @@ Founder acceptance.
     explicitly authorizes them.
 20. **Credentials are invisible to agents.** Never read, print, copy, decode,
     or expose credential files (including `.strikenova_gh_token`).
-6c. **Runtime and migration database identities are separable.** Alembic
-   runs under the identity from `STRIKENOVA_MIGRATION_DATABASE_URL` when
-   set; otherwise under the runtime credential (legacy behavior). The
-   runtime identity must never require cluster administration, and the
-   migration identity must never be the normal serving credential (ADR-016).
+6c. **Runtime and migration database identities are distinct and both are
+   mandatory on PostgreSQL.** Alembic and the startup backfill run under the
+   identity from `STRIKENOVA_MIGRATION_DATABASE_URL`; there is **no fallback**
+   to the runtime credential. On PostgreSQL a missing migration URL, or one
+   that resolves to the same database identity as `DATABASE_URL`, fails closed
+   (`45004`). The runtime identity must never require cluster administration,
+   and the migration identity must never be the normal serving credential
+   (ADR-016/ADR-017/ADR-018). SQLite keeps its single-identity local path.
 6d. **Migrations are serialized.** Only one process may execute the Alembic
    chain at a time; concurrent application startups must wait, take over an
    expired lease, or fail closed — never execute the same DDL concurrently.
@@ -118,10 +128,11 @@ Founder acceptance.
    (`python -m app.migrate bootstrap-lease --verify`) reports state and never
    changes installed protocol versions; upgrades use
    `--upgrade-protocol N`, never a direct `UPDATE installed_version`.
-6f. **Future application tables carry runtime DML by default.** In the
-   production database `strikenova`, default privileges bound to the
-   migration/creator role (`ALTER DEFAULT PRIVILEGES FOR ROLE
-   strikenova_prod_migrator IN SCHEMA public`) grant the runtime role
+6f. **Future application tables carry runtime DML by default.** Default
+   privileges are bound to the role that actually creates application objects
+   and are **schema-scoped** (`... IN SCHEMA public`), never global: in
+   Topology B that creator is `strikenova_prod_owner`, in Topology A it is the
+   migrator itself. They grant the runtime role
    `strikenova_production_app` SELECT / INSERT / UPDATE / DELETE on future
    tables and USAGE on future sequences, so a migration that creates
    objects never requires a follow-up manual grant for the serving

@@ -26,7 +26,15 @@ new migrations require independent evidence of a schema-contract gap. Evidence:
 `docs/PHASE_10_1A_DATABASE_MIGRATIONS.md`, `backend/alembic/`,
 `backend/tests/test_day5_alembic_authority.py`.
 
-## ADR-003 · Database portability with CockroachDB production target · Accepted
+## ADR-003 · Database portability with CockroachDB production target · Superseded by ADR-019
+
+> **Superseded (ADR-019, accepted on `main` in PR #148, 2026-11-20).**
+> CockroachDB is **retired**; the accepted strategic production database is
+> **Neon PostgreSQL** (PostgreSQL 16). Neon provisioning and production cutover
+> are separate authorized work and are **not** complete. The historical
+> CockroachDB evidence cited below is retained as historical record and is not
+> active target configuration. ADR-017/018 (the row-lock migration lease) is
+> PostgreSQL-only; `app/db.py` refuses an unleased CockroachDB migration path.
 
 The backend stays portable: SQLite for local development, PostgreSQL-compatible
 CI (service container), CockroachDB validated as the production runtime
@@ -34,14 +42,23 @@ CI (service container), CockroachDB validated as the production runtime
 Evidence: `docs/architecture/COCKROACH_RUNTIME_VALIDATION.md`,
 `docs/architecture/COCKROACH_LIVE_COMPATIBILITY_VALIDATION.md`,
 `backend/tests/test_cockroachdb_compat.py`, CI `PostgreSQL compatibility`.
+(Historical.)
 
-## ADR-004 · Railway superseded; production topology is Vercel/Render/CockroachDB · Accepted
+## ADR-004 · Railway superseded; production topology is Vercel/Render/Neon PostgreSQL · Superseded database target (ADR-019)
+
+> **Database target superseded (ADR-019, accepted on `main` in PR #148).** The
+> topology is frontend on **Vercel**, backend on **Render**, strategic production
+> database **Neon PostgreSQL** — not CockroachDB Cloud. Neither the Neon
+> instance nor any live role/grant configuration exists as part of this work;
+> no Render or Neon change is authorized here. The CockroachDB wording below is
+> historical.
 
 Railway was an early staging experiment (see `docs/RAILWAY_INFRASTRUCTURE_AUDIT.md`,
 2026-08-31 — historical). Current topology: frontend on **Vercel**, backend on
 **Render**, production database on **CockroachDB Cloud**. Evidence:
 `docs/architecture/VERCEL_STAGING_DEPLOYMENT.md`,
 `docs/architecture/RENDER_STAGING_DEPLOYMENT.md`, `frontend/vercel.json`.
+(Historical database target.)
 
 ## ADR-005 · BYOB broker architecture · Accepted
 
