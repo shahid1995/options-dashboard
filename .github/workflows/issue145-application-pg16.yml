@@ -148,6 +148,18 @@ jobs:
               echo "the integration suite produced no passing tests"
               status=1
             fi
+            # PostgreSQL provisioning is mandatory here: a suite that skipped
+            # everything must not look like a pass.
+            if grep -qE "[0-9]+ skipped" issue145-application.log; then
+              echo "::error::the integration suite skipped tests"
+              status=1
+            fi
+            passed=$(grep -oE "[0-9]+ passed" issue145-application.log | head -n1 | cut -d' ' -f1)
+            echo "integration tests passed: ${passed:-0}"
+            if [ -z "${passed:-}" ] || [ "$passed" -lt 22 ]; then
+              echo "::error::unexpectedly few integration tests (${passed:-0} < 22)"
+              status=1
+            fi
           else
             status=1
           fi
