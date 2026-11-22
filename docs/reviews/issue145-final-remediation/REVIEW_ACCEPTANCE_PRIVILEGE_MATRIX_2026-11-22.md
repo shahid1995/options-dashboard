@@ -1,5 +1,11 @@
 # Issue #145 — privilege-matrix closure and identity-fallback narrowing
 
+> **Historical.** This report records the `c872a58` pass. The current head's
+> evidence — including the migration-connection identity enforcement, the
+> incoming-membership model and the `71`/`160` gate counts — is in
+> [`REVIEW_ACCEPTANCE_MIGRATION_IDENTITY_2026-11-22.md`](REVIEW_ACCEPTANCE_MIGRATION_IDENTITY_2026-11-22.md).
+> Its `63`/`156` figures are superseded.
+
 **Branch:** `issue-145-fix` · **PR:** [#146](https://github.com/shahid1995/options-dashboard/pull/146) (Draft, open, unmerged)
 **Starting HEAD verified:** `5eb2bf2139c8665b77ede0616e5b71f3497741ee`
 **Remediation commit:** `c872a58e71cdc53f480d267b5da1082c935d9ecb` *(the report commit is a follow-up on top of it)*
