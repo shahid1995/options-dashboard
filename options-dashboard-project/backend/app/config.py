@@ -1,3 +1,4 @@
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -20,8 +21,8 @@ class Settings(BaseSettings):
     ALLOW_LOCALHOST_CORS: bool = False
     DEBUG: bool = False
     # Paper trading journal database. Defaults to a local SQLite file; point at
-    # a PostgreSQL URL (e.g. a Railway Postgres DATABASE_URL) for durable,
-    # shared production storage.
+    # a PostgreSQL URL (e.g. a Neon PostgreSQL DATABASE_URL per ADR-019) for
+    # durable, shared production storage.
     DATABASE_URL: str | None = None
     # Historical IV foundation (Phase 4.1): the persistence model and
     # repository exist, but collection is DISABLED by default. A future phase
@@ -62,6 +63,148 @@ class Settings(BaseSettings):
 
     # Phase 10.2B-6: Optional backend URL for auto-deriving UPSTOX_REDIRECT_URI
     BACKEND_URL: str = ""
+
+    # ---- ADR-017 / ADR-018 migration configuration (foundation only) ----
+    # This block defines the configuration contract for the PostgreSQL
+    # migration lease and the dedicated migration identity. Nothing here
+    # connects to a database, and no enforcement is wired up in this change:
+    # the fail-closed behaviour (missing or identical migration identity on
+    # PostgreSQL is refused) is implemented by the lease module and startup
+    # guard slice. There is deliberately no single-identity fallback and a
+    # missing STRIKENOVA_MIGRATION_DATABASE_URL never implies permission to
+    # reuse the runtime identity.
+    #
+    # Provider-neutral environment selector ("production", "staging",
+    # "development", ...). "production" (case-insensitive) is THE production
+    # signal, so it works identically on any host (Neon, Render, a VM,
+    # a disposable rehearsal cluster).
+    STRIKENOVA_ENV: str = ""
+
+    # ADR-017/018: the URL for the dedicated migration identity. Required
+    # whenever DATABASE_URL is PostgreSQL; it must resolve to a different
+    # database identity than DATABASE_URL. SQLite keeps its historical
+    # single-process behaviour and ignores this setting.
+    STRIKENOVA_MIGRATION_DATABASE_URL: str | None = None
+
+    # ADR-018 target-identity proof: explicit equivalence declarations for the
+    # rare case where one logical database is reachable through two hostnames
+    # (for example a Neon pooled route and its direct route). Comma-separated
+    # ``hostA=hostB`` pairs, literal hosts only. Empty (the default) means a
+    # different host is a different database.
+    STRIKENOVA_MIGRATION_TARGET_ALIASES: str = ""
+
+    # ADR-017 (migration lease): the transactional lease that guarantees only
+    # one process executes the migration chain (and the startup backfill) at a
+    # time. There is no renewal thread; long work refreshes the lease at every
+    # transaction boundary, so the TTL must exceed the slowest single protected
+    # transaction (one DDL transaction or one per-user backfill transaction).
+    #
+    # Defaults per ADR-017 §9 and the disposable PostgreSQL 16.16 measurements
+    # recorded in the design document: the whole Alembic chain and each
+    # per-user backfill transaction complete in seconds, so 300 s leaves a wide
+    # margin while keeping crash recovery bounded. The statement timeout is
+    # half the TTL so a runaway user transaction fails (57014) before
+    # ownership can expire.
+    MIGRATION_LEASE_TTL_SECONDS: float = 300.0
+    #: Bounded wait for the admission lock/acquisition retries.
+    MIGRATION_LEASE_WAIT_SECONDS: float = 180.0
+    #: Per-call lock_timeout handed to the lease functions (1..600000 ms).
+    MIGRATION_LEASE_LOCK_TIMEOUT_MS: int = 10000
+    #: statement_timeout for each per-user backfill transaction (< TTL).
+    MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS: int = 150000
+
+    # ADR-018 identity names. The runtime identity must hold zero access to
+    # migration_internal. STRIKENOVA_OWNER_ROLE is empty for Topology A (the
+    # migrator owns what Alembic creates) and is set only for Topology B (a
+    # separate NOLOGIN owner reached through an explicit SET ROLE window).
+    # Staging and preview environments must set their actual role names
+    # explicitly instead of relying on the production defaults.
+    STRIKENOVA_MIGRATOR_ROLE: str = "strikenova_prod_migrator"
+    STRIKENOVA_RUNTIME_ROLE: str = "strikenova_production_app"
+    STRIKENOVA_OWNER_ROLE: str = ""
+
+    # Optional per-run nonce used only to correlate a rehearsal's lease
+    # tokens. It is never published and never logged.
+    STRIKENOVA_LEASE_NONCE: str = ""
+
+    @field_validator("MIGRATION_LEASE_TTL_SECONDS")
+    @classmethod
+    def _validate_lease_ttl(cls, v: float) -> float:
+        if not (0 < v <= 86400):
+            raise ValueError(
+                "MIGRATION_LEASE_TTL_SECONDS must be > 0 and <= 86400: the "
+                "database rejects any other TTL with SQLSTATE 45004"
+            )
+        return v
+
+    @field_validator("MIGRATION_LEASE_WAIT_SECONDS")
+    @classmethod
+    def _validate_lease_wait(cls, v: float) -> float:
+        if not (v > 0):
+            raise ValueError(
+                "MIGRATION_LEASE_WAIT_SECONDS must be positive: a zero budget "
+                "would fail every attempt without waiting for a peer to finish"
+            )
+        return v
+
+    @field_validator("MIGRATION_LEASE_LOCK_TIMEOUT_MS")
+    @classmethod
+    def _validate_lease_lock_timeout(cls, v: int) -> int:
+        # PostgreSQL treats lock_timeout = 0 as "wait forever"; the lease
+        # functions reject it. Fail fast at the configuration boundary.
+        if not (1 <= v <= 600000):
+            raise ValueError(
+                "MIGRATION_LEASE_LOCK_TIMEOUT_MS must be between 1 and 600000; "
+                "0 means wait forever in PostgreSQL and is refused"
+            )
+        return v
+
+    @field_validator("MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS")
+    @classmethod
+    def _validate_backfill_statement_timeout(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(
+                "MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS must be positive"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _validate_statement_timeout_below_lease_ttl(self) -> "Settings":
+        """A per-user backfill transaction must fail before ownership can expire.
+
+        The rule is strict: the statement timeout must be *below* the lease
+        TTL, so equality is rejected as well. The defaults (300 s TTL,
+        150 000 ms timeout) satisfy it with a wide margin.
+        """
+        ttl_ms = self.MIGRATION_LEASE_TTL_SECONDS * 1000.0
+        if self.MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS >= ttl_ms:
+            raise ValueError(
+                "MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS "
+                f"({self.MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS} ms) must be "
+                "strictly below MIGRATION_LEASE_TTL_SECONDS * 1000 "
+                f"({ttl_ms:.0f} ms): a backfill transaction that outlives the "
+                "lease would let ownership expire mid-work"
+            )
+        return self
+
+    @property
+    def IS_PRODUCTION(self) -> bool:
+        """Detect production environments.
+
+        Primary signal is the provider-neutral ``STRIKENOVA_ENV=production``
+        (case-insensitive). The legacy Railway-era indicators are retained for
+        backward compatibility with deployments that predate the neutral
+        marker.
+        """
+        import os as _os
+
+        if self.STRIKENOVA_ENV.strip().lower() == "production":
+            return True
+        return bool(
+            _os.environ.get("RAILWAY_ENVIRONMENT")
+            or _os.environ.get("RAILWAY_SERVICE_NAME")
+            or _os.environ.get("PRODUCTION")
+        )
 
     @property
     def FRONTEND_ORIGIN(self) -> str:
