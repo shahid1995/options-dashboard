@@ -96,14 +96,14 @@ def test_init_db_uses_alembic(monkeypatch, temp_engine):
             ).fetchall()
         }
 
-    # All 24 application tables + alembic_version
+    # All application tables + alembic_version
     assert "users" in tables
     assert "user_sessions" in tables
     assert "trades" in tables
     assert "positions" in tables
     assert "paper_orders" in tables
     assert "alembic_version" in tables
-    assert len(tables) == 27  # 26 app tables + alembic_version (10.2B-1 added broker_connections, broker_tokens)
+    assert len(tables) == 31  # 30 app tables + alembic_version (10.2B-1 added broker_connections, broker_tokens; f2a7c9d1e4b8 added the four delivery tables)
 
 
 def test_init_db_creates_legacy_columns_via_baseline(monkeypatch, temp_engine):
