@@ -1,3 +1,5 @@
+import math
+
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings
 
@@ -140,10 +142,15 @@ class Settings(BaseSettings):
     @field_validator("MIGRATION_LEASE_WAIT_SECONDS")
     @classmethod
     def _validate_lease_wait(cls, v: float) -> float:
-        if not (v > 0):
+        # A non-finite budget would defeat the admission deadline: NaN compares
+        # false against every bound and an infinite budget never expires, so
+        # either could leave startup retrying without limit. Require a finite,
+        # strictly positive number of seconds.
+        if not math.isfinite(v) or v <= 0:
             raise ValueError(
-                "MIGRATION_LEASE_WAIT_SECONDS must be positive: a zero budget "
-                "would fail every attempt without waiting for a peer to finish"
+                "MIGRATION_LEASE_WAIT_SECONDS must be finite and positive: "
+                "NaN and infinities never expire, and a zero budget would fail "
+                "every attempt without waiting for a peer to finish"
             )
         return v
 
@@ -191,15 +198,16 @@ class Settings(BaseSettings):
     def IS_PRODUCTION(self) -> bool:
         """Detect production environments.
 
-        Primary signal is the provider-neutral ``STRIKENOVA_ENV=production``
-        (case-insensitive). The legacy Railway-era indicators are retained for
-        backward compatibility with deployments that predate the neutral
-        marker.
+        Precedence: a non-empty ``STRIKENOVA_ENV`` is authoritative, so an
+        explicit ``staging``/``preview``/``development`` value overrides a
+        stale legacy marker. Only when it is empty are the legacy Railway-era
+        indicators consulted, for deployments that predate the neutral marker.
         """
         import os as _os
 
-        if self.STRIKENOVA_ENV.strip().lower() == "production":
-            return True
+        selector = self.STRIKENOVA_ENV.strip().lower()
+        if selector:
+            return selector == "production"
         return bool(
             _os.environ.get("RAILWAY_ENVIRONMENT")
             or _os.environ.get("RAILWAY_SERVICE_NAME")
