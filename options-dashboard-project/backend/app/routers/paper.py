@@ -797,6 +797,7 @@ async def submit_exit_intent(
     # 3. Resolve market prices for all target positions
     try:
         # Build pseudo-legs for the existing market-price resolver
+        from app.models import Position as PositionModel
         from app.routers.paper import resolve_bulk_market_prices
 
         # Collect unique positions
@@ -804,7 +805,7 @@ async def submit_exit_intent(
         position_objects: list = []
         for t in targets:
             if t.position_id not in seen_positions:
-                pos = db.get(Position, t.position_id)
+                pos = db.get(PositionModel, t.position_id)
                 if pos is not None:
                     position_objects.append(pos)
                     seen_positions.add(t.position_id)
