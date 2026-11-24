@@ -1,15 +1,16 @@
-"""Regression test for the paper exit-intent Position reference defect.
+"""Regression tests for the paper exit-intent Position reference defect.
 
 POST /paper/exit-intent previously referenced an undefined ``Position`` name
 inside the market-price resolution loop, raising ``NameError`` and returning
-HTTP 500. This test fails against the original implementation and passes once
+HTTP 500. These tests fail against the original implementation and pass once
 the mapped SQLAlchemy ``Position`` model is resolved at that point.
 """
 
-import pytest
+import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -18,8 +19,11 @@ from sqlalchemy.pool import StaticPool
 from app.db import Base, get_db
 from app.main import app
 from app.models import Position
-from app.services import token_store
-from app.services.execution_intent import ExecutionResult, ExecutionStatus, ExecutionMode
+from app.services.execution_intent import (
+    ExecutionMode,
+    ExecutionResult,
+    ExecutionStatus,
+)
 from tests.test_helpers import create_test_identity
 
 EXPIRY = "2026-08-21"
@@ -74,6 +78,7 @@ def logged_in(client, db_session):
 
 def _account(db, user_id):
     from app.models import PaperAccount
+
     acc = PaperAccount(user_id=user_id, starting_capital=500000)
     db.add(acc)
     db.flush()
@@ -92,8 +97,8 @@ def _position(db, user_id):
 
 
 def _exposure(db, user_id, position_id):
-    from app.models import StrategyLegExposure, StrategyExecution
-    # ensure a strategy execution exists for attribution
+    from app.models import StrategyExecution, StrategyLegExposure
+
     se = StrategyExecution(
         user_id=user_id, execution_id="exec-ei", client_order_id="coid-ei",
         strategy_tag="Bull Call", symbol="NIFTY", status="FILLED", entry_net=0.0,
@@ -118,16 +123,6 @@ def test_exit_intent_resolves_position_model(client, logged_in, db_session):
     _exposure(db_session, uid, pos.id)
     db_session.commit()
 
-    # Spy on db.get to prove the mapped Position model and expected id are used.
-    original_get = db_session.get
-    get_calls = []
-
-    def spy(model, ident, *a, **k):
-        get_calls.append((model, ident))
-        return original_get(model, ident, *a, **k)
-
-    db_session.get = spy
-
     mock_router = MagicMock()
     mock_router.execute_intent = AsyncMock(return_value=ExecutionResult(
         intent_id="intent-test", status=ExecutionStatus.SUCCESS,
@@ -135,8 +130,9 @@ def test_exit_intent_resolves_position_model(client, logged_in, db_session):
     ))
 
     prices = {("NIFTY", EXPIRY, 25000.0, "call"): 155.0}
+    mock_resolve = AsyncMock(return_value=prices)
 
-    with patch("app.routers.paper.resolve_bulk_market_prices", new=AsyncMock(return_value=prices)), \
+    with patch("app.routers.paper.resolve_bulk_market_prices", new=mock_resolve), \
          patch("app.services.execution_intent.ExecutionRouter", return_value=mock_router):
         resp = client.post(
             "/paper/exit-intent",
@@ -155,12 +151,71 @@ def test_exit_intent_resolves_position_model(client, logged_in, db_session):
     data = resp.json()
     assert data["status"] == "SUCCESS"
 
-    # The endpoint's market-price loop must have looked up the real Position model
-    # with the expected position identifier.
-    matching = [c for c in get_calls if c[1] == pos.id]
-    assert matching, "db.get was not called with the expected position id"
-    assert any(c[0] is Position for c in matching), \
-        "db.get was not called with the mapped Position model"
+    # The market-price resolver must be awaited exactly once.
+    mock_resolve.assert_awaited_once()
+
+    # Its position collection must contain the actual expected mapped Position
+    # instance associated with pos.id, distinct from the earlier selector
+    # resolution lookup.
+    call = mock_resolve.await_args
+    if call.args and len(call.args) >= 2:
+        positions_arg = call.args[1]
+    else:
+        positions_arg = call.kwargs.get("positions")
+    positions_list = list(positions_arg)
+    assert pos in positions_list, "expected Position instance not passed to resolver"
+    assert any(
+        isinstance(p, Position) and getattr(p, "id", None) == pos.id
+        for p in positions_list
+    ), "resolver did not receive the mapped Position model for pos.id"
+
+
+def test_exit_intent_rejects_foreign_position(client, db_session):
+    session_id, caller_uid = create_test_identity(db_session, "tok-exit-intent-foreign")
+    _account(db_session, caller_uid)
+
+    # Create a foreign user + position without overwriting the caller's identity
+    # stored on the test session.
+    foreign_uid = str(uuid.uuid4())
+    from app.identity import User
+
+    db_session.add(User(id=foreign_uid, status="active", identity_source="email",
+                        broker_provider=None))
+    db_session.flush()
+    foreign_pos = _position(db_session, foreign_uid)
+    db_session.commit()
+
+    assert db_session._test_user_id == caller_uid
+
+    mock_resolve = AsyncMock(return_value={})
+    mock_router = MagicMock()
+    mock_router.execute_intent = AsyncMock()
+
+    with patch("app.routers.paper.resolve_bulk_market_prices", new=mock_resolve), \
+         patch("app.services.execution_intent.ExecutionRouter", return_value=mock_router):
+        resp = client.post(
+            "/paper/exit-intent",
+            headers={"X-Session-Id": session_id},
+            json={
+                "client_order_id": "ei-foreign-001",
+                "scope": "POSITION",
+                "position_id": foreign_pos.id,
+                "option_type": "CALL",
+                "action": "BUY",
+                "quantity_mode": "ALL",
+            },
+        )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "REJECTED"
+    assert data["targets_resolved"] == 0
+    errors = data.get("errors") or []
+    assert any("TARGET_NOT_FOUND" in e for e in errors), errors
+
+    # Rejection must occur before market-price resolution or execution.
+    mock_resolve.assert_not_awaited()
+    mock_router.execute_intent.assert_not_awaited()
 
 
 def test_exit_intent_requires_authentication(client, db_session):
