@@ -122,7 +122,8 @@ class Settings(BaseSettings):
     # different host is a different database and is refused with SQLSTATE
     # 45004. A declaration never bypasses the connection-time proof that both
     # URLs reach one cluster: app.db._verify_logical_target compares the
-    # database name, postmaster start time and pg_database OID seen by each.
+    # pg_control_system() system_identifier, the database name and the
+    # pg_database OID seen by each (all restart-stable).
     STRIKENOVA_MIGRATION_TARGET_ALIASES: str = ""
 
     # ADR-017 (migration lease): the transactional lease that guarantees only

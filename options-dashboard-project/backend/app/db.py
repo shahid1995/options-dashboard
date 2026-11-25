@@ -132,11 +132,14 @@ def _runtime_identity_problems(
     return problems
 
 
-#: The cluster/database signature proven by startup preflight. The runtime
-#: engine is created at import time, before any connection can be proven, so
-#: the listener reads this shared holder on every new connection: empty means
-#: "not proven yet" (identity is still checked), set means every later runtime
-#: connection must reach exactly that target.
+#: The restart-stable cluster/database identity proven by startup preflight.
+#: The runtime engine is created at import time, before any connection can be
+#: proven, so the listener reads this shared holder on every new connection:
+#: empty means "not proven yet" (the principal is still checked), set means
+#: every later runtime connection must reach exactly that target. A PostgreSQL
+#: restart or Neon compute suspend/wake does not change this value, so a
+#: reconnection after either is accepted; a different cluster or database is
+#: not.
 _RUNTIME_TARGET_SIGNATURE: list = [None]
 
 
@@ -161,7 +164,7 @@ def _install_runtime_identity_guard(
             observed = cursor.fetchone()
             expected = _RUNTIME_TARGET_SIGNATURE[0]
             if expected is not None:
-                signature = _dbapi_logical_signature(cursor)
+                signature = _dbapi_logical_identity(cursor)
         finally:
             cursor.close()
             dbapi_connection.rollback()
@@ -174,9 +177,9 @@ def _install_runtime_identity_guard(
         if signature is not None and signature != _RUNTIME_TARGET_SIGNATURE[0]:
             problems.append(
                 "the runtime engine's new connection does not reach the same "
-                "PostgreSQL cluster/database proven during startup preflight "
-                f"(observed database {signature[0]!r}); refusing to serve "
-                "application queries on an unproven target"
+                "PostgreSQL cluster/database identity proven during startup "
+                f"preflight (observed database {signature[0]!r}); refusing to "
+                "serve application queries on an unproven target"
             )
         if problems:
             # Never embed the URL or password: only the observed identity and
@@ -828,12 +831,23 @@ def assert_guarded_migration_configuration(
     return migration_url
 
 
-#: SQLSTATEs that mean "this installation does not let this role read
+#: SQLSTATEs that mean "this installation does not let the connected role read
 #: ``pg_control_system()``": ``insufficient_privilege`` when the function's
-#: PUBLIC EXECUTE has been revoked (the documented hardening) and
+#: EXECUTE has been revoked (the documented hardening) and
 #: ``undefined_function`` when the server does not provide it at all. They are
-#: the only conditions under which weaker identity evidence is acceptable.
-_IDENTITY_FALLBACK_SQLSTATES = frozenset({"42501", "42883"})
+#: classified so the refusal names the exact remedy — never so the check can
+#: downgrade to evidence that a restart would invalidate.
+_IDENTITY_UNAVAILABLE_SQLSTATES = frozenset({"42501", "42883"})
+
+#: The whole privilege the restart-stable identity needs. ``pg_control_system()``
+#: is created by ``initdb`` with the default function ACL, which grants EXECUTE
+#: to ``PUBLIC`` (stock PostgreSQL 16 needs no grant at all); a hardened
+#: installation that revoked it can restore exactly this one function instead
+#: of granting administrative rights.
+_IDENTITY_GRANT_HINT = (
+    "grant EXECUTE on pg_control_system() to the runtime and migration "
+    "logins (stock PostgreSQL 16 grants it to PUBLIC)"
+)
 
 
 #: SQLite opening modes libpq-style URI parameters may request. ``rwc``,
@@ -924,65 +938,114 @@ def _assert_sqlite_migration_target(
     return migration_url
 
 
-def _cluster_system_identifier(conn) -> str | None:
-    """Read the cluster's ``system_identifier`` when the role may execute it.
+def _cluster_system_identifier(conn) -> str:
+    """Read the cluster's ``system_identifier``, the deterministic evidence.
 
     ``pg_control_system()`` is created with the default function ACL
     (``=X/<owner>``, i.e. PUBLIC EXECUTE) on stock PostgreSQL 16, so an
     ordinary LOGIN role reads it without superuser. PostgreSQL documents that
-    a hardened installation may revoke it; that refusal, and a server without
-    the function, return ``None`` so the caller can fall back to the
-    probabilistic fingerprint and say so.
+    a hardened installation may revoke it.
+
+    That revocation (and a server without the function) **fails closed**. The
+    only weaker evidence available is the postmaster start time, and a restart
+    or a compute suspend/wake changes it without changing the cluster; using it
+    as identity either rejects a legitimate reconnection or accepts a different
+    cluster. A target that cannot be identified in a restart-stable way is
+    therefore refused with the exact grant that restores the evidence, never
+    silently accepted.
 
     Every other failure — a lost connection, a timeout, a permissions error on
-    another object, a malformed query — raises instead of returning ``None``.
-    Treating an unexpected database error as "the function is unavailable"
-    would silently downgrade deterministic identity evidence.
+    another object, a malformed query — raises as well.
     """
     from sqlalchemy.exc import DBAPIError
 
     from app._migration_lease import sqlstate_of
 
     try:
-        return conn.exec_driver_sql(
+        value = conn.exec_driver_sql(
             "SELECT system_identifier::text FROM pg_control_system()"
         ).scalar()
     except DBAPIError as exc:
         state = sqlstate_of(exc)
-        if state in _IDENTITY_FALLBACK_SQLSTATES:
-            return None
+        if state in _IDENTITY_UNAVAILABLE_SQLSTATES:
+            raise _config_error(
+                "cannot read pg_control_system().system_identifier (SQLSTATE "
+                f"{state}); without it the target cannot be identified across "
+                "a PostgreSQL restart, so the connection is refused instead "
+                f"of being accepted on restart-unsafe evidence: "
+                f"{_IDENTITY_GRANT_HINT}"
+            ) from None
         raise _config_error(
             "cannot read pg_control_system().system_identifier from one of the "
-            f"connections (SQLSTATE {state or 'none'}); refusing to fall back to "
-            "the probabilistic cluster fingerprint on an unexpected database error"
+            f"connections (SQLSTATE {state or 'none'}); refusing to prove the "
+            "target on an unexpected database error"
         ) from None
+    if not value:
+        raise _config_error(
+            "pg_control_system() returned no system_identifier; refusing an "
+            "unproven target"
+        )
+    return str(value)
 
 
 #: Canonical, timezone-independent postmaster start time in integer
 #: microseconds since the Unix epoch. ``pg_postmaster_start_time()::text``
 #: renders in the session's TimeZone, so two connections to the *same* cluster
-#: could disagree purely because they set different time zones. Epoch seconds
-#: are absolute; microseconds keep restarts within one second distinct.
+#: could disagree purely because they set different time zones.
+#:
+#: This value is **diagnostic only**. It changes on every restart, so it is
+#: never compared as identity: doing so would reject a legitimate reconnection
+#: after a PostgreSQL restart or a Neon compute suspend/wake.
 _POSTMASTER_START_SQL = (
     "(extract(epoch from pg_postmaster_start_time()) * 1000000)::bigint::text"
 )
 
 
-def _logical_target_signature(conn) -> tuple:
-    """Read the server-side identity of the cluster/database a connection sees.
+#: Fields of :func:`_logical_target_identity`, named for diagnostics.
+_TARGET_IDENTITY_FIELDS = ("database", "database_oid", "system_identifier")
 
-    ``system_identifier`` (when readable) is a 64-bit value generated by
-    ``initdb``. It is stable across restarts, identical for two connections to
-    one cluster, and different for any other cluster — deterministic identity
-    evidence. ``current_database()``, the canonical postmaster start epoch and
-    the database OID stay in the tuple: they are what remains comparable when
-    a provider has revoked ``pg_control_system()``.
+
+def _postmaster_start_epoch_us(conn) -> int:
+    """Read the server's start time as canonical epoch microseconds.
+
+    Diagnostic evidence only (see ``_POSTMASTER_START_SQL``): it proves that a
+    restart happened, and is what the restart regression test asserts on. It
+    is deliberately absent from :func:`_logical_target_identity`.
+    """
+    return int(conn.exec_driver_sql(f"SELECT {_POSTMASTER_START_SQL}").scalar())
+
+
+def _logical_target_identity(conn) -> tuple[str, int, str]:
+    """Read the restart-stable identity of the cluster/database a connection sees.
+
+    The tuple is ``(current_database(), pg_database.oid, system_identifier)``.
+    Every element lives in the data directory rather than in the server
+    process, so all three survive a restart, a crash recovery and a Neon
+    compute suspend/wake, while a different cluster (different
+    ``system_identifier``, generated by ``initdb``) or a different database in
+    the same cluster (different name and OID) still differs.
+
+    ``pg_postmaster_start_time()`` is intentionally not part of the tuple: it
+    changes on every restart without changing the target, so it could only be
+    used as identity by rejecting legitimate reconnections. It is read by
+    :func:`_postmaster_start_epoch_us` for diagnostics.
     """
     row = conn.exec_driver_sql(
-        f"SELECT current_database(), {_POSTMASTER_START_SQL}, "
+        "SELECT current_database(), "
         "(SELECT oid FROM pg_database WHERE datname = current_database())"
     ).one()
-    return (row[0], row[1], row[2], _cluster_system_identifier(conn))
+    if row[1] is None:
+        raise _config_error(
+            "the connected database has no pg_database row; refusing an "
+            "unproven target"
+        )
+    identifier = _cluster_system_identifier(conn)
+    if not identifier:
+        raise _config_error(
+            "the cluster identifier is empty; a target that cannot be "
+            "identified across a restart is refused rather than accepted"
+        )
+    return (str(row[0]), int(row[1]), identifier)
 
 
 def _verify_logical_target(
@@ -991,11 +1054,13 @@ def _verify_logical_target(
     """Prove, from the server, that both URLs reach one cluster and database.
 
     The static check compares what the URLs *say*. This check compares what the
-    server *is*: two connections that report the same database name, the same
-    postmaster start time and the same ``pg_database`` OID are served by one
-    PostgreSQL cluster. It runs after the static check and before the engine is
-    returned, so no caller can acquire the lease, run DDL or bootstrap on an
-    unproven target.
+    server *is*: two connections that report the same ``system_identifier``,
+    database name and ``pg_database`` OID are served by one cluster and one
+    database. All three live in the data directory, so the comparison survives
+    a PostgreSQL restart or a Neon compute suspend/wake; the postmaster start
+    time is read for diagnostics and never compared. It runs after the static
+    check and before the engine is returned, so no caller can acquire the
+    lease, run DDL or bootstrap on an unproven target.
 
     Errors raised here never include a URL: only the failing attribute and the
     observation are reported.
@@ -1016,7 +1081,8 @@ def _verify_logical_target(
     # reference while the target is re-proven, then publish the new evidence.
     _RUNTIME_TARGET_SIGNATURE[0] = None
     with migration_engine.connect() as conn:
-        observed = _logical_target_signature(conn)
+        observed = _logical_target_identity(conn)
+        migration_started = _postmaster_start_epoch_us(conn)
         conn.rollback()
 
     runtime_engine = _create_runtime_engine(
@@ -1024,7 +1090,8 @@ def _verify_logical_target(
     )
     try:
         with runtime_engine.connect() as conn:
-            runtime_observed = _logical_target_signature(conn)
+            runtime_observed = _logical_target_identity(conn)
+            runtime_started = _postmaster_start_epoch_us(conn)
             conn.rollback()
     finally:
         runtime_engine.dispose()
@@ -1039,32 +1106,34 @@ def _verify_logical_target(
             f"{observed[0]!r}, not the runtime database {expected_database!r}"
         )
 
-    # Deterministic evidence first: two connections served by one cluster read
-    # the same system_identifier, and any other cluster has a different one.
-    if observed[3] is not None and runtime_observed[3] is not None:
-        if observed[3] != runtime_observed[3]:
-            raise _config_error(
-                "the migration and runtime connections report different "
-                "PostgreSQL cluster identifiers (pg_control_system()."
-                "system_identifier differs); refusing to migrate a different "
-                "cluster"
-            )
-    else:
-        # PostgreSQL documents that pg_control_system() may be revoked in a
-        # hardened installation. Say so instead of silently presenting the
-        # weaker comparison as equivalent.
-        logger.warning(
-            "pg_control_system().system_identifier is not readable by %s; "
-            "falling back to the probabilistic fingerprint (database name, "
-            "postmaster start time, database OID)",
-            "one of the migration/runtime roles",
+    # Diagnostics only. A restart between the two preflight connections changes
+    # the server's start time, not the logical target, so it must not change
+    # the verdict — it is recorded so the restart is visible in the logs.
+    if migration_started != runtime_started:
+        logger.info(
+            "the PostgreSQL server restarted between the migration and runtime "
+            "preflight connections; the target identity is restart-stable, so "
+            "the same logical target is still accepted"
         )
 
-    if observed[:3] != runtime_observed[:3]:
+    # Deterministic, restart-stable evidence: two connections served by one
+    # cluster read the same initdb-generated system_identifier, and any other
+    # cluster has a different one.
+    if observed[2] != runtime_observed[2]:
         raise _config_error(
-            "the migration and runtime connections do not belong to the same "
-            "PostgreSQL cluster/database (database, postmaster start time or "
-            "database OID differ); refusing to migrate a different target"
+            "the migration and runtime connections report different "
+            "PostgreSQL cluster identifiers (pg_control_system()."
+            "system_identifier differs); refusing to migrate a different "
+            "cluster"
+        )
+
+    # Same cluster, different database: the name and the pg_database OID that
+    # lives in the data directory both have to agree.
+    if observed[:2] != runtime_observed[:2]:
+        raise _config_error(
+            "the migration and runtime connections report different databases "
+            "in one PostgreSQL cluster (database name or pg_database OID "
+            "differs); refusing to migrate a different target"
         )
 
     # Only a fully proven target becomes the per-connection reference. Every
@@ -1072,7 +1141,7 @@ def _verify_logical_target(
     if signature_holder is not None:
         signature_holder[0] = observed
     # The runtime engine's guard reads the same proof on every new connection,
-    # including pool reconnects and provider failover to another endpoint.
+    # including pool reconnects, restarts and provider failover.
     _RUNTIME_TARGET_SIGNATURE[0] = runtime_observed
 
 
@@ -1193,15 +1262,20 @@ def _assert_migration_session_identity(conn, *, stage: str) -> None:
         raise _config_error("; ".join(problems))
 
 
-def _dbapi_logical_signature(cursor) -> tuple:
-    """Server-side cluster/database signature from a raw DBAPI cursor.
+def _dbapi_logical_identity(cursor) -> tuple[str, int, str]:
+    """Restart-stable cluster/database identity from a raw DBAPI cursor.
 
     Used inside the migration engine's ``connect`` listener, before the
     connection can run any application statement, so a reconnect that fails
-    over to another cluster is rejected rather than trusted.
+    over to another cluster — or to another database in the same cluster — is
+    rejected rather than trusted. The postmaster start time is not read here:
+    it changes on every restart without changing the target.
+
+    An unreadable ``system_identifier`` fails closed with the exact grant that
+    restores the evidence; it never degrades to a restart-unsafe comparison.
     """
     cursor.execute(
-        f"SELECT current_database(), {_POSTMASTER_START_SQL}, "
+        "SELECT current_database(), "
         "(SELECT oid FROM pg_database WHERE datname = current_database())"
     )
     row = cursor.fetchone()
@@ -1211,13 +1285,24 @@ def _dbapi_logical_signature(cursor) -> tuple:
         system_identifier = cursor.fetchone()[0]
     except Exception as exc:  # noqa: BLE001 - classified immediately below
         state = getattr(exc, "sqlstate", None)
-        if state not in _IDENTITY_FALLBACK_SQLSTATES:
+        if state in _IDENTITY_UNAVAILABLE_SQLSTATES:
             raise _config_error(
                 "cannot read pg_control_system().system_identifier from a new "
-                f"migration connection (SQLSTATE {state or 'none'}); refusing to "
-                "accept an unproven target"
+                f"migration connection (SQLSTATE {state}); without it the "
+                "target cannot be identified across a PostgreSQL restart, so "
+                "the connection is refused: " + _IDENTITY_GRANT_HINT
             ) from None
-    return (row[0], row[1], row[2], system_identifier)
+        raise _config_error(
+            "cannot read pg_control_system().system_identifier from a new "
+            f"migration connection (SQLSTATE {state or 'none'}); refusing to "
+            "accept an unproven target"
+        ) from None
+    if not system_identifier or row[1] is None:
+        raise _config_error(
+            "a new migration connection reported an incomplete target identity; "
+            "refusing to accept an unproven target"
+        )
+    return (str(row[0]), int(row[1]), str(system_identifier))
 
 
 def _install_migration_identity_guard(
@@ -1232,8 +1317,10 @@ def _install_migration_identity_guard(
     wrong identity can never execute a statement on the migration path.
 
     Once ``expected_signature[0]`` is set by :func:`_verify_logical_target`,
-    every later connection must also report the same database, postmaster
-    start time, database OID and ``system_identifier``. That is what turns the
+    every later connection must also report the same database, database OID and
+    ``system_identifier`` — evidence that survives a restart. A postmaster
+    start time is not part of it, so reconnecting after a restart or a compute
+    suspend/wake is accepted for the same target. That is what turns the
     one-time preflight into a per-connection proof for reconnects and failover.
     """
     from sqlalchemy import event
@@ -1248,7 +1335,7 @@ def _install_migration_identity_guard(
             observed = cursor.fetchone()
             signature = None
             if expected_signature is not None and expected_signature[0] is not None:
-                signature = _dbapi_logical_signature(cursor)
+                signature = _dbapi_logical_identity(cursor)
         finally:
             cursor.close()
             dbapi_connection.rollback()
@@ -1260,7 +1347,7 @@ def _install_migration_identity_guard(
         if signature is not None and signature != expected_signature[0]:
             problems.append(
                 "the migration engine's new connection does not reach the same "
-                "PostgreSQL cluster/database proven during preflight "
+                "PostgreSQL cluster/database identity proven during preflight "
                 f"(observed database {signature[0]!r}); refusing to run lease "
                 "or DDL on an unproven target"
             )

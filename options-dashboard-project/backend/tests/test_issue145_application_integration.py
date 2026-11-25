@@ -1812,20 +1812,25 @@ def test_both_identities_read_one_cluster_system_identifier(pg_ready_a):
     runtime = create_engine(db_module.normalize_database_url(pg_ready_a.app_url))
     try:
         with migrator.connect() as conn:
-            migration_signature = db_module._logical_target_signature(conn)
+            migration_identity = db_module._logical_target_identity(conn)
         with runtime.connect() as conn:
-            runtime_signature = db_module._logical_target_signature(conn)
+            runtime_identity = db_module._logical_target_identity(conn)
     finally:
         migrator.dispose()
         runtime.dispose()
 
-    if not migration_signature[3] or not runtime_signature[3]:
+    if not migration_identity[2] or not runtime_identity[2]:
         raise AssertionError(
             "both identities must read pg_control_system().system_identifier on "
-            f"stock PostgreSQL 16; got {migration_signature[3]!r} and "
-            f"{runtime_signature[3]!r}"
+            f"stock PostgreSQL 16; got {migration_identity[2]!r} and "
+            f"{runtime_identity[2]!r}"
         )
-    assert migration_signature == runtime_signature
+    assert migration_identity == runtime_identity
+    if len(migration_identity) != len(db_module._TARGET_IDENTITY_FIELDS):
+        raise AssertionError(
+            "the identity must contain exactly "
+            f"{db_module._TARGET_IDENTITY_FIELDS}, got {migration_identity!r}"
+        )
 
 
 def test_guarded_upgrade_refuses_runtime_public_create(pg_topology_a):
@@ -1846,20 +1851,33 @@ def test_guarded_upgrade_refuses_runtime_public_create(pg_topology_a):
         raise AssertionError(f"unexpected refusal output: {output[-2000:]}")
 
 
-def test_logical_target_verification_uses_the_cluster_identifier(
-    pg_ready_a, caplog
-):
-    """The real guarded path takes the deterministic branch, not the fallback."""
-    caplog.set_level(logging.WARNING, logger="app.db")
+def test_logical_target_verification_uses_the_cluster_identifier(pg_ready_a):
+    """The real guarded path publishes a restart-stable proven identity."""
+    from sqlalchemy import create_engine
+
     engine = db_module._migration_engine()
     try:
-        assert not [
-            record
-            for record in caplog.records
-            if "system_identifier" in record.getMessage()
-        ]
+        published = db_module._RUNTIME_TARGET_SIGNATURE[0]
+        probe = create_engine(db_module.normalize_database_url(pg_ready_a.app_url))
+        try:
+            with probe.connect() as conn:
+                live = db_module._logical_target_identity(conn)
+                conn.rollback()
+        finally:
+            probe.dispose()
     finally:
         engine.dispose()
+    if published is None:
+        raise AssertionError("startup preflight did not publish a runtime identity")
+    if not published[2]:
+        raise AssertionError(
+            f"the published identity carries no cluster identifier: {published!r}"
+        )
+    if published != live:
+        raise AssertionError(
+            "the published runtime identity does not match the live target: "
+            f"{published!r} != {live!r}"
+        )
 
 
 def test_logical_target_refuses_a_different_cluster_identifier(
@@ -1903,11 +1921,19 @@ class _FailingConnection:
         )
 
 
-def test_cluster_identifier_only_degrades_for_documented_refusals():
-    """42501 (revoked) and 42883 (absent function) are the fallback cases."""
+def test_unreadable_cluster_identifier_is_refused_with_the_remedy():
+    """42501 (revoked) and 42883 (absent) refuse instead of degrading."""
     for state in ("42501", "42883"):
-        if db_module._cluster_system_identifier(_FailingConnection(state)) is not None:
-            raise AssertionError(f"SQLSTATE {state} must use the documented fallback")
+        with pytest.raises(LeaseError) as exc:
+            db_module._cluster_system_identifier(_FailingConnection(state))
+        _assert_sqlstate(exc, "45004")
+        message = str(exc.value)
+        if state not in message:
+            raise AssertionError(f"the refusal must name SQLSTATE {state}: {message}")
+        if "grant EXECUTE on pg_control_system()" not in message:
+            raise AssertionError(
+                f"the refusal must name the one grant that restores it: {message}"
+            )
 
 
 def test_cluster_identifier_unexpected_error_fails_closed():
@@ -1916,15 +1942,20 @@ def test_cluster_identifier_unexpected_error_fails_closed():
         db_module._cluster_system_identifier(_FailingConnection("08006"))
     _assert_sqlstate(exc, "45004")
     message = str(exc.value)
-    if "08006" not in message or "refusing to fall back" not in message:
+    if "08006" not in message or "refusing to prove the target" not in message:
         raise AssertionError(f"unexpected refusal message: {message}")
 
 
-def test_logical_target_warns_when_the_identifier_is_revoked(pg_ready_a, caplog):
-    """The real documented refusal degrades loudly and still proves the target."""
+def test_logical_target_refuses_when_the_identifier_is_revoked(pg_ready_a):
+    """The real documented revocation refuses instead of proving weakly.
+
+    Postmaster start time is not identity: after a restart the weaker
+    fingerprint would either reject the real target or accept another one, so
+    an unreadable ``system_identifier`` fails closed with the exact grant.
+    """
     from sqlalchemy import create_engine
 
-    caplog.set_level(logging.WARNING, logger="app.db")
+    saved = db_module._RUNTIME_TARGET_SIGNATURE[0]
     _admin_exec(
         pg_ready_a,
         "REVOKE EXECUTE ON FUNCTION pg_control_system() FROM PUBLIC",
@@ -1935,49 +1966,53 @@ def test_logical_target_warns_when_the_identifier_is_revoked(pg_ready_a, caplog)
         )
         try:
             with probe.connect() as conn:
-                if db_module._cluster_system_identifier(conn) is not None:
-                    raise AssertionError(
-                        "a revoked pg_control_system() must not return an identifier"
-                    )
+                with pytest.raises(LeaseError) as exc:
+                    db_module._cluster_system_identifier(conn)
         finally:
             probe.dispose()
+        _assert_sqlstate(exc, "45004")
+        if "grant EXECUTE on pg_control_system()" not in str(exc.value):
+            raise AssertionError(f"unexpected refusal: {exc.value}")
 
         engine = create_engine(
             db_module.normalize_database_url(pg_ready_a.migrator_url)
         )
         try:
-            db_module._verify_logical_target(engine)
+            with pytest.raises(LeaseError) as exc:
+                db_module._verify_logical_target(engine)
         finally:
             engine.dispose()
+        _assert_sqlstate(exc, "45004")
+        if "system_identifier" not in str(exc.value):
+            raise AssertionError(f"unexpected refusal: {exc.value}")
+        if db_module._RUNTIME_TARGET_SIGNATURE[0] is not None:
+            raise AssertionError(
+                "an unproven target must not be published as the runtime reference"
+            )
     finally:
         _admin_exec(
             pg_ready_a,
             "GRANT EXECUTE ON FUNCTION pg_control_system() TO PUBLIC",
         )
-    if not any(
-        "system_identifier is not readable" in record.getMessage()
-        for record in caplog.records
-    ):
-        raise AssertionError("the weaker-evidence warning was not logged")
+        db_module._RUNTIME_TARGET_SIGNATURE[0] = saved
 
 
-def test_logical_target_falls_back_explicitly_without_the_identifier(
-    pg_ready_a, monkeypatch, caplog
+def test_logical_target_refuses_an_empty_cluster_identifier(
+    pg_ready_a, monkeypatch
 ):
-    """A revoked pg_control_system() degrades loudly, not silently."""
+    """Even a reader that yields nothing must not become an accepted target."""
     from sqlalchemy import create_engine
 
     monkeypatch.setattr(db_module, "_cluster_system_identifier", lambda conn: None)
-    caplog.set_level(logging.WARNING, logger="app.db")
     engine = create_engine(db_module.normalize_database_url(pg_ready_a.migrator_url))
     try:
-        db_module._verify_logical_target(engine)
+        with pytest.raises(LeaseError) as exc:
+            db_module._verify_logical_target(engine)
     finally:
         engine.dispose()
-    assert any(
-        "system_identifier is not readable" in record.getMessage()
-        for record in caplog.records
-    )
+    _assert_sqlstate(exc, "45004")
+    if "cannot be identified across a restart" not in str(exc.value):
+        raise AssertionError(f"unexpected refusal: {exc.value}")
 
 
 # ---------------------------------------------------------------------------
@@ -2708,7 +2743,7 @@ def test_new_migration_connection_must_reach_the_proven_database(pg_ready_a):
         )
         try:
             with other_engine.connect() as conn:
-                other_signature = db_module._logical_target_signature(conn)
+                other_signature = db_module._logical_target_identity(conn)
                 conn.rollback()
         finally:
             other_engine.dispose()
@@ -2751,7 +2786,7 @@ def test_new_runtime_connection_must_reach_the_proven_target(pg_ready):
     )
     try:
         with migrator.connect() as conn:
-            actual = db_module._logical_target_signature(conn)
+            actual = db_module._logical_target_identity(conn)
             conn.rollback()
     finally:
         migrator.dispose()
@@ -2761,7 +2796,6 @@ def test_new_runtime_connection_must_reach_the_proven_target(pg_ready):
         db_module._RUNTIME_TARGET_SIGNATURE[0] = (
             actual[0],
             actual[1],
-            actual[2],
             "different-cluster-identifier",
         )
         engine = db_module._create_runtime_engine(
@@ -2796,7 +2830,12 @@ def test_new_runtime_connection_must_reach_the_proven_target(pg_ready):
 
 
 def test_target_signature_is_timezone_independent(pg_ready):
-    """Two sessions with different TimeZone settings agree on the target."""
+    """Two sessions with different TimeZone settings agree on the target.
+
+    The identity itself must be timezone-independent, and the diagnostic
+    postmaster epoch must also agree: it is compared in reports, never as
+    identity.
+    """
     from sqlalchemy import create_engine
     from sqlalchemy.pool import NullPool
 
@@ -2807,20 +2846,33 @@ def test_target_signature_is_timezone_independent(pg_ready):
         with engine.connect() as utc, engine.connect() as kolkata:
             utc.exec_driver_sql("SET TIME ZONE 'UTC'")
             kolkata.exec_driver_sql("SET TIME ZONE 'Asia/Kolkata'")
-            first = db_module._logical_target_signature(utc)
-            second = db_module._logical_target_signature(kolkata)
+            first = db_module._logical_target_identity(utc)
+            second = db_module._logical_target_identity(kolkata)
+            first_started = db_module._postmaster_start_epoch_us(utc)
+            second_started = db_module._postmaster_start_epoch_us(kolkata)
             utc.rollback()
             kolkata.rollback()
     finally:
         engine.dispose()
     if first != second:
         raise AssertionError(
-            "the target signature depends on the session time zone: "
+            "the target identity depends on the session time zone: "
             f"{first!r} != {second!r}"
         )
-    if not str(first[1]).lstrip("-").isdigit():
+    if first_started != second_started:
         raise AssertionError(
-            f"the postmaster start time is not canonical epoch microseconds: {first[1]!r}"
+            "the postmaster start diagnostic depends on the session time zone: "
+            f"{first_started!r} != {second_started!r}"
+        )
+    if not str(first_started).lstrip("-").isdigit():
+        raise AssertionError(
+            "the postmaster start time is not canonical epoch microseconds: "
+            f"{first_started!r}"
+        )
+    if first_started in first:
+        raise AssertionError(
+            "the postmaster start time must not be part of the target identity: "
+            f"{first!r} contains {first_started!r}"
         )
 
 

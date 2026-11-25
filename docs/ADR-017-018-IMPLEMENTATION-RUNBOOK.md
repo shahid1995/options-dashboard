@@ -194,10 +194,11 @@ whose `?user=` parameter authenticates as the migrator while its authority
 username still looks like the application.
 
 The target proof is no longer one-time. After the first fully proven migration
-connection, `_install_migration_identity_guard` records the cluster/database
-signature and every later migration connection re-reads and must match it
-before it may execute a statement. A reconnect or failover to another cluster
-is refused (`45004`) before the lease, DDL or backfill can use it.
+connection, `_install_migration_identity_guard` records the restart-stable
+cluster/database identity and every later migration connection re-reads and
+must match it before it may execute a statement. A reconnect or failover to
+another cluster is refused (`45004`) before the lease, DDL or backfill can use
+it, while a reconnection after a restart of the *same* server is accepted.
 
 **Supported endpoint topology.** One PostgreSQL cluster, one database, two
 logins. A second route to that same endpoint (the Neon pooled host
@@ -214,24 +215,49 @@ distinct, and the ports must match. A declaration alone is not proof, so after
 the static check `_verify_logical_target` opens both URLs and compares what the
 server reports, and refuses (`45004`) when they differ.
 
-The primary evidence is **deterministic**: `pg_control_system().system_identifier`,
-the 64-bit value PostgreSQL generates in `initdb`. It is stable across restarts,
-identical for every connection to one cluster (primaries and their replicas),
-and different for any other cluster. It is readable without superuser on stock
-PostgreSQL 16: the function is created with the default function ACL, which
-grants `EXECUTE` to `PUBLIC` (`=X/<owner>`), so both the runtime and the
-migration LOGIN read it directly. PostgreSQL documents that a hardened
-installation may revoke it; when either connection cannot read it, the check
-falls back to the probabilistic fingerprint below and logs a warning naming the
-fallback, so the weaker evidence is never presented as the stronger one.
+**The identity is restart-stable.** It is the tuple
 
-The fallback fingerprint is `current_database()`, `pg_postmaster_start_time()`
-and the `pg_database` OID of the connected database. Two routes that reach one
-cluster and one database agree on all three; a second cluster, a replica of
-another database or a pooled route to a different project almost certainly does
-not, but these values are not a cluster identity. There is no implicit
-`-pooler` suffix heuristic and no wildcard: an undeclared different host is a
-different database.
+```
+(current_database(), pg_database.oid, pg_control_system().system_identifier)
+```
+
+All three values live in the data directory rather than in the server process,
+so all three survive a PostgreSQL restart, crash recovery and a Neon compute
+suspend/wake. `system_identifier` is the 64-bit value `initdb` generates: it is
+identical for every connection to one cluster (primaries and replicas) and
+different for any other cluster. It is readable without superuser on stock
+PostgreSQL 16 because the function is created with the default function ACL,
+which grants `EXECUTE` to `PUBLIC` (`=X/<owner>`), so both the runtime and the
+migration LOGIN read it directly.
+
+`pg_postmaster_start_time()` is deliberately **not** part of the identity. It
+changes on every restart without changing the target, so using it as identity
+can only reject a legitimate reconnection after a restart or a compute
+suspend/wake. It is still read (canonical epoch microseconds, timezone-free)
+as a diagnostic: a restart observed between the two preflight connections is
+logged and does not change the verdict. `tests/test_issue145_pg_restart.py`
+proves this against a real server process restart on an unchanged data
+directory.
+
+**What the server-side proof does and does not establish.** It proves that two
+connections (and every later reconnection) reach one PostgreSQL cluster and one
+database. It does **not** identify a Neon branch, project or compute endpoint:
+Neon branches are copy-on-write forks, so a branch shares its parent's
+`system_identifier` and database OIDs. Branch/endpoint separation therefore
+rests on the *static* check above — an undeclared different host is refused
+before any connection is opened, and a declared alias is the operator's
+explicit statement that both routes are the same endpoint. There is no implicit
+`-pooler` suffix heuristic and no wildcard.
+
+**When the identifier is unreadable, the check fails closed.** PostgreSQL
+documents that a hardened installation may revoke `EXECUTE` on
+`pg_control_system()`. Without it the only remaining evidence is restart-unsafe,
+so the connection is refused (`45004`) with the exact remedy rather than
+accepted on a weaker comparison: grant `EXECUTE` on `pg_control_system()` to
+the runtime and migration logins. That is one function privilege which stock
+PostgreSQL 16 already grants to `PUBLIC`; no administrative or superuser
+privilege is required or introduced. Unexpected database errors (anything other
+than `42501`/`42883`) also fail closed.
 
 This connection-time proof runs in `_migration_engine()`, so every caller
 (`app.migrate` commands, startup migration, tests) fails before
@@ -588,16 +614,29 @@ rather than reasoned about.
 
 | Suite | Scope | Result |
 | --- | --- | --- |
-| `tests/test_issue145_application_integration.py` | real PG 16.16: concurrent `init_db()`, single connection, killed worker, injected failure, CLI, barrier, protocol, expiry, privileges, both ownership topologies, the Topology A §8.3 matrix and its restricted backfill, schema-ACL positive/negative controls, timing, **the §8.1 application privilege verifier (both topologies plus its negative/positive controls, including every default-privilege overgrant direction and excess privileges on the existing exposure sequence)**, **incoming membership and NOLOGIN controls**, **the actual-connection identity controls (superuser admin login, unrelated login, migrator-member login, superuser migrator role) with unchanged lease/version/data**, **deterministic `system_identifier` identity evidence with its narrowed fallback (documented refusal only; unexpected errors fail closed)**, **a deterministic two-process contention proof that pauses the first worker inside its first protected per-user backfill transaction (database trigger on an advisory lock) and observes the second worker queued on the admission guard with no lease row lock**, **the runtime principal read from the live connection and a `?user=` URL that authenticates as the migrator refused**, **column-level `UPDATE`/`REFERENCES` bypasses refused in both topologies and aborting the guarded upgrade**, **the lease/control protocol mirror mismatch refused without repair**, **a URL-encoded `%40` password accepted on the guarded path**, **a new migration connection pointed at another database refused before it can run a statement**, **every new runtime connection compared with the startup-proven target signature and refused when it differs**, **a timezone-independent postmaster epoch signature (UTC and Asia/Kolkata agree)**, **the actual lease-row lock proven with `SELECT … FOR UPDATE NOWAIT` (SQLSTATE 55P03) while worker A is paused, with a negative control after release**, **an inherited `PUBLIC` CREATE on `public` refused and then accepted once revoked** | 83 passed |
+| `tests/test_issue145_application_integration.py` | real PG 16.16: concurrent `init_db()`, single connection, killed worker, injected failure, CLI, barrier, protocol, expiry, privileges, both ownership topologies, the Topology A §8.3 matrix and its restricted backfill, schema-ACL positive/negative controls, timing, **the §8.1 application privilege verifier (both topologies plus its negative/positive controls, including every default-privilege overgrant direction and excess privileges on the existing exposure sequence)**, **incoming membership and NOLOGIN controls**, **the actual-connection identity controls (superuser admin login, unrelated login, migrator-member login, superuser migrator role) with unchanged lease/version/data**, **deterministic, restart-stable `system_identifier` target identity, with an unreadable identifier refused and named with its exact grant (unexpected errors fail closed too)**, **a deterministic two-process contention proof that pauses the first worker inside its first protected per-user backfill transaction (database trigger on an advisory lock) and observes the second worker queued on the admission guard with no lease row lock**, **the runtime principal read from the live connection and a `?user=` URL that authenticates as the migrator refused**, **column-level `UPDATE`/`REFERENCES` bypasses refused in both topologies and aborting the guarded upgrade**, **the lease/control protocol mirror mismatch refused without repair**, **a URL-encoded `%40` password accepted on the guarded path**, **a new migration connection pointed at another database refused before it can run a statement**, **every new runtime connection compared with the startup-proven target identity and refused when it differs**, **a timezone-independent diagnostic postmaster epoch (UTC and Asia/Kolkata agree) that is proven absent from the target identity**, **the actual lease-row lock proven with `SELECT … FOR UPDATE NOWAIT` (SQLSTATE 55P03) while worker A is paused, with a negative control after release**, **an inherited `PUBLIC` CREATE on `public` refused and then accepted once revoked** | 83 passed |
+| `tests/test_issue145_pg_restart.py` | **real restart of a self-provisioned PostgreSQL 16.16 cluster** (not a simulated signature change): the identity is captured, the server process is restarted on the same data directory, the postmaster start time is asserted to change, a new migration connection (full preflight) and a new runtime connection are accepted for the same target, the identity is asserted unchanged and asserted not to contain the start time, a different database in the same cluster and a second cluster with the same database name are still refused, and a revoked `pg_control_system()` after a restart fails closed with the grant and publishes nothing. Requires `ISSUE145_PG_BINDIR`; creates and owns its own scratch cluster and never restarts the CI/admin cluster | 4 passed (local 16.16) |
 | `tests/test_migration_serialization.py` | DB-free protocol/config/retirement contract, the timeout-below-TTL rule and its boundaries, finite/positive wait validation, no attempt past the admission deadline, no SQL after a checkout consumes the budget, bounded backoff for very high attempt counts, unchanged fast 55P03 retry, pre-acquisition cleanup, unconditional engine disposal when `release` raises, SQLite URI identity (`mode=memory`, `mode=rwc`, `uri=true`, unsupported modes), connection query/host-list override refusal, disposable-harness endpoint preservation (authority and query-form host/port) and service refusal, and the **JUnit-XML CI gate** (authoritative counts, fabricated-log controls, malformed/inconsistent reports, failures/errors/skips, rc and minimum) | 93 passed (file) |
 | `tests/test_db_migration.py`, `test_alembic_*.py`, `test_day5_alembic_authority.py`, `test_migration_identity_separation.py`, `test_leg_exposure.py` | SQLite chain, FK behavior, identity separation (**including the 16-target §8.1 URL contract: accepted pair, same-login, different database, different endpoint, declared alias, alias port mismatch, Neon pooled route, SQLite and CockroachDB migration targets, blank/malformed URLs, malformed alias configuration, no-password-in-errors, and the configured-identity binding — migration login must be `STRIKENOVA_MIGRATOR_ROLE`, runtime login must be `STRIKENOVA_RUNTIME_ROLE` when set, blank role name refused, unset runtime role not constrained**), exposure idempotency | 198 passed (regression suite total) |
 | `PostgreSQL compatibility` suite (9 modules: compatibility, importer, failure injection, large rehearsal, hardening, Day 5/6) | disposable PG 16.16 schemas built only through `python -m app.migrate upgrade head` | 122 passed |
 | `.github/workflows/issue145-application-pg16.yml` | the two suites above on a pinned `postgres@sha256:3950ad…` 16.16 service, exact `server_version_num = 160016` gate, evidence upload, cleanup | see PR #151 checks |
-| `scripts/pytest_gate.py` | gates **both** suites independently: missing log or exit code, failed/errored test, any skipped test, missing/unparseable authoritative summary, or fewer passes than the exact minimum all fail the job. Only pytest's terminal `... in <duration>s` summary line is trusted, so test output cannot fabricate counts | 80 / 181 minimums; negative controls in `TestPytestGate` |
+| `scripts/pytest_gate.py` | gates **all three** suites independently: integration, migration/SQLite regression, and PostgreSQL compatibility. The JUnit XML report and the recorded pytest exit status are authoritative; the text log is diagnostic only. The job fails on a missing or non-zero recorded exit status, a missing/malformed JUnit report (including a DOCTYPE), an inconsistent report (counter/summary vs testcases), any failure, error or skip, and fewer passes than the declared minimum. The minimums are floors, not exact counts, so a suite that silently stops collecting is still caught by the structure checks | 80 / 181 / 122 minimums; negative controls in `TestPytestGate` |
 
 Local verification used PGDG 16.16 server binaries extracted into the workspace
 (the container socket was unavailable in that environment); CI uses the pinned
-digest. Both report `server_version_num = 160016`.
+digest. Both report `server_version_num = 160016`. The gated suites are run
+exactly as the workflows run them, with `--junitxml` plus the recorded pytest
+exit status passed to `scripts/pytest_gate.py`.
+
+The restart proof is run separately, because it needs a server it can restart:
+
+```
+ISSUE145_PG_BINDIR=<16.16 bin> python -m pytest -q tests/test_issue145_pg_restart.py
+```
+
+It creates its own `initdb` cluster in a temporary directory and restarts only
+that server. `ISSUE145_PG_ADMIN_URL` is not used by it, so the shared CI/admin
+cluster is never restarted or modified.
 
 ## 10. Known limitations
 
@@ -616,18 +655,27 @@ digest. Both report `server_version_num = 160016`.
 * The endpoint-equivalence proof covers same-host URLs and explicitly
 declared aliases only, and comma-separated migration host lists are refused
 rather than proven host by host. After preflight, every new migration
-connection re-checks the proven signature, so a reconnect cannot silently land
-on an unproven cluster. When `pg_control_system()` is readable (the stock
-PostgreSQL 16 default) the alias is proven by the cluster's
-`system_identifier`, which is deterministic. The weaker fingerprint is used
-only when PostgreSQL reports `42501` (the documented revocation) or `42883`
-(the function is absent), and the degradation is logged; every other
-database error fails closed instead of degrading. When the fallback is in
-use, a declaration for two
-unrelated clusters that coincidentally share those three values is then not
-defended against. No provider API is queried, so nothing here proves that a
-pooled route terminates at the same *project* rather than a same-named
-cluster.
+  connection re-checks the proven identity, so a reconnect cannot silently land
+  on an unproven cluster. The identity is proven by the cluster's
+  `system_identifier` plus the database name and `pg_database` OID, all of
+  which survive a restart; the postmaster start time is diagnostic and is never
+  compared as identity. A revoked or absent `pg_control_system()` fails closed
+  with the one grant that restores it — there is no weaker fallback to
+  accidentally accept. `system_identifier` does not distinguish Neon branches
+  (a branch is a copy-on-write fork of the same cluster, so it shares the
+  identifier and database OIDs); branch and endpoint separation is enforced by
+  the static host/alias check instead, and no provider API is queried, so
+  nothing here proves that a pooled route terminates at the same *project*
+  rather than a same-named cluster.
+* The real-restart proof (`tests/test_issue145_pg_restart.py`) needs a
+  PostgreSQL 16.16 **binary** directory it may `initdb`/`pg_ctl`
+  (`ISSUE145_PG_BINDIR`), because the CI PostgreSQL is a service container
+  the job cannot restart and must not disturb while the other suites use it.
+  It is therefore executed locally against a self-owned 16.16 cluster and is
+  not part of the three gated CI suites. Neither a Neon compute
+  suspend/wake nor a Neon branch fork was tested live; the restart proof is a
+  local server restart on an unchanged data directory, which is the same
+  identity-invalidation event those provider events produce.
 * The compatibility and importer rehearsals build their schema as Topology A
   and perform the data import as the migration identity; they do not re-prove
   the runtime-identity boundary (that lives in the integration suite).
