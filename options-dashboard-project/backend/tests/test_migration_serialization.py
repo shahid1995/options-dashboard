@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import math
 import pathlib
 import subprocess
 import sys
@@ -295,126 +296,178 @@ class TestRetiredDesign:
 
 
 class TestPytestGate:
-    """The CI gate over both pytest logs must fail closed (ADR-017 completion).
-
-    These are deterministic negative controls over synthetic logs: no real test
-    is skipped, altered or re-run to produce them.
-    """
+    """The CI gate must decide from JUnit XML, never from untrusted log text."""
 
     SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "pytest_gate.py"
 
-    def _run(self, tmp_path, log_text, *, rc="0", minimum=22, log_name="suite.log"):
-        log = tmp_path / log_name
-        if log_text is not None:
-            log.write_text(log_text, encoding="utf-8")
+    @staticmethod
+    def _suite_xml(*, tests=22, failures=0, errors=0, skipped=0, listed=None):
+        listed = tests if listed is None else listed
+        cases = []
+        for index in range(listed):
+            child = ""
+            if index < failures:
+                child = '<failure message="boom"/>'
+            elif index < failures + errors:
+                child = '<error message="boom"/>'
+            elif index < failures + errors + skipped:
+                child = "<skipped/>"
+            cases.append(
+                f'<testcase classname="tests.x" name="case{index}">{child}</testcase>'
+            )
+        return (
+            f'<testsuite name="unit" tests="{tests}" failures="{failures}" '
+            f'errors="{errors}" skipped="{skipped}">' + "".join(cases) + "</testsuite>"
+        )
+
+    def _run(self, tmp_path, xml_text, *, rc="0", minimum=22, log_text=None):
+        xml = tmp_path / "suite.xml"
+        if xml_text is not None:
+            xml.write_text(xml_text, encoding="utf-8")
         rc_file = tmp_path / "suite.rc"
         if rc is not None:
             rc_file.write_text(rc, encoding="utf-8")
+        if log_text is not None:
+            (tmp_path / "suite.log").write_text(log_text, encoding="utf-8")
         return subprocess.run(
             [
                 sys.executable,
                 str(self.SCRIPT),
                 "--suite",
-                f"unit|{minimum}|{log}|{rc_file}",
+                f"unit|{minimum}|{xml}|{rc_file}",
             ],
             capture_output=True,
             text=True,
             timeout=60,
         )
 
-    def test_real_summary_passes(self, tmp_path):
-        result = self._run(tmp_path, "22 passed, 1 warning in 29.34s\n")
+    def test_real_junit_report_passes(self, tmp_path):
+        result = self._run(tmp_path, self._suite_xml())
         assert result.returncode == 0, result.stdout + result.stderr
         assert "unit: 22 passed" in result.stdout
 
-    def test_long_run_summary_with_clock_suffix_passes(self, tmp_path):
-        """pytest adds ``(0:01:10)`` after a minute; the gate must accept it."""
-        result = self._run(tmp_path, "22 passed, 1 warning in 70.36s (0:01:10)\n")
-        assert result.returncode == 0, result.stdout + result.stderr
-        assert "unit: 22 passed" in result.stdout
-
-    def test_all_skipped_log_fails(self, tmp_path):
-        result = self._run(tmp_path, "22 skipped, 3 warnings in 4.10s\n")
-        assert result.returncode == 1
-        assert "skipped" in result.stdout
-
-    def test_missing_summary_fails(self, tmp_path):
-        result = self._run(tmp_path, "collected 0 items\n\nno tests ran in 0.01s\n")
-        assert result.returncode == 1
-        assert "no authoritative pytest summary line" in result.stdout
-
-    def test_untrusted_output_cannot_inject_failure_counts(self, tmp_path):
-        """A test printing '999999 failed' must not fabricate a gate failure."""
-        log = (
-            "FAILED tests/x.py::test_y - assertion\n"
-            "999999 failed\n"
-            "1 error\n"
-            "22 passed, 1 warning in 9.00s\n"
+    def test_fabricated_log_failure_cannot_override_junit(self, tmp_path):
+        """A later summary-shaped failure line in the log is not acceptance evidence."""
+        result = self._run(
+            tmp_path,
+            self._suite_xml(),
+            log_text="22 passed in 9.00s\n999999 failed in 0.01s\n",
         )
-        result = self._run(tmp_path, log)
         assert result.returncode == 0, result.stdout + result.stderr
         assert "unit: 22 passed" in result.stdout
 
-    def test_last_authoritative_summary_wins(self, tmp_path):
-        """Only pytest's final summary line decides, not an earlier paste."""
-        log = "999 failed in 0.01s\n22 passed in 9.00s\n"
-        result = self._run(tmp_path, log)
-        assert result.returncode == 0, result.stdout + result.stderr
-        assert "unit: 22 passed" in result.stdout
-
-    def test_summary_without_duration_is_not_trusted(self, tmp_path):
-        result = self._run(tmp_path, "22 passed\n")
-        assert result.returncode == 1
-        assert "no authoritative pytest summary line" in result.stdout
-
-    def test_error_status_in_summary_fails(self, tmp_path):
-        result = self._run(tmp_path, "1 error, 21 passed in 12.0s\n")
+    def test_fabricated_log_pass_cannot_override_failing_junit(self, tmp_path):
+        """A green log line cannot mask a failure recorded by pytest itself."""
+        result = self._run(
+            tmp_path,
+            self._suite_xml(tests=22, failures=1),
+            log_text="999999 passed in 0.01s\n22 passed in 9.00s\n",
+        )
         assert result.returncode == 1
         assert "failed/errored" in result.stdout
 
-    def test_failed_test_fails_even_with_passes(self, tmp_path):
-        result = self._run(tmp_path, "21 passed, 1 failed in 12.0s\n")
+    def test_skipped_junit_fails(self, tmp_path):
+        result = self._run(tmp_path, self._suite_xml(tests=22, skipped=22))
         assert result.returncode == 1
-        assert "failed" in result.stdout
+        assert "skipped" in result.stdout
+
+    def test_missing_xml_fails(self, tmp_path):
+        result = self._run(tmp_path, None)
+        assert result.returncode == 1
+        assert "no JUnit XML report" in result.stdout
+
+    def test_malformed_xml_fails(self, tmp_path):
+        result = self._run(tmp_path, "<testsuite")
+        assert result.returncode == 1
+        assert "not well-formed" in result.stdout
+
+    def test_doctype_is_rejected(self, tmp_path):
+        result = self._run(
+            tmp_path,
+            '<!DOCTYPE testsuite [<!ENTITY x "y">]>' + self._suite_xml(),
+        )
+        assert result.returncode == 1
+        assert "DOCTYPE/ENTITY" in result.stdout
+
+    def test_wrong_root_fails(self, tmp_path):
+        result = self._run(tmp_path, "<html/>")
+        assert result.returncode == 1
+        assert "expected <testsuite> or <testsuites>" in result.stdout
+
+    def test_declared_count_must_match_listed_testcases(self, tmp_path):
+        """A report claiming 22 tests but listing one is inconsistent."""
+        result = self._run(tmp_path, self._suite_xml(tests=22, listed=1))
+        assert result.returncode == 1
+        assert "lists 1 <testcase>" in result.stdout
+
+    def test_testcase_markers_must_match_counters(self, tmp_path):
+        """A failure element with a zero failure counter is inconsistent."""
+        xml = (
+            '<testsuite name="unit" tests="2" failures="0" errors="0" skipped="0">'
+            '<testcase classname="t" name="a"/>'
+            '<testcase classname="t" name="b"><failure message="boom"/></testcase>'
+            "</testsuite>"
+        )
+        result = self._run(tmp_path, xml)
+        assert result.returncode == 1
+        assert "counters do not match" in result.stdout
+
+    def test_error_status_in_junit_fails(self, tmp_path):
+        result = self._run(tmp_path, self._suite_xml(tests=2, errors=1))
+        assert result.returncode == 1
+        assert "failed/errored" in result.stdout
 
     def test_non_zero_exit_code_fails(self, tmp_path):
-        result = self._run(tmp_path, "22 passed in 12.0s\n", rc="1")
+        result = self._run(tmp_path, self._suite_xml(), rc="1")
         assert result.returncode == 1
         assert "pytest exited 1" in result.stdout
 
     def test_missing_exit_code_fails(self, tmp_path):
-        result = self._run(tmp_path, "22 passed in 12.0s\n", rc=None)
+        result = self._run(tmp_path, self._suite_xml(), rc=None)
         assert result.returncode == 1
         assert "no recorded pytest exit code" in result.stdout
 
+    def test_unreadable_exit_code_fails(self, tmp_path):
+        result = self._run(tmp_path, self._suite_xml(), rc="not-a-number")
+        assert result.returncode == 1
+        assert "unreadable pytest exit code" in result.stdout
+
     def test_low_pass_count_fails(self, tmp_path):
-        result = self._run(tmp_path, "21 passed in 12.0s\n", minimum=22)
+        result = self._run(tmp_path, self._suite_xml(tests=21), minimum=22)
         assert result.returncode == 1
         assert "only 21 test(s) passed" in result.stdout
 
-    def test_missing_log_fails(self, tmp_path):
-        result = self._run(tmp_path, None)
-        assert result.returncode == 1
-        assert "no pytest log" in result.stdout
+    def test_multiple_testsuites_are_summed(self, tmp_path):
+        xml = (
+            "<testsuites>"
+            + self._suite_xml(tests=11)
+            + self._suite_xml(tests=11)
+            + "</testsuites>"
+        )
+        result = self._run(tmp_path, xml)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "unit: 22 passed" in result.stdout
 
     def test_regression_suite_is_gated_independently(self, tmp_path):
-        """A green integration log must not mask a broken regression log."""
-        good = tmp_path / "integration.log"
-        good.write_text("22 passed in 20.0s\n", encoding="utf-8")
-        good_rc = tmp_path / "integration.rc"
-        good_rc.write_text("0", encoding="utf-8")
-        bad = tmp_path / "regression.log"
-        bad.write_text("135 skipped in 20.0s\n", encoding="utf-8")
-        bad_rc = tmp_path / "regression.rc"
-        bad_rc.write_text("0", encoding="utf-8")
+        """A green integration report must not mask a broken regression one."""
+        integration = tmp_path / "integration.xml"
+        integration.write_text(self._suite_xml(), encoding="utf-8")
+        integration_rc = tmp_path / "integration.rc"
+        integration_rc.write_text("0", encoding="utf-8")
+        regression = tmp_path / "regression.xml"
+        regression.write_text(
+            self._suite_xml(tests=141, skipped=141), encoding="utf-8"
+        )
+        regression_rc = tmp_path / "regression.rc"
+        regression_rc.write_text("0", encoding="utf-8")
         result = subprocess.run(
             [
                 sys.executable,
                 str(self.SCRIPT),
                 "--suite",
-                f"integration|22|{good}|{good_rc}",
+                f"integration|22|{integration}|{integration_rc}",
                 "--suite",
-                f"regression|141|{bad}|{bad_rc}",
+                f"regression|141|{regression}|{regression_rc}",
             ],
             capture_output=True,
             text=True,
@@ -422,7 +475,8 @@ class TestPytestGate:
         )
         assert result.returncode == 1
         assert "integration: 22 passed" in result.stdout
-        assert "regression: 135 skipped" in result.stdout
+        assert "regression" in result.stdout
+        assert "skipped" in result.stdout
 
 
 class TestLeaseWaitValidation:
@@ -464,6 +518,104 @@ class TestAcquisitionBudget:
         assert exc.value.sqlstate == "45002"
         assert "wait budget was already exhausted" in str(exc.value)
         assert engine.calls == 0
+
+    def test_backoff_stays_bounded_for_very_high_attempts(self, monkeypatch):
+        """The exponent is capped before `2 ** n`, and delay never exceeds 2 s."""
+        monkeypatch.setattr(lease.random, "random", lambda: 0.0)
+        assert lease._retry_delay(1) == pytest.approx(0.1)
+        monkeypatch.setattr(lease.random, "random", lambda: 1.0)
+        for attempt in (10_000, 10**9):
+            delay = lease._retry_delay(attempt)
+            assert math.isfinite(delay)
+            assert 0.1 <= delay <= 2.0
+
+    def test_connection_checkout_past_the_deadline_executes_no_sql(self, monkeypatch):
+        """A checkout that consumed the budget must not run lease SQL."""
+        clock = [0.0]
+        executed: list[tuple] = []
+
+        class _Conn:
+            def execute(self, *args, **_kwargs):  # pragma: no cover - must not run
+                executed.append(args)
+                raise AssertionError("lease SQL ran after the admission deadline")
+
+            def begin(self):
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+        class _Checkout:
+            def __enter__(self):
+                clock[0] += 10.0  # the checkout consumed the 0.05s budget
+                return _Conn()
+
+            def __exit__(self, *_exc):
+                return False
+
+        class _Engine:
+            def connect(self):
+                return _Checkout()
+
+        monkeypatch.setattr(lease.time, "monotonic", lambda: clock[0])
+        guard = lease.MigrationLease(_Engine(), wait_seconds=0.05)  # type: ignore[arg-type]
+        with pytest.raises(lease.LeaseError):
+            guard.acquire()
+        assert executed == []
+
+    def test_transient_lock_conflict_retries_and_acquires(self, monkeypatch):
+        """A 55P03 conflict still retries once, jitters once and succeeds."""
+        from sqlalchemy.exc import DBAPIError
+
+        sleeps: list[float] = []
+        calls = {"count": 0}
+
+        class _Row:
+            out_owner_fingerprint = "f" * 12
+            out_expires_at = None
+            out_generation = 1
+
+        class _Result:
+            def one(self):
+                return _Row()
+
+        class _Conn:
+            def begin(self):
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def execute(self, *_args, **_kwargs):
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    raise DBAPIError("SELECT lease", {}, _FakeOrig("55P03"))
+                return _Result()
+
+        class _Checkout:
+            def __enter__(self):
+                return _Conn()
+
+            def __exit__(self, *_exc):
+                return False
+
+        class _Engine:
+            def connect(self):
+                return _Checkout()
+
+        monkeypatch.setattr(lease.time, "sleep", sleeps.append)
+        guard = lease.MigrationLease(_Engine(), wait_seconds=5)  # type: ignore[arg-type]
+        state = guard.acquire()
+        assert state.generation == 1
+        assert calls["count"] == 2
+        assert len(sleeps) == 1
+        assert 0 < sleeps[0] <= 2.0
 
 
 class TestGuardedMigrationCleanup:
@@ -522,6 +674,66 @@ class TestGuardedMigrationCleanup:
         assert disposed == [True]
         assert released == []
 
+    def test_release_failure_still_disposes_and_propagates(self, monkeypatch):
+        """A release error with no earlier exception must not skip disposal."""
+        disposed: list[bool] = []
+
+        class _Conn:
+            def exec_driver_sql(self, *_args, **_kwargs):
+                return None
+
+            def commit(self):
+                return None
+
+            def begin(self):
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+        class _Engine:
+            def connect(self):
+                return _Conn()
+
+            def dispose(self):
+                disposed.append(True)
+
+        def _release(_self):
+            raise RuntimeError("release boom")
+
+        monkeypatch.setattr(db_module, "_migration_engine", lambda: _Engine())
+        monkeypatch.setattr(lease, "preflight", lambda engine: None)
+        monkeypatch.setattr(lease.MigrationLease, "acquire", lambda self: None)
+        monkeypatch.setattr(lease.MigrationLease, "enter", lambda self, conn: None)
+        monkeypatch.setattr(lease.MigrationLease, "release", _release)
+        monkeypatch.setattr(db_module, "_set_owner_role", lambda conn: None)
+        monkeypatch.setattr(db_module, "_reset_owner_role", lambda conn: None)
+        monkeypatch.setattr(
+            db_module, "apply_migrator_backfill_grants", lambda conn: 0
+        )
+        monkeypatch.setattr(
+            db_module, "apply_migrator_privilege_restrictions", lambda conn: 0
+        )
+        monkeypatch.setattr(
+            db_module, "_verify_application_privileges", lambda conn: None
+        )
+
+        class _Command:
+            def upgrade(self, _cfg, _revision):
+                return None
+
+        class _Config:
+            attributes: dict = {}
+
+        with pytest.raises(RuntimeError, match="release boom"):
+            db_module._run_guarded_migrations(
+                _Config(), _Command(), logging.getLogger("t")
+            )
+        assert disposed == [True]
+
 
 class TestSqliteMigrationTarget:
     def test_a_separate_sqlite_migration_url_is_refused(self, monkeypatch, tmp_path):
@@ -548,6 +760,81 @@ class TestSqliteMigrationTarget:
         with patch("app.db.settings", settings_obj):
             resolved = db_module.assert_guarded_migration_configuration()
         assert resolved.startswith("sqlite:///")
+
+    def test_default_file_mode_and_explicit_rwc_are_the_same_target(
+        self, tmp_path
+    ):
+        runtime = tmp_path / "runtime.db"
+        settings_obj = Settings(
+            DATABASE_URL=f"sqlite:///{runtime}",
+            STRIKENOVA_MIGRATION_DATABASE_URL=f"sqlite:///{runtime}?mode=rwc",
+        )
+        with patch("app.db.settings", settings_obj):
+            resolved = db_module.assert_guarded_migration_configuration()
+        assert resolved.startswith("sqlite:///")
+
+    def test_a_file_target_and_a_memory_mode_of_the_same_name_are_refused(
+        self, tmp_path
+    ):
+        runtime = tmp_path / "runtime.db"
+        settings_obj = Settings(
+            DATABASE_URL=f"sqlite:///{runtime}",
+            STRIKENOVA_MIGRATION_DATABASE_URL=f"sqlite:///{runtime}?mode=memory",
+        )
+        with patch("app.db.settings", settings_obj), pytest.raises(
+            lease.LeaseError
+        ) as exc:
+            db_module.assert_guarded_migration_configuration()
+        assert exc.value.sqlstate == "45004"
+        assert "separate SQLite migration URL is not supported" in str(exc.value)
+
+    def test_uri_mode_memory_database_is_distinct_from_a_file(self, tmp_path):
+        runtime = tmp_path / "runtime.db"
+        settings_obj = Settings(
+            DATABASE_URL=f"sqlite:///{runtime}",
+            STRIKENOVA_MIGRATION_DATABASE_URL=(
+                "sqlite:///file:shared-memdb?mode=memory&cache=shared&uri=true"
+            ),
+        )
+        with patch("app.db.settings", settings_obj), pytest.raises(
+            lease.LeaseError
+        ) as exc:
+            db_module.assert_guarded_migration_configuration()
+        assert exc.value.sqlstate == "45004"
+        assert "separate SQLite migration URL is not supported" in str(exc.value)
+
+    def test_identical_uri_mode_memory_databases_are_accepted(self):
+        url = "sqlite:///file:shared-memdb?mode=memory&cache=shared&uri=true"
+        settings_obj = Settings(
+            DATABASE_URL=url, STRIKENOVA_MIGRATION_DATABASE_URL=url
+        )
+        with patch("app.db.settings", settings_obj):
+            resolved = db_module.assert_guarded_migration_configuration()
+        assert "mode=memory" in resolved
+
+    def test_unsupported_sqlite_mode_is_refused(self, tmp_path):
+        runtime = tmp_path / "runtime.db"
+        settings_obj = Settings(
+            DATABASE_URL=f"sqlite:///{runtime}",
+            STRIKENOVA_MIGRATION_DATABASE_URL=f"sqlite:///{runtime}?mode=wal",
+        )
+        with patch("app.db.settings", settings_obj), pytest.raises(
+            lease.LeaseError
+        ) as exc:
+            db_module.assert_guarded_migration_configuration()
+        assert "unsupported SQLite mode" in str(exc.value)
+
+    def test_uri_true_without_a_file_name_is_refused(self, tmp_path):
+        runtime = tmp_path / "runtime.db"
+        settings_obj = Settings(
+            DATABASE_URL=f"sqlite:///{runtime}",
+            STRIKENOVA_MIGRATION_DATABASE_URL=f"sqlite:///{runtime}?uri=true",
+        )
+        with patch("app.db.settings", settings_obj), pytest.raises(
+            lease.LeaseError
+        ) as exc:
+            db_module.assert_guarded_migration_configuration()
+        assert "requires a file: database name" in str(exc.value)
 
 
 class TestConnectionTargetOverrides:
@@ -628,3 +915,74 @@ class TestDisposableHarnessUrls:
         admin_db = make_url(prov.admin_database_url)
         assert admin_db.database == "sn145_probe"
         assert "dbname" not in admin_db.query
+
+    def test_query_form_endpoint_is_preserved_when_deriving(self):
+        """A URL whose endpoint lives in the query must keep that endpoint."""
+        from sqlalchemy.engine import make_url
+
+        admin = (
+            "postgresql://admin:pw@/postgres"
+            "?host=db.internal&port=6543&sslmode=require"
+        )
+        prov = support.Provisioned(admin, "sn145_query_host", support.TOPOLOGY_A)
+        migrator = make_url(prov.migrator_url)
+        assert migrator.query.get("host") == "db.internal"
+        assert migrator.query.get("port") == "6543"
+        assert migrator.query.get("sslmode") == "require"
+        assert migrator.database == "sn145_query_host"
+        admin_db = make_url(prov.admin_database_url)
+        assert admin_db.query.get("host") == "db.internal"
+        assert admin_db.query.get("port") == "6543"
+
+    def test_authority_endpoint_survives_derivation(self):
+        from sqlalchemy.engine import make_url
+
+        admin = "postgresql://admin:pw@db.internal:6543/postgres?sslmode=require"
+        prov = support.Provisioned(admin, "sn145_authority", support.TOPOLOGY_B)
+        migrator = make_url(prov.migrator_url)
+        assert migrator.host == "db.internal"
+        assert migrator.port == 6543
+        assert migrator.query.get("sslmode") == "require"
+
+    def test_service_indirection_is_refused_before_provisioning(self):
+        """A service can redirect the endpoint; refuse instead of guessing."""
+        admin = "postgresql://admin:pw@/postgres?service=production"
+        prov = support.Provisioned(admin, "sn145_service", support.TOPOLOGY_A)
+        with pytest.raises(ValueError, match="unsupported connection"):
+            _ = prov.migrator_url
+
+    def test_failed_provisioning_drops_only_the_resources_it_created(
+        self, monkeypatch
+    ):
+        dropped: list[str] = []
+        monkeypatch.setattr(support, "require_pg16_16", lambda url: None)
+
+        class _Conn:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def execute(self, *_args, **_kwargs):
+                return None
+
+        calls = {"count": 0}
+
+        def _connect(*_args, **_kwargs):
+            calls["count"] += 1
+            if calls["count"] >= 2:
+                raise RuntimeError("acl step failed")
+            return _Conn()
+
+        monkeypatch.setattr(support.psycopg, "connect", _connect)
+        monkeypatch.setattr(
+            support, "drop", lambda prov: dropped.append(prov.database)
+        )
+        with pytest.raises(RuntimeError, match="acl step failed"):
+            support.provision(
+                "postgresql://admin@db.internal/postgres",
+                topology=support.TOPOLOGY_A,
+            )
+        assert len(dropped) == 1
+        assert dropped[0].startswith("sn145_")

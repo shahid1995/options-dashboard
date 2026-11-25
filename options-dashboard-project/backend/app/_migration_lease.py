@@ -126,9 +126,16 @@ def generate_token(nonce_prefix: str = "") -> str:
 
 
 def _retry_delay(attempt: int) -> float:
-    """Backoff starting near 200 ms, capped at 2 s, with jitter (ADR §6.7)."""
-    base = min(2.0, 0.2 * (2 ** max(0, attempt - 1)))
-    return base * (0.5 + random.random())
+    """Backoff starting near 200 ms, capped at 2 s, with jitter (ADR §6.7).
+
+    The exponent is capped before exponentiation: ``2 ** (attempt - 1)`` is
+    unbounded and a long contention run (thousands of attempts) would spend
+    time and memory computing a gigantic integer only to discard it. Capping
+    at ``2 ** 4`` keeps the 0.2 s initial delay and the 2 s ceiling exactly.
+    """
+    exponent = min(max(0, attempt - 1), 4)
+    base = min(2.0, 0.2 * (2**exponent))
+    return min(2.0, base * (0.5 + random.random()))
 
 
 # ---------------------------------------------------------------------------
@@ -1747,11 +1754,16 @@ class MigrationLease:
     def acquire(self) -> LeaseState:
         """Acquire ownership, retrying within the monotonic budget.
 
-        The budget is checked *before* every attempt, and each attempt's
+        The budget is checked *before* every attempt and again after the
+        connection is checked out; if it expired during checkout, the attempt
+        is abandoned without executing the lease SQL. Each attempt's
         ``lock_timeout`` is the smaller of the configured value and the
-        remaining budget, so no single attempt can start after (or run past)
-        the deadline. Jitter is calculated once per attempt and reused for
-        both the deadline test and the sleep.
+        remaining budget. Connection checkout and establishment are bounded
+        separately by the engine's ``pool_timeout`` and ``connect_timeout``;
+        an in-flight checkout can therefore consume the remainder and delay
+        the failure message, so this is not a strict wall-clock deadline.
+        Jitter is calculated once per attempt and reused for both the
+        deadline test and the sleep.
         """
         deadline = time.monotonic() + self.wait_seconds
         attempt = 0
@@ -1774,11 +1786,22 @@ class MigrationLease:
                 )
 
             attempt += 1
-            attempt_lock_timeout = max(
-                1, min(self.lock_timeout_ms, int(remaining * 1000))
-            )
             try:
                 with self.engine.connect() as conn:
+                    # Checkout may have blocked for most of the budget; never
+                    # run the acquisition SQL after the deadline has passed.
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise LeaseError(
+                            SQLSTATE_INVALID_STATE,
+                            f"migration lease not acquired: the "
+                            f"{self.wait_seconds:.0f}s wait budget expired "
+                            "during connection checkout",
+                            fingerprint=self.fingerprint,
+                        )
+                    attempt_lock_timeout = max(
+                        1, min(self.lock_timeout_ms, int(remaining * 1000))
+                    )
                     with conn.begin():
                         row = conn.execute(
                             text(

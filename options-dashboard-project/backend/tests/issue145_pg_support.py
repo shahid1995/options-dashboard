@@ -33,24 +33,17 @@ TOPOLOGY_B = "B"
 TOPOLOGY_A = "A"
 TOPOLOGIES = (TOPOLOGY_A, TOPOLOGY_B)
 
-#: Query parameters libpq merges into the connect arguments after the URL
-#: authority/path. Any derived URL must drop these, otherwise an admin URL
+#: Query parameters that name the database or login. A derived URL replaces
+#: those fields, so any query-form copy must be dropped; otherwise an admin URL
 #: such as ``...?dbname=postgres`` would make provisioning create the
 #: disposable database but apply its ACLs to the maintenance database.
-_OVERRIDE_QUERY_KEYS = frozenset(
-    {
-        "host",
-        "hostaddr",
-        "port",
-        "dbname",
-        "database",
-        "user",
-        "password",
-        "service",
-        "servicefile",
-        "passfile",
-    }
-)
+_REPLACED_QUERY_KEYS = frozenset({"dbname", "database", "user", "password"})
+
+#: Endpoint or credential representations this fixture cannot rewrite safely.
+#: A ``service``/``servicefile`` can redirect the connection to another endpoint
+#: and a ``passfile`` can supply a different password, so a URL carrying one is
+#: refused *before* any role or database is created rather than derived.
+_UNSUPPORTED_ENDPOINT_KEYS = frozenset({"service", "servicefile", "passfile"})
 
 
 class Provisioned:
@@ -109,21 +102,35 @@ def _derived_url(
     username: str | None = None,
     password: str | None = None,
 ) -> str:
-    """Rebuild a URL with one database/login, dropping override parameters.
+    """Rebuild a URL with one database/login, preserving the endpoint.
 
     ``make_url`` keeps the query string verbatim, and psycopg applies query
     parameters *after* the authority and path. A copied ``?dbname=`` or
     ``?user=`` would therefore silently win over the value this fixture just
-    set. The override keys are removed and every unrelated option (SSL mode,
-    connect timeout, application name) is preserved.
+    set, so those keys are removed. Query-form ``host``/``hostaddr``/``port``
+    are *kept*: they are the effective endpoint for a URL that specifies its
+    endpoint only in the query, and dropping them would create the disposable
+    database on one server while applying its ACLs to another. Every unrelated
+    option (SSL mode, connect timeout, application name) is preserved.
+
+    A ``service``/``servicefile``/``passfile`` can redirect the endpoint or
+    credentials in ways this rewrite cannot see; that representation is
+    refused before any resource is created.
     """
     from sqlalchemy.engine import make_url
 
     parsed = make_url(url)
+    query = {str(key).lower(): value for key, value in (parsed.query or {}).items()}
+    unsupported = sorted(set(query) & _UNSUPPORTED_ENDPOINT_KEYS)
+    if unsupported:
+        raise ValueError(
+            "the disposable PostgreSQL admin URL uses unsupported connection "
+            f"parameter(s) {unsupported}; use an explicit host/port instead"
+        )
     query = {
         key: value
-        for key, value in (parsed.query or {}).items()
-        if str(key).lower() not in _OVERRIDE_QUERY_KEYS
+        for key, value in query.items()
+        if key not in _REPLACED_QUERY_KEYS
     }
     return parsed.set(
         database=database if database is not None else parsed.database,

@@ -122,8 +122,10 @@ jobs:
           exit 0
 
       # A suite that skipped everything would also exit 0. This gate fails the
-      # job on a non-zero pytest status, on any skipped test, or when the
-      # passing count is lower than the suite's real size.
+      # job on a non-zero pytest status, a missing/malformed/inconsistent JUnit
+      # report, on any failure/error/skip, or when the passing count is lower
+      # than the declared minimum. The JUnit XML is the only count source; the
+      # text log above is diagnostics and cannot override it.
       - name: Gate on the actual test results (no false green)
         if: always()
         run: |
@@ -131,24 +133,8 @@ jobs:
           rc=$(cat postgres-compatibility.rc 2>/dev/null || echo missing)
           echo "pytest exit status: $rc"
           tail -n 40 postgres-compatibility.log 2>/dev/null || echo "no log produced"
-          if [ "$rc" != "0" ]; then
-            echo "::error::the PostgreSQL compatibility suite failed (exit $rc)"
-            exit 1
-          fi
-          if grep -qE "[0-9]+ (failed|error)" postgres-compatibility.log; then
-            echo "::error::the suite reported failures or errors"
-            exit 1
-          fi
-          if grep -qE "[0-9]+ skipped" postgres-compatibility.log; then
-            echo "::error::the suite skipped tests (PostgreSQL provisioning is not optional)"
-            exit 1
-          fi
-          passed=$(grep -oE "[0-9]+ passed" postgres-compatibility.log | head -n1 | cut -d' ' -f1)
-          echo "passed tests: ${passed:-0}"
-          if [ -z "${passed:-}" ] || [ "$passed" -lt 122 ]; then
-            echo "::error::unexpectedly few passing tests (${passed:-0} < 122)"
-            exit 1
-          fi
+          python scripts/pytest_gate.py \
+            --suite "compatibility|122|postgres-compatibility.xml|postgres-compatibility.rc"
 
       - name: Upload sanitized evidence
         if: always()

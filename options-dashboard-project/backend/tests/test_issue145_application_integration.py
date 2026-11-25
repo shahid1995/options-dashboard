@@ -2139,6 +2139,25 @@ def test_two_process_startup_serializes_the_per_user_backfill(pg_topology_a):
                     "protected backfill"
                 )
 
+            # A granted row-level lock is not a pg_locks row, so prove the
+            # lock by trying to take it: an observer transaction must get
+            # SQLSTATE 55P03 on the exact lease row while A owns it.
+            probe = psycopg.connect(pg.admin_database_url)
+            try:
+                with pytest.raises(psycopg.errors.LockNotAvailable) as probe_exc:
+                    probe.execute(
+                        "SELECT 1 FROM migration_internal.migration_lease "
+                        "WHERE lease_name = 'migration-lease' FOR UPDATE NOWAIT"
+                    ).fetchone()
+                if probe_exc.value.sqlstate != "55P03":
+                    raise AssertionError(
+                        "the row-lock probe failed with SQLSTATE "
+                        f"{probe_exc.value.sqlstate}, expected 55P03"
+                    )
+            finally:
+                probe.rollback()
+                probe.close()
+
             b = subprocess.Popen(
                 [sys.executable, "-c", worker],
                 cwd=os.getcwd(),
@@ -2198,6 +2217,18 @@ def test_two_process_startup_serializes_the_per_user_backfill(pg_topology_a):
                 )
             if "23505" in output:
                 raise AssertionError("startup workers reported SQLSTATE 23505")
+
+        # Negative control: once A (and B) released the lease, the same exact
+        # row probe must succeed rather than raise 55P03.
+        after = psycopg.connect(pg.admin_database_url)
+        try:
+            after.execute(
+                "SELECT 1 FROM migration_internal.migration_lease "
+                "WHERE lease_name = 'migration-lease' FOR UPDATE NOWAIT"
+            ).fetchone()
+        finally:
+            after.rollback()
+            after.close()
 
         counts = _exposure_counts(pg)
         if counts != {f"issue145-user-{u}": 1 for u in (1, 2)}:
@@ -2702,3 +2733,103 @@ def test_new_migration_connection_must_reach_the_proven_database(pg_ready_a):
             raise AssertionError(f"unexpected refusal: {message}")
     finally:
         support.drop(other)
+
+
+def test_new_runtime_connection_must_reach_the_proven_target(pg_ready):
+    """A correctly authenticated runtime connection to another target is refused.
+
+    The runtime listener now compares every new connection with the signature
+    startup preflight proved. Tampering only the expected signature exercises
+    the deterministic rejection a provider failover to another cluster would
+    produce, without needing a second cluster.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import NullPool
+
+    migrator = create_engine(
+        db_module.normalize_database_url(pg_ready.migrator_url), poolclass=NullPool
+    )
+    try:
+        with migrator.connect() as conn:
+            actual = db_module._logical_target_signature(conn)
+            conn.rollback()
+    finally:
+        migrator.dispose()
+
+    saved = db_module._RUNTIME_TARGET_SIGNATURE[0]
+    try:
+        db_module._RUNTIME_TARGET_SIGNATURE[0] = (
+            actual[0],
+            actual[1],
+            actual[2],
+            "different-cluster-identifier",
+        )
+        engine = db_module._create_runtime_engine(
+            db_module.normalize_database_url(pg_ready.app_url)
+        )
+        try:
+            with pytest.raises(LeaseError) as exc:
+                with engine.connect() as conn:
+                    conn.exec_driver_sql("SELECT 1")
+        finally:
+            engine.dispose()
+        _assert_sqlstate(exc, "45004")
+        message = str(exc.value)
+        if "unproven target" not in message:
+            raise AssertionError(f"unexpected refusal: {message}")
+        if pg_ready.app_password in message:
+            raise AssertionError("the runtime target refusal leaked a password")
+
+        # Positive control: the proven signature accepts the same connection.
+        db_module._RUNTIME_TARGET_SIGNATURE[0] = actual
+        engine = db_module._create_runtime_engine(
+            db_module.normalize_database_url(pg_ready.app_url)
+        )
+        try:
+            with engine.connect() as conn:
+                if conn.exec_driver_sql("SELECT 1").scalar() != 1:
+                    raise AssertionError("the proven runtime connection did not work")
+        finally:
+            engine.dispose()
+    finally:
+        db_module._RUNTIME_TARGET_SIGNATURE[0] = saved
+
+
+def test_target_signature_is_timezone_independent(pg_ready):
+    """Two sessions with different TimeZone settings agree on the target."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import NullPool
+
+    engine = create_engine(
+        db_module.normalize_database_url(pg_ready.migrator_url), poolclass=NullPool
+    )
+    try:
+        with engine.connect() as utc, engine.connect() as kolkata:
+            utc.exec_driver_sql("SET TIME ZONE 'UTC'")
+            kolkata.exec_driver_sql("SET TIME ZONE 'Asia/Kolkata'")
+            first = db_module._logical_target_signature(utc)
+            second = db_module._logical_target_signature(kolkata)
+            utc.rollback()
+            kolkata.rollback()
+    finally:
+        engine.dispose()
+    if first != second:
+        raise AssertionError(
+            "the target signature depends on the session time zone: "
+            f"{first!r} != {second!r}"
+        )
+    if not str(first[1]).lstrip("-").isdigit():
+        raise AssertionError(
+            f"the postmaster start time is not canonical epoch microseconds: {first[1]!r}"
+        )
+
+
+def test_effective_public_create_is_refused(pg_ready):
+    """Inherited PUBLIC CREATE on public must fail the runtime matrix check."""
+    _admin_exec(pg_ready, "GRANT CREATE ON SCHEMA public TO PUBLIC")
+    try:
+        _expect_application_refusal(pg_ready, "CREATE on schema public")
+    finally:
+        _admin_exec(pg_ready, "REVOKE CREATE ON SCHEMA public FROM PUBLIC")
+    # The refusal is gone once the inherited PUBLIC grant is removed.
+    _verify_application_matrix(pg_ready)

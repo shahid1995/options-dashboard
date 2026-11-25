@@ -132,6 +132,14 @@ def _runtime_identity_problems(
     return problems
 
 
+#: The cluster/database signature proven by startup preflight. The runtime
+#: engine is created at import time, before any connection can be proven, so
+#: the listener reads this shared holder on every new connection: empty means
+#: "not proven yet" (identity is still checked), set means every later runtime
+#: connection must reach exactly that target.
+_RUNTIME_TARGET_SIGNATURE: list = [None]
+
+
 def _install_runtime_identity_guard(
     engine_, runtime_role: str, migrator_role: str
 ) -> None:
@@ -147,9 +155,13 @@ def _install_runtime_identity_guard(
     @event.listens_for(engine_, "connect")
     def _verify_runtime_identity(dbapi_connection, _record):
         cursor = dbapi_connection.cursor()
+        signature = None
         try:
             cursor.execute(_RUNTIME_IDENTITY_SQL)
             observed = cursor.fetchone()
+            expected = _RUNTIME_TARGET_SIGNATURE[0]
+            if expected is not None:
+                signature = _dbapi_logical_signature(cursor)
         finally:
             cursor.close()
             dbapi_connection.rollback()
@@ -159,6 +171,13 @@ def _install_runtime_identity_guard(
             migrator_role,
             stage="the runtime engine's new connection",
         )
+        if signature is not None and signature != _RUNTIME_TARGET_SIGNATURE[0]:
+            problems.append(
+                "the runtime engine's new connection does not reach the same "
+                "PostgreSQL cluster/database proven during startup preflight "
+                f"(observed database {signature[0]!r}); refusing to serve "
+                "application queries on an unproven target"
+            )
         if problems:
             # Never embed the URL or password: only the observed identity and
             # the configured role names appear here.
@@ -817,18 +836,71 @@ def assert_guarded_migration_configuration(
 _IDENTITY_FALLBACK_SQLSTATES = frozenset({"42501", "42883"})
 
 
-def _sqlite_target_path(url: str | None) -> str:
-    """Canonical file/memory identity of a SQLite URL (default path when unset)."""
+#: SQLite opening modes libpq-style URI parameters may request. ``rwc``,
+#: ``rw`` and ``ro`` all address the same on-disk database; ``memory`` names a
+#: distinct in-memory database even when it reuses a file-like name.
+_SQLITE_MODES = frozenset({"rwc", "rw", "ro", "memory"})
+_SQLITE_CACHES = frozenset({"shared", "private"})
+
+
+def _sqlite_target_identity(url: str | None) -> tuple[str, str, str | None]:
+    """Canonical identity of the SQLite database a URL really opens.
+
+    Path equality alone is not target equality: ``?mode=memory`` turns a
+    file-shaped name into a *shared in-memory* database, ``?mode=rwc`` is the
+    ordinary file mode, and a ``file:`` name is only a URI when ``?uri=true``
+    is present. The returned identity distinguishes those cases. Ambiguous or
+    unsupported combinations are refused instead of being treated as the same
+    target, and two ordinary file URLs for the same path still compare equal.
+    """
     from sqlalchemy.engine import make_url
 
     if not url:
-        return os.path.realpath(_DEFAULT_DB_PATH)
-    database = make_url(url).database
+        return (os.path.realpath(_DEFAULT_DB_PATH), "file", None)
+    try:
+        parsed = make_url(url)
+    except Exception as exc:  # noqa: BLE001 - never echo the URL
+        raise _config_error(
+            f"the SQLite URL cannot be parsed ({type(exc).__name__})"
+        ) from None
+    if parsed.get_backend_name() != "sqlite":
+        raise _config_error(
+            f"expected a SQLite URL, got the {parsed.get_backend_name()!r} dialect"
+        )
+    query = {str(key).lower(): str(value) for key, value in (parsed.query or {}).items()}
+    database = parsed.database or ""
+    uri_value = query.get("uri")
+    if uri_value is None:
+        uri = False
+    elif uri_value.lower() in {"true", "1", "yes"}:
+        uri = True
+    elif uri_value.lower() in {"false", "0", "no"}:
+        uri = False
+    else:
+        raise _config_error("SQLite ?uri= must be true or false")
+    if uri and not database.startswith("file:"):
+        raise _config_error(
+            "SQLite ?uri=true requires a file: database name; refusing an "
+            "ambiguous target"
+        )
+    if database.startswith("file:") and not uri:
+        raise _config_error(
+            "a SQLite file: database name requires ?uri=true; refusing an "
+            "ambiguous target"
+        )
+    if uri:
+        database = database[len("file:") :]
+    mode = query.get("mode", "memory" if database in ("", ":memory:") else "rwc")
+    if mode not in _SQLITE_MODES:
+        raise _config_error(f"unsupported SQLite mode {mode!r}")
+    cache = query.get("cache")
+    if cache is not None and cache not in _SQLITE_CACHES:
+        raise _config_error(f"unsupported SQLite cache {cache!r}")
+    if mode == "memory":
+        return (database or ":memory:", "memory", cache)
     if not database:
-        return ""
-    if database == ":memory:":
-        return database
-    return os.path.realpath(database)
+        raise _config_error("a file-mode SQLite URL must name a database file")
+    return (os.path.realpath(database), "file", None)
 
 
 def _assert_sqlite_migration_target(
@@ -843,7 +915,7 @@ def _assert_sqlite_migration_target(
     """
     if not (migration_url or "").lower().startswith("sqlite"):
         return migration_url
-    if _sqlite_target_path(runtime_url) != _sqlite_target_path(migration_url):
+    if _sqlite_target_identity(runtime_url) != _sqlite_target_identity(migration_url):
         raise _config_error(
             "a separate SQLite migration URL is not supported: Alembic is given "
             "the runtime SQLite engine, so the configured migration target must "
@@ -886,18 +958,28 @@ def _cluster_system_identifier(conn) -> str | None:
         ) from None
 
 
+#: Canonical, timezone-independent postmaster start time in integer
+#: microseconds since the Unix epoch. ``pg_postmaster_start_time()::text``
+#: renders in the session's TimeZone, so two connections to the *same* cluster
+#: could disagree purely because they set different time zones. Epoch seconds
+#: are absolute; microseconds keep restarts within one second distinct.
+_POSTMASTER_START_SQL = (
+    "(extract(epoch from pg_postmaster_start_time()) * 1000000)::bigint::text"
+)
+
+
 def _logical_target_signature(conn) -> tuple:
     """Read the server-side identity of the cluster/database a connection sees.
 
     ``system_identifier`` (when readable) is a 64-bit value generated by
     ``initdb``. It is stable across restarts, identical for two connections to
     one cluster, and different for any other cluster — deterministic identity
-    evidence. ``current_database()``, the postmaster start time and the
-    database OID stay in the tuple: they are what remains comparable when a
-    provider has revoked ``pg_control_system()``.
+    evidence. ``current_database()``, the canonical postmaster start epoch and
+    the database OID stay in the tuple: they are what remains comparable when
+    a provider has revoked ``pg_control_system()``.
     """
     row = conn.exec_driver_sql(
-        "SELECT current_database(), pg_postmaster_start_time()::text, "
+        f"SELECT current_database(), {_POSTMASTER_START_SQL}, "
         "(SELECT oid FROM pg_database WHERE datname = current_database())"
     ).one()
     return (row[0], row[1], row[2], _cluster_system_identifier(conn))
@@ -930,6 +1012,9 @@ def _verify_logical_target(
         runtime_url, label="DATABASE_URL"
     ).database
 
+    # A previous proof must never authorize this one: clear the runtime
+    # reference while the target is re-proven, then publish the new evidence.
+    _RUNTIME_TARGET_SIGNATURE[0] = None
     with migration_engine.connect() as conn:
         observed = _logical_target_signature(conn)
         conn.rollback()
@@ -986,6 +1071,9 @@ def _verify_logical_target(
     # later connection on this engine re-reads and must match it.
     if signature_holder is not None:
         signature_holder[0] = observed
+    # The runtime engine's guard reads the same proof on every new connection,
+    # including pool reconnects and provider failover to another endpoint.
+    _RUNTIME_TARGET_SIGNATURE[0] = runtime_observed
 
 
 def _verified_runtime_role() -> str:
@@ -1113,7 +1201,7 @@ def _dbapi_logical_signature(cursor) -> tuple:
     over to another cluster is rejected rather than trusted.
     """
     cursor.execute(
-        "SELECT current_database(), pg_postmaster_start_time()::text, "
+        f"SELECT current_database(), {_POSTMASTER_START_SQL}, "
         "(SELECT oid FROM pg_database WHERE datname = current_database())"
     )
     row = cursor.fetchone()
@@ -1183,13 +1271,22 @@ def _install_migration_identity_guard(
 def _migration_engine():
     """Build, verify and return the engine for the dedicated migration identity."""
     url = assert_guarded_migration_configuration()
+    # Each acquisition attempt composes three independent finite bounds: pool
+    # checkout (``pool_timeout``), TCP/authentication (``connect_timeout``)
+    # and the lease SQL's lock wait (``lock_timeout``, further capped by the
+    # remaining admission budget). This is not a strict wall-clock cap on the
+    # whole retry loop; the loop itself stops starting attempts at the deadline.
+    attempt_bound_seconds = max(
+        1, int(min(30, settings.MIGRATION_LEASE_WAIT_SECONDS))
+    )
     engine_ = create_engine(
         url,
         poolclass=None,
         pool_pre_ping=True,
         pool_size=2,
         max_overflow=2,
-        pool_timeout=30,
+        pool_timeout=attempt_bound_seconds,
+        connect_args={"connect_timeout": attempt_bound_seconds},
     )
     # The reference is empty during preflight (the first connection is what
     # proves the target) and set before the engine is returned, so every
@@ -1453,17 +1550,21 @@ def _run_guarded_migrations(
         primary = exc
         raise
     finally:
-        if acquired:
-            try:
-                lease.release()
-            except Exception:  # noqa: BLE001 - cleanup must never mask the cause
-                logger.exception(
-                    "migration lease cleanup failed (fingerprint=%s)",
-                    lease.fingerprint,
-                )
-                if primary is None:
-                    raise
-        migration_engine.dispose()
+        # Nested so disposal is unconditional: a release failure must neither
+        # skip engine disposal nor hide an earlier exception.
+        try:
+            if acquired:
+                try:
+                    lease.release()
+                except Exception:  # noqa: BLE001 - cleanup must never mask the cause
+                    logger.exception(
+                        "migration lease cleanup failed (fingerprint=%s)",
+                        lease.fingerprint,
+                    )
+                    if primary is None:
+                        raise
+        finally:
+            migration_engine.dispose()
 
 
 def _run_alembic_migrations(

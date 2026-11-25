@@ -1,36 +1,35 @@
-"""Fail-closed gate over the pytest logs produced by CI.
+"""Fail-closed gate over the pytest JUnit reports produced by CI.
 
-The PostgreSQL workflows deliberately keep pytest's exit status in a side file
-so the job can upload sanitized evidence before deciding the outcome. This
-script makes that decision, for **every** suite, from the two artifacts CI
-actually produced:
+The PostgreSQL workflows keep pytest's exit status in a side file and write a
+JUnit XML report, so the job can upload sanitized evidence before deciding the
+outcome. This script makes that decision, for **every** suite, from the
+artifacts CI actually produced:
 
     python scripts/pytest_gate.py \
-        --suite 'integration|80|issue145-application.log|issue145-application.rc' \
-        --suite 'regression|181|issue145-regression.log|issue145-regression.rc'
+        --suite 'integration|80|issue145-application.xml|issue145-application.rc' \
+        --suite 'regression|181|issue145-regression.xml|issue145-regression.rc'
 
 A suite passes only when all of the following hold:
 
-* its recorded exit code exists and is ``0``;
-* its pytest log exists;
-* the log's authoritative terminal summary reports no ``N failed`` and no
-  ``N error`` / ``N errors`` counts;
-* that summary reports no ``N skipped`` count (a skipped PostgreSQL suite is a
-  false green, not a pass);
-* the summary reports a ``N passed`` count;
-* ``N`` is at least the declared minimum.
+* its recorded exit code exists, is readable and is exactly ``0``;
+* its JUnit XML report exists and parses;
+* the report has a ``testsuite``/``testsuites`` root with at least one
+  ``testsuite`` and every suite carries consistent, non-negative ``tests``,
+  ``failures``, ``errors`` and ``skipped`` counts;
+* the recorded counts agree with the ``testcase`` elements actually present
+  (a report that claims more or fewer tests than it lists is rejected);
+* there are no failures, errors or skips;
+* the derived passed count (``tests - failures - errors - skipped``) is at
+  least the declared minimum.
 
-Only pytest's own terminal summary line is trusted. Earlier revisions scanned
-every line of the (untrusted) log for ``N <word>`` tokens, so arbitrary test
-output containing "999999 failed" could fabricate a failure. The summary line
-is the last line that consists solely of ``<count> <status>`` pairs followed by
-`` in <seconds>s``, which is the shape pytest prints and test output does not
-control.
+The JUnit XML is the only acceptance-count source. The text logs are retained
+for diagnostics and are never parsed by this gate, so arbitrary test or
+teardown output — including a fabricated ``999999 failed`` or ``999 passed``
+line before or after the real summary — cannot change the decision.
 
-The minimum is the exact number of tests the suite is expected to run. It is
-deliberately exact rather than a round number: dropping or silently skipping
-tests lowers the count, so the gate fails until the change is made explicit in
-the workflow alongside the test that added or removed coverage.
+The minimum is a floor, not a target: dropping or silently skipping tests
+lowers the passed count and fails the gate until the change is made explicit
+in the workflow alongside the test that added or removed coverage.
 
 Exit status: ``0`` all suites pass, ``1`` at least one suite fails, ``2`` the
 gate itself was invoked incorrectly.
@@ -40,63 +39,127 @@ from __future__ import annotations
 
 import argparse
 import pathlib
-import re
 import sys
+import xml.etree.ElementTree as ET
 
-#: One ``<count> <status>`` pair. ``errors`` is what pytest prints for
-#: collection errors; the singular forms appear for single occurrences.
-_SUMMARY_PAIR = re.compile(
-    r"(\d+) "
-    r"(passed|failed|errors?|skipped|xfailed|xpassed|deselected|warnings?|warning)"
-)
-#: pytest appends ``(0:01:10)`` to the duration once a run is over a minute,
-#: so the suffix is optional but must be the whole tail of the line.
-_SUMMARY_DURATION = re.compile(
-    r" in \d+(?:\.\d+)?s(?: \(\d+:\d{2}:\d{2}\))?$"
-)
-_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+#: The largest report the gate will read. A CI report is far smaller; the cap
+#: keeps a corrupt or hostile artifact from consuming the runner's memory.
+_MAX_REPORT_BYTES = 64 * 1024 * 1024
 
 
-def _summary_counts(text: str) -> dict[str, int]:
-    """Return the counts from pytest's authoritative terminal summary.
+class GateError(Exception):
+    """The report cannot be trusted as acceptance evidence."""
 
-    The scan walks the log backwards and accepts the first line that:
 
-    * ends with pytest's `` in <duration>s`` suffix;
-    * is composed **only** of ``<count> <status>`` pairs (optionally prefixed
-      by a run of ``=`` characters).
+def _count_attr(element: ET.Element, name: str) -> int:
+    raw = element.get(name)
+    if raw is None:
+        raise GateError(f"<{element.tag}> is missing the {name!r} attribute")
+    try:
+        value = int(raw)
+    except ValueError:
+        raise GateError(
+            f"<{element.tag}> has a non-integer {name!r} attribute ({raw!r})"
+        ) from None
+    if value < 0:
+        raise GateError(
+            f"<{element.tag}> has a negative {name!r} attribute ({value})"
+        )
+    return value
 
-    Everything else in the log is untrusted test output and is ignored, so a
-    test that prints "999999 failed" cannot change the gate's decision. An
-    empty mapping means no unambiguous summary was found, which the caller
-    treats as a failure.
+
+def _suite_counts(suite: ET.Element) -> tuple[int, int, int, int]:
+    """Validate one ``<testsuite>`` and return (tests, failures, errors, skipped).
+
+    The declared counters must agree with the ``testcase`` elements the report
+    actually lists. That cross-check is what stops a report whose summary says
+    everything passed while individual cases are marked failed/skipped.
     """
-    for raw_line in reversed(text.splitlines()):
-        line = _ANSI.sub("", raw_line).strip()
-        if not line:
-            continue
-        line = line.strip("=").strip()
-        duration = _SUMMARY_DURATION.search(line)
-        if duration is None:
-            continue
-        body = line[: duration.start()].strip()
-        if not body:
-            continue
-        counts: dict[str, int] = {}
-        consumed = 0
-        valid = True
-        for part in body.split(","):
-            token = part.strip()
-            match = _SUMMARY_PAIR.fullmatch(token)
-            if match is None:
-                valid = False
-                break
-            status = match.group(2)
-            counts[status] = counts.get(status, 0) + int(match.group(1))
-            consumed += 1
-        if valid and consumed:
-            return counts
-    return {}
+    tests = _count_attr(suite, "tests")
+    failures = _count_attr(suite, "failures")
+    errors = _count_attr(suite, "errors")
+    skipped = _count_attr(suite, "skipped")
+    if failures + errors + skipped > tests:
+        raise GateError(
+            f"<testsuite {suite.get('name', '?')!r}> reports "
+            f"{failures} failure(s), {errors} error(s) and {skipped} skip(s) "
+            f"for only {tests} test(s)"
+        )
+    if suite.find("testsuite") is not None:
+        raise GateError(
+            f"<testsuite {suite.get('name', '?')!r}> contains a nested "
+            "<testsuite>; nested reports are ambiguous and are rejected"
+        )
+
+    cases = suite.findall("testcase")
+    if len(cases) != tests:
+        raise GateError(
+            f"<testsuite {suite.get('name', '?')!r}> declares {tests} test(s) "
+            f"but lists {len(cases)} <testcase> element(s)"
+        )
+
+    observed_failures = sum(1 for case in cases if case.find("failure") is not None)
+    observed_errors = sum(1 for case in cases if case.find("error") is not None)
+    observed_skipped = sum(1 for case in cases if case.find("skipped") is not None)
+    if (observed_failures, observed_errors, observed_skipped) != (
+        failures,
+        errors,
+        skipped,
+    ):
+        raise GateError(
+            f"<testsuite {suite.get('name', '?')!r}> counters do not match its "
+            f"<testcase> elements (declared failures/errors/skips "
+            f"{failures}/{errors}/{skipped}, observed "
+            f"{observed_failures}/{observed_errors}/{observed_skipped})"
+        )
+    return tests, failures, errors, skipped
+
+
+def _read_report(path: pathlib.Path) -> tuple[int, int, int, int]:
+    """Parse and validate a JUnit XML report; return summed counts."""
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise GateError(f"cannot read {path} ({type(exc).__name__})") from None
+    if size <= 0:
+        raise GateError(f"{path} is empty")
+    if size > _MAX_REPORT_BYTES:
+        raise GateError(f"{path} is larger than {_MAX_REPORT_BYTES} bytes")
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise GateError(f"cannot read {path} ({type(exc).__name__})") from None
+    # JUnit is a plain data document. External entities/DOCTYPEs are never
+    # needed and are refused rather than handed to the XML parser.
+    head = raw[:4096].lower()
+    if b"<!doctype" in head or b"<!entity" in head:
+        raise GateError(f"{path} contains a DOCTYPE/ENTITY declaration")
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as exc:
+        raise GateError(f"{path} is not well-formed XML ({exc})") from None
+
+    if root.tag == "testsuite":
+        suites = [root]
+    elif root.tag == "testsuites":
+        suites = [child for child in root if child.tag == "testsuite"]
+        if len(suites) != len(list(root)):
+            raise GateError(
+                f"{path} has a <testsuites> root with non-<testsuite> children"
+            )
+    else:
+        raise GateError(
+            f"{path} has root <{root.tag}>, expected <testsuite> or <testsuites>"
+        )
+    if not suites:
+        raise GateError(f"{path} contains no <testsuite>")
+
+    totals = [0, 0, 0, 0]
+    for suite in suites:
+        counts = _suite_counts(suite)
+        for index, value in enumerate(counts):
+            totals[index] += value
+    return totals[0], totals[1], totals[2], totals[3]
 
 
 class Suite:
@@ -104,12 +167,12 @@ class Suite:
         parts = spec.split("|")
         if len(parts) != 4:
             raise ValueError(
-                f"invalid --suite {spec!r}: expected 'label|min_passed|log|rc'"
+                f"invalid --suite {spec!r}: expected 'label|min_passed|xml|rc'"
             )
-        label, minimum, log, rc = parts
+        label, minimum, report, rc = parts
         self.label = label.strip()
         self.minimum = int(minimum)
-        self.log = pathlib.Path(log.strip())
+        self.report = pathlib.Path(report.strip())
         self.rc = pathlib.Path(rc.strip())
 
 
@@ -139,25 +202,22 @@ def check(suite: Suite, errors: list[str]) -> int | None:
         fail("the pytest exit status is missing or unreadable")
     elif exit_code != 0:
         fail(f"pytest exited {exit_code}")
-    if not suite.log.is_file():
-        fail(f"no pytest log at {suite.log}")
+    if not suite.report.is_file():
+        fail(f"no JUnit XML report at {suite.report}")
         return None
-    text = suite.log.read_text(encoding="utf-8", errors="replace")
-
-    counts = _summary_counts(text)
-    if not counts:
-        fail("the log has no authoritative pytest summary line")
+    try:
+        tests, failures, errors_count, skipped = _read_report(suite.report)
+    except GateError as exc:
+        fail(str(exc))
         return None
 
-    failed = counts.get("failed", 0) + counts.get("error", 0) + counts.get("errors", 0)
-    if failed:
-        fail(f"{failed} failed/errored test(s)")
-    skipped = counts.get("skipped", 0)
+    if failures or errors_count:
+        fail(f"{failures + errors_count} failed/errored test(s) in the JUnit report")
     if skipped:
-        fail(f"{skipped} skipped test(s)")
-    passed = counts.get("passed", 0)
-    if not passed:
-        fail("the summary reports no passed tests")
+        fail(f"{skipped} skipped test(s) in the JUnit report")
+    passed = tests - failures - errors_count - skipped
+    if passed <= 0:
+        fail("the JUnit report contains no passed tests")
         return None
     if passed < suite.minimum:
         fail(f"only {passed} test(s) passed, expected at least {suite.minimum}")
@@ -166,13 +226,13 @@ def check(suite: Suite, errors: list[str]) -> int | None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="pytest_gate", description="Fail-closed gate over pytest CI logs."
+        prog="pytest_gate", description="Fail-closed gate over pytest JUnit reports."
     )
     parser.add_argument(
         "--suite",
         action="append",
         required=True,
-        metavar="LABEL|MIN_PASSED|LOG|RC",
+        metavar="LABEL|MIN_PASSED|XML|RC",
         help="one suite to validate; repeat the flag for each suite",
     )
     args = parser.parse_args(argv)

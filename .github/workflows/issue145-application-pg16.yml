@@ -146,7 +146,8 @@ jobs:
               tests/test_alembic_single_head.py \
               tests/test_alembic_env_resolution.py \
               tests/test_day5_alembic_authority.py \
-              tests/test_leg_exposure.py > issue145-regression.log 2>&1
+              tests/test_leg_exposure.py \
+              --junitxml=issue145-regression.xml > issue145-regression.log 2>&1
           rc=$?
           echo "$rc" > issue145-regression.rc
           exit 0
@@ -161,14 +162,13 @@ jobs:
             tail -n 60 "$stem.log" 2>/dev/null || echo "no log produced"
           done
           # Both suites are gated independently and fail closed on a missing
-          # log or exit code, a failed/errored test, ANY skipped test, a
-          # missing pass summary, or fewer passes than the suite really has.
-          # The minimums are the exact counts this commit runs: removing or
-          # silently dropping coverage lowers the count and fails the job
-          # until the workflow is updated deliberately.
+          # or non-zero exit code, a missing/malformed/inconsistent JUnit
+          # report, a failed/errored/skipped test, or fewer passes than the
+          # declared minimum. The JUnit XML is the only count source; the text
+          # logs above are diagnostics and cannot override it.
           python scripts/pytest_gate.py \
-            --suite "integration|80|issue145-application.log|issue145-application.rc" \
-            --suite "regression|181|issue145-regression.log|issue145-regression.rc"
+            --suite "integration|80|issue145-application.xml|issue145-application.rc" \
+            --suite "regression|181|issue145-regression.xml|issue145-regression.rc"
 
       - name: Drop leftover test databases and roles
         if: always()
@@ -207,6 +207,7 @@ jobs:
             options-dashboard-project/backend/issue145-application.log
             options-dashboard-project/backend/issue145-application.xml
             options-dashboard-project/backend/issue145-regression.log
+            options-dashboard-project/backend/issue145-regression.xml
             options-dashboard-project/backend/issue145-application.rc
             options-dashboard-project/backend/issue145-regression.rc
             options-dashboard-project/backend/scripts/pytest_gate.py

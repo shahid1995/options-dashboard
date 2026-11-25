@@ -260,16 +260,26 @@ This connection-time proof runs in `_migration_engine()`, so every caller
 * **Timeouts:** `lock_timeout` bounds each lock acquisition. `statement_timeout`
   bounds each *statement*, **not** the whole multi-statement transaction; a
   per-user transaction may contain several statements that each fit the
-  timeout. Its total duration is bounded by the mandatory pre-commit `enter`
-  refresh, which fails once ownership has expired, and by the TTL. When a
-  timeout fires, PostgreSQL rolls that user's transaction back, the remaining
-  users are not attempted, and the lease is released; users already committed
-  stay committed. There is no background renewal thread.
+  timeout. The TTL does **not** bound the duration of an active transaction: a
+  running user transaction keeps the lease row lock and its own locks past
+  `expires_at` while a statement is still executing, or blocked on a lock.
+  The mandatory pre-commit `enter` refresh fails once ownership has expired,
+  so the transaction cannot *commit* as owner after expiry; PostgreSQL rolls
+  it back. Until that transaction actually ends, a new process's
+  `lease_acquire` waits for the row lock, so TTL expiry alone does not admit
+  it. When a timeout fires, PostgreSQL rolls that user's transaction back, the
+  remaining users are not attempted, and the lease is released; users already
+  committed stay committed. Supported recovery for a wedged or long-running
+  statement is to let it finish, cancel the backend (`pg_cancel_backend`) when
+  that is safe, or terminate it (`pg_terminate_backend`) as an operator
+  action; the lease then becomes acquirable. There is no background renewal
+  thread.
 * **Cleanup:** a failure before acquisition (preflight or `acquire`) attempts
   no release because ownership was never taken, but still disposes the
   migration engine. After acquisition, release runs in its own short
-  transaction; a cleanup failure is logged and never hides the original
-  exception.
+  transaction exactly once; a cleanup failure is logged and never hides the
+  original exception, and engine disposal still runs in the outer `finally`
+  even when `release` itself raises.
 
 ## 4. Operator CLI
 
@@ -333,6 +343,15 @@ CLI and startup use the **migration** identity, never the runtime identity.
    strikenova_production_app; REVOKE CREATE ON SCHEMA public FROM
    strikenova_production_app;`. Its table and sequence privileges come only
    from the defaults in the next sentence.
+
+   PostgreSQL 15+ no longer grants `CREATE` on `public` to `PUBLIC`, but a
+   database upgraded from an earlier major version can still carry that
+   inherited grant. Inspect and remove it when present (as the schema owner):
+   `REVOKE CREATE ON SCHEMA public FROM PUBLIC;`. Verify the runtime role's
+   **effective** privilege, which includes anything inherited through
+   `PUBLIC`: `SELECT has_schema_privilege('strikenova_production_app',
+   'public', 'CREATE');` must return `false`. The guarded upgrade enforces the
+   same effective check and refuses to migrate otherwise.
 
    Create the schema-scoped default privileges for the creator role
    (`STRIKENOVA_OWNER_ROLE` if set, else the migrator) in schema `public`:
@@ -427,17 +446,21 @@ stay conservative regardless of which measurement is cited.
 
 Derivation:
 
-* **TTL 300 s**: ≈ 8 500 × the slower measured p99 (35.3 ms). It only bounds how long a *new*
-  process waits before taking over an abandoned row, so a wide margin costs
-  nothing at normal scale while keeping a wedged deploy bounded to minutes.
+* **TTL 300 s**: ≈ 8 500 × the slower measured p99 (35.3 ms). It only decides
+  when a *new* process may take over a row left by a crashed or vanished owner;
+  the server must still release that owner's row lock, and an active transaction
+  can hold locks past the TTL (§3). A wide margin costs nothing at normal scale
+  while keeping takeover after a crash bounded to minutes.
 * **Statement timeout 150 s**: ≈ 4 250 × the slower measured p99 for one user.
   The configuration validator enforces it **strictly below** the TTL
   (`MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS < MIGRATION_LEASE_TTL_SECONDS ×
   1000`): equality and larger values are refused at the settings boundary. The
   timeout applies to each statement, not to the whole transaction; the
-  pre-commit `enter` refresh is what actually guarantees a user cannot hold the
-  lease past its expiry. It is large enough for a slower production host or a
-  user with many positions.
+  pre-commit `enter` refresh guarantees a user cannot **commit** after expiry.
+  It does not cap how long an active transaction may keep its locks, so a
+  wedged statement is recovered by cancel/terminate rather than by waiting for
+  the TTL (§3). It is large enough for a slower production host or a user with
+  many positions.
 * **Wait 180 s / lock timeout 10 s**: the wait budget must exceed a normal
   full-chain migration on this chain (~20 s observed end to end on the test
   instance, including backfill) with headroom for platform cold starts; the
@@ -565,9 +588,9 @@ rather than reasoned about.
 
 | Suite | Scope | Result |
 | --- | --- | --- |
-| `tests/test_issue145_application_integration.py` | real PG 16.16: concurrent `init_db()`, single connection, killed worker, injected failure, CLI, barrier, protocol, expiry, privileges, both ownership topologies, the Topology A §8.3 matrix and its restricted backfill, schema-ACL positive/negative controls, timing, **the §8.1 application privilege verifier (both topologies plus its negative/positive controls, including every default-privilege overgrant direction and excess privileges on the existing exposure sequence)**, **incoming membership and NOLOGIN controls**, **the actual-connection identity controls (superuser admin login, unrelated login, migrator-member login, superuser migrator role) with unchanged lease/version/data**, **deterministic `system_identifier` identity evidence with its narrowed fallback (documented refusal only; unexpected errors fail closed)**, **a deterministic two-process contention proof that pauses the first worker inside its first protected per-user backfill transaction (database trigger on an advisory lock) and observes the second worker queued on the admission guard with no lease row lock**, **the runtime principal read from the live connection and a `?user=` URL that authenticates as the migrator refused**, **column-level `UPDATE`/`REFERENCES` bypasses refused in both topologies and aborting the guarded upgrade**, **the lease/control protocol mirror mismatch refused without repair**, **a URL-encoded `%40` password accepted on the guarded path**, **a new migration connection pointed at another database refused before it can run a statement** | 80 passed |
-| `tests/test_migration_serialization.py` | DB-free protocol/config/retirement contract, the timeout-below-TTL rule and its boundaries, finite/positive wait validation, no attempt past the admission deadline, pre-acquisition cleanup, separate-SQLite-target refusal, connection query/host-list override refusal, disposable-harness URL normalization, and the CI log gate's authoritative-summary controls (including pytest's long-run `(0:01:10)` suffix) | 76 passed |
-| `tests/test_db_migration.py`, `test_alembic_*.py`, `test_day5_alembic_authority.py`, `test_migration_identity_separation.py`, `test_leg_exposure.py` | SQLite chain, FK behavior, identity separation (**including the 16-target §8.1 URL contract: accepted pair, same-login, different database, different endpoint, declared alias, alias port mismatch, Neon pooled route, SQLite and CockroachDB migration targets, blank/malformed URLs, malformed alias configuration, no-password-in-errors, and the configured-identity binding — migration login must be `STRIKENOVA_MIGRATOR_ROLE`, runtime login must be `STRIKENOVA_RUNTIME_ROLE` when set, blank role name refused, unset runtime role not constrained**), exposure idempotency | 181 passed (regression suite total) |
+| `tests/test_issue145_application_integration.py` | real PG 16.16: concurrent `init_db()`, single connection, killed worker, injected failure, CLI, barrier, protocol, expiry, privileges, both ownership topologies, the Topology A §8.3 matrix and its restricted backfill, schema-ACL positive/negative controls, timing, **the §8.1 application privilege verifier (both topologies plus its negative/positive controls, including every default-privilege overgrant direction and excess privileges on the existing exposure sequence)**, **incoming membership and NOLOGIN controls**, **the actual-connection identity controls (superuser admin login, unrelated login, migrator-member login, superuser migrator role) with unchanged lease/version/data**, **deterministic `system_identifier` identity evidence with its narrowed fallback (documented refusal only; unexpected errors fail closed)**, **a deterministic two-process contention proof that pauses the first worker inside its first protected per-user backfill transaction (database trigger on an advisory lock) and observes the second worker queued on the admission guard with no lease row lock**, **the runtime principal read from the live connection and a `?user=` URL that authenticates as the migrator refused**, **column-level `UPDATE`/`REFERENCES` bypasses refused in both topologies and aborting the guarded upgrade**, **the lease/control protocol mirror mismatch refused without repair**, **a URL-encoded `%40` password accepted on the guarded path**, **a new migration connection pointed at another database refused before it can run a statement**, **every new runtime connection compared with the startup-proven target signature and refused when it differs**, **a timezone-independent postmaster epoch signature (UTC and Asia/Kolkata agree)**, **the actual lease-row lock proven with `SELECT … FOR UPDATE NOWAIT` (SQLSTATE 55P03) while worker A is paused, with a negative control after release**, **an inherited `PUBLIC` CREATE on `public` refused and then accepted once revoked** | 83 passed |
+| `tests/test_migration_serialization.py` | DB-free protocol/config/retirement contract, the timeout-below-TTL rule and its boundaries, finite/positive wait validation, no attempt past the admission deadline, no SQL after a checkout consumes the budget, bounded backoff for very high attempt counts, unchanged fast 55P03 retry, pre-acquisition cleanup, unconditional engine disposal when `release` raises, SQLite URI identity (`mode=memory`, `mode=rwc`, `uri=true`, unsupported modes), connection query/host-list override refusal, disposable-harness endpoint preservation (authority and query-form host/port) and service refusal, and the **JUnit-XML CI gate** (authoritative counts, fabricated-log controls, malformed/inconsistent reports, failures/errors/skips, rc and minimum) | 93 passed (file) |
+| `tests/test_db_migration.py`, `test_alembic_*.py`, `test_day5_alembic_authority.py`, `test_migration_identity_separation.py`, `test_leg_exposure.py` | SQLite chain, FK behavior, identity separation (**including the 16-target §8.1 URL contract: accepted pair, same-login, different database, different endpoint, declared alias, alias port mismatch, Neon pooled route, SQLite and CockroachDB migration targets, blank/malformed URLs, malformed alias configuration, no-password-in-errors, and the configured-identity binding — migration login must be `STRIKENOVA_MIGRATOR_ROLE`, runtime login must be `STRIKENOVA_RUNTIME_ROLE` when set, blank role name refused, unset runtime role not constrained**), exposure idempotency | 198 passed (regression suite total) |
 | `PostgreSQL compatibility` suite (9 modules: compatibility, importer, failure injection, large rehearsal, hardening, Day 5/6) | disposable PG 16.16 schemas built only through `python -m app.migrate upgrade head` | 122 passed |
 | `.github/workflows/issue145-application-pg16.yml` | the two suites above on a pinned `postgres@sha256:3950ad…` 16.16 service, exact `server_version_num = 160016` gate, evidence upload, cleanup | see PR #151 checks |
 | `scripts/pytest_gate.py` | gates **both** suites independently: missing log or exit code, failed/errored test, any skipped test, missing/unparseable authoritative summary, or fewer passes than the exact minimum all fail the job. Only pytest's terminal `... in <duration>s` summary line is trusted, so test output cannot fabricate counts | 80 / 181 minimums; negative controls in `TestPytestGate` |
