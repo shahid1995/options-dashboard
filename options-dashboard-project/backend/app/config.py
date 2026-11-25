@@ -137,14 +137,23 @@ class Settings(BaseSettings):
     # docs/ADR-017-018-IMPLEMENTATION-RUNBOOK.md: the measured per-user
     # backfill p99 was well under a second, and the whole Alembic chain
     # completed in a few seconds. 300 s leaves a wide margin over both while
-    # keeping crash recovery bounded; the statement timeout is half the TTL so
-    # a runaway user transaction fails (57014) before ownership can expire.
+    # keeping crash recovery bounded. The statement timeout is per-statement
+    # only, not cumulative across the transaction, and does not by itself bound
+    # the total transaction duration. A transaction can run several statements
+    # each below the statement_timeout while still holding its lease row lock
+    # beyond the lease TTL. The pre-commit enter check then refuses an expired
+    # owner, rolling back work that held locks longer than the TTL.
     MIGRATION_LEASE_TTL_SECONDS: float = 300.0
     #: Bounded wait for the admission lock/acquisition retries (ADR §6.7).
     MIGRATION_LEASE_WAIT_SECONDS: float = 180.0
     #: Per-call lock_timeout handed to the lease functions (1..600000 ms).
     MIGRATION_LEASE_LOCK_TIMEOUT_MS: int = 10000
-    #: statement_timeout for each per-user backfill transaction (< TTL).
+    #: Per-statement execution bound applied to each backfill transaction
+    #: call. A single statement must complete within this timeout; it does not
+    #: accumulate across statements within the same transaction. The default
+    #: 150000 ms (2.5 min) is well below the 300 s lease TTL, providing
+    #: margin for a runaway statement to fail (57014) before the lease can
+    #: expire at pre-commit enter.
     MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS: int = 150000
 
     # ADR-018 identity names. The runtime identity must hold zero access to
