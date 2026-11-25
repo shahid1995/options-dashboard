@@ -275,7 +275,8 @@ jobs:
           done
           version="$("$bindir/postgres" --version)"
           echo "$version"
-          if [ "$version" != "postgres (PostgreSQL) 16.16" ]; then
+          if ! printf '%s\n' "$version" |
+              grep -Eq '^postgres \(PostgreSQL\) 16\.16([[:space:]]|$)'; then
             echo "::error::expected PostgreSQL 16.16, got: $version"
             exit 1
           fi
