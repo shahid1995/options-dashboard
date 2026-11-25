@@ -615,28 +615,39 @@ rather than reasoned about.
 | Suite | Scope | Result |
 | --- | --- | --- |
 | `tests/test_issue145_application_integration.py` | real PG 16.16: concurrent `init_db()`, single connection, killed worker, injected failure, CLI, barrier, protocol, expiry, privileges, both ownership topologies, the Topology A §8.3 matrix and its restricted backfill, schema-ACL positive/negative controls, timing, **the §8.1 application privilege verifier (both topologies plus its negative/positive controls, including every default-privilege overgrant direction and excess privileges on the existing exposure sequence)**, **incoming membership and NOLOGIN controls**, **the actual-connection identity controls (superuser admin login, unrelated login, migrator-member login, superuser migrator role) with unchanged lease/version/data**, **deterministic, restart-stable `system_identifier` target identity, with an unreadable identifier refused and named with its exact grant (unexpected errors fail closed too)**, **a deterministic two-process contention proof that pauses the first worker inside its first protected per-user backfill transaction (database trigger on an advisory lock) and observes the second worker queued on the admission guard with no lease row lock**, **the runtime principal read from the live connection and a `?user=` URL that authenticates as the migrator refused**, **column-level `UPDATE`/`REFERENCES` bypasses refused in both topologies and aborting the guarded upgrade**, **the lease/control protocol mirror mismatch refused without repair**, **a URL-encoded `%40` password accepted on the guarded path**, **a new migration connection pointed at another database refused before it can run a statement**, **every new runtime connection compared with the startup-proven target identity and refused when it differs**, **a timezone-independent diagnostic postmaster epoch (UTC and Asia/Kolkata agree) that is proven absent from the target identity**, **the actual lease-row lock proven with `SELECT … FOR UPDATE NOWAIT` (SQLSTATE 55P03) while worker A is paused, with a negative control after release**, **an inherited `PUBLIC` CREATE on `public` refused and then accepted once revoked** | 83 passed |
-| `tests/test_issue145_pg_restart.py` | **real restart of a self-provisioned PostgreSQL 16.16 cluster** (not a simulated signature change): the identity is captured, the server process is restarted on the same data directory, the postmaster start time is asserted to change, a new migration connection (full preflight) and a new runtime connection are accepted for the same target, the identity is asserted unchanged and asserted not to contain the start time, a different database in the same cluster and a second cluster with the same database name are still refused, and a revoked `pg_control_system()` after a restart fails closed with the grant and publishes nothing. Requires `ISSUE145_PG_BINDIR`; creates and owns its own scratch cluster and never restarts the CI/admin cluster | 4 passed (local 16.16) |
+| `tests/test_issue145_pg_restart.py` | **real restart of a self-provisioned PostgreSQL 16.16 cluster** (not a simulated signature change). (1) *Existing process, pre-restart proof:* startup preflight publishes `_RUNTIME_TARGET_SIGNATURE` once; a runtime engine with the application's listener and pool options (`pool_size=5`, `max_overflow=10`, `pool_timeout=30`, `pool_recycle=1800`, `pool_pre_ping=True`) is created and holds one pooled connection; the server is restarted; the **same engine object** is checked out again with no dispose, no `_migration_engine()`/`_verify_logical_target()` and no restart of application startup (both are replaced by fail-fast stubs). `pool_pre_ping` must replace the terminated pooled DBAPI connection (backend PID changes, a new `connect` event fires), the runtime listener must accept it, `SELECT 1` must work, `_RUNTIME_TARGET_SIGNATURE` must stay the *same object and value*, the identity must be unchanged and the postmaster start time must have changed. The test also records the identity the guard itself computes on the reconnection, so the comparison input is observed rather than assumed. (2) *New connection, re-proven target:* a new preflight and a new runtime connection are accepted after the restart, and the start time is asserted absent from the identity. (3) *Negative controls:* a different database in the same cluster and a second cluster with the same database name are still refused, and a revoked `pg_control_system()` after a restart fails closed with the grant and publishes nothing. Requires `ISSUE145_PG_BINDIR`; creates and owns its own scratch cluster and never restarts the CI/admin cluster | 5 passed (local 16.16) |
 | `tests/test_migration_serialization.py` | DB-free protocol/config/retirement contract, the timeout-below-TTL rule and its boundaries, finite/positive wait validation, no attempt past the admission deadline, no SQL after a checkout consumes the budget, bounded backoff for very high attempt counts, unchanged fast 55P03 retry, pre-acquisition cleanup, unconditional engine disposal when `release` raises, SQLite URI identity (`mode=memory`, `mode=rwc`, `uri=true`, unsupported modes), connection query/host-list override refusal, disposable-harness endpoint preservation (authority and query-form host/port) and service refusal, and the **JUnit-XML CI gate** (authoritative counts, fabricated-log controls, malformed/inconsistent reports, failures/errors/skips, rc and minimum) | 93 passed (file) |
 | `tests/test_db_migration.py`, `test_alembic_*.py`, `test_day5_alembic_authority.py`, `test_migration_identity_separation.py`, `test_leg_exposure.py` | SQLite chain, FK behavior, identity separation (**including the 16-target §8.1 URL contract: accepted pair, same-login, different database, different endpoint, declared alias, alias port mismatch, Neon pooled route, SQLite and CockroachDB migration targets, blank/malformed URLs, malformed alias configuration, no-password-in-errors, and the configured-identity binding — migration login must be `STRIKENOVA_MIGRATOR_ROLE`, runtime login must be `STRIKENOVA_RUNTIME_ROLE` when set, blank role name refused, unset runtime role not constrained**), exposure idempotency | 198 passed (regression suite total) |
 | `PostgreSQL compatibility` suite (9 modules: compatibility, importer, failure injection, large rehearsal, hardening, Day 5/6) | disposable PG 16.16 schemas built only through `python -m app.migrate upgrade head` | 122 passed |
-| `.github/workflows/issue145-application-pg16.yml` | the two suites above on a pinned `postgres@sha256:3950ad…` 16.16 service, exact `server_version_num = 160016` gate, evidence upload, cleanup | see PR #151 checks |
-| `scripts/pytest_gate.py` | gates **all three** suites independently: integration, migration/SQLite regression, and PostgreSQL compatibility. The JUnit XML report and the recorded pytest exit status are authoritative; the text log is diagnostic only. The job fails on a missing or non-zero recorded exit status, a missing/malformed JUnit report (including a DOCTYPE), an inconsistent report (counter/summary vs testcases), any failure, error or skip, and fewer passes than the declared minimum. The minimums are floors, not exact counts, so a suite that silently stops collecting is still caught by the structure checks | 80 / 181 / 122 minimums; negative controls in `TestPytestGate` |
+| `.github/workflows/issue145-application-pg16.yml` (`application-integration`) | the integration and regression suites above on a pinned `postgres@sha256:3950ad…` 16.16 service, exact `server_version_num = 160016` gate, evidence upload, cleanup | see PR #151 checks |
+| `.github/workflows/issue145-application-pg16.yml` (`restart-runtime-reconnect`) | **isolated restart job, no `services:` block**, so it never restarts or mutates the shared service container: fetches the SHA-256-pinned 16.16 PGDG build for Ubuntu 24.04, asserts `postgres (PostgreSQL) 16.16` exactly, fails when `ISSUE145_PG_BINDIR` is unset, runs `tests/test_issue145_pg_restart.py`, and gates its JUnit XML with a minimum of 5 passes — a skip fails the job | see PR #151 checks |
+| `scripts/pytest_gate.py` | gates **all four** suites independently: integration, migration/SQLite regression, PostgreSQL compatibility, and the restart/reconnection module. The JUnit XML report and the recorded pytest exit status are authoritative; the text log is diagnostic only. The job fails on a missing or non-zero recorded exit status, a missing/malformed JUnit report (including a DOCTYPE), an inconsistent report (counter/summary vs testcases), any failure, error or skip, and fewer passes than the declared minimum. The minimums are floors, not exact counts, so a suite that silently stops collecting is still caught by the structure checks | 80 / 181 / 122 / 5 minimums; negative controls in `TestPytestGate` |
 
-Local verification used PGDG 16.16 server binaries extracted into the workspace
-(the container socket was unavailable in that environment); CI uses the pinned
-digest. Both report `server_version_num = 160016`. The gated suites are run
-exactly as the workflows run them, with `--junitxml` plus the recorded pytest
-exit status passed to `scripts/pytest_gate.py`.
+Three evidence classes are kept distinct:
 
-The restart proof is run separately, because it needs a server it can restart:
+1. **Local execution.** The three service-container gates and the restart
+   module were also run locally against PGDG 16.16 server binaries extracted
+   into the workspace (the container socket was unavailable in that
+   environment). The gated suites are run exactly as the workflows run them,
+   with `--junitxml` plus the recorded pytest exit status passed to
+   `scripts/pytest_gate.py`.
+2. **Isolated restart CI job** (`restart-runtime-reconnect`). It has no
+   `services:` block and owns the binaries and data directory it restarts:
 
-```
-ISSUE145_PG_BINDIR=<16.16 bin> python -m pytest -q tests/test_issue145_pg_restart.py
-```
+   ```
+   ISSUE145_PG_BINDIR=<16.16 bin> python -m pytest -q tests/test_issue145_pg_restart.py
+   ```
 
-It creates its own `initdb` cluster in a temporary directory and restarts only
-that server. `ISSUE145_PG_ADMIN_URL` is not used by it, so the shared CI/admin
-cluster is never restarted or modified.
+   The job fetches the exact SHA-256-pinned 16.16 build, asserts
+   `postgres (PostgreSQL) 16.16`, fails if `ISSUE145_PG_BINDIR` is unset, and
+   gates the JUnit report (`restart|5|…`), so a skipped or silently
+   uncollected test fails the job. The module creates its own `initdb` cluster
+   in a temporary directory and restarts only that server;
+   `ISSUE145_PG_ADMIN_URL` is not used by it.
+3. **The three service-container database gates** (`application-integration`,
+   `PostgreSQL compatibility`, `StrikeNova Status Gate`). Their PostgreSQL is a
+   service container they cannot restart; they never exercise the restart
+   path.
 
 ## 10. Known limitations
 
@@ -667,15 +678,19 @@ rather than proven host by host. After preflight, every new migration
   the static host/alias check instead, and no provider API is queried, so
   nothing here proves that a pooled route terminates at the same *project*
   rather than a same-named cluster.
-* The real-restart proof (`tests/test_issue145_pg_restart.py`) needs a
-  PostgreSQL 16.16 **binary** directory it may `initdb`/`pg_ctl`
-  (`ISSUE145_PG_BINDIR`), because the CI PostgreSQL is a service container
-  the job cannot restart and must not disturb while the other suites use it.
-  It is therefore executed locally against a self-owned 16.16 cluster and is
-  not part of the three gated CI suites. Neither a Neon compute
-  suspend/wake nor a Neon branch fork was tested live; the restart proof is a
-  local server restart on an unchanged data directory, which is the same
-  identity-invalidation event those provider events produce.
+* The real-restart proof (`tests/test_issue145_pg_restart.py`) runs in its own
+  isolated CI job (`restart-runtime-reconnect`) with its own 16.16 binaries and
+  data directory, because the PostgreSQL the three other suites use is a
+  service container they cannot restart and must not disturb. The proof is a
+  real server process restart on an unchanged data directory — the same
+  identity-invalidation event a Neon compute suspend/wake or provider failover
+  produces — but **no live Neon suspend/wake, branch fork, TLS or failover was
+  tested**. `system_identifier` does not distinguish Neon branches, so branch
+  separation rests on the static host/alias check, not on this proof. The
+  reconnection proof is also single-node and local to the job: it shows that
+  the application's own pool and connect listener accept the restarted server
+  against the pre-restart reference, not that a specific provider's proxy
+  preserves the connection semantics.
 * The compatibility and importer rehearsals build their schema as Topology A
   and perform the data import as the migration identity; they do not re-prove
   the runtime-identity boundary (that lives in the integration suite).

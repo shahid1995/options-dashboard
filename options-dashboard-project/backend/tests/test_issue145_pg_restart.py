@@ -15,11 +15,17 @@ Requirements and safety:
   cluster ``ISSUE145_PG_ADMIN_URL`` names, and never touches Neon, staging,
   production or Render.
 
-Why opt-in rather than part of the CI suites: the CI job's PostgreSQL is a
-service container, which the job cannot restart (and must not, because the
-integration and regression suites share it). The restart behaviour is proven
-against a self-owned 16.16 cluster; the runbook records both the proof and
-this limitation.
+Why a separate CI job rather than part of the shared suites: the integration,
+regression and compatibility jobs use a PostgreSQL service container, which
+they cannot restart (and must not, because the suites share it).
+``.github/workflows/issue145-application-pg16.yml`` therefore runs this module
+as its own isolated job with on-runner PostgreSQL 16.16 binaries, and the
+runbook records it separately from the three service-container gates.
+
+The module proves two lifecycles: a fresh preflight after the restart (the
+migration path) and, more importantly, an **already-running runtime engine**
+whose pooled connection the restart terminated and whose ``pool_pre_ping``
+reconnection must be accepted against the identity the engine already held.
 """
 
 from __future__ import annotations
@@ -40,6 +46,18 @@ from app.config import settings
 
 BINDIR_ENV = "ISSUE145_PG_BINDIR"
 REQUIRED_SERVER_VERSION_NUM = 160016
+
+#: The pool configuration ``app.db._engine()`` gives the application runtime
+#: engine. The reconnection proof uses the same values so the pool behaviour
+#: under test (``pool_pre_ping`` recycling a connection the restarted server
+#: terminated) is the behaviour the application actually has.
+_RUNTIME_POOL_OPTIONS = dict(
+    pool_size=5,
+    max_overflow=10,
+    pool_timeout=30,
+    pool_recycle=1800,
+    pool_pre_ping=True,
+)
 
 MIGRATOR_ROLE = "issue145_restart_migrator"
 APP_ROLE = "issue145_restart_app"
@@ -336,6 +354,152 @@ def test_target_identity_survives_a_real_postmaster_restart(cluster, monkeypatch
             if conn.exec_driver_sql("SELECT 1").scalar() != 1:
                 raise AssertionError("the runtime connection did not work")
             conn.rollback()
+    finally:
+        runtime.dispose()
+
+
+def test_running_runtime_engine_reconnects_after_a_real_restart(cluster, monkeypatch):
+    """An engine that already holds the proof reconnects after a restart.
+
+    This is the application's real lifecycle: the runtime engine exists from
+    import time, startup preflight publishes ``_RUNTIME_TARGET_SIGNATURE`` once,
+    and the connection SQLAlchemy opens after a restart terminated the pooled
+    one is checked against that same reference. The test therefore refuses to
+    re-run ``_migration_engine()``, ``_verify_logical_target()`` or any
+    application startup after the restart (both helpers are replaced by
+    fail-fast stubs), so a reconnection that silently depended on a fresh
+    startup proof fails instead of passing.
+    """
+    from sqlalchemy import event
+
+    _configure(monkeypatch, cluster)
+
+    # 1. The single startup preflight the application performs.
+    preflight = db_module._migration_engine()
+    try:
+        proven = db_module._RUNTIME_TARGET_SIGNATURE[0]
+    finally:
+        preflight.dispose()
+    if proven is None:
+        raise AssertionError("startup preflight did not publish a runtime identity")
+    # Keep the exact object, not a copy: a republished identity is a different
+    # object, so this proves the reconnection was accepted against the
+    # pre-restart reference rather than a freshly published one.
+    proven_reference = db_module._RUNTIME_TARGET_SIGNATURE[0]
+    proven_identity = tuple(proven_reference)
+
+    # 2. Runtime engine with the application's listener and pool behaviour,
+    #    created BEFORE the restart, with one pooled connection established.
+    runtime = db_module._create_runtime_engine(
+        cluster.app_url, **_RUNTIME_POOL_OPTIONS
+    )
+    connected_pids: list[int] = []
+
+    @event.listens_for(runtime, "connect")
+    def _record_new_dbapi_connection(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("SELECT pg_backend_pid()")
+            connected_pids.append(int(cursor.fetchone()[0]))
+        finally:
+            cursor.close()
+            dbapi_connection.rollback()
+
+    # Observe the identity the runtime guard itself computes on each new
+    # connection, so the test reads the comparison input instead of assuming it.
+    guard_identities: list[tuple[str, int, str]] = []
+    original_dbapi_identity = db_module._dbapi_logical_identity
+
+    def _record_guard_identity(cursor):
+        value = original_dbapi_identity(cursor)
+        guard_identities.append(tuple(value))
+        return value
+
+    monkeypatch.setattr(db_module, "_dbapi_logical_identity", _record_guard_identity)
+
+    try:
+        with runtime.connect() as conn:
+            before_pid = int(conn.exec_driver_sql("SELECT pg_backend_pid()").scalar())
+            before_started = db_module._postmaster_start_epoch_us(conn)
+            before_identity = db_module._logical_target_identity(conn)
+            conn.rollback()
+        if before_identity != proven_identity:
+            raise AssertionError(
+                "the runtime engine did not connect to the proven target: "
+                f"{before_identity!r} != {proven_identity!r}"
+            )
+        # ``connect()`` returned the connection to the pool, so exactly one
+        # pooled DBAPI connection exists and there is no second connect event.
+        if connected_pids != [before_pid]:
+            raise AssertionError(
+                f"expected one pooled connection, saw {connected_pids!r}"
+            )
+
+        # 3. Restart under the live engine. Nothing may re-prove the target.
+        def _forbidden(*_args, **_kwargs):
+            raise AssertionError(
+                "the reconnection must not re-run preflight or application startup"
+            )
+
+        monkeypatch.setattr(db_module, "_verify_logical_target", _forbidden)
+        monkeypatch.setattr(db_module, "_migration_engine", _forbidden)
+
+        cluster.restart()
+
+        # 4. Same engine object, no dispose and no republish: pool_pre_ping has
+        #    to detect the terminated pooled connection and open a new DBAPI
+        #    connection, which the runtime listener then accepts against the
+        #    identity proven before the restart.
+        with runtime.connect() as conn:
+            after_pid = int(conn.exec_driver_sql("SELECT pg_backend_pid()").scalar())
+            if conn.exec_driver_sql("SELECT 1").scalar() != 1:
+                raise AssertionError("the reconnected runtime session did not work")
+            after_started = db_module._postmaster_start_epoch_us(conn)
+            after_identity = db_module._logical_target_identity(conn)
+            conn.rollback()
+
+        if db_module._RUNTIME_TARGET_SIGNATURE[0] is not proven_reference:
+            raise AssertionError(
+                "the runtime identity reference was republished after the restart; "
+                "the reconnection must be accepted against the pre-restart proof"
+            )
+        if db_module._RUNTIME_TARGET_SIGNATURE[0] != proven_identity:
+            raise AssertionError(
+                "the runtime identity reference changed across the restart: "
+                f"{db_module._RUNTIME_TARGET_SIGNATURE[0]!r} != {proven_identity!r}"
+            )
+        if len(connected_pids) != 2:
+            raise AssertionError(
+                "expected exactly one new DBAPI connection after the restart, "
+                f"saw {connected_pids!r}"
+            )
+        if connected_pids[0] == connected_pids[1]:
+            raise AssertionError(
+                "the stale pooled connection was reused instead of replaced: "
+                f"backend pid {connected_pids[0]} survived the restart"
+            )
+        if after_pid != connected_pids[1]:
+            raise AssertionError(
+                "the checked-out connection is not the newly opened DBAPI "
+                f"connection ({after_pid} != {connected_pids[1]})"
+            )
+        # The listener ran on both connections and computed the pre-restart
+        # identity each time; the second entry is the reconnection's check.
+        if guard_identities != [proven_identity, proven_identity]:
+            raise AssertionError(
+                "the runtime listener did not check the reconnection against "
+                f"the pre-restart identity: {guard_identities!r}"
+            )
+        if after_identity != proven_identity:
+            raise AssertionError(
+                "the reconnected target identity differs from the proven one: "
+                f"{after_identity!r} != {proven_identity!r}"
+            )
+        if after_started <= before_started:
+            raise AssertionError(
+                "the restart did not publish a later postmaster start time: "
+                f"{after_started} <= {before_started}"
+            )
     finally:
         runtime.dispose()
 

@@ -213,3 +213,109 @@ jobs:
             options-dashboard-project/backend/scripts/pytest_gate.py
           if-no-files-found: warn
           retention-days: 14
+
+  # Isolated restart job. It deliberately has NO ``services:`` block: it must
+  # own the PostgreSQL binaries and the data directory it restarts, and must
+  # never restart or mutate the service container the three suites above share.
+  #
+  # The binaries are the exact 16.16 PGDG build for Ubuntu 24.04 (the same
+  # build the local proof used), fetched from the stable PGDG pool and pinned by
+  # SHA-256. The job asserts the exact server version, so a different build
+  # fails instead of being silently accepted, and the gate below fails on any
+  # skip — an unset ISSUE145_PG_BINDIR can never turn the required restart
+  # proof into a skipped test.
+  restart-runtime-reconnect:
+    name: PostgreSQL 16.16 restart and runtime-pool reconnection
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    env:
+      PG16_DEB_URL: https://apt.postgresql.org/pub/repos/apt/pool/main/p/postgresql-16/postgresql-16_16.16-1.pgdg24.04+1_amd64.deb
+      PG16_DEB_SHA256: 5f5d9933de23e7501bb484c8ae6d3bbef787b1fa3692529055b90280443deffa
+
+    defaults:
+      run:
+        working-directory: options-dashboard-project/backend
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            options-dashboard-project/backend/requirements.lock
+            options-dashboard-project/backend/requirements.txt
+            options-dashboard-project/backend/requirements-dev.txt
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade --only-binary :all: "pip==26.3"
+          python -m pip install --only-binary :all: --require-hashes \
+            -r requirements.lock
+
+      - name: Fetch exact PostgreSQL 16.16 binaries
+        run: |
+          set -euo pipefail
+          deb="$RUNNER_TEMP/postgresql-16.deb"
+          curl -fsSL --retry 3 --retry-delay 2 -o "$deb" "$PG16_DEB_URL"
+          echo "$PG16_DEB_SHA256  $deb" | sha256sum --check --strict -
+          root="$RUNNER_TEMP/pg16"
+          mkdir -p "$root"
+          dpkg-deb -x "$deb" "$root"
+          # postgres, initdb and pg_ctl all live in this one package; libpq5 is
+          # the only runtime dependency a stock ubuntu-24.04 image may lack.
+          sudo apt-get install -y --no-install-recommends libpq5
+          bindir="$root/usr/lib/postgresql/16/bin"
+          for tool in postgres initdb pg_ctl; do
+            test -x "$bindir/$tool" || { echo "::error::missing $tool in $bindir"; exit 1; }
+          done
+          version="$("$bindir/postgres" --version)"
+          echo "$version"
+          if [ "$version" != "postgres (PostgreSQL) 16.16" ]; then
+            echo "::error::expected PostgreSQL 16.16, got: $version"
+            exit 1
+          fi
+          echo "ISSUE145_PG_BINDIR=$bindir" >> "$GITHUB_ENV"
+
+      - name: Require the restart binary directory
+        run: |
+          # A missing value would make the module skip; fail before pytest can.
+          : "${ISSUE145_PG_BINDIR:?ISSUE145_PG_BINDIR must be set; the restart proof must not be skipped}"
+
+      - name: Real restart and runtime-pool reconnection tests
+        env:
+          STRIKENOVA_ENV: ""
+        run: |
+          set +e
+          python -m pytest -q \
+              tests/test_issue145_pg_restart.py \
+              --junitxml=issue145-restart.xml > issue145-restart.log 2>&1
+          rc=$?
+          echo "$rc" > issue145-restart.rc
+          exit 0
+
+      - name: Gate on the actual restart results
+        if: always()
+        run: |
+          set -uo pipefail
+          rc=$(cat issue145-restart.rc 2>/dev/null || echo "missing")
+          echo "===== issue145-restart (exit $rc) ====="
+          tail -n 60 issue145-restart.log 2>/dev/null || echo "no log produced"
+          python scripts/pytest_gate.py \
+            --suite "restart|5|issue145-restart.xml|issue145-restart.rc"
+
+      - name: Upload sanitized evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue145-restart-pg16-evidence
+          path: |
+            options-dashboard-project/backend/issue145-restart.log
+            options-dashboard-project/backend/issue145-restart.xml
+            options-dashboard-project/backend/issue145-restart.rc
+          if-no-files-found: warn
+          retention-days: 14
