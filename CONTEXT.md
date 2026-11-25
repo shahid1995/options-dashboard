@@ -147,9 +147,10 @@ See `TESTING.md` for the authoritative verification strategy.
 
 ## 8. Current Control Model
 
-- Founder: final product/architecture authority
+- Founder: final product/architecture authority and final acceptance/release authority
 - Obsidian Second Brain: durable knowledge/context authority
-- GitHub: implementation/project authority
+- GitHub: implementation/project authority and canonical implementation evidence
+- Primary Independent Engineering Reviewer (currently ChatGPT): independent technical review and verification for substantive engineering work; advisory, not implementation or merge authority
 - Hermes / FreeBuff: execution agents
 
 The current task contract comes from the GitHub Issue. Accepted architecture and invariants must be preserved unless explicitly changed.

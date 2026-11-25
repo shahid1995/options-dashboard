@@ -90,7 +90,9 @@ Fresh evidence should include the relevant command, result, and scope.
 
 Classify failures honestly as product defects, test defects, environment failures, flaky failures, or unrelated pre-existing failures.
 
-Use `TESTING.md) for the repository's verification strategy.
+For substantive engineering PRs, follow the independent-review checkpoint and disposition rules in `PROJECT-CONTROL.md`. Give the reviewer the exact PR/base/head and complete evidence; do not substitute a PR summary, implementation-agent report, automated-review result, or green CI badge for the review. Address each material finding with a fix and fresh verification, evidence that the finding is not valid, a tracked deferral with explicit risk treatment, or an explicit Founder risk-acceptance decision. Do not dismiss, conceal, or silently waive findings. The reviewer does not acquire merge or deployment authority.
+
+Use `TESTING.md` for the repository's verification strategy.
 
 ## 8. Documentation
 
