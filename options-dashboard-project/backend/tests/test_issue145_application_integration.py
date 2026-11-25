@@ -2639,8 +2639,21 @@ def test_guarded_upgrade_accepts_url_encoded_credentials(pg_ready, monkeypatch):
     )
     if "%" not in url:
         raise AssertionError("the test URL did not encode the special characters")
+    if make_url(url).password != password:
+        raise AssertionError("the URL round-trip changed the password")
     monkeypatch.setattr(settings, "STRIKENOVA_MIGRATION_DATABASE_URL", url)
-    db_module._run_alembic_migrations()
+    try:
+        db_module._run_alembic_migrations()
+    finally:
+        # Restore the fixture's password: the helper connections (and the
+        # fixture teardown) still use ``migrator_url``. A real deployment does
+        # not rotate the login as part of a migration; this only isolates the
+        # interpolation test.
+        _admin_exec(
+            pg_ready,
+            f"ALTER ROLE {pg_ready.migrator_role} "
+            f"PASSWORD '{pg_ready.migrator_password}'",
+        )
     unowned, _, _, _ = _lease_row(pg_ready)
     if not unowned:
         raise AssertionError("the lease was not released after the guarded upgrade")
