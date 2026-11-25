@@ -27,6 +27,7 @@ only the 12-hex ``owner_fingerprint`` may appear in logs and exceptions.
 from __future__ import annotations
 
 import logging
+import math
 import random
 import secrets
 import time
@@ -1036,6 +1037,64 @@ def _sequence_problems(conn: Connection, role: str, *, label: str) -> list[str]:
     return problems
 
 
+#: Privileges PostgreSQL can grant at column granularity. TRUNCATE and TRIGGER
+#: are relation-level only, so they are excluded here and checked by
+#: ``_privilege_matrix`` instead.
+_COLUMN_GRANTABLE_PRIVILEGES = frozenset({"SELECT", "INSERT", "UPDATE", "REFERENCES"})
+
+
+def _column_privilege_problems(
+    conn: Connection,
+    role: str,
+    table: str,
+    *,
+    forbidden: frozenset[str],
+    label: str,
+) -> list[str]:
+    """Detect column-level grants that bypass a table-level restriction.
+
+    ``has_table_privilege`` answers false when only ``GRANT UPDATE (col)`` was
+    issued, so a column-level grant is invisible to the table matrix while it
+    still authorises the operation the ADR §8.3 matrix forbids. Each forbidden
+    column-grantable privilege is read with ``has_column_privilege``; it is
+    reported only when the table-level privilege is absent, which is precisely
+    the column-level bypass rather than a duplicate of an existing failure.
+    """
+    wanted = sorted(set(forbidden) & _COLUMN_GRANTABLE_PRIVILEGES)
+    if not wanted:
+        return []
+    relation = conn.execute(
+        text(
+            "SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = :schema AND c.relname = :table"
+        ),
+        {"schema": _APP_SCHEMA, "table": table},
+    ).scalar()
+    if relation is None:
+        return []
+    problems: list[str] = []
+    rows = conn.execute(
+        text(
+            "SELECT a.attname, p.priv "
+            "FROM pg_attribute a "
+            "CROSS JOIN (VALUES ('SELECT'),('INSERT'),('UPDATE'),('REFERENCES')) AS p(priv) "
+            "WHERE a.attrelid = :oid AND a.attnum > 0 AND NOT a.attisdropped "
+            "  AND has_column_privilege(:role, a.attrelid, a.attnum, p.priv) "
+            "  AND NOT has_table_privilege(:role, a.attrelid, p.priv) "
+            "ORDER BY a.attnum, p.priv"
+        ),
+        {"oid": relation, "role": role},
+    )
+    for row in rows:
+        if row.priv not in wanted:
+            continue
+        problems.append(
+            f"{label} role {role} has column-level {row.priv} on "
+            f"{_APP_SCHEMA}.{table}.{row.attname}; ADR §8.3 forbids it"
+        )
+    return problems
+
+
 def _runtime_migration_internal_problems(
     conn: Connection, runtime_role: str
 ) -> list[str]:
@@ -1443,6 +1502,30 @@ def verify_application_privileges(
                     problems.append(
                         f"runtime role has {forbidden} on {_APP_SCHEMA}.{table}"
                     )
+        # Column-level grants are a separate ACL from the table ACL: a
+        # ``GRANT UPDATE (col)`` leaves ``has_table_privilege`` false while it
+        # still authorises the write. Both ownership topologies are held to
+        # the same per-table forbidden set.
+        problems.extend(
+            _column_privilege_problems(
+                conn,
+                migrator_role,
+                table,
+                forbidden=frozenset(_APP_TABLE_PRIVILEGES)
+                - _APP_MIGRATOR_MATRIX[table],
+                label="migrator",
+            )
+        )
+        if runtime_role:
+            problems.extend(
+                _column_privilege_problems(
+                    conn,
+                    runtime_role,
+                    table,
+                    forbidden=frozenset({"REFERENCES", "TRIGGER"}),
+                    label="runtime",
+                )
+            )
 
     problems.extend(_sequence_problems(conn, migrator_role, label="migrator"))
     if runtime_role:
@@ -1484,6 +1567,27 @@ def _row_problems(conn: Connection, expected_version: int) -> list[str]:
                 problems.append(f"barrier_state {row.barrier_state!r} is invalid")
             if row.bootstrap_state not in ("ready", "installing"):
                 problems.append(f"bootstrap_state {row.bootstrap_state!r} is invalid")
+            # The lease row and the control row carry the protocol version
+            # independently. An idle lease row at the wrong version passes
+            # every individual check yet makes the next ``lease_acquire_v1``
+            # fail with 45006, so the pair must agree before this installation
+            # is reported valid. Nothing here repairs the mismatch.
+            if int(lease_rows) == 1:
+                lease_protocol = conn.execute(
+                    text(
+                        f"SELECT protocol_version FROM {LEASE_TABLE} "
+                        "WHERE lease_name = :name"
+                    ),
+                    {"name": LEASE_NAME},
+                ).scalar()
+                if lease_protocol is None or int(lease_protocol) != int(
+                    row.installed_version
+                ):
+                    problems.append(
+                        f"lease row protocol_version {lease_protocol!r} does not "
+                        f"match the installed protocol {row.installed_version}; "
+                        "the mirror pair is inconsistent"
+                    )
     return problems
 
 
@@ -1611,6 +1715,25 @@ class MigrationLease:
         self.protocol = protocol
         self._token = token or generate_token()
         self.state: LeaseState | None = None
+        # Validate even when the values were passed explicitly: a NaN or
+        # infinite wait would make the monotonic deadline meaningless, and an
+        # out-of-range TTL/lock timeout is rejected by the SQL functions with
+        # 45004 anyway. Failing here keeps the client consistent with the
+        # server contract.
+        for name, value in (
+            ("ttl_seconds", self.ttl_seconds),
+            ("wait_seconds", self.wait_seconds),
+        ):
+            if not math.isfinite(value) or not (0 < value <= 86400):
+                raise LeaseError(
+                    SQLSTATE_CONFIG,
+                    f"lease {name} must be finite, > 0 and <= 86400",
+                )
+        if not (1 <= self.lock_timeout_ms <= 600000):
+            raise LeaseError(
+                SQLSTATE_CONFIG,
+                "lease lock_timeout_ms must be between 1 and 600000",
+            )
 
     # -- credentials -----------------------------------------------------
     @property
@@ -1622,12 +1745,38 @@ class MigrationLease:
 
     # -- admission -------------------------------------------------------
     def acquire(self) -> LeaseState:
-        """Acquire ownership, retrying within the monotonic budget."""
+        """Acquire ownership, retrying within the monotonic budget.
+
+        The budget is checked *before* every attempt, and each attempt's
+        ``lock_timeout`` is the smaller of the configured value and the
+        remaining budget, so no single attempt can start after (or run past)
+        the deadline. Jitter is calculated once per attempt and reused for
+        both the deadline test and the sleep.
+        """
         deadline = time.monotonic() + self.wait_seconds
         attempt = 0
         last: LeaseError | None = None
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if last is None:
+                    raise LeaseError(
+                        SQLSTATE_INVALID_STATE,
+                        f"migration lease not acquired: the "
+                        f"{self.wait_seconds:.0f}s wait budget was already exhausted",
+                        fingerprint=self.fingerprint,
+                    )
+                raise LeaseError(
+                    last.sqlstate,
+                    f"migration lease not acquired within {self.wait_seconds:.0f}s "
+                    f"(last: {last})",
+                    fingerprint=self.fingerprint,
+                )
+
             attempt += 1
+            attempt_lock_timeout = max(
+                1, min(self.lock_timeout_ms, int(remaining * 1000))
+            )
             try:
                 with self.engine.connect() as conn:
                     with conn.begin():
@@ -1640,7 +1789,7 @@ class MigrationLease:
                                 "protocol": self.protocol,
                                 "token": self._token,
                                 "ttl": self.ttl_seconds,
-                                "lock_timeout": self.lock_timeout_ms,
+                                "lock_timeout": attempt_lock_timeout,
                             },
                         ).one()
                 self.state = LeaseState(
@@ -1663,14 +1812,15 @@ class MigrationLease:
 
             if last.sqlstate not in RETRYABLE_SQLSTATES:
                 raise last
-            if time.monotonic() + _retry_delay(attempt) >= deadline:
+            delay = _retry_delay(attempt)
+            if time.monotonic() + delay >= deadline:
                 raise LeaseError(
                     last.sqlstate,
                     f"migration lease not acquired within {self.wait_seconds:.0f}s "
                     f"(last: {last})",
                     fingerprint=self.fingerprint,
                 )
-            time.sleep(_retry_delay(attempt))
+            time.sleep(delay)
 
     # -- protected transaction entry ------------------------------------
     def enter(self, conn: Connection) -> LeaseState:

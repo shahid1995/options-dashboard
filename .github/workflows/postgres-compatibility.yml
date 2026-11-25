@@ -145,8 +145,8 @@ jobs:
           fi
           passed=$(grep -oE "[0-9]+ passed" postgres-compatibility.log | head -n1 | cut -d' ' -f1)
           echo "passed tests: ${passed:-0}"
-          if [ -z "${passed:-}" ] || [ "$passed" -lt 120 ]; then
-            echo "::error::unexpectedly few passing tests (${passed:-0} < 120)"
+          if [ -z "${passed:-}" ] || [ "$passed" -lt 122 ]; then
+            echo "::error::unexpectedly few passing tests (${passed:-0} < 122)"
             exit 1
           fi
 

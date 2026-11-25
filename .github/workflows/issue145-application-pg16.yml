@@ -167,8 +167,8 @@ jobs:
           # silently dropping coverage lowers the count and fails the job
           # until the workflow is updated deliberately.
           python scripts/pytest_gate.py \
-            --suite "integration|71|issue145-application.log|issue145-application.rc" \
-            --suite "regression|160|issue145-regression.log|issue145-regression.rc"
+            --suite "integration|80|issue145-application.log|issue145-application.rc" \
+            --suite "regression|181|issue145-regression.log|issue145-regression.rc"
 
       - name: Drop leftover test databases and roles
         if: always()

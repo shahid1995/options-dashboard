@@ -133,10 +133,29 @@ the parsed URLs and refuses (`45004`) anything it cannot prove:
    role would satisfy separation while executing migrations as the wrong
    principal.
 
+The parser also refuses two connection forms that would make a URL's text
+diverge from the target it really reaches:
+
+* any query parameter libpq merges into the connect arguments after the
+  authority/path — `host`, `hostaddr`, `port`, `dbname`, `database`, `user`,
+  `password`, `service`, `servicefile`, `passfile` — because `?user=` or
+  `?dbname=` can authenticate as, or connect to, something other than the URL
+  appears to name. Unrelated options (`sslmode`, `application_name`, …) are
+  preserved;
+* a comma-separated host list, because it is a libpq failover list and a later
+  host may serve a cluster this check never proved.
+
 Every URL that is blank, malformed, partial (no host, no database, no login)
 or unparseable fails closed here, before an engine, a connection, a lease or
 any DDL exists. Error text names only the setting and the failing attribute
 (role, database name, ports); the URL and its password are never embedded.
+
+On SQLite, a separate `STRIKENOVA_MIGRATION_DATABASE_URL` naming a *different*
+file is refused (`45004`). The SQLite path hands Alembic the runtime engine, so
+the only supported local arrangement is one database (single identity): the
+configured migration target must resolve to the runtime SQLite file. A
+migration must never silently apply to one file while the configured target is
+another.
 
 ### 2.4 The live connection, not only the URL, must be the migrator
 
@@ -164,6 +183,21 @@ Topology B's approved exception is preserved: inside the DDL window
 `current_user` is the NOLOGIN owner, but `session_user` remains the migrator and
 `_reset_owner_role` proves the window closed before verification and before the
 backfill.
+
+The runtime side is verified the same way. The runtime engine registers a
+`connect` listener that reads `session_user`/`current_user` on **every** new
+DBAPI connection, requires both to be `STRIKENOVA_RUNTIME_ROLE`, requires that
+role to differ from the migrator, and refuses elevated attributes. The §8.3
+runtime checks are then evaluated against that verified `session_user`, never
+against the username declared in `DATABASE_URL`. This is what catches a URL
+whose `?user=` parameter authenticates as the migrator while its authority
+username still looks like the application.
+
+The target proof is no longer one-time. After the first fully proven migration
+connection, `_install_migration_identity_guard` records the cluster/database
+signature and every later migration connection re-reads and must match it
+before it may execute a statement. A reconnect or failover to another cluster
+is refused (`45004`) before the lease, DDL or backfill can use it.
 
 **Supported endpoint topology.** One PostgreSQL cluster, one database, two
 logins. A second route to that same endpoint (the Neon pooled host
@@ -223,6 +257,19 @@ This connection-time proof runs in `_migration_engine()`, so every caller
 * **Barrier:** `close_barrier` takes the protocol row lock, records the owner
   fingerprint it observed, sets `barrier_state='closed'`, and refuses new
   admission with `45004`. An already-admitted owner keeps working.
+* **Timeouts:** `lock_timeout` bounds each lock acquisition. `statement_timeout`
+  bounds each *statement*, **not** the whole multi-statement transaction; a
+  per-user transaction may contain several statements that each fit the
+  timeout. Its total duration is bounded by the mandatory pre-commit `enter`
+  refresh, which fails once ownership has expired, and by the TTL. When a
+  timeout fires, PostgreSQL rolls that user's transaction back, the remaining
+  users are not attempted, and the lease is released; users already committed
+  stay committed. There is no background renewal thread.
+* **Cleanup:** a failure before acquisition (preflight or `acquire`) attempts
+  no release because ownership was never taken, but still disposes the
+  migration engine. After acquisition, release runs in its own short
+  transaction; a cleanup failure is logged and never hides the original
+  exception.
 
 ## 4. Operator CLI
 
@@ -253,12 +300,26 @@ CLI and startup use the **migration** identity, never the runtime identity.
 
 ### 5.1 Empty database (first bootstrap)
 
-1. Provision roles (out of band, an admin identity that is never used by the
-   application):
+1. Provision roles and their prerequisites (out of band, an admin identity
+   that is never used by the application):
    * **Topology B** — create `strikenova_prod_owner` (`NOLOGIN`),
      `strikenova_prod_migrator` (`LOGIN`) and `strikenova_production_app`
-     (`LOGIN`); grant `strikenova_prod_owner` to the migrator **with
-     `INHERIT FALSE, SET TRUE`**; set `STRIKENOVA_OWNER_ROLE=strikenova_prod_owner`.
+     (`LOGIN`).
+     * The migrator needs `CREATE` on the database (or database ownership) so
+       `bootstrap-lease` can create the `migration_internal` schema. On a
+       database owned by an administrator:
+       `GRANT CREATE ON DATABASE <db> TO strikenova_prod_migrator`.
+     * The owner needs `CREATE` and `USAGE` on schema `public` so the guarded
+       DDL can create application objects there:
+       `GRANT CREATE, USAGE ON SCHEMA public TO strikenova_prod_owner`
+       (executed by the schema owner or a superuser; PostgreSQL refuses it
+       otherwise).
+     * Grant the owner to the migrator with all three options the verifier
+       asserts:
+       `GRANT strikenova_prod_owner TO strikenova_prod_migrator WITH INHERIT FALSE, SET TRUE, ADMIN FALSE`.
+       `INHERIT TRUE` would hand the owner's privileges to the backfill
+       identity and is refused.
+     * Set `STRIKENOVA_OWNER_ROLE=strikenova_prod_owner`.
    * **Topology A** (default) — create only `strikenova_prod_migrator`
      (`LOGIN`) and `strikenova_production_app` (`LOGIN`); leave
      `STRIKENOVA_OWNER_ROLE` **empty**. The migrator owns the database and
@@ -267,7 +328,13 @@ CLI and startup use the **migration** identity, never the runtime identity.
    (migrator) to the same host/port/database with distinct logins (§2.3). If
    the provider exposes a second route to the same endpoint, declare it in
    `STRIKENOVA_MIGRATION_TARGET_ALIASES`; otherwise the second URL is refused.
-3. Create the schema-scoped default privileges for the creator role
+3. Grant the runtime role `USAGE` on schema `public` and make sure it has no
+   `CREATE` there: `GRANT USAGE ON SCHEMA public TO
+   strikenova_production_app; REVOKE CREATE ON SCHEMA public FROM
+   strikenova_production_app;`. Its table and sequence privileges come only
+   from the defaults in the next sentence.
+
+   Create the schema-scoped default privileges for the creator role
    (`STRIKENOVA_OWNER_ROLE` if set, else the migrator) in schema `public`:
    `SELECT/INSERT/UPDATE/DELETE ON TABLES` and `USAGE` **only** on sequences to
    the runtime role. Do **not** create a global (`ALTER DEFAULT PRIVILEGES`
@@ -366,9 +433,11 @@ Derivation:
 * **Statement timeout 150 s**: ≈ 4 250 × the slower measured p99 for one user.
   The configuration validator enforces it **strictly below** the TTL
   (`MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS < MIGRATION_LEASE_TTL_SECONDS ×
-  1000`): equality and larger values are refused at the settings boundary, so
-  a single user can never hold the lease past its own expiry. It is large
-  enough for a slower production host or a user with many positions.
+  1000`): equality and larger values are refused at the settings boundary. The
+  timeout applies to each statement, not to the whole transaction; the
+  pre-commit `enter` refresh is what actually guarantees a user cannot hold the
+  lease past its expiry. It is large enough for a slower production host or a
+  user with many positions.
 * **Wait 180 s / lock timeout 10 s**: the wait budget must exceed a normal
   full-chain migration on this chain (~20 s observed end to end on the test
   instance, including backfill) with headroom for platform cold starts; the
@@ -438,6 +507,7 @@ statements the code issued) and refuses with `45004` when any of these fail:
 | Incoming membership (who may *become* an identity) | no role is a member of the migrator | same, and the migrator is the owner role's only member; any other member of either role is a failure |
 | Migrator table matrix (`has_table_privilege`, one privilege at a time) | `SELECT` on `positions`/`paper_orders`; `SELECT, INSERT` on `strategy_leg_exposures`; no `UPDATE`/`DELETE`/`TRUNCATE`/`REFERENCES`/`TRIGGER` anywhere | identical |
 | Migrator sequence | `USAGE` true, `SELECT` false, `UPDATE` false | identical |
+| Column-level privileges (`has_column_privilege`) | every forbidden column-grantable privilege (`SELECT`, `INSERT`, `UPDATE`, `REFERENCES`) is refused when it exists only at column level; a `GRANT UPDATE (col)` or `GRANT REFERENCES (col)` is a bypass of the table matrix | identical |
 | Runtime matrix | `SELECT/INSERT/UPDATE/DELETE` on all three; no `TRUNCATE`, `REFERENCES` or `TRIGGER` | identical |
 | Runtime sequence / schema | sequence `USAGE` true, `SELECT` false, `UPDATE` false; no `USAGE`/`CREATE` on `migration_internal`, no table or function privilege there; no effective `CREATE` on schema `public` | identical |
 | Runtime membership | no membership at all (not only not migrator/owner): any granted role is an unreviewed privilege path | identical |
@@ -463,8 +533,9 @@ role, a transitive path into `migration_internal`, a revoked runtime default
 privilege, an excess runtime default (`TRUNCATE`, `REFERENCES`/`TRIGGER` on
 future tables; `SELECT`/`UPDATE` on future sequences), excess privileges on
 the existing exposure sequence, an unexpected incoming member of the migrator,
-an unexpected incoming member of the owner, and a NOLOGIN migration identity)
-and assert `45004` with the specific message; the valid Topology A
+an unexpected incoming member of the owner, a column-level `UPDATE` or
+`REFERENCES` grant to the migrator, and a NOLOGIN migration identity) and
+assert `45004` with the specific message; the valid Topology A
 and Topology B installations pass. `test_bad_privilege_matrix_aborts_the_guarded_upgrade`
 and `test_guarded_upgrade_refuses_runtime_public_create` prove the enforcement
 path itself refuses an installation the DDL cannot repair (the superuser case
@@ -494,12 +565,12 @@ rather than reasoned about.
 
 | Suite | Scope | Result |
 | --- | --- | --- |
-| `tests/test_issue145_application_integration.py` | real PG 16.16: concurrent `init_db()`, single connection, killed worker, injected failure, CLI, barrier, protocol, expiry, privileges, both ownership topologies, the Topology A §8.3 matrix and its restricted backfill, schema-ACL positive/negative controls, timing, **the §8.1 application privilege verifier (both topologies plus its negative/positive controls, including every default-privilege overgrant direction and excess privileges on the existing exposure sequence)**, **incoming membership and NOLOGIN controls**, **the actual-connection identity controls (superuser admin login, unrelated login, migrator-member login, superuser migrator role) with unchanged lease/version/data**, **deterministic `system_identifier` identity evidence with its narrowed fallback (documented refusal only; unexpected errors fail closed)**, **a deterministic two-process contention proof observed through `pg_stat_activity`/`pg_locks`, which asserts the advisory guard lock and explicitly not the lease row lock** | 71 passed |
-| `tests/test_migration_serialization.py` | DB-free protocol/config/retirement contract, the timeout-below-TTL rule and its boundaries, and the CI log gate's negative controls | 55 passed |
-| `tests/test_db_migration.py`, `test_alembic_*.py`, `test_day5_alembic_authority.py`, `test_migration_identity_separation.py`, `test_leg_exposure.py` | SQLite chain, FK behavior, identity separation (**including the 16-target §8.1 URL contract: accepted pair, same-login, different database, different endpoint, declared alias, alias port mismatch, Neon pooled route, SQLite and CockroachDB migration targets, blank/malformed URLs, malformed alias configuration, no-password-in-errors, and the configured-identity binding — migration login must be `STRIKENOVA_MIGRATOR_ROLE`, runtime login must be `STRIKENOVA_RUNTIME_ROLE` when set, blank role name refused, unset runtime role not constrained**), exposure idempotency | 160 passed (regression suite total) |
+| `tests/test_issue145_application_integration.py` | real PG 16.16: concurrent `init_db()`, single connection, killed worker, injected failure, CLI, barrier, protocol, expiry, privileges, both ownership topologies, the Topology A §8.3 matrix and its restricted backfill, schema-ACL positive/negative controls, timing, **the §8.1 application privilege verifier (both topologies plus its negative/positive controls, including every default-privilege overgrant direction and excess privileges on the existing exposure sequence)**, **incoming membership and NOLOGIN controls**, **the actual-connection identity controls (superuser admin login, unrelated login, migrator-member login, superuser migrator role) with unchanged lease/version/data**, **deterministic `system_identifier` identity evidence with its narrowed fallback (documented refusal only; unexpected errors fail closed)**, **a deterministic two-process contention proof that pauses the first worker inside its first protected per-user backfill transaction (database trigger on an advisory lock) and observes the second worker queued on the admission guard with no lease row lock**, **the runtime principal read from the live connection and a `?user=` URL that authenticates as the migrator refused**, **column-level `UPDATE`/`REFERENCES` bypasses refused in both topologies and aborting the guarded upgrade**, **the lease/control protocol mirror mismatch refused without repair**, **a URL-encoded `%40` password accepted on the guarded path**, **a new migration connection pointed at another database refused before it can run a statement** | 80 passed |
+| `tests/test_migration_serialization.py` | DB-free protocol/config/retirement contract, the timeout-below-TTL rule and its boundaries, finite/positive wait validation, no attempt past the admission deadline, pre-acquisition cleanup, separate-SQLite-target refusal, connection query/host-list override refusal, disposable-harness URL normalization, and the CI log gate's authoritative-summary controls (including pytest's long-run `(0:01:10)` suffix) | 76 passed |
+| `tests/test_db_migration.py`, `test_alembic_*.py`, `test_day5_alembic_authority.py`, `test_migration_identity_separation.py`, `test_leg_exposure.py` | SQLite chain, FK behavior, identity separation (**including the 16-target §8.1 URL contract: accepted pair, same-login, different database, different endpoint, declared alias, alias port mismatch, Neon pooled route, SQLite and CockroachDB migration targets, blank/malformed URLs, malformed alias configuration, no-password-in-errors, and the configured-identity binding — migration login must be `STRIKENOVA_MIGRATOR_ROLE`, runtime login must be `STRIKENOVA_RUNTIME_ROLE` when set, blank role name refused, unset runtime role not constrained**), exposure idempotency | 181 passed (regression suite total) |
 | `PostgreSQL compatibility` suite (9 modules: compatibility, importer, failure injection, large rehearsal, hardening, Day 5/6) | disposable PG 16.16 schemas built only through `python -m app.migrate upgrade head` | 122 passed |
-| `.github/workflows/issue145-application-pg16.yml` | the two suites above on a pinned `postgres@sha256:3950ad…` 16.16 service, exact `server_version_num = 160016` gate, evidence upload, cleanup | see PR #146 checks |
-| `scripts/pytest_gate.py` | gates **both** suites independently: missing log or exit code, failed/errored test, any skipped test, missing pass summary, or fewer passes than the exact minimum all fail the job | 71 / 160 minimums; negative controls in `TestPytestGate` |
+| `.github/workflows/issue145-application-pg16.yml` | the two suites above on a pinned `postgres@sha256:3950ad…` 16.16 service, exact `server_version_num = 160016` gate, evidence upload, cleanup | see PR #151 checks |
+| `scripts/pytest_gate.py` | gates **both** suites independently: missing log or exit code, failed/errored test, any skipped test, missing/unparseable authoritative summary, or fewer passes than the exact minimum all fail the job. Only pytest's terminal `... in <duration>s` summary line is trusted, so test output cannot fabricate counts | 80 / 181 minimums; negative controls in `TestPytestGate` |
 
 Local verification used PGDG 16.16 server binaries extracted into the workspace
 (the container socket was unavailable in that environment); CI uses the pinned
@@ -511,15 +582,19 @@ digest. Both report `server_version_num = 160016`.
   sequential cold starts plus a dedicated bootstrap-contention test; a
   simultaneous two-process first-ever bootstrap is not claimed as proven.
 * The two-process startup proof (§9) is deterministic for *contention*: the
-test blocks the first worker's DDL transaction and observes the second
-worker waiting, then releases it. It is not a stress test and does not
-claim to measure throughput or a real deployment's timing. It asserts the
-advisory guard lock specifically — `lease_enter_v1` takes
-`pg_advisory_xact_lock` before the lease row `FOR UPDATE`, so a queued
-second worker never reaches the row lock. The test deliberately does not
-claim row-lock contention.
+  test pauses the first worker **inside its first per-user backfill
+  transaction**, after `enter` and after it has attempted real writes, and
+  observes the second worker waiting for admission; releasing the pause lets
+  both finish. It is not a stress test and does not claim to measure
+  throughput or a real deployment's timing. It asserts the advisory guard
+  lock specifically — `lease_enter_v1` takes `pg_advisory_xact_lock` before
+  the lease row `FOR UPDATE`, so a queued second worker never reaches the row
+  lock. The test deliberately does not claim row-lock contention.
 * The endpoint-equivalence proof covers same-host URLs and explicitly
-declared aliases only. When `pg_control_system()` is readable (the stock
+declared aliases only, and comma-separated migration host lists are refused
+rather than proven host by host. After preflight, every new migration
+connection re-checks the proven signature, so a reconnect cannot silently land
+on an unproven cluster. When `pg_control_system()` is readable (the stock
 PostgreSQL 16 default) the alias is proven by the cluster's
 `system_identifier`, which is deterministic. The weaker fingerprint is used
 only when PostgreSQL reports `42501` (the documented revocation) or `42883`

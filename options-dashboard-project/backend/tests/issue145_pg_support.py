@@ -19,6 +19,7 @@ import sys
 import textwrap
 
 import psycopg
+from psycopg import sql
 
 ADMIN_ENV = "ISSUE145_PG_ADMIN_URL"
 REQUIRED_SERVER_VERSION_NUM = 160016  # PostgreSQL 16.16 exactly
@@ -31,6 +32,25 @@ TOPOLOGY_B = "B"
 #: identity itself creates and owns application objects.
 TOPOLOGY_A = "A"
 TOPOLOGIES = (TOPOLOGY_A, TOPOLOGY_B)
+
+#: Query parameters libpq merges into the connect arguments after the URL
+#: authority/path. Any derived URL must drop these, otherwise an admin URL
+#: such as ``...?dbname=postgres`` would make provisioning create the
+#: disposable database but apply its ACLs to the maintenance database.
+_OVERRIDE_QUERY_KEYS = frozenset(
+    {
+        "host",
+        "hostaddr",
+        "port",
+        "dbname",
+        "database",
+        "user",
+        "password",
+        "service",
+        "servicefile",
+        "passfile",
+    }
+)
 
 
 class Provisioned:
@@ -82,19 +102,45 @@ class Provisioned:
         return env
 
 
-def _replace_database(url: str, database: str) -> str:
+def _derived_url(
+    url: str,
+    *,
+    database: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
+) -> str:
+    """Rebuild a URL with one database/login, dropping override parameters.
+
+    ``make_url`` keeps the query string verbatim, and psycopg applies query
+    parameters *after* the authority and path. A copied ``?dbname=`` or
+    ``?user=`` would therefore silently win over the value this fixture just
+    set. The override keys are removed and every unrelated option (SSL mode,
+    connect timeout, application name) is preserved.
+    """
     from sqlalchemy.engine import make_url
 
-    return make_url(url).set(database=database).render_as_string(hide_password=False)
+    parsed = make_url(url)
+    query = {
+        key: value
+        for key, value in (parsed.query or {}).items()
+        if str(key).lower() not in _OVERRIDE_QUERY_KEYS
+    }
+    return parsed.set(
+        database=database if database is not None else parsed.database,
+        username=username if username is not None else parsed.username,
+        password=password if password is not None else parsed.password,
+        query=query,
+    ).render_as_string(hide_password=False)
+
+
+def _replace_database(url: str, database: str) -> str:
+    return _derived_url(url, database=database)
 
 
 def _role_url(role: str, password: str, admin_url: str, database: str) -> str:
-    from sqlalchemy.engine import make_url
-
-    parsed = make_url(admin_url).set(
-        username=role, password=password, database=database
+    return _derived_url(
+        admin_url, database=database, username=role, password=password
     )
-    return parsed.render_as_string(hide_password=False)
 
 
 def admin_url() -> str | None:
@@ -146,35 +192,74 @@ def provision(url: str | None = None, *, topology: str = TOPOLOGY_B) -> Provisio
     try:
         with psycopg.connect(url, autocommit=True) as conn:
             if prov.owner_role:
-                conn.execute(f"CREATE ROLE {prov.owner_role} NOLOGIN")
+                conn.execute(
+                    sql.SQL("CREATE ROLE {} NOLOGIN").format(
+                        sql.Identifier(prov.owner_role)
+                    )
+                )
             conn.execute(
-                f"CREATE ROLE {prov.migrator_role} LOGIN PASSWORD '{prov.migrator_password}'"
+                sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
+                    sql.Identifier(prov.migrator_role),
+                    sql.Literal(prov.migrator_password),
+                )
             )
-            conn.execute(f"CREATE ROLE {prov.app_role} LOGIN PASSWORD '{prov.app_password}'")
-            conn.execute(f"CREATE DATABASE {prov.database} OWNER {prov.migrator_role}")
+            conn.execute(
+                sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
+                    sql.Identifier(prov.app_role),
+                    sql.Literal(prov.app_password),
+                )
+            )
+            conn.execute(
+                sql.SQL("CREATE DATABASE {} OWNER {}").format(
+                    sql.Identifier(prov.database),
+                    sql.Identifier(prov.migrator_role),
+                )
+            )
 
         with psycopg.connect(prov.admin_database_url, autocommit=True) as conn:
             if prov.owner_role:
                 conn.execute(
-                    f"GRANT CREATE, USAGE ON SCHEMA public TO {prov.owner_role}"
+                    sql.SQL("GRANT CREATE, USAGE ON SCHEMA public TO {}").format(
+                        sql.Identifier(prov.owner_role)
+                    )
                 )
                 conn.execute(
-                    f"GRANT {prov.owner_role} TO {prov.migrator_role} "
-                    "WITH INHERIT FALSE, SET TRUE, ADMIN FALSE"
+                    sql.SQL(
+                        "GRANT {} TO {} WITH INHERIT FALSE, SET TRUE, ADMIN FALSE"
+                    ).format(
+                        sql.Identifier(prov.owner_role),
+                        sql.Identifier(prov.migrator_role),
+                    )
                 )
-            conn.execute(f"GRANT USAGE ON SCHEMA public TO {prov.app_role}")
+            conn.execute(
+                sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(
+                    sql.Identifier(prov.app_role)
+                )
+            )
             # The runtime identity is a DML identity only: no schema DDL.
-            conn.execute(f"REVOKE CREATE ON SCHEMA public FROM {prov.app_role}")
+            conn.execute(
+                sql.SQL("REVOKE CREATE ON SCHEMA public FROM {}").format(
+                    sql.Identifier(prov.app_role)
+                )
+            )
             # Application tables created by the creator role are usable by the
             # runtime identity with ordinary DML only (ADR-018). Schema-scoped
             # on purpose: a global default would also cover migration_internal.
             conn.execute(
-                f"ALTER DEFAULT PRIVILEGES FOR ROLE {creator} IN SCHEMA public "
-                f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {prov.app_role}"
+                sql.SQL(
+                    "ALTER DEFAULT PRIVILEGES FOR ROLE {} IN SCHEMA public "
+                    "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {}"
+                ).format(
+                    sql.Identifier(creator), sql.Identifier(prov.app_role)
+                )
             )
             conn.execute(
-                f"ALTER DEFAULT PRIVILEGES FOR ROLE {creator} IN SCHEMA public "
-                f"GRANT USAGE ON SEQUENCES TO {prov.app_role}"
+                sql.SQL(
+                    "ALTER DEFAULT PRIVILEGES FOR ROLE {} IN SCHEMA public "
+                    "GRANT USAGE ON SEQUENCES TO {}"
+                ).format(
+                    sql.Identifier(creator), sql.Identifier(prov.app_role)
+                )
             )
     except BaseException:
         drop(prov)
@@ -278,13 +363,21 @@ def grant_importer_write_privileges(prov: Provisioned) -> None:
         )
     with psycopg.connect(prov.migrator_url, autocommit=True) as conn:
         conn.execute(
-            f'GRANT INSERT, UPDATE, DELETE, TRUNCATE ON TABLE '
-            f'public."positions", public."paper_orders", '
-            f'public."strategy_leg_exposures" TO "{prov.migrator_role}"'
+            sql.SQL(
+                "GRANT INSERT, UPDATE, DELETE, TRUNCATE ON TABLE "
+                "public.{}, public.{}, public.{} TO {}"
+            ).format(
+                sql.Identifier("positions"),
+                sql.Identifier("paper_orders"),
+                sql.Identifier("strategy_leg_exposures"),
+                sql.Identifier(prov.migrator_role),
+            )
         )
         conn.execute(
-            f'GRANT ALL ON SEQUENCE public."strategy_leg_exposures_id_seq" '
-            f'TO "{prov.migrator_role}"'
+            sql.SQL("GRANT ALL ON SEQUENCE public.{} TO {}").format(
+                sql.Identifier("strategy_leg_exposures_id_seq"),
+                sql.Identifier(prov.migrator_role),
+            )
         )
 
 
@@ -298,17 +391,26 @@ def grant_backfill_privileges(prov: Provisioned) -> None:
         )
     with psycopg.connect(prov.admin_database_url, autocommit=True) as conn:
         conn.execute(
-            f"GRANT SELECT ON public.positions TO {prov.migrator_role}"
+            sql.SQL("GRANT SELECT ON public.{} TO {}").format(
+                sql.Identifier("positions"), sql.Identifier(prov.migrator_role)
+            )
         )
         conn.execute(
-            f"GRANT SELECT ON public.paper_orders TO {prov.migrator_role}"
+            sql.SQL("GRANT SELECT ON public.{} TO {}").format(
+                sql.Identifier("paper_orders"), sql.Identifier(prov.migrator_role)
+            )
         )
         conn.execute(
-            f"GRANT SELECT, INSERT ON public.strategy_leg_exposures TO {prov.migrator_role}"
+            sql.SQL("GRANT SELECT, INSERT ON public.{} TO {}").format(
+                sql.Identifier("strategy_leg_exposures"),
+                sql.Identifier(prov.migrator_role),
+            )
         )
         conn.execute(
-            f"GRANT USAGE ON SEQUENCE public.strategy_leg_exposures_id_seq "
-            f"TO {prov.migrator_role}"
+            sql.SQL("GRANT USAGE ON SEQUENCE public.{} TO {}").format(
+                sql.Identifier("strategy_leg_exposures_id_seq"),
+                sql.Identifier(prov.migrator_role),
+            )
         )
 
 
@@ -319,12 +421,18 @@ def drop(prov: Provisioned) -> None:
             "WHERE datname = %s AND pid <> pg_backend_pid()",
             (prov.database,),
         )
-        conn.execute(f"DROP DATABASE IF EXISTS {prov.database}")
+        conn.execute(
+            sql.SQL("DROP DATABASE IF EXISTS {}").format(
+                sql.Identifier(prov.database)
+            )
+        )
         roles = [prov.app_role, prov.migrator_role]
         if prov.owner_role:
             roles.append(prov.owner_role)
         for role in roles:
-            conn.execute(f"DROP ROLE IF EXISTS {role}")
+            conn.execute(
+                sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role))
+            )
 
 
 def seed_legacy_users(

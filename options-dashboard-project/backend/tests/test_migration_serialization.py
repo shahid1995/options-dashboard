@@ -10,9 +10,12 @@ retirement of the renewal-thread design.
 from __future__ import annotations
 
 import inspect
+import logging
 import pathlib
 import subprocess
 import sys
+from typing import ClassVar
+from unittest.mock import patch
 
 import pytest
 from pydantic import ValidationError
@@ -20,6 +23,7 @@ from pydantic import ValidationError
 import app.db as db_module
 from app import _migration_lease as lease
 from app.config import Settings
+from tests import issue145_pg_support as support
 
 
 class _FakeOrig(Exception):
@@ -323,6 +327,12 @@ class TestPytestGate:
         assert result.returncode == 0, result.stdout + result.stderr
         assert "unit: 22 passed" in result.stdout
 
+    def test_long_run_summary_with_clock_suffix_passes(self, tmp_path):
+        """pytest adds ``(0:01:10)`` after a minute; the gate must accept it."""
+        result = self._run(tmp_path, "22 passed, 1 warning in 70.36s (0:01:10)\n")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "unit: 22 passed" in result.stdout
+
     def test_all_skipped_log_fails(self, tmp_path):
         result = self._run(tmp_path, "22 skipped, 3 warnings in 4.10s\n")
         assert result.returncode == 1
@@ -331,7 +341,36 @@ class TestPytestGate:
     def test_missing_summary_fails(self, tmp_path):
         result = self._run(tmp_path, "collected 0 items\n\nno tests ran in 0.01s\n")
         assert result.returncode == 1
-        assert "no 'N passed' summary" in result.stdout
+        assert "no authoritative pytest summary line" in result.stdout
+
+    def test_untrusted_output_cannot_inject_failure_counts(self, tmp_path):
+        """A test printing '999999 failed' must not fabricate a gate failure."""
+        log = (
+            "FAILED tests/x.py::test_y - assertion\n"
+            "999999 failed\n"
+            "1 error\n"
+            "22 passed, 1 warning in 9.00s\n"
+        )
+        result = self._run(tmp_path, log)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "unit: 22 passed" in result.stdout
+
+    def test_last_authoritative_summary_wins(self, tmp_path):
+        """Only pytest's final summary line decides, not an earlier paste."""
+        log = "999 failed in 0.01s\n22 passed in 9.00s\n"
+        result = self._run(tmp_path, log)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "unit: 22 passed" in result.stdout
+
+    def test_summary_without_duration_is_not_trusted(self, tmp_path):
+        result = self._run(tmp_path, "22 passed\n")
+        assert result.returncode == 1
+        assert "no authoritative pytest summary line" in result.stdout
+
+    def test_error_status_in_summary_fails(self, tmp_path):
+        result = self._run(tmp_path, "1 error, 21 passed in 12.0s\n")
+        assert result.returncode == 1
+        assert "failed/errored" in result.stdout
 
     def test_failed_test_fails_even_with_passes(self, tmp_path):
         result = self._run(tmp_path, "21 passed, 1 failed in 12.0s\n")
@@ -384,3 +423,208 @@ class TestPytestGate:
         assert result.returncode == 1
         assert "integration: 22 passed" in result.stdout
         assert "regression: 135 skipped" in result.stdout
+
+
+class TestLeaseWaitValidation:
+    """The admission budget must be a finite positive duration."""
+
+    @pytest.mark.parametrize("wait", [float("nan"), float("inf"), 0, -1, 86400.5])
+    def test_invalid_wait_is_rejected(self, wait):
+        with pytest.raises(ValidationError, match="MIGRATION_LEASE_WAIT_SECONDS"):
+            Settings(
+                DATABASE_URL="postgresql://r@h/db",
+                MIGRATION_LEASE_WAIT_SECONDS=wait,
+            )
+
+    def test_explicit_lease_waits_are_also_validated(self):
+        for wait in (float("nan"), float("inf"), 0.0, -1.0):
+            with pytest.raises(lease.LeaseError) as exc:
+                lease.MigrationLease(object(), wait_seconds=wait)  # type: ignore[arg-type]
+            assert exc.value.sqlstate == "45004"
+        with pytest.raises(lease.LeaseError) as exc:
+            lease.MigrationLease(object(), ttl_seconds=float("nan"))  # type: ignore[arg-type]
+        assert exc.value.sqlstate == "45004"
+
+
+class TestAcquisitionBudget:
+    def test_an_exhausted_budget_starts_no_attempt(self, monkeypatch):
+        class _NeverConnects:
+            calls = 0
+
+            def connect(self):  # pragma: no cover - must never run
+                self.calls += 1
+                raise AssertionError("acquire() connected after the deadline")
+
+        engine = _NeverConnects()
+        guard = lease.MigrationLease(engine, wait_seconds=0.05)  # type: ignore[arg-type]
+        clock = iter([0.0, 10.0])  # deadline is 0.05s; the next read is 10s
+        monkeypatch.setattr(lease.time, "monotonic", lambda: next(clock))
+        with pytest.raises(lease.LeaseError) as exc:
+            guard.acquire()
+        assert exc.value.sqlstate == "45002"
+        assert "wait budget was already exhausted" in str(exc.value)
+        assert engine.calls == 0
+
+
+class TestGuardedMigrationCleanup:
+    @staticmethod
+    def _engine(disposed):
+        class _Engine:
+            def dispose(self):
+                disposed.append(True)
+
+        return _Engine()
+
+    def test_preflight_failure_disposes_without_release(self, monkeypatch):
+        disposed: list[bool] = []
+        released: list[bool] = []
+        monkeypatch.setattr(
+            db_module, "_migration_engine", lambda: self._engine(disposed)
+        )
+        monkeypatch.setattr(
+            lease,
+            "preflight",
+            lambda engine: (_ for _ in ()).throw(
+                lease.LeaseError("45005", "protocol row missing")
+            ),
+        )
+        monkeypatch.setattr(
+            lease.MigrationLease,
+            "release",
+            lambda self: released.append(True),
+        )
+        with pytest.raises(lease.LeaseError):
+            db_module._run_guarded_migrations(object(), object(), logging.getLogger("t"))
+        assert disposed == [True]
+        assert released == []
+
+    def test_acquisition_failure_disposes_without_release(self, monkeypatch):
+        disposed: list[bool] = []
+        released: list[bool] = []
+        monkeypatch.setattr(
+            db_module, "_migration_engine", lambda: self._engine(disposed)
+        )
+        monkeypatch.setattr(lease, "preflight", lambda engine: None)
+        monkeypatch.setattr(
+            lease.MigrationLease,
+            "acquire",
+            lambda self: (_ for _ in ()).throw(
+                lease.LeaseError("45002", "lease held by another owner")
+            ),
+        )
+        monkeypatch.setattr(
+            lease.MigrationLease,
+            "release",
+            lambda self: released.append(True),
+        )
+        with pytest.raises(lease.LeaseError):
+            db_module._run_guarded_migrations(object(), object(), logging.getLogger("t"))
+        assert disposed == [True]
+        assert released == []
+
+
+class TestSqliteMigrationTarget:
+    def test_a_separate_sqlite_migration_url_is_refused(self, monkeypatch, tmp_path):
+        runtime = tmp_path / "runtime.db"
+        other = tmp_path / "other.db"
+        settings_obj = Settings(
+            DATABASE_URL=f"sqlite:///{runtime}",
+            STRIKENOVA_MIGRATION_DATABASE_URL=f"sqlite:///{other}",
+        )
+        with patch("app.db.settings", settings_obj), pytest.raises(
+            lease.LeaseError
+        ) as exc:
+            db_module._run_alembic_migrations()
+        assert exc.value.sqlstate == "45004"
+        assert "separate SQLite migration URL is not supported" in str(exc.value)
+        assert not other.exists(), "Alembic must not migrate a different SQLite file"
+
+    def test_the_same_sqlite_target_is_accepted(self, monkeypatch, tmp_path):
+        runtime = tmp_path / "runtime.db"
+        settings_obj = Settings(
+            DATABASE_URL=f"sqlite:///{runtime}",
+            STRIKENOVA_MIGRATION_DATABASE_URL=f"sqlite:///{runtime}",
+        )
+        with patch("app.db.settings", settings_obj):
+            resolved = db_module.assert_guarded_migration_configuration()
+        assert resolved.startswith("sqlite:///")
+
+
+class TestConnectionTargetOverrides:
+    ROLES: ClassVar[dict[str, str]] = {
+        "STRIKENOVA_MIGRATOR_ROLE": "migrator",
+        "STRIKENOVA_RUNTIME_ROLE": "runtime",
+    }
+
+    def _assert_refused(self, runtime, migration, fragment):
+        settings_obj = Settings(
+            DATABASE_URL=runtime,
+            STRIKENOVA_MIGRATION_DATABASE_URL=migration,
+            **self.ROLES,
+        )
+        with patch("app.db.settings", settings_obj), pytest.raises(
+            lease.LeaseError
+        ) as exc:
+            db_module.assert_guarded_migration_configuration()
+        assert exc.value.sqlstate == "45004"
+        assert fragment in str(exc.value)
+        for secret in ("runtime-secret", "migrator-secret", "postgresql://"):
+            assert secret not in str(exc.value)
+
+    def test_query_user_override_is_refused(self):
+        self._assert_refused(
+            "postgresql://runtime:runtime-secret@db.example:5432/app?user=migrator",
+            "postgresql://migrator:migrator-secret@db.example:5432/app",
+            "connection query parameter",
+        )
+
+    def test_query_dbname_override_is_refused(self):
+        self._assert_refused(
+            "postgresql://runtime:runtime-secret@db.example:5432/app",
+            "postgresql://migrator:migrator-secret@db.example:5432/app?dbname=elsewhere",
+            "connection query parameter",
+        )
+
+    def test_multi_host_migration_url_is_refused(self):
+        self._assert_refused(
+            "postgresql://runtime:runtime-secret@db.example:5432/app",
+            "postgresql://migrator:migrator-secret@db.example,other.example:5432/app",
+            "names multiple hosts",
+        )
+
+    def test_unrelated_connection_options_are_preserved(self):
+        settings_obj = Settings(
+            DATABASE_URL=(
+                "postgresql://runtime:runtime-secret@db.example:5432/app?sslmode=require"
+            ),
+            STRIKENOVA_MIGRATION_DATABASE_URL=(
+                "postgresql://migrator:migrator-secret@db.example:5432/app"
+                "?application_name=issue145"
+            ),
+            **self.ROLES,
+        )
+        with patch("app.db.settings", settings_obj):
+            resolved = db_module.assert_guarded_migration_configuration()
+        assert "sslmode=require" not in resolved  # migration URL keeps its own options
+        assert "application_name=issue145" in resolved
+
+
+class TestDisposableHarnessUrls:
+    def test_admin_query_parameters_cannot_override_derived_targets(self):
+        from sqlalchemy.engine import make_url
+
+        admin = (
+            "postgresql://admin:pw@db.example:5432/postgres"
+            "?dbname=postgres&user=admin&sslmode=require"
+        )
+        prov = support.Provisioned(admin, "sn145_probe", support.TOPOLOGY_A)
+        migrator = make_url(prov.migrator_url)
+        assert migrator.database == "sn145_probe"
+        assert migrator.username == prov.migrator_role
+        assert migrator.password == prov.migrator_password
+        assert migrator.query.get("sslmode") == "require"
+        assert "dbname" not in migrator.query
+        assert "user" not in migrator.query
+        admin_db = make_url(prov.admin_database_url)
+        assert admin_db.database == "sn145_probe"
+        assert "dbname" not in admin_db.query

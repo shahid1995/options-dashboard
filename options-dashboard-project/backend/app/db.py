@@ -41,6 +41,151 @@ def normalize_database_url(url: str) -> str:
     return url
 
 
+#: Query parameters psycopg merges into the connection arguments *after* the
+#: URL authority and path. ``?user=`` or ``?dbname=`` can therefore make a URL
+#: authenticate as, or connect to, something other than what the URL appears to
+#: name. No URL whose identity is used as evidence may carry one of these.
+_FORBIDDEN_CONNECTION_QUERY_KEYS = frozenset(
+    {
+        "host",
+        "hostaddr",
+        "port",
+        "dbname",
+        "database",
+        "user",
+        "password",
+        "service",
+        "servicefile",
+        "passfile",
+    }
+)
+
+#: The server's own view of a runtime connection: the authenticated login
+#: (``session_user``), the role it currently runs as (``current_user``, which a
+#: ``SET ROLE`` or an inherited membership changes) and that login's attributes.
+_RUNTIME_IDENTITY_SQL = (
+    "SELECT session_user, current_user, r.rolcanlogin, r.rolsuper, "
+    "r.rolcreaterole, r.rolcreatedb, r.rolbypassrls, r.rolreplication "
+    "FROM pg_roles r WHERE r.rolname = session_user"
+)
+
+_RUNTIME_FORBIDDEN_ATTRIBUTES: tuple[tuple[int, str], ...] = (
+    (3, "SUPERUSER"),
+    (4, "CREATEROLE"),
+    (5, "CREATEDB"),
+    (6, "BYPASSRLS"),
+    (7, "REPLICATION"),
+)
+
+
+def _raise_config_error(message: str) -> None:
+    from app._migration_lease import LeaseError, SQLSTATE_CONFIG
+
+    raise LeaseError(SQLSTATE_CONFIG, message)
+
+
+def _runtime_identity_problems(
+    observed,
+    runtime_role: str,
+    migrator_role: str,
+    *,
+    stage: str,
+) -> list[str]:
+    """Problems with one live runtime connection's identity (none == verified).
+
+    The URL's declared username is not evidence: the check reads the principal
+    PostgreSQL authenticated and the role the session currently runs as, so a
+    ``SET ROLE``, an inherited membership or a libpq query parameter cannot
+    make the runtime look like a different, safer identity.
+    """
+    if observed is None:
+        return [
+            f"{stage}: the runtime connection's login is not a role in pg_roles, "
+            "so its identity cannot be proven"
+        ]
+    session_user, current_user = observed[0], observed[1]
+    problems: list[str] = []
+    if runtime_role == migrator_role:
+        problems.append(
+            "the configured runtime identity and migration identity are the same "
+            f"role ({runtime_role!r}); ADR-018 requires two distinct logins"
+        )
+    if session_user != runtime_role:
+        problems.append(
+            f"{stage}: session_user is {session_user!r}, not the configured "
+            f"runtime identity {runtime_role!r}"
+        )
+    if current_user != runtime_role:
+        problems.append(
+            f"{stage}: current_user is {current_user!r}, not the configured "
+            f"runtime identity {runtime_role!r} (unexpected role elevation)"
+        )
+    if not observed[2]:
+        problems.append(
+            f"{stage}: runtime identity {runtime_role!r} is not a LOGIN role"
+        )
+    for index, name in _RUNTIME_FORBIDDEN_ATTRIBUTES:
+        if observed[index]:
+            problems.append(
+                f"{stage}: runtime identity {runtime_role!r} has {name}"
+            )
+    return problems
+
+
+def _install_runtime_identity_guard(
+    engine_, runtime_role: str, migrator_role: str
+) -> None:
+    """Verify the real principal of EVERY runtime DBAPI connection.
+
+    Sampling one connection would leave the rest of the pool unproven, and a
+    pool member that authenticated as another login (for example through a
+    ``?user=`` query parameter) would then serve application traffic while the
+    privilege verifier still inspected the configured runtime role.
+    """
+    from sqlalchemy import event
+
+    @event.listens_for(engine_, "connect")
+    def _verify_runtime_identity(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute(_RUNTIME_IDENTITY_SQL)
+            observed = cursor.fetchone()
+        finally:
+            cursor.close()
+            dbapi_connection.rollback()
+        problems = _runtime_identity_problems(
+            observed,
+            runtime_role,
+            migrator_role,
+            stage="the runtime engine's new connection",
+        )
+        if problems:
+            # Never embed the URL or password: only the observed identity and
+            # the configured role names appear here.
+            _raise_config_error("; ".join(problems))
+
+
+def _create_runtime_engine(url: str, **kwargs):
+    """Build a runtime engine whose every new connection is identity-checked.
+
+    ``STRIKENOVA_RUNTIME_ROLE`` is mandatory on PostgreSQL: the whole point of
+    the guard is that the authenticated principal is the named runtime
+    identity, so an unnamed identity fails closed instead of skipping the
+    check.
+    """
+    runtime_role = (getattr(settings, "STRIKENOVA_RUNTIME_ROLE", "") or "").strip()
+    migrator_role = (getattr(settings, "STRIKENOVA_MIGRATOR_ROLE", "") or "").strip()
+    if not runtime_role or not migrator_role:
+        _raise_config_error(
+            "STRIKENOVA_RUNTIME_ROLE and STRIKENOVA_MIGRATOR_ROLE must both be "
+            "configured on PostgreSQL so the authenticated runtime principal "
+            "can be proven distinct from the migration identity"
+        )
+    eng = create_engine(url, **kwargs)
+    _install_runtime_identity_guard(eng, runtime_role, migrator_role)
+    return eng
+
+
 def _engine():
     if settings.DATABASE_URL:
         url = normalize_database_url(settings.DATABASE_URL)
@@ -58,15 +203,24 @@ def _engine():
             dbapi_conn.execute("PRAGMA journal_mode=WAL")
             dbapi_conn.execute("PRAGMA synchronous=NORMAL")
     else:
-        # PostgreSQL production/staging configuration.
-        eng = create_engine(
-            url,
+        # PostgreSQL production/staging configuration. The runtime identity
+        # guard is attached here so every pooled connection is verified. It is
+        # PostgreSQL-only: a legacy CockroachDB URL keeps its historical
+        # engine, and CockroachDB is retired for migrations by ADR-019.
+        options = dict(
             pool_size=5,
             max_overflow=10,
             pool_timeout=30,
             pool_recycle=1800,
             pool_pre_ping=True,
         )
+        # Inline scheme check: ``_engine()`` runs at import time, before the
+        # later ADR helpers are defined. ``cockroachdb+psycopg`` is not
+        # PostgreSQL here and keeps its historical engine.
+        if url.split(":", 1)[0].startswith("postgres"):
+            eng = _create_runtime_engine(url, **options)
+        else:
+            eng = create_engine(url, **options)
 
     return eng
 
@@ -211,7 +365,12 @@ def validate_migration_state() -> dict:
         from alembic.runtime.migration import MigrationContext
 
         alembic_cfg = AlembicConfig("alembic.ini")
-        alembic_cfg.set_main_option("sqlalchemy.url", str(engine.url))
+        # This path genuinely needs the INI option (no supplied connection),
+        # and ConfigParser treats ``%`` as interpolation: a URL-encoded
+        # credential character such as ``%40`` must be escaped.
+        alembic_cfg.set_main_option(
+            "sqlalchemy.url", str(engine.url).replace("%", "%%")
+        )
         script = ScriptDirectory.from_config(alembic_cfg)
         heads = script.get_heads()
         result["alembic_heads"] = list(heads)
@@ -409,6 +568,25 @@ def _parse_migration_target(url: str, *, label: str) -> _MigrationTarget:
             f"{label} is not a usable SQLAlchemy database URL ({type(exc).__name__})"
         ) from None
 
+    # libpq merges query parameters into the connect arguments after the URL
+    # authority/path, so ``?user=`` or ``?dbname=`` can change the principal or
+    # database this URL really uses. Such a URL cannot serve as identity
+    # evidence; refuse it before anything is derived from it.
+    query_keys = {str(key).lower() for key in (parsed.query or {})}
+    overrides = query_keys & _FORBIDDEN_CONNECTION_QUERY_KEYS
+    if overrides:
+        raise _config_error(
+            f"{label} carries connection query parameter(s) {sorted(overrides)} "
+            "that can override the host, database or login this check proves"
+        )
+    # A comma-separated host list is a libpq failover list: a later host may
+    # serve a cluster this check never proved. Refuse it rather than guess.
+    if "," in (parsed.host or ""):
+        raise _config_error(
+            f"{label} names multiple hosts; a failover host list cannot be "
+            "proven to reach the one target the migration lease protects"
+        )
+
     backend = parsed.get_backend_name()
     if backend in ("postgres", "postgresql"):
         backend = "postgresql"
@@ -588,7 +766,7 @@ def assert_guarded_migration_configuration(
                 "DATABASE_URL is not: a migration identity without a PostgreSQL "
                 "runtime database has no proven target"
             )
-        return migration_url
+        return _assert_sqlite_migration_target(runtime_url, migration_url)
 
     explicit = (
         getattr(settings, "STRIKENOVA_MIGRATION_DATABASE_URL", None) or ""
@@ -637,6 +815,41 @@ def assert_guarded_migration_configuration(
 #: ``undefined_function`` when the server does not provide it at all. They are
 #: the only conditions under which weaker identity evidence is acceptable.
 _IDENTITY_FALLBACK_SQLSTATES = frozenset({"42501", "42883"})
+
+
+def _sqlite_target_path(url: str | None) -> str:
+    """Canonical file/memory identity of a SQLite URL (default path when unset)."""
+    from sqlalchemy.engine import make_url
+
+    if not url:
+        return os.path.realpath(_DEFAULT_DB_PATH)
+    database = make_url(url).database
+    if not database:
+        return ""
+    if database == ":memory:":
+        return database
+    return os.path.realpath(database)
+
+
+def _assert_sqlite_migration_target(
+    runtime_url: str | None, migration_url: str
+) -> str:
+    """Refuse a separate SQLite migration URL (ADR-018 local single identity).
+
+    The SQLite path hands Alembic the global runtime engine, so a migration URL
+    naming a *different* SQLite file would silently migrate the runtime file
+    while the configured target stayed untouched. SQLite keeps the historical
+    single-identity behaviour, which means one database only.
+    """
+    if not (migration_url or "").lower().startswith("sqlite"):
+        return migration_url
+    if _sqlite_target_path(runtime_url) != _sqlite_target_path(migration_url):
+        raise _config_error(
+            "a separate SQLite migration URL is not supported: Alembic is given "
+            "the runtime SQLite engine, so the configured migration target must "
+            "be the runtime SQLite database (single-identity local behavior)"
+        )
+    return migration_url
 
 
 def _cluster_system_identifier(conn) -> str | None:
@@ -690,7 +903,9 @@ def _logical_target_signature(conn) -> tuple:
     return (row[0], row[1], row[2], _cluster_system_identifier(conn))
 
 
-def _verify_logical_target(migration_engine) -> None:
+def _verify_logical_target(
+    migration_engine, signature_holder: list | None = None
+) -> None:
     """Prove, from the server, that both URLs reach one cluster and database.
 
     The static check compares what the URLs *say*. This check compares what the
@@ -703,7 +918,6 @@ def _verify_logical_target(migration_engine) -> None:
     Errors raised here never include a URL: only the failing attribute and the
     observation are reported.
     """
-    from sqlalchemy import create_engine
     from sqlalchemy.pool import NullPool
 
     runtime_url = _runtime_url_from_settings()
@@ -720,7 +934,9 @@ def _verify_logical_target(migration_engine) -> None:
         observed = _logical_target_signature(conn)
         conn.rollback()
 
-    runtime_engine = create_engine(runtime_url, poolclass=NullPool, pool_pre_ping=True)
+    runtime_engine = _create_runtime_engine(
+        runtime_url, poolclass=NullPool, pool_pre_ping=True
+    )
     try:
         with runtime_engine.connect() as conn:
             runtime_observed = _logical_target_signature(conn)
@@ -765,6 +981,51 @@ def _verify_logical_target(migration_engine) -> None:
             "PostgreSQL cluster/database (database, postmaster start time or "
             "database OID differ); refusing to migrate a different target"
         )
+
+    # Only a fully proven target becomes the per-connection reference. Every
+    # later connection on this engine re-reads and must match it.
+    if signature_holder is not None:
+        signature_holder[0] = observed
+
+
+def _verified_runtime_role() -> str:
+    """Read the authenticated runtime principal from a live runtime connection.
+
+    The connect listener already refuses a wrong identity; this returns the
+    server-verified ``session_user`` so the §8.3 privilege matrix is evaluated
+    against the principal that actually serves application traffic — not the
+    username the URL happens to declare.
+    """
+    runtime_url = _runtime_url_from_settings()
+    if not runtime_url or not _is_postgres_url(runtime_url):
+        raise _config_error(
+            "cannot verify the runtime privilege matrix: PostgreSQL DATABASE_URL "
+            "is required"
+        )
+    from sqlalchemy.pool import NullPool
+
+    engine_ = _create_runtime_engine(runtime_url, poolclass=NullPool)
+    try:
+        with engine_.connect() as conn:
+            session_user, current_user = conn.exec_driver_sql(
+                "SELECT session_user, current_user"
+            ).one()
+            conn.rollback()
+    finally:
+        engine_.dispose()
+    expected = (getattr(settings, "STRIKENOVA_RUNTIME_ROLE", "") or "").strip()
+    if session_user != expected or current_user != expected:
+        raise _config_error(
+            "the verified runtime principal is "
+            f"{session_user!r}/{current_user!r}, not the configured runtime "
+            f"identity {expected!r}"
+        )
+    if session_user == _configured_migration_role():
+        raise _config_error(
+            "the runtime connection authenticated as the migration identity; "
+            "ADR-018 requires distinct runtime and migration principals"
+        )
+    return str(session_user)
 
 
 #: Identity evidence read from every migration connection: the login the
@@ -844,7 +1105,36 @@ def _assert_migration_session_identity(conn, *, stage: str) -> None:
         raise _config_error("; ".join(problems))
 
 
-def _install_migration_identity_guard(engine_) -> None:
+def _dbapi_logical_signature(cursor) -> tuple:
+    """Server-side cluster/database signature from a raw DBAPI cursor.
+
+    Used inside the migration engine's ``connect`` listener, before the
+    connection can run any application statement, so a reconnect that fails
+    over to another cluster is rejected rather than trusted.
+    """
+    cursor.execute(
+        "SELECT current_database(), pg_postmaster_start_time()::text, "
+        "(SELECT oid FROM pg_database WHERE datname = current_database())"
+    )
+    row = cursor.fetchone()
+    system_identifier = None
+    try:
+        cursor.execute("SELECT system_identifier::text FROM pg_control_system()")
+        system_identifier = cursor.fetchone()[0]
+    except Exception as exc:  # noqa: BLE001 - classified immediately below
+        state = getattr(exc, "sqlstate", None)
+        if state not in _IDENTITY_FALLBACK_SQLSTATES:
+            raise _config_error(
+                "cannot read pg_control_system().system_identifier from a new "
+                f"migration connection (SQLSTATE {state or 'none'}); refusing to "
+                "accept an unproven target"
+            ) from None
+    return (row[0], row[1], row[2], system_identifier)
+
+
+def _install_migration_identity_guard(
+    engine_, expected_signature: list | None = None
+) -> None:
     """Verify every DBAPI connection the migration engine opens.
 
     Sampling one connection would let a different pooled connection run the
@@ -852,6 +1142,11 @@ def _install_migration_identity_guard(engine_) -> None:
     listener is registered before the engine's first connection and raises
     SQLSTATE ``45004`` while the connection is still being created, so a
     wrong identity can never execute a statement on the migration path.
+
+    Once ``expected_signature[0]`` is set by :func:`_verify_logical_target`,
+    every later connection must also report the same database, postmaster
+    start time, database OID and ``system_identifier``. That is what turns the
+    one-time preflight into a per-connection proof for reconnects and failover.
     """
     from sqlalchemy import event
 
@@ -863,6 +1158,9 @@ def _install_migration_identity_guard(engine_) -> None:
         try:
             cursor.execute(_MIGRATION_IDENTITY_SQL)
             observed = cursor.fetchone()
+            signature = None
+            if expected_signature is not None and expected_signature[0] is not None:
+                signature = _dbapi_logical_signature(cursor)
         finally:
             cursor.close()
             dbapi_connection.rollback()
@@ -871,6 +1169,13 @@ def _install_migration_identity_guard(engine_) -> None:
             migrator_role,
             stage="the migration engine's new connection",
         )
+        if signature is not None and signature != expected_signature[0]:
+            problems.append(
+                "the migration engine's new connection does not reach the same "
+                "PostgreSQL cluster/database proven during preflight "
+                f"(observed database {signature[0]!r}); refusing to run lease "
+                "or DDL on an unproven target"
+            )
         if problems:
             raise _config_error("; ".join(problems))
 
@@ -886,10 +1191,14 @@ def _migration_engine():
         max_overflow=2,
         pool_timeout=30,
     )
+    # The reference is empty during preflight (the first connection is what
+    # proves the target) and set before the engine is returned, so every
+    # connection the lease/DDL/backfill path opens afterwards is re-proven.
+    signature_holder: list = [None]
     try:
         if not url.startswith("sqlite"):
-            _install_migration_identity_guard(engine_)
-            _verify_logical_target(engine_)
+            _install_migration_identity_guard(engine_, signature_holder)
+            _verify_logical_target(engine_, signature_holder)
     except BaseException:
         engine_.dispose()
         raise
@@ -1054,10 +1363,19 @@ def _verify_application_privileges(conn) -> None:
     _assert_migration_session_identity(
         conn, stage="before the §8.3 application privilege verification"
     )
+    # The runtime matrix must be evaluated for the principal PostgreSQL
+    # actually authenticated, not the username DATABASE_URL declares.
+    runtime_role = _verified_runtime_role()
+    migrator_role = _configured_migration_role()
+    if runtime_role == migrator_role:
+        raise _config_error(
+            "the verified runtime identity is the migration identity; ADR-018 "
+            "requires two distinct principals"
+        )
     verify_application_privileges(
         conn,
-        migrator_role=settings.STRIKENOVA_MIGRATOR_ROLE,
-        runtime_role=getattr(settings, "STRIKENOVA_RUNTIME_ROLE", None),
+        migrator_role=migrator_role,
+        runtime_role=runtime_role,
         owner_role=(getattr(settings, "STRIKENOVA_OWNER_ROLE", "") or "").strip() or None,
     )
 
@@ -1078,10 +1396,15 @@ def _run_guarded_migrations(
 
     migration_engine = _migration_engine()
     lease = MigrationLease(migration_engine)
-    preflight(migration_engine)
-    lease.acquire()
+    # Ownership is tracked explicitly so cleanup can distinguish "failed before
+    # acquisition" (nothing to release) from "failed after acquisition"
+    # (release exactly once). Both paths dispose the engine.
+    acquired = False
     primary: BaseException | None = None
     try:
+        preflight(migration_engine)
+        lease.acquire()
+        acquired = True
         with migration_engine.connect() as conn:
             # Session-level bounded lock wait, before the transaction begins.
             conn.exec_driver_sql(
@@ -1130,16 +1453,17 @@ def _run_guarded_migrations(
         primary = exc
         raise
     finally:
-        try:
-            lease.release()
-        except Exception:  # noqa: BLE001 - cleanup must never mask the cause
-            logger.exception(
-                "migration lease cleanup failed (fingerprint=%s)", lease.fingerprint
-            )
-            if primary is None:
-                raise
-        finally:
-            migration_engine.dispose()
+        if acquired:
+            try:
+                lease.release()
+            except Exception:  # noqa: BLE001 - cleanup must never mask the cause
+                logger.exception(
+                    "migration lease cleanup failed (fingerprint=%s)",
+                    lease.fingerprint,
+                )
+                if primary is None:
+                    raise
+        migration_engine.dispose()
 
 
 def _run_alembic_migrations(
@@ -1159,7 +1483,14 @@ def _run_alembic_migrations(
     logger = logging.getLogger(__name__)
     alembic_cfg = Config("alembic.ini")
     migration_url = assert_guarded_migration_configuration()
-    alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
+    # Only the SQLite path still needs the ConfigParser-stored URL (it has no
+    # supplied connection). The guarded PostgreSQL path passes a live
+    # connection to env.py, so a credential-bearing URL must not go through
+    # ConfigParser, which treats ``%`` as interpolation (``%40`` would raise).
+    if migration_url.startswith("sqlite"):
+        alembic_cfg.set_main_option(
+            "sqlalchemy.url", migration_url.replace("%", "%%")
+        )
 
     if migration_url.startswith("sqlite"):
         # Single-process by construction: no distributed lease is needed.

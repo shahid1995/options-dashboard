@@ -380,7 +380,7 @@ def test_backfill_uses_migrator_identity_and_per_user_transactions(pg_ready, mon
     def observed(db, user_id):
         row = db.execute(
             db_module.text(
-                "SELECT current_user, "
+                "SELECT current_user, txid_current(), "
                 " (SELECT count(*) FROM pg_locks l "
                 "   WHERE l.pid = pg_backend_pid() "
                 "     AND l.relation = 'migration_internal.migration_lease'::regclass "
@@ -388,16 +388,24 @@ def test_backfill_uses_migrator_identity_and_per_user_transactions(pg_ready, mon
             )
         ).one()
         observations.append(
-            {"user": user_id, "current_user": row[0], "lease_locks": int(row[1])}
+            {
+                "user": user_id,
+                "current_user": row[0],
+                "txid": int(row[1]),
+                "lease_locks": int(row[2]),
+            }
         )
         return real_backfill(db, user_id)
 
     monkeypatch.setattr(leg, "backfill_exposures", observed)
-    enter_calls: list[str] = []
+    enter_calls: list[tuple[str, int]] = []
     real_enter = MigrationLease.enter
 
     def counting_enter(self, conn):
-        enter_calls.append(conn.exec_driver_sql("SELECT current_user").scalar())
+        row = conn.exec_driver_sql(
+            "SELECT current_user, txid_current()"
+        ).one()
+        enter_calls.append((row[0], int(row[1])))
         return real_enter(self, conn)
 
     monkeypatch.setattr(MigrationLease, "enter", counting_enter)
@@ -418,8 +426,34 @@ def test_backfill_uses_migrator_identity_and_per_user_transactions(pg_ready, mon
         raise AssertionError(
             f"expected 8 enter calls (DDL pair + 2 per user), got {len(enter_calls)}"
         )
-    if enter_calls.count(pg_ready.migrator_role) != 8:
+    if any(role != pg_ready.migrator_role for role, _ in enter_calls):
         raise AssertionError("every enter must run as the migration identity")
+
+    # The pair for one user must belong to that user's one transaction, and
+    # different users must use different transactions. Counting calls alone
+    # would accept a broken boundary.
+    ddl_txids = {txid for _, txid in enter_calls[:2]}
+    if len(ddl_txids) != 1:
+        raise AssertionError(f"the DDL enter pair spans transactions: {ddl_txids}")
+    per_user = enter_calls[2:]
+    user_txids: dict[str, int] = {}
+    for index, obs in enumerate(observations):
+        pair = per_user[index * 2 : (index + 1) * 2]
+        if len(pair) != 2 or pair[0][1] != pair[1][1]:
+            raise AssertionError(
+                f"the two enter calls for {obs['user']} are not in one "
+                f"transaction: {pair}"
+            )
+        if pair[0][1] != obs["txid"]:
+            raise AssertionError(
+                f"enter txid {pair[0][1]} != backfill txid {obs['txid']} for "
+                f"{obs['user']}"
+            )
+        user_txids[obs["user"]] = pair[0][1]
+    if len(set(user_txids.values())) != len(observations):
+        raise AssertionError(
+            f"different users shared one transaction: {user_txids}"
+        )
 
 
 def test_backfill_failure_rolls_back_user_and_releases_lease(pg_ready, monkeypatch):
@@ -428,16 +462,34 @@ def test_backfill_failure_rolls_back_user_and_releases_lease(pg_ready, monkeypat
     import app.services.leg_exposure as leg
 
     real_backfill = leg.backfill_exposures
+    work: dict[str, int] = {}
 
     def failing(db, user_id):
+        created = real_backfill(db, user_id)
         if user_id.endswith("-2"):
+            # Prove user 2 really wrote inside its own transaction before the
+            # exception, so "its writes rolled back" is a meaningful assertion
+            # rather than a transaction that never did anything.
+            work["rows"] = int(
+                db.execute(
+                    db_module.text(
+                        "SELECT count(*) FROM strategy_leg_exposures "
+                        "WHERE user_id = :u"
+                    ),
+                    {"u": user_id},
+                ).scalar()
+            )
             raise RuntimeError("injected backfill failure")
-        return real_backfill(db, user_id)
+        return created
 
     monkeypatch.setattr(leg, "backfill_exposures", failing)
     with pytest.raises(RuntimeError, match="injected backfill failure"):
         db_module.init_db()
 
+    if work.get("rows") != 1:
+        raise AssertionError(
+            f"user 2 performed no real backfill work before the failure: {work}"
+        )
     counts = _exposure_counts(pg_ready)
     if counts != {"issue145-user-1": 1}:
         raise AssertionError(f"expected only user 1 committed, got {counts}")
@@ -1994,19 +2046,21 @@ def _advisory_granted(conn, pid: int, key: int, *, granted: bool) -> int:
     ).fetchone()[0]
 
 
-def test_two_process_startup_contends_on_the_advisory_guard_lock(pg_topology_a):
-    """Deterministic overlap: A holds the guard, B is observed queued on it.
+def test_two_process_startup_serializes_the_per_user_backfill(pg_topology_a):
+    """Deterministic overlap INSIDE the first protected per-user backfill.
 
-    ``lease_enter_v1`` takes the transaction-scoped advisory lock on the
-    migration guard key *before* it selects the lease row ``FOR UPDATE``, so
-    the guard — not the row lock — is what makes a second worker wait. The
-    test takes ``ACCESS EXCLUSIVE`` on ``strategy_leg_exposures`` before either
-    worker starts: worker A's protected DDL transaction (the §8.3 revokes)
-    blocks on that table lock while it already holds both the advisory guard
-    and the lease row lock; worker B is then observed *by PostgreSQL* with an
-    ungranted advisory lock on that exact key and with no lock relationship to
-    ``migration_internal.migration_lease`` at all, which is what proves the
-    documented ordering instead of merely "some lock".
+    Worker A is paused by a database trigger on ``strategy_leg_exposures``
+    that waits on an advisory lock held by this test. By the time it blocks, A
+    has entered its first per-user transaction (``lease_enter_v1`` has taken
+    the transaction advisory guard and the lease row lock) and performed real
+    work (the INSERT that fired the trigger). Worker B is then observed by
+    PostgreSQL waiting on the *admission* guard with no lease row lock, which
+    is what proves the backfill is serialized, not merely the DDL. Releasing
+    the lock proves B proceeds only after A releases ownership.
+
+    The previous revision blocked A in its DDL transaction, which let A finish
+    the whole backfill before B arrived: a regression that released the lease
+    before the backfill would still have passed.
     """
     pg = pg_topology_a
     _bootstrap(pg)
@@ -2016,14 +2070,28 @@ def test_two_process_startup_contends_on_the_advisory_guard_lock(pg_topology_a):
     worker = "from app.db import init_db; init_db()"
     env = _startup_env(pg, "sn145_worker_a")
     env_b = _startup_env(pg, "sn145_worker_b")
-
-    blocker = psycopg.connect(pg.admin_database_url, autocommit=True)
     procs: list[subprocess.Popen] = []
+    blocker = psycopg.connect(pg.admin_database_url, autocommit=True)
     try:
-        blocker.execute("BEGIN")
-        blocker.execute(
-            "LOCK TABLE public.strategy_leg_exposures IN ACCESS EXCLUSIVE MODE"
-        )
+        with psycopg.connect(pg.admin_database_url, autocommit=True) as setup:
+            key = setup.execute(
+                "SELECT hashtextextended("
+                "'strikenova:issue145:backfill_pause', 0)"
+            ).fetchone()[0]
+            setup.execute(
+                "CREATE OR REPLACE FUNCTION public._issue145_pause_insert() "
+                "RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+                "PERFORM pg_advisory_xact_lock(hashtextextended("
+                "'strikenova:issue145:backfill_pause', 0)); "
+                "RETURN NEW; END $$"
+            )
+            setup.execute(
+                "CREATE TRIGGER _issue145_pause_trigger BEFORE INSERT ON "
+                "public.strategy_leg_exposures FOR EACH ROW EXECUTE FUNCTION "
+                "public._issue145_pause_insert()"
+            )
+        unsigned_pause = key % (1 << 64)
+        blocker.execute("SELECT pg_advisory_lock(%s)", (key,))
 
         a = subprocess.Popen(
             [sys.executable, "-c", worker],
@@ -2036,17 +2104,40 @@ def test_two_process_startup_contends_on_the_advisory_guard_lock(pg_topology_a):
         procs.append(a)
         deadline = time.monotonic() + 90
         with psycopg.connect(pg.admin_database_url, autocommit=True) as observer:
-            _wait_for(
+            guardian = _guard_key(observer)
+
+            # A is paused in the INSERT inside its first per-user transaction.
+            row_a = _wait_for(
                 observer,
                 lambda: (
                     row
                     if (row := _activity(observer, "sn145_worker_a"))
                     and row[2] == "Lock"
+                    and _advisory_granted(
+                        observer, row[0], unsigned_pause, granted=False
+                    )
                     else None
                 ),
                 deadline=deadline,
-                description="worker A to block while holding the lease",
+                description="worker A to pause inside its first backfill insert",
             )
+            pid_a = row_a[0]
+            if not _advisory_granted(observer, pid_a, guardian, granted=True):
+                raise AssertionError(
+                    "worker A does not hold the admission guard while paused in "
+                    "the backfill"
+                )
+            hold = observer.execute(
+                "SELECT count(*) FROM pg_locks l WHERE l.pid = %s "
+                "AND l.relation = 'migration_internal.migration_lease'::regclass "
+                "AND l.granted",
+                (pid_a,),
+            ).fetchone()[0]
+            if not hold:
+                raise AssertionError(
+                    "worker A does not own the lease row while paused in the "
+                    "protected backfill"
+                )
 
             b = subprocess.Popen(
                 [sys.executable, "-c", worker],
@@ -2063,43 +2154,13 @@ def test_two_process_startup_contends_on_the_advisory_guard_lock(pg_topology_a):
                 lambda: (
                     row
                     if (row := _activity(observer, "sn145_worker_b"))
-                    and row[2] == "Lock"
-                    and row[1] == "active"
+                    and _advisory_granted(observer, row[0], guardian, granted=False)
                     else None
                 ),
                 deadline=deadline,
-                description="worker B to wait on a database lock",
+                description="worker B to wait for lease admission",
             )
-
-            # Positive, simultaneous observations: A still alive and holding an
-            # open transaction, B waiting on the advisory guard (not merely
-            # running), and A holding both locks it takes before the DDL.
-            if a.poll() is not None:
-                raise AssertionError("worker A finished before the overlap was observed")
-            pid_a = _activity(observer, "sn145_worker_a")[0]
             pid_b = row_b[0]
-            key = _guard_key(observer)
-
-            if not _advisory_granted(observer, pid_b, key, granted=False):
-                raise AssertionError(
-                    "worker B is not waiting on the transaction-scoped advisory "
-                    "guard lock"
-                )
-            if not _advisory_granted(observer, pid_a, key, granted=True):
-                raise AssertionError(
-                    "worker A does not hold the advisory guard lock that "
-                    "serialises admission"
-                )
-            hold = observer.execute(
-                "SELECT count(*) FROM pg_locks l WHERE l.pid = %s "
-                "AND l.relation = 'migration_internal.migration_lease'::regclass "
-                "AND l.granted",
-                (pid_a,),
-            ).fetchone()[0]
-            if not hold:
-                raise AssertionError(
-                    "worker A did not hold the migration_lease row lock while B waited"
-                )
             row_locks_b = observer.execute(
                 "SELECT count(*) FROM pg_locks l WHERE l.pid = %s "
                 "AND l.relation = 'migration_internal.migration_lease'::regclass",
@@ -2107,22 +2168,34 @@ def test_two_process_startup_contends_on_the_advisory_guard_lock(pg_topology_a):
             ).fetchone()[0]
             if row_locks_b:
                 raise AssertionError(
-                    "worker B already holds or requested a migration_lease row "
-                    "lock; the documented order is advisory guard first"
+                    "worker B reached the lease row before worker A released it"
+                )
+            if a.poll() is not None:
+                raise AssertionError(
+                    "worker A finished while it was supposed to be paused in the "
+                    "backfill"
+                )
+            still_owned = observer.execute(
+                "SELECT count(*) FROM pg_locks l WHERE l.pid = %s "
+                "AND l.relation = 'migration_internal.migration_lease'::regclass "
+                "AND l.granted",
+                (pid_a,),
+            ).fetchone()[0]
+            if not still_owned:
+                raise AssertionError(
+                    "worker A lost the lease while worker B was waiting"
                 )
 
-        # Only now let A finish; B must then proceed on its own.
-        blocker.execute("COMMIT")
+        # Resume A. Only now may B be admitted and finish.
+        blocker.execute("SELECT pg_advisory_unlock(%s)", (key,))
 
-        outputs = []
         for proc in procs:
             stdout, stderr = proc.communicate(timeout=240)
-            outputs.append(stdout + stderr)
+            output = stdout + stderr
             if proc.returncode != 0:
                 raise AssertionError(
-                    f"startup worker failed rc={proc.returncode}: {(stdout + stderr)[-2000:]}"
+                    f"startup worker failed rc={proc.returncode}: {output[-2000:]}"
                 )
-        for output in outputs:
             if "23505" in output:
                 raise AssertionError("startup workers reported SQLSTATE 23505")
 
@@ -2137,7 +2210,22 @@ def test_two_process_startup_contends_on_the_advisory_guard_lock(pg_topology_a):
             if proc.poll() is None:
                 proc.kill()
                 proc.communicate(timeout=30)
+        try:
+            blocker.execute("SELECT pg_advisory_unlock_all()")
+        except Exception:  # noqa: BLE001 - cleanup must not mask the result
+            pass
         blocker.close()
+        try:
+            with psycopg.connect(pg.admin_database_url, autocommit=True) as cleanup:
+                cleanup.execute(
+                    "DROP TRIGGER IF EXISTS _issue145_pause_trigger "
+                    "ON public.strategy_leg_exposures"
+                )
+                cleanup.execute(
+                    "DROP FUNCTION IF EXISTS public._issue145_pause_insert()"
+                )
+        except Exception:  # noqa: BLE001 - the disposable database is dropped too
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -2329,3 +2417,275 @@ def test_verifier_refuses_unexpected_incoming_owner_membership(pg_ready):
     finally:
         _admin_exec(pg_ready, f"REVOKE {pg_ready.owner_role} FROM {role}")
         _admin_exec(pg_ready, f"DROP ROLE IF EXISTS {role}")
+
+
+# ---------------------------------------------------------------------------
+# Column-level privilege bypass (ADR §8.3 table matrix is not the whole ACL)
+# ---------------------------------------------------------------------------
+
+
+def test_verifier_refuses_column_level_migrator_update_topology_b(pg_ready):
+    _admin_exec(
+        pg_ready,
+        f"GRANT UPDATE (status) ON TABLE public.positions TO {pg_ready.migrator_role}",
+    )
+    try:
+        _expect_application_refusal(
+            pg_ready,
+            "column-level UPDATE on public.positions.status",
+        )
+    finally:
+        _admin_exec(
+            pg_ready,
+            f"REVOKE UPDATE (status) ON TABLE public.positions "
+            f"FROM {pg_ready.migrator_role}",
+        )
+
+
+def test_verifier_refuses_column_level_migrator_references_topology_b(pg_ready):
+    _admin_exec(
+        pg_ready,
+        f"GRANT REFERENCES (status) ON TABLE public.positions "
+        f"TO {pg_ready.migrator_role}",
+    )
+    try:
+        _expect_application_refusal(
+            pg_ready,
+            "column-level REFERENCES on public.positions.status",
+        )
+    finally:
+        _admin_exec(
+            pg_ready,
+            f"REVOKE REFERENCES (status) ON TABLE public.positions "
+            f"FROM {pg_ready.migrator_role}",
+        )
+
+
+def test_verifier_refuses_column_level_migrator_update_topology_a(pg_ready_a):
+    """Topology A's owner-only restriction is also checked per column."""
+    _admin_exec(
+        pg_ready_a,
+        f"GRANT UPDATE (status) ON TABLE public.positions "
+        f"TO {pg_ready_a.migrator_role}",
+    )
+    try:
+        _expect_application_refusal(
+            pg_ready_a,
+            "column-level UPDATE on public.positions.status",
+        )
+    finally:
+        _admin_exec(
+            pg_ready_a,
+            f"REVOKE UPDATE (status) ON TABLE public.positions "
+            f"FROM {pg_ready_a.migrator_role}",
+        )
+
+
+def test_column_level_update_aborts_the_guarded_upgrade(pg):
+    """A column-level bypass cannot reach a commit through the startup path.
+
+    Topology B's guarded upgrade installs its four grants but never an UPDATE
+    grant, so a column-level UPDATE survives the topology step and the
+    in-transaction verifier must abort the whole migration.
+    """
+    _bootstrap(pg)
+    db_module._run_alembic_migrations()
+    _admin_exec(
+        pg,
+        f"GRANT UPDATE (status) ON TABLE public.positions TO {pg.migrator_role}",
+    )
+    try:
+        with pytest.raises(LeaseError) as exc:
+            db_module._run_alembic_migrations()
+        _assert_sqlstate(exc, "45004")
+        if "column-level UPDATE" not in str(exc.value):
+            raise AssertionError(f"unexpected refusal: {exc.value}")
+        unowned, generation, _, _ = _lease_row(pg)
+        if not unowned or generation != 2:
+            raise AssertionError(
+                "the aborted migration left the lease owned or did not "
+                f"release the acquisition (unowned={unowned} generation={generation})"
+            )
+    finally:
+        _admin_exec(
+            pg,
+            f"REVOKE UPDATE (status) ON TABLE public.positions "
+            f"FROM {pg.migrator_role}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Protocol mirror consistency (lease row vs control row)
+# ---------------------------------------------------------------------------
+
+
+def test_verify_refuses_an_inconsistent_protocol_mirror_without_repair(pg_ready):
+    """A version-2 lease row under a version-1 control row must fail closed.
+
+    Both rows are individually valid, but ``lease_acquire_v1`` compares them,
+    so the next admission would fail 45006. Verification must catch the pair
+    and roll back without changing either row.
+    """
+    with psycopg.connect(pg_ready.admin_database_url) as conn:
+        control_before = conn.execute(
+            "SELECT installed_version, min_supported_version, "
+            "max_supported_version, barrier_state, bootstrap_state "
+            "FROM migration_internal.lease_protocol"
+        ).fetchone()
+        lease_before = conn.execute(
+            "SELECT protocol_version, owner_token_hash, generation "
+            "FROM migration_internal.migration_lease"
+        ).fetchone()
+        conn.execute(
+            "UPDATE migration_internal.migration_lease SET protocol_version = 2"
+        )
+        conn.commit()
+    try:
+        message = _verify_refusal(pg_ready)
+        if "does not match the installed protocol" not in message:
+            raise AssertionError(f"unexpected refusal: {message}")
+        with psycopg.connect(pg_ready.admin_database_url) as conn:
+            control_after = conn.execute(
+                "SELECT installed_version, min_supported_version, "
+                "max_supported_version, barrier_state, bootstrap_state "
+                "FROM migration_internal.lease_protocol"
+            ).fetchone()
+            lease_after = conn.execute(
+                "SELECT protocol_version, owner_token_hash, generation "
+                "FROM migration_internal.migration_lease"
+            ).fetchone()
+        if control_after != control_before:
+            raise AssertionError(
+                f"verification changed the control row: {control_before} -> "
+                f"{control_after}"
+            )
+        if lease_after[0] != 2 or lease_after[1:] != lease_before[1:]:
+            raise AssertionError(
+                "verification silently repaired the mismatched lease row: "
+                f"{lease_after}"
+            )
+    finally:
+        _admin_exec(
+            pg_ready,
+            "UPDATE migration_internal.migration_lease SET protocol_version = 1",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Runtime identity is read from the connection, not from the URL
+# ---------------------------------------------------------------------------
+
+
+def test_runtime_engine_refuses_a_query_parameter_identity_override(pg_ready):
+    """A URL that authenticates as the migrator cannot pass as the runtime.
+
+    SQLAlchemy/psycopg merges ``?user=`` into the connect arguments, so the
+    URL's authority username is not the principal that actually logs in.
+    """
+    from sqlalchemy.engine import make_url
+
+    url = (
+        make_url(pg_ready.app_url)
+        .set(password=pg_ready.migrator_password)
+        .update_query_dict({"user": pg_ready.migrator_role})
+        .render_as_string(hide_password=False)
+    )
+    engine = db_module._create_runtime_engine(db_module.normalize_database_url(url))
+    try:
+        with pytest.raises(LeaseError) as exc:
+            with engine.connect() as conn:
+                conn.exec_driver_sql("SELECT 1")
+    finally:
+        engine.dispose()
+    _assert_sqlstate(exc, "45004")
+    message = str(exc.value)
+    if pg_ready.migrator_role not in message:
+        raise AssertionError(f"unexpected refusal: {message}")
+    if "runtime identity" not in message:
+        raise AssertionError(f"unexpected refusal: {message}")
+    if pg_ready.migrator_password in message:
+        raise AssertionError("the refusal leaked a password")
+
+
+def test_verified_runtime_role_comes_from_the_live_session(pg_ready):
+    """The verifier uses the authenticated principal, and it is the app role."""
+    if db_module._verified_runtime_role() != pg_ready.app_role:
+        raise AssertionError("the verified runtime role is not the app role")
+
+
+# ---------------------------------------------------------------------------
+# ConfigParser interpolation: URL-encoded credentials on the guarded path
+# ---------------------------------------------------------------------------
+
+
+def test_guarded_upgrade_accepts_url_encoded_credentials(pg_ready, monkeypatch):
+    """A password containing ``%40`` must not be interpreted by ConfigParser.
+
+    The guarded PostgreSQL path supplies a live connection to ``env.py``, so
+    the credential-bearing URL is never passed to ``set_main_option``. Before
+    the correction, ``%40`` raised an interpolation error before the lease.
+    """
+    from sqlalchemy.engine import make_url
+
+    password = "a@b%40c"
+    _admin_exec(
+        pg_ready,
+        f"ALTER ROLE {pg_ready.migrator_role} PASSWORD '{password}'",
+    )
+    url = (
+        make_url(pg_ready.migrator_url)
+        .set(password=password)
+        .render_as_string(hide_password=False)
+    )
+    if "%" not in url:
+        raise AssertionError("the test URL did not encode the special characters")
+    monkeypatch.setattr(settings, "STRIKENOVA_MIGRATION_DATABASE_URL", url)
+    db_module._run_alembic_migrations()
+    unowned, _, _, _ = _lease_row(pg_ready)
+    if not unowned:
+        raise AssertionError("the lease was not released after the guarded upgrade")
+
+
+def test_new_migration_connection_must_reach_the_proven_database(pg_ready_a):
+    """A later connection to another database is rejected before any statement.
+
+    The guard records the preflight signature and re-reads it on every new
+    migration connection. Pointing the same guard at a database other than the
+    one it proved must fail closed, which is the failover/substitution case.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import NullPool
+
+    other = support.provision(topology=support.TOPOLOGY_A)
+    try:
+        other_engine = create_engine(
+            db_module.normalize_database_url(other.migrator_url),
+            poolclass=NullPool,
+        )
+        try:
+            with other_engine.connect() as conn:
+                other_signature = db_module._logical_target_signature(conn)
+                conn.rollback()
+        finally:
+            other_engine.dispose()
+        if other_signature[0] == pg_ready_a.database:
+            raise AssertionError("the substitution test did not use another database")
+
+        holder = [other_signature]
+        engine = create_engine(
+            db_module.normalize_database_url(pg_ready_a.migrator_url),
+            poolclass=NullPool,
+        )
+        db_module._install_migration_identity_guard(engine, holder)
+        try:
+            with pytest.raises(LeaseError) as exc:
+                with engine.connect() as conn:
+                    conn.exec_driver_sql("SELECT 1")
+        finally:
+            engine.dispose()
+        _assert_sqlstate(exc, "45004")
+        message = str(exc.value)
+        if "does not reach the same PostgreSQL cluster/database" not in message:
+            raise AssertionError(f"unexpected refusal: {message}")
+    finally:
+        support.drop(other)

@@ -6,18 +6,26 @@ script makes that decision, for **every** suite, from the two artifacts CI
 actually produced:
 
     python scripts/pytest_gate.py \
-        --suite 'integration|63|issue145-application.log|issue145-application.rc' \
-        --suite 'regression|156|issue145-regression.log|issue145-regression.rc'
+        --suite 'integration|80|issue145-application.log|issue145-application.rc' \
+        --suite 'regression|181|issue145-regression.log|issue145-regression.rc'
 
 A suite passes only when all of the following hold:
 
 * its recorded exit code exists and is ``0``;
 * its pytest log exists;
-* the log contains no ``N failed`` and no ``N error`` / ``N errors`` counts;
-* the log contains no ``N skipped`` count (a skipped PostgreSQL suite is a
+* the log's authoritative terminal summary reports no ``N failed`` and no
+  ``N error`` / ``N errors`` counts;
+* that summary reports no ``N skipped`` count (a skipped PostgreSQL suite is a
   false green, not a pass);
-* the log contains a ``N passed`` summary;
+* the summary reports a ``N passed`` count;
 * ``N`` is at least the declared minimum.
+
+Only pytest's own terminal summary line is trusted. Earlier revisions scanned
+every line of the (untrusted) log for ``N <word>`` tokens, so arbitrary test
+output containing "999999 failed" could fabricate a failure. The summary line
+is the last line that consists solely of ``<count> <status>`` pairs followed by
+`` in <seconds>s``, which is the shape pytest prints and test output does not
+control.
 
 The minimum is the exact number of tests the suite is expected to run. It is
 deliberately exact rather than a round number: dropping or silently skipping
@@ -32,25 +40,63 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+import re
 import sys
 
+#: One ``<count> <status>`` pair. ``errors`` is what pytest prints for
+#: collection errors; the singular forms appear for single occurrences.
+_SUMMARY_PAIR = re.compile(
+    r"(\d+) "
+    r"(passed|failed|errors?|skipped|xfailed|xpassed|deselected|warnings?|warning)"
+)
+#: pytest appends ``(0:01:10)`` to the duration once a run is over a minute,
+#: so the suffix is optional but must be the whole tail of the line.
+_SUMMARY_DURATION = re.compile(
+    r" in \d+(?:\.\d+)?s(?: \(\d+:\d{2}:\d{2}\))?$"
+)
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
-def _counts(text: str, words: tuple[str, ...]) -> list[str]:
-    """Find every ``N <word>`` count in one linear pass over the log.
 
-    A linear token scan rather than a regular expression: the previous
-    patterns were reported by static analysis as super-linear (S8786), and
-    the log is untrusted CI input. Semantics are unchanged: each summary
-    line such as ``1 failed, 24 passed in 3.2s`` yields the numbers that
-    immediately precede the requested words.
+def _summary_counts(text: str) -> dict[str, int]:
+    """Return the counts from pytest's authoritative terminal summary.
+
+    The scan walks the log backwards and accepts the first line that:
+
+    * ends with pytest's `` in <duration>s`` suffix;
+    * is composed **only** of ``<count> <status>`` pairs (optionally prefixed
+      by a run of ``=`` characters).
+
+    Everything else in the log is untrusted test output and is ignored, so a
+    test that prints "999999 failed" cannot change the gate's decision. An
+    empty mapping means no unambiguous summary was found, which the caller
+    treats as a failure.
     """
-    found: list[str] = []
-    for line in text.splitlines():
-        tokens = line.replace(",", " ").split()
-        for index, token in enumerate(tokens):
-            if index and token in words and tokens[index - 1].isdigit():
-                found.append(tokens[index - 1])
-    return found
+    for raw_line in reversed(text.splitlines()):
+        line = _ANSI.sub("", raw_line).strip()
+        if not line:
+            continue
+        line = line.strip("=").strip()
+        duration = _SUMMARY_DURATION.search(line)
+        if duration is None:
+            continue
+        body = line[: duration.start()].strip()
+        if not body:
+            continue
+        counts: dict[str, int] = {}
+        consumed = 0
+        valid = True
+        for part in body.split(","):
+            token = part.strip()
+            match = _SUMMARY_PAIR.fullmatch(token)
+            if match is None:
+                valid = False
+                break
+            status = match.group(2)
+            counts[status] = counts.get(status, 0) + int(match.group(1))
+            consumed += 1
+        if valid and consumed:
+            return counts
+    return {}
 
 
 class Suite:
@@ -76,6 +122,9 @@ def check(suite: Suite, errors: list[str]) -> int | None:
     if not suite.label:
         fail("empty suite label")
         return None
+    if not suite.minimum > 0:
+        fail(f"declared minimum {suite.minimum} is not positive")
+        return None
     if not suite.rc.is_file():
         fail(f"no recorded pytest exit code at {suite.rc}")
         exit_code = None
@@ -86,27 +135,33 @@ def check(suite: Suite, errors: list[str]) -> int | None:
         except ValueError:
             fail(f"unreadable pytest exit code {raw!r} in {suite.rc}")
             exit_code = None
-    if exit_code not in (None, 0):
+    if exit_code is None:
+        fail("the pytest exit status is missing or unreadable")
+    elif exit_code != 0:
         fail(f"pytest exited {exit_code}")
     if not suite.log.is_file():
         fail(f"no pytest log at {suite.log}")
         return None
     text = suite.log.read_text(encoding="utf-8", errors="replace")
 
-    failed = _counts(text, ("failed", "error", "errors"))
-    if failed:
-        fail(f"{', '.join(f + ' failed/errored test(s)' for f in failed)}")
-    skipped = _counts(text, ("skipped",))
-    if skipped:
-        fail(f"{', '.join(s + ' skipped test(s)' for s in skipped)}")
-    passed = _counts(text, ("passed",))
-    if not passed:
-        fail("the log has no 'N passed' summary")
+    counts = _summary_counts(text)
+    if not counts:
+        fail("the log has no authoritative pytest summary line")
         return None
-    count = int(passed[-1])
-    if count < suite.minimum:
-        fail(f"only {count} test(s) passed, expected at least {suite.minimum}")
-    return count
+
+    failed = counts.get("failed", 0) + counts.get("error", 0) + counts.get("errors", 0)
+    if failed:
+        fail(f"{failed} failed/errored test(s)")
+    skipped = counts.get("skipped", 0)
+    if skipped:
+        fail(f"{skipped} skipped test(s)")
+    passed = counts.get("passed", 0)
+    if not passed:
+        fail("the summary reports no passed tests")
+        return None
+    if passed < suite.minimum:
+        fail(f"only {passed} test(s) passed, expected at least {suite.minimum}")
+    return passed
 
 
 def main(argv: list[str] | None = None) -> int:

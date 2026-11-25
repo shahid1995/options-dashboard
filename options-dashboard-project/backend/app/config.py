@@ -1,3 +1,5 @@
+import math
+
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings
 
@@ -158,10 +160,26 @@ class Settings(BaseSettings):
     @field_validator("MIGRATION_LEASE_TTL_SECONDS")
     @classmethod
     def _validate_lease_ttl(cls, v: float) -> float:
-        if not (0 < v <= 86400):
+        # ``math.isfinite`` is explicit: NaN compares false against every
+        # bound, so an ordering test alone is easy to get wrong, and infinity
+        # would otherwise be the only value the upper bound catches.
+        if not math.isfinite(v) or not (0 < v <= 86400):
             raise ValueError(
-                "MIGRATION_LEASE_TTL_SECONDS must be > 0 and <= 86400: the "
-                "database rejects any other TTL with SQLSTATE 45004"
+                "MIGRATION_LEASE_TTL_SECONDS must be finite, > 0 and <= 86400: "
+                "the database rejects any other TTL with SQLSTATE 45004"
+            )
+        return v
+
+    @field_validator("MIGRATION_LEASE_WAIT_SECONDS")
+    @classmethod
+    def _validate_lease_wait(cls, v: float) -> float:
+        # A NaN or infinite wait would make the monotonic admission deadline
+        # meaningless (``now + nan`` is never exceeded), so both are refused
+        # at the configuration boundary rather than inside the retry loop.
+        if not math.isfinite(v) or not (0 < v <= 86400):
+            raise ValueError(
+                "MIGRATION_LEASE_WAIT_SECONDS must be finite, > 0 and <= 86400: "
+                "an unbounded or undefined admission wait is refused"
             )
         return v
 
