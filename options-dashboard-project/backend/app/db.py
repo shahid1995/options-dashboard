@@ -1,4 +1,5 @@
 import os
+import re
 from dataclasses import dataclass
 from typing import Callable
 
@@ -59,6 +60,28 @@ _FORBIDDEN_CONNECTION_QUERY_KEYS = frozenset(
         "passfile",
     }
 )
+
+#: Neon's documented native connection-string grammar:
+#: ``<endpoint-id>[-pooler].<region>.<cloud>.neon.tech``. The first label is the
+#: *compute endpoint* identifier (e.g. ``ep-cool-darkness-123456``) — never a
+#: branch or project identifier — and the pooled route for one endpoint differs
+#: from its direct route only by the documented ``-pooler`` suffix. Neon states
+#: that a different compute or branch has a different host.
+_NEON_DOMAIN = "neon.tech"
+_NEON_ENDPOINT_ID_RE = re.compile(r"^ep-[a-z0-9]+(?:-[a-z0-9]+)*$")
+_NEON_HOST_RE = re.compile(
+    r"^(?P<endpoint>ep-[a-z0-9]+(?:-[a-z0-9]+)*?)"
+    r"(?P<pooler>-pooler)?"
+    r"\.(?P<region>[a-z0-9]+(?:-[a-z0-9]+)*)"
+    r"\.(?P<cloud>aws|azure)"
+    r"\.neon\.tech$"
+)
+
+#: Connection-option names Neon documents for naming the compute endpoint when
+#: the client cannot send SNI: ``options=endpoint=<id>`` and its deprecated
+#: former name ``project=<id>``. The option routes the connection, so it must
+#: agree with the hostname before a URL may be used as identity evidence.
+_NEON_ENDPOINT_OPTIONS = frozenset({"endpoint", "project"})
 
 #: The server's own view of a runtime connection: the authenticated login
 #: (``session_user``), the role it currently runs as (``current_user``, which a
@@ -546,6 +569,29 @@ def _is_postgres_url(url: str) -> bool:
 
 
 @dataclass(frozen=True)
+class _NeonComputeEndpoint:
+    """The Neon compute endpoint a native Neon hostname names.
+
+    ``endpoint`` is the compute endpoint identifier in the hostname's first
+    label. Its documented identity is textual only: a different Neon compute or
+    branch has a different host, and the pooled and direct routes for one
+    compute differ only by the ``-pooler`` suffix. It is a *compute endpoint*
+    identifier — not a branch identifier and not a project identifier — and it
+    is neither provider-verified nor evidence about provider-side ownership.
+    """
+
+    endpoint: str
+    region: str
+    cloud: str
+    pooled: bool
+
+    @property
+    def identity(self) -> tuple[str, str, str]:
+        """Everything that distinguishes a compute, except the pooler variant."""
+        return (self.endpoint, self.region, self.cloud)
+
+
+@dataclass(frozen=True)
 class _MigrationTarget:
     """One parsed PostgreSQL endpoint: role, host, port and database.
 
@@ -559,6 +605,7 @@ class _MigrationTarget:
     host: str
     port: int
     database: str
+    neon: _NeonComputeEndpoint | None = None
 
     @property
     def endpoint(self) -> tuple[str, int]:
@@ -569,6 +616,68 @@ def _config_error(message: str):
     from app._migration_lease import LeaseError, SQLSTATE_CONFIG
 
     return LeaseError(SQLSTATE_CONFIG, message)
+
+
+def _neon_compute_endpoint(
+    host: str, *, label: str
+) -> _NeonComputeEndpoint | None:
+    """Read the compute endpoint from a native Neon hostname.
+
+    Returns ``None`` for a host outside ``neon.tech``: generic PostgreSQL
+    providers are never assumed to share Neon's grammar. A host *under*
+    ``neon.tech`` that does not match the documented grammar is refused rather
+    than handed to the generic alias policy, because an unreadable Neon compute
+    identity is exactly the case an alias could otherwise paper over.
+    """
+    if host != _NEON_DOMAIN and not host.endswith("." + _NEON_DOMAIN):
+        return None
+    match = _NEON_HOST_RE.match(host)
+    if match is None:
+        raise _config_error(
+            f"{label} names a host under neon.tech that does not match Neon's "
+            "documented '<endpoint-id>[-pooler].<region>.<cloud>.neon.tech' "
+            "grammar; a Neon host whose compute endpoint cannot be read is "
+            "refused rather than treated as a generic host"
+        )
+    return _NeonComputeEndpoint(
+        endpoint=match.group("endpoint"),
+        region=match.group("region"),
+        cloud=match.group("cloud"),
+        pooled=bool(match.group("pooler")),
+    )
+
+
+def _declared_compute_endpoint(query, *, label: str) -> str | None:
+    """Read ``options=endpoint=<id>`` (or deprecated ``project=<id>``) from a URL.
+
+    Neon documents these connection options as the way a client without SNI
+    names the compute it wants, so the option *routes* the connection: a value
+    that disagrees with the hostname would reach a compute the URL does not
+    name. Ordinary runtime parameters carried in the same ``options`` string
+    (``-c name=value``) cannot change the endpoint and are ignored.
+    """
+    declared: set[str] = set()
+    for key, value in (query or {}).items():
+        if str(key).lower() != "options":
+            continue
+        for token in str(value).split():
+            name, separator, raw = token.partition("=")
+            if not separator or name.lower() not in _NEON_ENDPOINT_OPTIONS:
+                continue
+            endpoint = raw.strip().strip("'\"")
+            if not _NEON_ENDPOINT_ID_RE.match(endpoint):
+                raise _config_error(
+                    f"{label} carries a connection option naming a malformed "
+                    "Neon compute endpoint; refusing an endpoint identity that "
+                    "cannot be read"
+                )
+            declared.add(endpoint)
+    if len(declared) > 1:
+        raise _config_error(
+            f"{label} carries connection options naming more than one Neon "
+            "compute endpoint; refusing an ambiguous endpoint identity"
+        )
+    return declared.pop() if declared else None
 
 
 def _parse_migration_target(url: str, *, label: str) -> _MigrationTarget:
@@ -639,7 +748,28 @@ def _parse_migration_target(url: str, *, label: str) -> _MigrationTarget:
         )
     if not (0 < port <= 65535):
         raise _config_error(f"{label} has an out-of-range port")
-    return _MigrationTarget(backend, role, host, port, database)
+
+    # Neon compute-endpoint identity, read from the hostname and required to
+    # agree with any ``options=endpoint=``/``project=`` routing option. This is
+    # static evidence: it is compared before an engine or a connection exists.
+    neon = _neon_compute_endpoint(host, label=label)
+    declared_endpoint = _declared_compute_endpoint(parsed.query, label=label)
+    if declared_endpoint is not None:
+        if neon is None:
+            raise _config_error(
+                f"{label} carries a Neon compute-endpoint connection option "
+                "while its host is not a native Neon host; that option has no "
+                "documented meaning for another server, so the pair is refused "
+                "rather than assumed"
+            )
+        if declared_endpoint != neon.endpoint:
+            raise _config_error(
+                f"{label} carries a connection option naming Neon compute "
+                f"endpoint {declared_endpoint!r} while its host names compute "
+                f"endpoint {neon.endpoint!r}; the option routes the connection, "
+                "so the hostname and the option must name one compute"
+            )
+    return _MigrationTarget(backend, role, host, port, database, neon)
 
 
 def _declared_endpoint_aliases() -> dict[str, set[str]]:
@@ -696,6 +826,46 @@ def _declared_endpoint_aliases() -> dict[str, set[str]]:
     return groups
 
 
+def _assert_same_neon_compute_endpoint(
+    runtime: _MigrationTarget, migration: _MigrationTarget
+) -> None:
+    """Refuse two different Neon compute endpoints (and mixed Neon/non-Neon pairs).
+
+    Neon's documented grammar makes the compute endpoint identity textual: a
+    different compute or branch is a different host, and the pooled and direct
+    routes for one compute differ only by ``-pooler``. Two different endpoint
+    identifiers are therefore two different targets whatever signature the
+    servers report — a branch is a copy-on-write fork, so it shares its
+    parent's ``system_identifier`` and database OIDs and the server-side
+    comparison cannot separate them. An explicit alias asserts that two
+    *hostnames* for one endpoint are one route; it is never evidence that two
+    endpoints are one target, so it cannot override this refusal.
+
+    A Neon host paired with a host that carries no Neon compute endpoint is
+    refused too: no documented equivalence between the two exists, so the pair
+    is not assumed to be one target.
+    """
+    if runtime.neon is None and migration.neon is None:
+        return
+    if runtime.neon is None or migration.neon is None:
+        raise _config_error(
+            "the runtime and migration URLs mix a native Neon host with a host "
+            "that carries no Neon compute endpoint; no documented equivalence "
+            "between them exists, so the pair is refused"
+        )
+    if runtime.neon.identity != migration.neon.identity:
+        raise _config_error(
+            "the runtime and migration URLs name different Neon compute "
+            f"endpoints ({runtime.neon.endpoint} in "
+            f"{runtime.neon.region}.{runtime.neon.cloud} vs "
+            f"{migration.neon.endpoint} in "
+            f"{migration.neon.region}.{migration.neon.cloud}); a different "
+            "compute or branch is a different host, and "
+            "STRIKENOVA_MIGRATION_TARGET_ALIASES cannot declare two different "
+            "compute endpoints to be one target"
+        )
+
+
 def _same_endpoint(runtime: _MigrationTarget, migration: _MigrationTarget) -> bool:
     """Prove the two URLs address the same logical PostgreSQL endpoint.
 
@@ -704,9 +874,19 @@ def _same_endpoint(runtime: _MigrationTarget, migration: _MigrationTarget) -> bo
     ``STRIKENOVA_MIGRATION_TARGET_ALIASES``; the declaration is checked for a
     matching port, and the connection-time check in
     :func:`_verify_logical_target` then proves both routes reach one cluster.
+
+    Native Neon hosts must additionally name the same compute endpoint: the
+    caller raises the specific refusal in
+    :func:`_assert_same_neon_compute_endpoint`, and the comparison here refuses
+    the same cases so no later caller can let an alias join two Neon computes.
     """
     if runtime.endpoint == migration.endpoint:
         return True
+    if runtime.neon is not None or migration.neon is not None:
+        if runtime.neon is None or migration.neon is None:
+            return False
+        if runtime.neon.identity != migration.neon.identity:
+            return False
     for members in _declared_endpoint_aliases().values():
         if runtime.host in members and migration.host in members:
             return runtime.port == migration.port
@@ -767,7 +947,8 @@ def assert_guarded_migration_configuration(
        separation;
     3. the database name is identical;
     4. the endpoint (``host:port``) is identical, or is declared equivalent in
-       ``STRIKENOVA_MIGRATION_TARGET_ALIASES``;
+       ``STRIKENOVA_MIGRATION_TARGET_ALIASES`` — and on native Neon hosts both
+       URLs must name one compute endpoint, which no alias can override;
     5. the migration login *is* ``STRIKENOVA_MIGRATOR_ROLE`` and the runtime
        login *is* ``STRIKENOVA_RUNTIME_ROLE`` where that is configured — being
        different from each other is not the same as being the named identities.
@@ -820,6 +1001,9 @@ def assert_guarded_migration_configuration(
             f"({migration.database!r} vs {runtime.database!r}); the migration "
             "login must serve the runtime database"
         )
+    # Neon compute-endpoint identity is part of the static evidence and is
+    # checked before the alias policy, so an alias can never join two computes.
+    _assert_same_neon_compute_endpoint(runtime, migration)
     if not _same_endpoint(runtime, migration):
         raise _config_error(
             "the migration and runtime URLs address different PostgreSQL "
@@ -1021,9 +1205,15 @@ def _logical_target_identity(conn) -> tuple[str, int, str]:
     The tuple is ``(current_database(), pg_database.oid, system_identifier)``.
     Every element lives in the data directory rather than in the server
     process, so all three survive a restart, a crash recovery and a Neon
-    compute suspend/wake, while a different cluster (different
-    ``system_identifier``, generated by ``initdb``) or a different database in
-    the same cluster (different name and OID) still differs.
+    compute suspend/wake. What the tuple establishes is *equality of an
+    observed signature*: a cluster initialized independently has its own
+    ``system_identifier`` (generated by ``initdb``) and a different database in
+    one cluster has a different name and OID. It does not identify a physical
+    data directory, because a physical copy or a copy-on-write fork (a Neon
+    branch, for example) preserves both the identifier and the database OIDs.
+    It is also not a Neon project, branch or compute-endpoint identifier: that
+    identity comes from the hostname check in :func:`_parse_migration_target`,
+    not from this query.
 
     ``pg_postmaster_start_time()`` is intentionally not part of the tuple: it
     changes on every restart without changing the target, so it could only be
@@ -1054,13 +1244,18 @@ def _verify_logical_target(
     """Prove, from the server, that both URLs reach one cluster and database.
 
     The static check compares what the URLs *say*. This check compares what the
-    server *is*: two connections that report the same ``system_identifier``,
-    database name and ``pg_database`` OID are served by one cluster and one
-    database. All three live in the data directory, so the comparison survives
-    a PostgreSQL restart or a Neon compute suspend/wake; the postmaster start
-    time is read for diagnostics and never compared. It runs after the static
-    check and before the engine is returned, so no caller can acquire the
-    lease, run DDL or bootstrap on an unproven target.
+    server *reports*: two connections that present the same
+    ``system_identifier``, database name and ``pg_database`` OID present one
+    observed signature. All three live in the data directory, so the comparison
+    survives a PostgreSQL restart or a Neon compute suspend/wake, and a
+    reconnect after either is accepted. Equality of that signature is not proof
+    that one physical cluster serves both connections — a physical copy or a
+    copy-on-write fork preserves it — and it says nothing about provider
+    project, branch or compute-endpoint identity, which the static hostname
+    check carries instead. The postmaster start time is read for diagnostics and
+    never compared. This runs after the static check and before the engine is
+    returned, so no caller can acquire the lease, run DDL or bootstrap on a
+    target the static check refused.
 
     Errors raised here never include a URL: only the failing attribute and the
     observation are reported.
@@ -1116,9 +1311,12 @@ def _verify_logical_target(
             "the same logical target is still accepted"
         )
 
-    # Deterministic, restart-stable evidence: two connections served by one
-    # cluster read the same initdb-generated system_identifier, and any other
-    # cluster has a different one.
+    # Deterministic, restart-stable evidence: two connections opened by one
+    # running server report the same initdb-generated system_identifier, and an
+    # independently initialized cluster reports a different one. Equality is an
+    # observed-signature match, not proof of one physical cluster: a physical
+    # copy or a copy-on-write fork (a Neon branch) preserves the value, which is
+    # why the endpoint identity above is checked statically from the hostname.
     if observed[2] != runtime_observed[2]:
         raise _config_error(
             "the migration and runtime connections report different "

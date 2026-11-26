@@ -5,6 +5,7 @@ dedicated migration identity; otherwise behavior is identical to the
 historical single-identity model. These tests are hermetic: no module
 reloads, no shared-state mutation, no destructive operations.
 """
+import contextlib
 import os
 from unittest.mock import patch
 
@@ -253,6 +254,256 @@ class TestGuardedTargetIdentity:
         self._assert_refused(
             self._settings(STRIKENOVA_MIGRATION_TARGET_ALIASES="db.example=db.example"),
             "distinct",
+        )
+
+
+class TestNeonComputeEndpointIdentity:
+    """Neon compute-endpoint identity read from the native hostname.
+
+    Neon documents the native connection-string shape
+    ``<endpoint-id>[-pooler].<region>.<cloud>.neon.tech``: the first label is
+    the compute endpoint (never a branch or project id), a different compute or
+    branch has a different host, and the pooled route differs from the direct
+    route for one compute only by the ``-pooler`` suffix. These tests are
+    hermetic: every refusal must happen statically, before an engine, a
+    connection or the server-side identity proof exists.
+    """
+
+    HOST_DIRECT = "ep-cool-darkness-123456.eu-central-1.aws.neon.tech"
+    HOST_POOLED = "ep-cool-darkness-123456-pooler.eu-central-1.aws.neon.tech"
+    HOST_OTHER = "ep-quiet-mountain-654321.eu-central-1.aws.neon.tech"
+    ALIAS = HOST_POOLED + "=" + HOST_DIRECT
+
+    @staticmethod
+    def _url(role, host, *, database="neondb", query=""):
+        secret = "runtime-secret" if role == "strikenova_app" else "migrator-secret"
+        return f"postgresql://{role}:{secret}@{host}/{database}{query}"
+
+    def _settings(self, **overrides):
+        values = {
+            "DATABASE_URL": self._url("strikenova_app", self.HOST_POOLED),
+            "STRIKENOVA_MIGRATION_DATABASE_URL": self._url(
+                "strikenova_migrator", self.HOST_DIRECT
+            ),
+            "STRIKENOVA_MIGRATOR_ROLE": "strikenova_migrator",
+            "STRIKENOVA_RUNTIME_ROLE": "strikenova_app",
+            "STRIKENOVA_MIGRATION_TARGET_ALIASES": self.ALIAS,
+        }
+        values.update(overrides)
+        return Settings(**values)
+
+    @contextlib.contextmanager
+    def _spies(self, settings_obj, calls):
+        """Arm every engine/connection entry point as a recording spy."""
+
+        def _record(*args, **kwargs):
+            calls.append(args)
+            raise AssertionError(
+                "an engine, connection or server-side proof was attempted before "
+                "the static endpoint check finished"
+            )
+
+        with patch("app.db.settings", settings_obj), patch(
+            "app.db.create_engine", _record
+        ), patch("app.db._create_runtime_engine", _record), patch(
+            "app.db._verify_logical_target", _record
+        ):
+            yield
+
+    def _assert_accepted(self, settings_obj):
+        calls = []
+        with self._spies(settings_obj, calls):
+            resolved = assert_guarded_migration_configuration()
+        assert resolved.startswith("postgresql+psycopg://strikenova_migrator:")
+        assert calls == []
+        return resolved
+
+    def _assert_refused(self, settings_obj, *fragments):
+        import pytest
+
+        from app._migration_lease import LeaseError
+
+        calls = []
+        with self._spies(settings_obj, calls):
+            with pytest.raises(LeaseError) as exc:
+                assert_guarded_migration_configuration()
+        assert exc.value.sqlstate == "45004"
+        message = str(exc.value)
+        for secret in ("runtime-secret", "migrator-secret", "postgresql://"):
+            assert secret not in message
+        for fragment in fragments:
+            assert fragment in message
+        # Refused by the static check: nothing was opened, so no server-side
+        # signature could have agreed and authorized the pair.
+        assert calls == []
+
+    def test_same_neon_host_and_port_is_accepted(self):
+        self._assert_accepted(
+            self._settings(
+                DATABASE_URL=self._url("strikenova_app", self.HOST_DIRECT),
+                STRIKENOVA_MIGRATION_TARGET_ALIASES="",
+            )
+        )
+
+    def test_neon_direct_and_pooled_routes_with_matching_endpoint_are_accepted(self):
+        self._assert_accepted(self._settings())
+
+    def test_different_neon_endpoints_with_an_alias_are_refused(self):
+        alias = self.HOST_OTHER + "=" + self.HOST_DIRECT
+        self._assert_refused(
+            self._settings(
+                DATABASE_URL=self._url("strikenova_app", self.HOST_OTHER),
+                STRIKENOVA_MIGRATION_TARGET_ALIASES=alias,
+            ),
+            "different Neon compute endpoints",
+            "ep-quiet-mountain-654321",
+            "ep-cool-darkness-123456",
+            "cannot declare two different compute endpoints",
+        )
+
+    def test_different_neon_endpoints_are_refused_despite_one_server_signature(self):
+        """A branch/copy shares the signature, so equality must not rescue it."""
+        alias = self.HOST_OTHER + "=" + self.HOST_DIRECT
+        with patch(
+            "app.db._logical_target_identity",
+            lambda conn: ("neondb", 16384, "7300000000000000000"),
+        ):
+            self._assert_refused(
+                self._settings(
+                    DATABASE_URL=self._url("strikenova_app", self.HOST_OTHER),
+                    STRIKENOVA_MIGRATION_TARGET_ALIASES=alias,
+                ),
+                "different Neon compute endpoints",
+            )
+
+    def test_neon_direct_and_pooled_routes_without_a_declaration_are_refused(self):
+        self._assert_refused(
+            self._settings(STRIKENOVA_MIGRATION_TARGET_ALIASES=""),
+            "different PostgreSQL endpoints",
+        )
+
+    def test_neon_host_mixed_with_a_non_neon_host_is_refused(self):
+        self._assert_refused(
+            self._settings(
+                STRIKENOVA_MIGRATION_DATABASE_URL=self._url(
+                    "strikenova_migrator", "db.example"
+                ),
+                STRIKENOVA_MIGRATION_TARGET_ALIASES=(self.HOST_POOLED + "=db.example"),
+            ),
+            "mix a native Neon host",
+        )
+
+    def test_malformed_neon_hosts_are_refused_not_alias_handled(self):
+        """An unreadable Neon compute identity is never handed to the alias policy."""
+        for host in (
+            "ep-cool-darkness-123456.neon.tech",  # no region/cloud labels
+            "epcool-darkness.eu-central-1.aws.neon.tech",  # not an endpoint id
+            "ep-cool-darkness-123456.eu-central-1.gcp.neon.tech",  # undocumented cloud
+        ):
+            self._assert_refused(
+                self._settings(
+                    DATABASE_URL=self._url("strikenova_app", host),
+                    STRIKENOVA_MIGRATION_TARGET_ALIASES=(host + "=" + self.HOST_DIRECT),
+                ),
+                "does not match Neon's documented",
+            )
+
+    def test_neon_host_case_and_trailing_dot_are_normalized(self):
+        self._assert_accepted(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app", self.HOST_POOLED.upper() + "."
+                ),
+            )
+        )
+
+    def test_endpoint_option_matching_the_host_is_accepted(self):
+        self._assert_accepted(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app",
+                    self.HOST_POOLED,
+                    query="?options=endpoint%3Dep-cool-darkness-123456&sslmode=require",
+                ),
+            )
+        )
+
+    def test_endpoint_option_conflicting_with_the_host_is_refused(self):
+        self._assert_refused(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app",
+                    self.HOST_DIRECT,
+                    query="?options=endpoint%3Dep-quiet-mountain-654321",
+                ),
+            ),
+            "must name one compute",
+        )
+
+    def test_endpoint_option_on_a_non_neon_host_is_refused(self):
+        self._assert_refused(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app",
+                    "db.example",
+                    database="options",
+                    query="?options=endpoint%3Dep-cool-darkness-123456",
+                ),
+                STRIKENOVA_MIGRATION_DATABASE_URL=self._url(
+                    "strikenova_migrator", "db.example", database="options"
+                ),
+                STRIKENOVA_MIGRATION_TARGET_ALIASES="",
+            ),
+            "no documented meaning",
+        )
+
+    def test_malformed_and_ambiguous_endpoint_options_are_refused(self):
+        self._assert_refused(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app",
+                    self.HOST_DIRECT,
+                    query="?options=endpoint%3Dnot-an-endpoint",
+                )
+            ),
+            "malformed Neon compute endpoint",
+        )
+        self._assert_refused(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app",
+                    self.HOST_DIRECT,
+                    query=(
+                        "?options=endpoint%3Dep-cool-darkness-123456%20"
+                        "project%3Dep-quiet-mountain-654321"
+                    ),
+                )
+            ),
+            "more than one Neon compute endpoint",
+        )
+
+    def test_generic_postgres_hosts_keep_the_existing_alias_policy(self):
+        generic = self._settings(
+            DATABASE_URL=self._url("strikenova_app", "db.example", database="options"),
+            STRIKENOVA_MIGRATION_DATABASE_URL=self._url(
+                "strikenova_migrator", "direct.example", database="options"
+            ),
+            STRIKENOVA_MIGRATION_TARGET_ALIASES="db.example=direct.example",
+        )
+        self._assert_accepted(generic)
+        # A Neon-shaped label on a non-Neon domain is a generic host: no Neon
+        # grammar is assumed for other providers.
+        self._assert_refused(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app", "ep-cool-1.db.example", database="options"
+                ),
+                STRIKENOVA_MIGRATION_DATABASE_URL=self._url(
+                    "strikenova_migrator", "db.example", database="options"
+                ),
+                STRIKENOVA_MIGRATION_TARGET_ALIASES="",
+            ),
+            "different PostgreSQL endpoints",
         )
 
 
