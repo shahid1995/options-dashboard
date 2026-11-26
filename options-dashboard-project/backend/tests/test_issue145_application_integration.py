@@ -369,16 +369,88 @@ def test_two_concurrent_startups_serialize_and_backfill_exactly_once(pg_topology
         raise AssertionError(f"backfill at head was not idempotent/exact: {counts}")
 
 
+def _assert_protected_backfill_trace(
+    events: list[dict], *, migrator_role: str, users: list[str]
+) -> None:
+    """Prove the ADR §7.2–§7.3 order from one ordered event trace.
+
+    The trace must read exactly: the DDL transaction's two lease entries, then
+    one ``enter`` → ``backfill`` → ``enter`` triple per user. Grouping is by
+    *position*, never by transaction id, so moving an entry across a backfill
+    (or starting a user transaction with backfill work) changes the sequence
+    and fails here even when every recorded id would still agree.
+    """
+    labels = [event["event"] for event in events]
+    ddl, per_user = events[:2], events[2:]
+    if [event["event"] for event in ddl] != ["enter", "enter"]:
+        raise AssertionError(
+            f"the DDL transaction must open with its two lease entries: {labels}"
+        )
+    if len(per_user) % 3:
+        raise AssertionError(
+            f"every user must contribute one enter/backfill/enter triple: {labels}"
+        )
+    triples = [per_user[index : index + 3] for index in range(0, len(per_user), 3)]
+    expected = ["enter", "enter"] + ["enter", "backfill", "enter"] * len(triples)
+    if labels != expected:
+        raise AssertionError(
+            f"the protected order is not enter -> backfill -> pre-commit enter: {labels}"
+        )
+    if len(triples) != len(users):
+        raise AssertionError(
+            f"expected {len(users)} protected user transactions, got {len(triples)}"
+        )
+
+    ddl_txids = {event["txid"] for event in ddl}
+    if len(ddl_txids) != 1:
+        raise AssertionError(f"the DDL enter pair spans transactions: {ddl_txids}")
+    traced_users: list[str] = []
+    per_user_txids: set[int] = set()
+    for triple in triples:
+        user = triple[1]["user"]
+        traced_users.append(user)
+        txids = {event["txid"] for event in triple}
+        if len(txids) != 1:
+            raise AssertionError(
+                f"{user}: both entries and the backfill must share one "
+                f"transaction, got {txids}"
+            )
+        if txids & ddl_txids:
+            raise AssertionError(f"{user} ran inside the DDL transaction")
+        per_user_txids |= txids
+    if sorted(traced_users) != sorted(users) or len(set(traced_users)) != len(users):
+        raise AssertionError(
+            f"expected one protected transaction per user {users}, got {traced_users}"
+        )
+    if len(per_user_txids) != len(triples):
+        raise AssertionError(f"different users shared one transaction: {per_user_txids}")
+
+    for event in events:
+        if event["current_user"] != migrator_role:
+            raise AssertionError(
+                f"{event['event']} for {event['user']} ran as "
+                f"{event['current_user']}, not {migrator_role}"
+            )
+        if event["lease_locks"] < 1:
+            raise AssertionError(
+                f"{event['event']} for {event['user']} lost the lease row lock"
+            )
+
+
 def test_backfill_uses_migrator_identity_and_per_user_transactions(pg_ready, monkeypatch):
+    users = [f"issue145-user-{index}" for index in (1, 2, 3)]
     support.seed_legacy_users(pg_ready.admin_database_url, users=3)
 
     import app.services.leg_exposure as leg
 
-    observations: list[dict] = []
-    real_backfill = leg.backfill_exposures
+    # One ordered trace of every lease-protected step of this startup. An event
+    # is appended only after the wrapped call has run, so no entry can describe
+    # SQL that has not executed yet, and the list order is the execution order
+    # (startup is single-threaded).
+    events: list[dict] = []
 
-    def observed(db, user_id):
-        row = db.execute(
+    def record(executor, *, event: str, user: str | None) -> None:
+        row = executor.execute(
             db_module.text(
                 "SELECT current_user, txid_current(), "
                 " (SELECT count(*) FROM pg_locks l "
@@ -387,73 +459,50 @@ def test_backfill_uses_migrator_identity_and_per_user_transactions(pg_ready, mon
                 "     AND l.granted) AS lease_locks"
             )
         ).one()
-        observations.append(
+        events.append(
             {
-                "user": user_id,
+                "event": event,
+                "user": user,
                 "current_user": row[0],
                 "txid": int(row[1]),
                 "lease_locks": int(row[2]),
             }
         )
-        return real_backfill(db, user_id)
 
-    monkeypatch.setattr(leg, "backfill_exposures", observed)
-    enter_calls: list[tuple[str, int]] = []
+    real_backfill = leg.backfill_exposures
+
+    def traced_backfill(db, user_id):
+        created = real_backfill(db, user_id)
+        record(db, event="backfill", user=user_id)
+        return created
+
+    monkeypatch.setattr(leg, "backfill_exposures", traced_backfill)
     real_enter = MigrationLease.enter
 
-    def counting_enter(self, conn):
-        row = conn.exec_driver_sql(
-            "SELECT current_user, txid_current()"
-        ).one()
-        enter_calls.append((row[0], int(row[1])))
-        return real_enter(self, conn)
+    def traced_enter(self, conn):
+        # The real entry runs first: the wrapper must not slip a statement in
+        # ahead of the first-statement-of-the-transaction contract proven here.
+        state = real_enter(self, conn)
+        record(conn, event="enter", user=None)
+        return state
 
-    monkeypatch.setattr(MigrationLease, "enter", counting_enter)
+    monkeypatch.setattr(MigrationLease, "enter", traced_enter)
 
     db_module.init_db()
 
-    if len(observations) != 3:
-        raise AssertionError(f"expected 3 user backfills, got {observations}")
-    for obs in observations:
-        if obs["current_user"] != pg_ready.migrator_role:
-            raise AssertionError(f"backfill ran as {obs['current_user']}, not the migrator")
-        if obs["lease_locks"] < 1:
-            raise AssertionError(
-                f"backfill for {obs['user']} ran without holding the lease row lock"
-            )
-    # 2 enters for the DDL transaction + 2 for each of 3 user transactions.
-    if len(enter_calls) != 8:
+    labels = [event["event"] for event in events]
+    # 2 entries for the DDL transaction + 2 for each of 3 user transactions,
+    # and exactly one completed backfill per user: unchanged requirements.
+    if labels.count("enter") != 8:
         raise AssertionError(
-            f"expected 8 enter calls (DDL pair + 2 per user), got {len(enter_calls)}"
+            f"expected 8 enter calls (DDL pair + 2 per user), got {labels}"
         )
-    if any(role != pg_ready.migrator_role for role, _ in enter_calls):
-        raise AssertionError("every enter must run as the migration identity")
+    if labels.count("backfill") != 3:
+        raise AssertionError(f"expected 3 completed user backfills, got {labels}")
 
-    # The pair for one user must belong to that user's one transaction, and
-    # different users must use different transactions. Counting calls alone
-    # would accept a broken boundary.
-    ddl_txids = {txid for _, txid in enter_calls[:2]}
-    if len(ddl_txids) != 1:
-        raise AssertionError(f"the DDL enter pair spans transactions: {ddl_txids}")
-    per_user = enter_calls[2:]
-    user_txids: dict[str, int] = {}
-    for index, obs in enumerate(observations):
-        pair = per_user[index * 2 : (index + 1) * 2]
-        if len(pair) != 2 or pair[0][1] != pair[1][1]:
-            raise AssertionError(
-                f"the two enter calls for {obs['user']} are not in one "
-                f"transaction: {pair}"
-            )
-        if pair[0][1] != obs["txid"]:
-            raise AssertionError(
-                f"enter txid {pair[0][1]} != backfill txid {obs['txid']} for "
-                f"{obs['user']}"
-            )
-        user_txids[obs["user"]] = pair[0][1]
-    if len(set(user_txids.values())) != len(observations):
-        raise AssertionError(
-            f"different users shared one transaction: {user_txids}"
-        )
+    _assert_protected_backfill_trace(
+        events, migrator_role=pg_ready.migrator_role, users=users
+    )
 
 
 def test_backfill_failure_rolls_back_user_and_releases_lease(pg_ready, monkeypatch):
