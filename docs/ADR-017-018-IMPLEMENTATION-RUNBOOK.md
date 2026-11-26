@@ -620,34 +620,52 @@ rather than reasoned about.
 | `tests/test_db_migration.py`, `test_alembic_*.py`, `test_day5_alembic_authority.py`, `test_migration_identity_separation.py`, `test_leg_exposure.py` | SQLite chain, FK behavior, identity separation (**including the 16-target §8.1 URL contract: accepted pair, same-login, different database, different endpoint, declared alias, alias port mismatch, Neon pooled route, SQLite and CockroachDB migration targets, blank/malformed URLs, malformed alias configuration, no-password-in-errors, and the configured-identity binding — migration login must be `STRIKENOVA_MIGRATOR_ROLE`, runtime login must be `STRIKENOVA_RUNTIME_ROLE` when set, blank role name refused, unset runtime role not constrained**), exposure idempotency | 198 passed (regression suite total) |
 | `PostgreSQL compatibility` suite (9 modules: compatibility, importer, failure injection, large rehearsal, hardening, Day 5/6) | disposable PG 16.16 schemas built only through `python -m app.migrate upgrade head` | 122 passed |
 | `.github/workflows/issue145-application-pg16.yml` (`application-integration`) | the integration and regression suites above on a pinned `postgres@sha256:3950ad…` 16.16 service, exact `server_version_num = 160016` gate, evidence upload, cleanup | see PR #151 checks |
-| `.github/workflows/issue145-application-pg16.yml` (`restart-runtime-reconnect`) | **isolated restart job, no `services:` block**, so it never restarts or mutates the shared service container: fetches the SHA-256-pinned 16.16 PGDG build for Ubuntu 24.04, asserts `postgres (PostgreSQL) 16.16` exactly, fails when `ISSUE145_PG_BINDIR` is unset, runs `tests/test_issue145_pg_restart.py`, and gates its JUnit XML with a minimum of 5 passes — a skip fails the job | see PR #151 checks |
+| `.github/workflows/postgres-compatibility.yml` (`postgres-compatibility`) | the 9-module compatibility suite on the same pinned `postgres@sha256:3950ad…` 16.16 **service container**, `server_version_num = 160016` gate, `compatibility|122|…` JUnit gate, evidence upload, cleanup | see PR #151 checks |
+| `.github/workflows/strikenova-status-gate.yml` (`status-gate`) | **no PostgreSQL service and no database suite**: verifies the status tracker, master plan and execution protocol exist and that the tracker's recorded master-plan SHA matches the plan's current Git revision | see PR #151 checks |
+| `.github/workflows/issue145-application-pg16.yml` (`restart-runtime-reconnect`) | **isolated restart job, no `services:` block**, so it never restarts or mutates the shared service container: fetches the SHA-256-pinned 16.16 PGDG build for Ubuntu 24.04, matches `postgres --version` against `^postgres \(PostgreSQL\) 16\.16([[:space:]]|$)`, fails when `ISSUE145_PG_BINDIR` is unset, runs `tests/test_issue145_pg_restart.py`, and gates its JUnit XML with a minimum of 5 passes — a skip fails the job | see PR #151 checks |
 | `scripts/pytest_gate.py` | gates **all four** suites independently: integration, migration/SQLite regression, PostgreSQL compatibility, and the restart/reconnection module. The JUnit XML report and the recorded pytest exit status are authoritative; the text log is diagnostic only. The job fails on a missing or non-zero recorded exit status, a missing/malformed JUnit report (including a DOCTYPE), an inconsistent report (counter/summary vs testcases), any failure, error or skip, and fewer passes than the declared minimum. The minimums are floors, not exact counts, so a suite that silently stops collecting is still caught by the structure checks | 80 / 181 / 122 / 5 minimums; negative controls in `TestPytestGate` |
 
 Three evidence classes are kept distinct:
 
-1. **Local execution.** The three service-container gates and the restart
-   module were also run locally against PGDG 16.16 server binaries extracted
-   into the workspace (the container socket was unavailable in that
-   environment). The gated suites are run exactly as the workflows run them,
-   with `--junitxml` plus the recorded pytest exit status passed to
-   `scripts/pytest_gate.py`.
-2. **Isolated restart CI job** (`restart-runtime-reconnect`). It has no
-   `services:` block and owns the binaries and data directory it restarts:
+1. **PostgreSQL service-container database gates.** Two workflows run their
+   suites against a GitHub Actions `services:` PostgreSQL they cannot restart:
+   `application-integration` (`.github/workflows/issue145-application-pg16.yml`:
+   the integration and regression suites on the pinned
+   `postgres@sha256:3950ad…` 16.16 service, gated on
+   `server_version_num = 160016`) and `PostgreSQL compatibility`
+   (`.github/workflows/postgres-compatibility.yml`: the compatibility suite on
+   the same pinned 16.16 service, also gated on
+   `server_version_num = 160016`).
+2. **Separately provisioned PostgreSQL restart/reconnection test**
+   (`restart-runtime-reconnect`). It has no `services:` block and owns the
+   binaries and data directory it restarts:
 
    ```
    ISSUE145_PG_BINDIR=<16.16 bin> python -m pytest -q tests/test_issue145_pg_restart.py
    ```
 
-   The job fetches the exact SHA-256-pinned 16.16 build, asserts
-   `postgres (PostgreSQL) 16.16`, fails if `ISSUE145_PG_BINDIR` is unset, and
-   gates the JUnit report (`restart|5|…`), so a skipped or silently
-   uncollected test fails the job. The module creates its own `initdb` cluster
-   in a temporary directory and restarts only that server;
-   `ISSUE145_PG_ADMIN_URL` is not used by it.
-3. **The three service-container database gates** (`application-integration`,
-   `PostgreSQL compatibility`, `StrikeNova Status Gate`). Their PostgreSQL is a
-   service container they cannot restart; they never exercise the restart
-   path.
+   The job fetches the SHA-256-pinned 16.16 PGDG build for Ubuntu 24.04 and
+   matches `postgres --version` against
+   `^postgres \(PostgreSQL\) 16\.16([[:space:]]|$)` — 16.16 followed by
+   whitespace or end-of-line, so a distribution suffix after the version
+   (e.g. `(Ubuntu 16.16-1.pgdg24.04+1)`) is accepted — fails if
+   `ISSUE145_PG_BINDIR` is unset, and gates the JUnit report (`restart|5|…`),
+   so a skipped or silently uncollected test fails the job. The module creates
+   its own `initdb` cluster in a temporary directory and restarts only that
+   server; `ISSUE145_PG_ADMIN_URL` is not used by it.
+3. **The non-database `StrikeNova Status Gate`**
+   (`.github/workflows/strikenova-status-gate.yml`). It validates repository
+   governance only: that the status tracker, the master plan and the execution
+   protocol files exist, and that the tracker's recorded master-plan SHA
+   matches the plan's current Git revision. It runs no PostgreSQL service and
+   no database test suite, so it is **not** a database gate and must not be
+   counted as one.
+
+Local provenance is separate from all three classes: the suites were also run
+locally against PGDG 16.16 server binaries extracted into the workspace (the
+container socket was unavailable in that environment), invoked exactly as the
+workflows invoke them, with `--junitxml` plus the recorded pytest exit status
+passed to `scripts/pytest_gate.py`.
 
 ## 10. Known limitations
 
@@ -680,8 +698,8 @@ rather than proven host by host. After preflight, every new migration
   rather than a same-named cluster.
 * The real-restart proof (`tests/test_issue145_pg_restart.py`) runs in its own
   isolated CI job (`restart-runtime-reconnect`) with its own 16.16 binaries and
-  data directory, because the PostgreSQL the three other suites use is a
-  service container they cannot restart and must not disturb. The proof is a
+  data directory, because the PostgreSQL the two service-container suites use is
+  a service container they cannot restart and must not disturb. The proof is a
   real server process restart on an unchanged data directory — the same
   identity-invalidation event a Neon compute suspend/wake or provider failover
   produces — but **no live Neon suspend/wake, branch fork, TLS or failover was
