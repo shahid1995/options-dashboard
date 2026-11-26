@@ -216,7 +216,16 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_statement_timeout_below_lease_ttl(self) -> "Settings":
-        """A per-user backfill transaction must fail before ownership can expire.
+        """Require the per-statement timeout to be below the lease TTL.
+
+        ``statement_timeout`` bounds each individual SQL statement; it does not
+        accumulate across the statements of one transaction. A multi-statement
+        backfill transaction can therefore keep holding its lease-row lock
+        beyond the TTL. The TTL is an expiry/takeover threshold, not a hard
+        duration limit on an already-running transaction: the mandatory
+        pre-commit ``enter`` ownership check rejects expired ownership, so the
+        protected transaction rolls back instead of committing work it no
+        longer owns.
 
         The runbook rule is strict: the statement timeout must be *below* the
         lease TTL, so equality is rejected as well. The defaults (300 s TTL,
