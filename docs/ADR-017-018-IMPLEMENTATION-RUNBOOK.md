@@ -232,7 +232,9 @@ identifier (after the ordinary lower-case and trailing-dot normalization) and
 different compute endpoints, or when one is a native Neon host and the other is
 not. The comparison is static: it happens in
 `assert_guarded_migration_configuration`, before an engine, a connection, a
-lease or any DDL exists.
+lease or any DDL exists. Every other documented way of naming the compute (the
+query option, the database component and the password prefix) is decided in the
+same static pass, described below.
 
 The endpoint identifier is a **compute endpoint**, not a branch identifier and
 not a project identifier, and it is not provider-verified: no Neon API is
@@ -247,13 +249,42 @@ alias policy, because an unreadable Neon identity is the case an alias could
 otherwise paper over; hosts outside `neon.tech` keep the previous generic
 policy unchanged.
 
-Neon's documented `options=endpoint=<id>` (and its deprecated former name
-`project=<id>`) *routes* a connection to a compute, so the parser reads it as
-well: a value that disagrees with the hostname's endpoint, a malformed value,
-two conflicting values, or such an option on a non-Neon host is refused
-(`45004`) before anything connects. Ordinary runtime parameters carried in the
-same `options` string (`-c name=value`) cannot change the endpoint and are
-ignored.
+Neon documents three ways to name a compute, and all three are decided
+statically, before an engine, a connection, a lease or any DDL exists:
+
+* **Query option** — `?options=endpoint=<id>` (deprecated former name
+  `project=<id>`). The parser reads the `options` value: a value that disagrees
+  with the hostname's endpoint, a malformed value, two conflicting values, or
+  such an option on a non-Neon host is refused (`45004`). Ordinary runtime
+  parameters carried in the same `options` string (`-c name=value`) cannot
+  change the endpoint and are ignored.
+* **Database component** — `dbname=neondb options=endpoint=<id>`. libpq expands
+  a `dbname` value into connection parameters only when it contains `=` or
+  begins with a URI scheme, so exactly those values are parsed with libpq's own
+  parser (`psycopg.conninfo.conninfo_to_dict`), never a substring guess.
+  Ordinary database names — including dotted, dashed and underscored ones —
+  are not parsed at all. A value that expands into `host`, `hostaddr`, `port`,
+  `user`, `password`, `service`, `servicefile` or `passfile` is refused, as is
+  an endpoint option that disagrees with the hostname, an ambiguous pair of
+  endpoint options, or a value libpq cannot parse.
+  With the pinned psycopg 3 the value is in fact passed through verbatim:
+  psycopg builds one conninfo string (`make_conninfo`) and libpq's
+  `expand_dbname` step is never used, so the form cannot currently route at
+  all. The static check is therefore defence in depth and does not depend on
+  that driver behaviour.
+* **Password prefix** — `endpoint=<id>;<password>` (or `$`). The prefix is
+  interpreted by Neon's proxy, not by libpq or psycopg: psycopg passes the
+  password through untouched, so the application cannot see which compute the
+  proxy would select. Neon also documents that the form downgrades
+  authentication from SCRAM-SHA-256 to password authentication. It is refused
+  outright on a native Neon host — even when the prefix names the hostname's
+  endpoint — instead of being supported with weaker authentication. Use a plain
+  password and select the compute with the hostname.
+
+`sslsni=0` is not a routing input: it only stops libpq sending the SNI
+extension, and the connect then still has to name the compute through one of
+the options above, each of which must agree with the hostname (with no option
+at all, Neon refuses the connection).
 
 **The identity is restart-stable.** It is the tuple
 
@@ -671,7 +702,7 @@ rather than reasoned about.
 | `tests/test_issue145_application_integration.py` | real PG 16.16: concurrent `init_db()`, single connection, killed worker, injected failure, CLI, barrier, protocol, expiry, privileges, both ownership topologies, the Topology A §8.3 matrix and its restricted backfill, schema-ACL positive/negative controls, timing, **the §8.1 application privilege verifier (both topologies plus its negative/positive controls, including every default-privilege overgrant direction and excess privileges on the existing exposure sequence)**, **incoming membership and NOLOGIN controls**, **the actual-connection identity controls (superuser admin login, unrelated login, migrator-member login, superuser migrator role) with unchanged lease/version/data**, **deterministic, restart-stable `system_identifier` target identity, with an unreadable identifier refused and named with its exact grant (unexpected errors fail closed too)**, **a deterministic two-process contention proof that pauses the first worker inside its first protected per-user backfill transaction (database trigger on an advisory lock) and observes the second worker queued on the admission guard with no lease row lock**, **the runtime principal read from the live connection and a `?user=` URL that authenticates as the migrator refused**, **column-level `UPDATE`/`REFERENCES` bypasses refused in both topologies and aborting the guarded upgrade**, **the lease/control protocol mirror mismatch refused without repair**, **a URL-encoded `%40` password accepted on the guarded path**, **a new migration connection pointed at another database refused before it can run a statement**, **every new runtime connection compared with the startup-proven target identity and refused when it differs**, **a timezone-independent diagnostic postmaster epoch (UTC and Asia/Kolkata agree) that is proven absent from the target identity**, **the actual lease-row lock proven with `SELECT … FOR UPDATE NOWAIT` (SQLSTATE 55P03) while worker A is paused, with a negative control after release**, **an inherited `PUBLIC` CREATE on `public` refused and then accepted once revoked** | 83 passed |
 | `tests/test_issue145_pg_restart.py` | **real restart of a self-provisioned PostgreSQL 16.16 cluster** (not a simulated signature change). (1) *Existing process, pre-restart proof:* startup preflight publishes `_RUNTIME_TARGET_SIGNATURE` once; a runtime engine with the application's listener and pool options (`pool_size=5`, `max_overflow=10`, `pool_timeout=30`, `pool_recycle=1800`, `pool_pre_ping=True`) is created and holds one pooled connection; the server is restarted; the **same engine object** is checked out again with no dispose, no `_migration_engine()`/`_verify_logical_target()` and no restart of application startup (both are replaced by fail-fast stubs). `pool_pre_ping` must replace the terminated pooled DBAPI connection (backend PID changes, a new `connect` event fires), the runtime listener must accept it, `SELECT 1` must work, `_RUNTIME_TARGET_SIGNATURE` must stay the *same object and value*, the identity must be unchanged and the postmaster start time must have changed. The test also records the identity the guard itself computes on the reconnection, so the comparison input is observed rather than assumed. (2) *New connection, re-proven target:* a new preflight and a new runtime connection are accepted after the restart, and the start time is asserted absent from the identity. (3) *Negative controls:* a different database in the same cluster and a second cluster with the same database name are still refused, and a revoked `pg_control_system()` after a restart fails closed with the grant and publishes nothing. Requires `ISSUE145_PG_BINDIR`; creates and owns its own scratch cluster and never restarts the CI/admin cluster | 5 passed (local 16.16) |
 | `tests/test_migration_serialization.py` | DB-free protocol/config/retirement contract, the timeout-below-TTL rule and its boundaries, finite/positive wait validation, no attempt past the admission deadline, no SQL after a checkout consumes the budget, bounded backoff for very high attempt counts, unchanged fast 55P03 retry, pre-acquisition cleanup, unconditional engine disposal when `release` raises, SQLite URI identity (`mode=memory`, `mode=rwc`, `uri=true`, unsupported modes), connection query/host-list override refusal, disposable-harness endpoint preservation (authority and query-form host/port) and service refusal, and the **JUnit-XML CI gate** (authoritative counts, fabricated-log controls, malformed/inconsistent reports, failures/errors/skips, rc and minimum) | 93 passed (file) |
-| `tests/test_db_migration.py`, `test_alembic_*.py`, `test_day5_alembic_authority.py`, `test_migration_identity_separation.py`, `test_leg_exposure.py` | SQLite chain, FK behavior, identity separation (**including the 16-target §8.1 URL contract: accepted pair, same-login, different database, different endpoint, declared alias, alias port mismatch, Neon pooled route, SQLite and CockroachDB migration targets, blank/malformed URLs, malformed alias configuration, no-password-in-errors, and the configured-identity binding — migration login must be `STRIKENOVA_MIGRATOR_ROLE`, runtime login must be `STRIKENOVA_RUNTIME_ROLE` when set, blank role name refused, unset runtime role not constrained**), **the Neon compute-endpoint contract: one host accepted, the documented direct/pooled pair accepted only with its declaration, two different endpoint identifiers refused even with an alias and even when one server signature is mocked, a Neon/non-Neon mixed pair refused, malformed Neon-looking hosts refused instead of alias-handled, host case/trailing-dot normalization, `options=endpoint=` matching/conflicting/malformed/ambiguous and on a non-Neon host, the unchanged generic alias policy, and every refusal asserted to open no engine, connection or server-side proof**, exposure idempotency | 211 passed (regression suite total) |
+| `tests/test_db_migration.py`, `test_alembic_*.py`, `test_day5_alembic_authority.py`, `test_migration_identity_separation.py`, `test_leg_exposure.py` | SQLite chain, FK behavior, identity separation (**including the 16-target §8.1 URL contract: accepted pair, same-login, different database, different endpoint, declared alias, alias port mismatch, Neon pooled route, SQLite and CockroachDB migration targets, blank/malformed URLs, malformed alias configuration, no-password-in-errors, and the configured-identity binding — migration login must be `STRIKENOVA_MIGRATOR_ROLE`, runtime login must be `STRIKENOVA_RUNTIME_ROLE` when set, blank role name refused, unset runtime role not constrained**), **the Neon compute-endpoint contract: one host accepted, the documented direct/pooled pair accepted only with its declaration, two different endpoint identifiers refused even with an alias and even when one server signature is mocked, a Neon/non-Neon mixed pair refused, malformed Neon-looking hosts refused instead of alias-handled, host case/trailing-dot normalization, `options=endpoint=` matching/conflicting/malformed/ambiguous and on a non-Neon host, the unchanged generic alias policy, **Neon's other documented routing inputs (password prefix refused with `;` and `$` separators, including a matching one, and the deprecated `project` spelling; query `project` matching/conflicting; database-component endpoint option matching/conflicting/ambiguous, `host`/`port`/`user`/`password`/`service` parameters refused, an unparseable connection-string value refused, and punctuated database names not parsed at all; generic PostgreSQL hosts keep the previous policy), and every refusal asserted to open no engine, connection or server-side proof**, exposure idempotency | 223 passed (regression suite total) |
 | `PostgreSQL compatibility` suite (9 modules: compatibility, importer, failure injection, large rehearsal, hardening, Day 5/6) | disposable PG 16.16 schemas built only through `python -m app.migrate upgrade head` | 122 passed |
 | `.github/workflows/issue145-application-pg16.yml` (`application-integration`) | the integration and regression suites above on a pinned `postgres@sha256:3950ad…` 16.16 service, exact `server_version_num = 160016` gate, evidence upload, cleanup | see PR #151 checks |
 | `.github/workflows/postgres-compatibility.yml` (`postgres-compatibility`) | the 9-module compatibility suite on the same pinned `postgres@sha256:3950ad…` 16.16 **service container**, `server_version_num = 160016` gate, JUnit gate for the compatibility suite (minimum 122 passes), evidence upload, cleanup | see PR #151 checks |
@@ -773,6 +804,10 @@ rather than proven host by host. After preflight, every new migration
   nothing here proves that a pooled route terminates at the same *project*
   rather than a same-named cluster. The endpoint identifier is documented
   hostname text, not a provider-verified fact, and it is not a branch id.
+  Neon's database-field and password-prefix endpoint forms are handled
+  statically (validated or refused) and their provider-side precedence was not
+  exercised against a live Neon compute: no Neon API, project lookup or
+  connection was used.
 * The real-restart proof (`tests/test_issue145_pg_restart.py`) runs in its own
   isolated CI job (`restart-runtime-reconnect`) with its own 16.16 binaries and
   data directory, because the PostgreSQL the two service-container suites use is

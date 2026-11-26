@@ -83,6 +83,34 @@ _NEON_HOST_RE = re.compile(
 #: agree with the hostname before a URL may be used as identity evidence.
 _NEON_ENDPOINT_OPTIONS = frozenset({"endpoint", "project"})
 
+#: A libpq ``dbname`` value is expanded into connection parameters when it
+#: contains ``=`` or begins with a URI scheme. Neon documents
+#: ``dbname=neondb options=endpoint=<id>`` as an alternative way to name the
+#: compute, so a database component that would be expanded must not be able to
+#: name a different one.
+_NEON_DBNAME_URI_PREFIXES = ("postgresql://", "postgres://")
+_NEON_DBNAME_FORBIDDEN_KEYS = frozenset(
+    {
+        "host",
+        "hostaddr",
+        "port",
+        "user",
+        "password",
+        "service",
+        "servicefile",
+        "passfile",
+    }
+)
+
+#: Neon's last-resort password form, ``endpoint=<id>;<password>`` (or ``$``).
+#: Neon's proxy interprets the prefix as a compute selector, and Neon documents
+#: that the form downgrades authentication from SCRAM-SHA-256 to password;
+#: libpq and psycopg pass the value through untouched, so the application can
+#: never see which compute it would select.
+_NEON_PASSWORD_PREFIX_RE = re.compile(
+    r"^\s*(?:endpoint|project)\s*=", re.IGNORECASE
+)
+
 #: The server's own view of a runtime connection: the authenticated login
 #: (``session_user``), the role it currently runs as (``current_user``, which a
 #: ``SET ROLE`` or an inherited membership changes) and that login's attributes.
@@ -680,6 +708,112 @@ def _declared_compute_endpoint(query, *, label: str) -> str | None:
     return declared.pop() if declared else None
 
 
+def _assert_endpoint_option_matches(
+    neon: _NeonComputeEndpoint | None,
+    declared: str | None,
+    *,
+    label: str,
+    source: str,
+) -> None:
+    """Require a documented endpoint option to agree with the hostname."""
+    if declared is None:
+        return
+    if neon is None:
+        raise _config_error(
+            f"{label} carries a Neon compute-endpoint {source} while its host "
+            "is not a native Neon host; that option has no documented meaning "
+            "for another server, so the pair is refused rather than assumed"
+        )
+    if declared != neon.endpoint:
+        raise _config_error(
+            f"{label} carries a Neon compute-endpoint {source} naming "
+            f"{declared!r} while its host names compute endpoint "
+            f"{neon.endpoint!r}; the option routes the connection, so the "
+            "hostname and the option must name one compute"
+        )
+
+
+def _assert_no_neon_dbname_routing(
+    database: str, neon: _NeonComputeEndpoint | None, *, label: str
+) -> None:
+    """Refuse a Neon database component that libpq would expand as a conninfo string.
+
+    Neon documents ``dbname=neondb options=endpoint=<id>`` as an alternative way
+    to name the compute when the client cannot send SNI. libpq only expands such
+    a value when it contains an equal sign or begins with a URI scheme, so only
+    those values are parsed — with libpq's own parser, never a substring guess —
+    and only on a native Neon host. A value carrying ``host``, ``hostaddr``,
+    ``port``, ``user``, ``password``, ``service``, ``servicefile`` or
+    ``passfile`` is refused because it can retarget the connection or change
+    the principal, and an endpoint option must agree with the hostname.
+
+    Ordinary database names, including dotted, dashed and underscored ones, are
+    never parsed. This is a static check only: it runs before any engine or
+    connection exists, and it does not depend on the driver choosing to expand
+    the value (with psycopg 3 the value is passed through verbatim).
+    """
+    if neon is None:
+        return
+    if "=" not in database and not database.lower().startswith(
+        _NEON_DBNAME_URI_PREFIXES
+    ):
+        return
+    from psycopg.conninfo import conninfo_to_dict
+
+    try:
+        expanded = conninfo_to_dict(database)
+    except Exception as exc:  # noqa: BLE001 - never echo the value
+        raise _config_error(
+            f"{label} uses a database component that libpq would treat as a "
+            "connection string and that cannot be parsed "
+            f"({type(exc).__name__}); refusing an ambiguous Neon target"
+        ) from None
+    forbidden = sorted(set(expanded) & _NEON_DBNAME_FORBIDDEN_KEYS)
+    if forbidden:
+        raise _config_error(
+            f"{label} uses a database component that expands into connection "
+            f"parameter(s) {forbidden} capable of overriding the host, login "
+            "or password this check proves; refusing a Neon database value "
+            "that carries connection parameters"
+        )
+    options = expanded.get("options")
+    _assert_endpoint_option_matches(
+        neon,
+        _declared_compute_endpoint({"options": options}, label=label)
+        if options
+        else None,
+        label=label,
+        source="database-component option",
+    )
+
+
+def _assert_no_neon_password_routing(
+    password: str | None, neon: _NeonComputeEndpoint | None, *, label: str
+) -> None:
+    """Refuse Neon's endpoint-prefixed password form on a native Neon host.
+
+    ``endpoint=<id>;<password>`` (or ``endpoint=<id>$<password>``) is a
+    documented workaround for clients without SNI: Neon's proxy reads the
+    prefix as a compute selector, and Neon documents that it downgrades
+    authentication from SCRAM-SHA-256 to password authentication. libpq and
+    psycopg pass the password through verbatim, so the application cannot tell
+    which compute the proxy would choose, and the hostname check would be
+    bypassed by a value that is not even a hostname. The form is therefore
+    refused outright — even when the prefix happens to name the hostname's
+    endpoint — rather than supported with weaker authentication. The message
+    never contains the password.
+    """
+    if neon is None or not password:
+        return
+    if _NEON_PASSWORD_PREFIX_RE.match(password):
+        raise _config_error(
+            f"{label} uses Neon's endpoint-prefixed password form, which Neon's "
+            "proxy interprets as a compute selector and which downgrades "
+            "authentication from SCRAM-SHA-256 to password; use a plain "
+            "password and select the compute with the hostname"
+        )
+
+
 def _parse_migration_target(url: str, *, label: str) -> _MigrationTarget:
     """Parse a URL into a :class:`_MigrationTarget`, failing closed.
 
@@ -753,22 +887,18 @@ def _parse_migration_target(url: str, *, label: str) -> _MigrationTarget:
     # agree with any ``options=endpoint=``/``project=`` routing option. This is
     # static evidence: it is compared before an engine or a connection exists.
     neon = _neon_compute_endpoint(host, label=label)
-    declared_endpoint = _declared_compute_endpoint(parsed.query, label=label)
-    if declared_endpoint is not None:
-        if neon is None:
-            raise _config_error(
-                f"{label} carries a Neon compute-endpoint connection option "
-                "while its host is not a native Neon host; that option has no "
-                "documented meaning for another server, so the pair is refused "
-                "rather than assumed"
-            )
-        if declared_endpoint != neon.endpoint:
-            raise _config_error(
-                f"{label} carries a connection option naming Neon compute "
-                f"endpoint {declared_endpoint!r} while its host names compute "
-                f"endpoint {neon.endpoint!r}; the option routes the connection, "
-                "so the hostname and the option must name one compute"
-            )
+    # Every documented way of naming a Neon compute must agree with the
+    # hostname: the query parameter, the database component, and the password
+    # prefix (which is refused outright). All of this is static evidence — it is
+    # decided before an engine, a connection, a lease or any DDL exists.
+    _assert_endpoint_option_matches(
+        neon,
+        _declared_compute_endpoint(parsed.query, label=label),
+        label=label,
+        source="connection query option",
+    )
+    _assert_no_neon_dbname_routing(parsed.database or "", neon, label=label)
+    _assert_no_neon_password_routing(parsed.password, neon, label=label)
     return _MigrationTarget(backend, role, host, port, database, neon)
 
 

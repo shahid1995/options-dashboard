@@ -275,8 +275,10 @@ class TestNeonComputeEndpointIdentity:
     ALIAS = HOST_POOLED + "=" + HOST_DIRECT
 
     @staticmethod
-    def _url(role, host, *, database="neondb", query=""):
-        secret = "runtime-secret" if role == "strikenova_app" else "migrator-secret"
+    def _url(role, host, *, database="neondb", query="", password=None):
+        secret = password or (
+            "runtime-secret" if role == "strikenova_app" else "migrator-secret"
+        )
         return f"postgresql://{role}:{secret}@{host}/{database}{query}"
 
     def _settings(self, **overrides):
@@ -505,6 +507,200 @@ class TestNeonComputeEndpointIdentity:
             ),
             "different PostgreSQL endpoints",
         )
+
+
+    # -- Neon's other documented endpoint-routing inputs ---------------------
+    #
+    # Neon documents three ways to name a compute: the query option, the
+    # database field, and the password prefix. With the pinned psycopg 3 the
+    # password is passed to Neon's proxy verbatim and the database field is not
+    # expanded (libpq's expand_dbname path is not used), but none of them may
+    # be allowed to name a compute the hostname does not name.
+
+    def test_password_endpoint_prefix_with_a_semicolon_is_refused(self):
+        self._assert_refused(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app",
+                    self.HOST_DIRECT,
+                    password="endpoint=ep-quiet-mountain-654321;runtime-secret",
+                )
+            ),
+            "endpoint-prefixed password",
+            "SCRAM-SHA-256",
+        )
+
+    def test_password_endpoint_prefix_with_a_dollar_separator_is_refused(self):
+        self._assert_refused(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app",
+                    self.HOST_POOLED,
+                    password="endpoint=ep-quiet-mountain-654321$runtime-secret",
+                )
+            ),
+            "endpoint-prefixed password",
+        )
+
+    def test_password_endpoint_prefix_is_refused_even_when_it_matches_the_host(self):
+        """Chosen policy: refuse the form, do not support it with weaker auth.
+
+        Neon documents that the prefix downgrades authentication from
+        SCRAM-SHA-256 to password authentication, and psycopg passes the value
+        through untouched, so the application cannot see which compute the
+        proxy would select. A matching prefix is therefore still refused: the
+        supported way to select a compute is the hostname plus, at most, the
+        documented query option.
+        """
+        self._assert_refused(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app",
+                    self.HOST_DIRECT,
+                    password="endpoint=ep-cool-darkness-123456;runtime-secret",
+                )
+            ),
+            "endpoint-prefixed password",
+            "use a plain password",
+        )
+
+    def test_deprecated_project_password_prefix_is_refused_too(self):
+        self._assert_refused(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app",
+                    self.HOST_DIRECT,
+                    password="project=ep-quiet-mountain-654321;runtime-secret",
+                )
+            ),
+            "endpoint-prefixed password",
+        )
+
+    def test_query_project_option_follows_the_same_endpoint_policy(self):
+        accepted = self._settings(
+            DATABASE_URL=self._url(
+                "strikenova_app",
+                self.HOST_POOLED,
+                query="?options=project%3Dep-cool-darkness-123456",
+            )
+        )
+        self._assert_accepted(accepted)
+        self._assert_refused(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app",
+                    self.HOST_POOLED,
+                    query="?options=project%3Dep-quiet-mountain-654321",
+                )
+            ),
+            "must name one compute",
+        )
+
+    def test_dbname_endpoint_option_differing_from_the_host_is_refused(self):
+        self._assert_refused(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app",
+                    self.HOST_DIRECT,
+                    database="dbname=neondb options=endpoint=ep-quiet-mountain-654321",
+                )
+            ),
+            "must name one compute",
+        )
+
+    def test_dbname_endpoint_option_matching_the_host_is_accepted(self):
+        self._assert_accepted(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app",
+                    self.HOST_DIRECT,
+                    database="dbname=neondb options=endpoint=ep-cool-darkness-123456",
+                ),
+                STRIKENOVA_MIGRATION_DATABASE_URL=self._url(
+                    "strikenova_migrator",
+                    self.HOST_DIRECT,
+                    database="dbname=neondb options=endpoint=ep-cool-darkness-123456",
+                ),
+                STRIKENOVA_MIGRATION_TARGET_ALIASES="",
+            )
+        )
+
+    def test_dbname_connection_parameters_that_can_retarget_are_refused(self):
+        for database, fragment in (
+            ("dbname=neondb host=ep-quiet-mountain-654321.eu.aws.neon.tech", "host"),
+            ("dbname=neondb port=6543", "port"),
+            ("dbname=neondb user=someone_else", "user"),
+            ("dbname=neondb password=another-secret", "password"),
+            ("dbname=neondb service=other", "service"),
+        ):
+            self._assert_refused(
+                self._settings(
+                    DATABASE_URL=self._url(
+                        "strikenova_app", self.HOST_DIRECT, database=database
+                    )
+                ),
+                "carries connection parameters",
+                fragment,
+            )
+
+    def test_dbname_connection_string_that_cannot_be_parsed_is_refused(self):
+        self._assert_refused(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app",
+                    self.HOST_DIRECT,
+                    database="weird=name options=endpoint=ep-quiet-mountain-654321",
+                )
+            ),
+            "cannot be parsed",
+        )
+
+    def test_ambiguous_dbname_endpoint_declaration_is_refused(self):
+        self._assert_refused(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app",
+                    self.HOST_DIRECT,
+                    database=(
+                        "dbname=neondb options='endpoint=ep-cool-darkness-123456 "
+                        "project=ep-quiet-mountain-654321'"
+                    ),
+                )
+            ),
+            "more than one Neon compute endpoint",
+        )
+
+    def test_punctuated_database_names_are_not_parsed_as_connection_strings(self):
+        for database in ("app.db-v2_prod", "neondb", "options"):
+            self._assert_accepted(
+                self._settings(
+                    DATABASE_URL=self._url(
+                        "strikenova_app", self.HOST_DIRECT, database=database
+                    ),
+                    STRIKENOVA_MIGRATION_DATABASE_URL=self._url(
+                        "strikenova_migrator", self.HOST_DIRECT, database=database
+                    ),
+                    STRIKENOVA_MIGRATION_TARGET_ALIASES="",
+                )
+            )
+
+    def test_generic_postgres_hosts_keep_the_previous_routing_policy(self):
+        """No Neon-only parsing is applied outside native Neon hostnames."""
+        generic = dict(
+            DATABASE_URL=self._url(
+                "strikenova_app",
+                "db.example",
+                database="dbname=options options=endpoint=ep-quiet-mountain-654321",
+                password="endpoint=ep-quiet-mountain-654321;runtime-secret",
+            ),
+            STRIKENOVA_MIGRATION_DATABASE_URL=self._url(
+                "strikenova_migrator",
+                "db.example",
+                database="dbname=options options=endpoint=ep-quiet-mountain-654321",
+            ),
+            STRIKENOVA_MIGRATION_TARGET_ALIASES="",
+        )
+        self._assert_accepted(self._settings(**generic))
 
 
 class TestSingleIdentityBackwardCompatibility:
