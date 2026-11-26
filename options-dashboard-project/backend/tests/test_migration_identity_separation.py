@@ -484,6 +484,210 @@ class TestNeonComputeEndpointIdentity:
             "more than one Neon compute endpoint",
         )
 
+    def test_sqlalchemy_represents_a_repeated_options_parameter_as_a_tuple(self):
+        """The guard's input shape, observed on the pinned SQLAlchemy."""
+        from sqlalchemy.engine import make_url
+
+        parsed = make_url(
+            self._url(
+                "strikenova_app",
+                self.HOST_DIRECT,
+                query=(
+                    "?options=endpoint%3Dep-cool-darkness-123456"
+                    "&options=endpoint%3Dep-quiet-mountain-654321"
+                ),
+            )
+        )
+        assert parsed.query["options"] == (
+            "endpoint=ep-cool-darkness-123456",
+            "endpoint=ep-quiet-mountain-654321",
+        )
+
+    def test_psycopg_renders_a_repeated_options_tuple_as_a_python_tuple_string(self):
+        """Why a repeated value is refused: the pinned driver does not reject it.
+
+        ``make_conninfo`` accepts the tuple the URL parser produced and embeds
+        ``str(tuple)`` into one options string, whose first token is a
+        parenthesis rather than a libpq option. The value is therefore not a
+        readable options command at all.
+        """
+        from psycopg.conninfo import make_conninfo
+
+        rendered = make_conninfo(
+            "",
+            options=(
+                "endpoint=ep-cool-darkness-123456",
+                "-c statement_timeout=5000",
+            ),
+        )
+        assert rendered.startswith("options='(")
+
+    def test_single_runtime_options_are_still_accepted_on_a_neon_host(self):
+        self._assert_accepted(
+            self._settings(
+                STRIKENOVA_MIGRATION_DATABASE_URL=self._url(
+                    "strikenova_migrator",
+                    self.HOST_DIRECT,
+                    query="?options=-c%20statement_timeout%3D5000",
+                ),
+            )
+        )
+
+    def test_repeated_options_with_matching_and_conflicting_endpoints_are_refused(
+        self,
+    ):
+        self._assert_refused(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app",
+                    self.HOST_DIRECT,
+                    query=(
+                        "?options=endpoint%3Dep-cool-darkness-123456"
+                        "&options=endpoint%3Dep-quiet-mountain-654321"
+                    ),
+                )
+            ),
+            "more than one Neon compute endpoint",
+        )
+
+    def test_repeated_options_with_two_endpoint_ids_are_refused(self):
+        self._assert_refused(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app",
+                    self.HOST_DIRECT,
+                    query=(
+                        "?options=endpoint%3Dep-quiet-mountain-654321"
+                        "&options=endpoint%3Dep-mute-forest-111111"
+                    ),
+                )
+            ),
+            "more than one Neon compute endpoint",
+        )
+
+    def test_repeated_identical_options_values_are_refused(self):
+        """The chosen policy for a repetition that names one endpoint: refuse.
+
+        No repeated value can reach a server (the driver renders the tuple), so
+        accepting it would only defer an unreadable options string to connect
+        time; the parameter is refused statically instead.
+        """
+        self._assert_refused(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app",
+                    self.HOST_DIRECT,
+                    query=(
+                        "?options=endpoint%3Dep-cool-darkness-123456"
+                        "&options=endpoint%3Dep-cool-darkness-123456"
+                    ),
+                )
+            ),
+            "repeats the 'options' query parameter",
+            "supply a single 'options' value",
+        )
+
+    def test_repeated_options_cannot_hide_a_malformed_endpoint_declaration(self):
+        self._assert_refused(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app",
+                    self.HOST_DIRECT,
+                    query=(
+                        "?options=-c%20statement_timeout%3D5000"
+                        "&options=endpoint%3Dnot-an-endpoint"
+                    ),
+                )
+            ),
+            "malformed Neon compute endpoint",
+        )
+
+    def test_repeated_options_cannot_hide_an_endpoint_behind_a_runtime_option(self):
+        """A hidden selector is compared with the hostname, not stringified away.
+
+        Under the previous ``str(value)`` reading this URL's endpoint option sat
+        behind tuple punctuation and was not read; the conflicting selector must
+        now be detected and refused as a mismatch.
+        """
+        self._assert_refused(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app",
+                    self.HOST_DIRECT,
+                    query=(
+                        "?options=-c%20statement_timeout%3D5000"
+                        "&options=endpoint%3Dep-quiet-mountain-654321"
+                    ),
+                )
+            ),
+            "must name one compute",
+        )
+
+    def test_repeated_deprecated_project_spelling_is_refused_too(self):
+        self._assert_refused(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app",
+                    self.HOST_DIRECT,
+                    query=(
+                        "?options=project%3Dep-cool-darkness-123456"
+                        "&options=project%3Dep-quiet-mountain-654321"
+                    ),
+                )
+            ),
+            "more than one Neon compute endpoint",
+        )
+
+    def test_non_string_option_values_are_refused(self):
+        """Values the URL parser cannot produce are still refused explicitly."""
+        import pytest
+
+        import app.db as db_module
+        from app._migration_lease import LeaseError
+
+        for value in (
+            ("endpoint=ep-cool-darkness-123456", 7),
+            (),
+            {"endpoint": "ep-cool-darkness-123456"},
+        ):
+            with pytest.raises(LeaseError) as exc:
+                db_module._declared_compute_endpoint(
+                    {"options": value}, label="DATABASE_URL"
+                )
+            assert exc.value.sqlstate == "45004"
+            assert "DATABASE_URL" in str(exc.value)
+
+    def test_generic_postgres_urls_keep_their_options_behavior(self):
+        """No repeated-parameter policy is applied outside native Neon hosts."""
+        self._assert_accepted(
+            self._settings(
+                DATABASE_URL=self._url(
+                    "strikenova_app",
+                    "db.example",
+                    database="options",
+                    query="?options=-c%20statement_timeout%3D5000",
+                ),
+                STRIKENOVA_MIGRATION_DATABASE_URL=self._url(
+                    "strikenova_migrator", "db.example", database="options"
+                ),
+                STRIKENOVA_MIGRATION_TARGET_ALIASES="",
+            )
+        )
+        # A repeated ``options`` parameter carries no Neon endpoint identity on a
+        # generic host, so the Neon-only repetition refusal does not apply.
+        import app.db as db_module
+
+        target = db_module._parse_migration_target(
+            self._url(
+                "strikenova_migrator",
+                "db.example",
+                database="options",
+                query="?options=-c%20statement_timeout%3D5000&options=-c%20lock_timeout%3D100",
+            ),
+            label="STRIKENOVA_MIGRATION_DATABASE_URL",
+        )
+        assert target.neon is None
+
     def test_generic_postgres_hosts_keep_the_existing_alias_policy(self):
         generic = self._settings(
             DATABASE_URL=self._url("strikenova_app", "db.example", database="options"),

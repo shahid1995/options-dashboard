@@ -675,6 +675,41 @@ def _neon_compute_endpoint(
     )
 
 
+def _connection_option_commands(value, *, label: str) -> tuple[str, ...]:
+    """Return the ``options`` command strings one query value carries.
+
+    SQLAlchemy 2.0 represents a URL query parameter that appears more than once
+    as a tuple of strings (``?options=a&options=b`` becomes ``("a", "b")``),
+    and its Psycopg ``create_connect_args`` passes that tuple through unchanged.
+    psycopg then renders the tuple into one options string with Python's
+    ``repr`` (``options='(\'a\', \'b\')'``) instead of rejecting it, so a tuple
+    is *never* one options command: every element is a command in its own right
+    and is inspected independently. Anything that is not a string, or a
+    tuple/list of strings, is refused rather than handed to the driver.
+    """
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, (tuple, list)):
+        if not value:
+            raise _config_error(
+                f"{label} carries an empty repeated 'options' query parameter; "
+                "refusing a value that declares no option"
+            )
+        for item in value:
+            if not isinstance(item, str):
+                raise _config_error(
+                    f"{label} carries a repeated 'options' query parameter "
+                    f"containing a {type(item).__name__} instead of a string; "
+                    "refusing a value whose meaning cannot be read"
+                )
+        return tuple(value)
+    raise _config_error(
+        f"{label} carries an 'options' query parameter of type "
+        f"{type(value).__name__} instead of a string; refusing a value whose "
+        "meaning cannot be read"
+    )
+
+
 def _declared_compute_endpoint(query, *, label: str) -> str | None:
     """Read ``options=endpoint=<id>`` (or deprecated ``project=<id>``) from a URL.
 
@@ -683,29 +718,67 @@ def _declared_compute_endpoint(query, *, label: str) -> str | None:
     that disagrees with the hostname would reach a compute the URL does not
     name. Ordinary runtime parameters carried in the same ``options`` string
     (``-c name=value``) cannot change the endpoint and are ignored.
+
+    Every value is read as its own command; a repeated query parameter is never
+    stringified into one value, so no repetition can hide an endpoint selector
+    behind tuple punctuation. A repeated parameter itself is refused separately
+    by :func:`_assert_no_repeated_connection_options`.
     """
     declared: set[str] = set()
     for key, value in (query or {}).items():
         if str(key).lower() != "options":
             continue
-        for token in str(value).split():
-            name, separator, raw = token.partition("=")
-            if not separator or name.lower() not in _NEON_ENDPOINT_OPTIONS:
-                continue
-            endpoint = raw.strip().strip("'\"")
-            if not _NEON_ENDPOINT_ID_RE.match(endpoint):
-                raise _config_error(
-                    f"{label} carries a connection option naming a malformed "
-                    "Neon compute endpoint; refusing an endpoint identity that "
-                    "cannot be read"
-                )
-            declared.add(endpoint)
+        for command in _connection_option_commands(value, label=label):
+            for token in command.split():
+                name, separator, raw = token.partition("=")
+                if name.lower() not in _NEON_ENDPOINT_OPTIONS:
+                    continue
+                if not separator:
+                    raise _config_error(
+                        f"{label} carries a connection option naming a Neon "
+                        "compute endpoint without a value; refusing an endpoint "
+                        "declaration that cannot be read"
+                    )
+                endpoint = raw.strip().strip("'\"")
+                if not _NEON_ENDPOINT_ID_RE.match(endpoint):
+                    raise _config_error(
+                        f"{label} carries a connection option naming a "
+                        "malformed Neon compute endpoint; refusing an endpoint "
+                        "identity that cannot be read"
+                    )
+                declared.add(endpoint)
     if len(declared) > 1:
         raise _config_error(
             f"{label} carries connection options naming more than one Neon "
             "compute endpoint; refusing an ambiguous endpoint identity"
         )
     return declared.pop() if declared else None
+
+
+def _assert_no_repeated_connection_options(query, *, label: str) -> None:
+    """Refuse a repeated ``options`` query parameter on a native Neon host.
+
+    SQLAlchemy turns a repeated parameter into a tuple and psycopg renders that
+    tuple with Python's ``repr`` into one options string, which libpq does not
+    accept as an options command (its first token is a parenthesis). No accepted
+    repeated value can therefore reach a server, and what Neon's proxy would
+    make of the rendered string is unproven, so the parameter is refused
+    outright instead of being interpreted. Each value has already been read by
+    :func:`_declared_compute_endpoint`, so a repeated parameter can never hide
+    an endpoint selector or a malformed declaration; a conflicting selector is
+    reported as such before this refusal.
+    """
+    for key, value in (query or {}).items():
+        if str(key).lower() != "options":
+            continue
+        if isinstance(value, str):
+            continue
+        raise _config_error(
+            f"{label} repeats the 'options' query parameter; SQLAlchemy "
+            "represents that as a tuple and the driver renders the tuple as "
+            "one Python-repr string, which libpq does not accept as an options "
+            "command - supply a single 'options' value"
+        )
 
 
 def _assert_endpoint_option_matches(
@@ -897,6 +970,8 @@ def _parse_migration_target(url: str, *, label: str) -> _MigrationTarget:
         label=label,
         source="connection query option",
     )
+    if neon is not None:
+        _assert_no_repeated_connection_options(parsed.query, label=label)
     _assert_no_neon_dbname_routing(parsed.database or "", neon, label=label)
     _assert_no_neon_password_routing(parsed.password, neon, label=label)
     return _MigrationTarget(backend, role, host, port, database, neon)
