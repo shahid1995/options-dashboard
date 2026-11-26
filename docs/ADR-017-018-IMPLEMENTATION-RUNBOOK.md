@@ -196,9 +196,14 @@ username still looks like the application.
 The target proof is no longer one-time. After the first fully proven migration
 connection, `_install_migration_identity_guard` records the restart-stable
 cluster/database identity and every later migration connection re-reads and
-must match it before it may execute a statement. A reconnect or failover to
-another cluster is refused (`45004`) before the lease, DDL or backfill can use
-it, while a reconnection after a restart of the *same* server is accepted.
+must match it before it may execute a statement. A reconnect or failover whose
+newly observed identity tuple differs from the proven one, whose identifier is
+unreadable, or whose endpoint is outside the configured host-equivalence policy
+is refused (`45004`) before the lease, DDL or backfill can use it, while a
+reconnection after a restart of the *same* server is accepted. This is not a
+universal guarantee that every copied or forked target can be distinguished
+(see "What the server-side proof does and does not establish" below and
+§10).
 
 **Supported endpoint topology.** One PostgreSQL cluster, one database, two
 logins. A second route to that same endpoint (the Neon pooled host
@@ -223,9 +228,12 @@ server reports, and refuses (`45004`) when they differ.
 
 All three values live in the data directory rather than in the server process,
 so all three survive a PostgreSQL restart, crash recovery and a Neon compute
-suspend/wake. `system_identifier` is the 64-bit value `initdb` generates: it is
-identical for every connection to one cluster (primaries and replicas) and
-different for any other cluster. It is readable without superuser on stock
+suspend/wake. `system_identifier` is the 64-bit value generated when a cluster
+is initialized: it is identical for every connection to one cluster (primaries
+and replicas), and a cluster initialized independently gets its own value.
+It is not by itself a proof of a *different* cluster, because a physical copy
+or copy-on-write fork of a data directory preserves it, so a copied target can
+present the same identifier. It is readable without superuser on stock
 PostgreSQL 16 because the function is created with the default function ACL,
 which grants `EXECUTE` to `PUBLIC` (`=X/<owner>`), so both the runtime and the
 migration LOGIN read it directly.
@@ -239,15 +247,25 @@ logged and does not change the verdict. `tests/test_issue145_pg_restart.py`
 proves this against a real server process restart on an unchanged data
 directory.
 
-**What the server-side proof does and does not establish.** It proves that two
-connections (and every later reconnection) reach one PostgreSQL cluster and one
-database. It does **not** identify a Neon branch, project or compute endpoint:
-Neon branches are copy-on-write forks, so a branch shares its parent's
-`system_identifier` and database OIDs. Branch/endpoint separation therefore
-rests on the *static* check above — an undeclared different host is refused
-before any connection is opened, and a declared alias is the operator's
-explicit statement that both routes are the same endpoint. There is no implicit
-`-pooler` suffix heuristic and no wildcard.
+**What the server-side proof does and does not establish.** What it proves is
+*equality of an observed signature*: two connections (and every later
+reconnection) report the same `current_database()`, `pg_database.oid` and
+`pg_control_system().system_identifier`, subject to the host policy above.
+What it refuses is a connection whose observed signature differs, whose
+identifier cannot be read, or whose endpoint is outside the configured
+equivalence policy — each before any protected work. What it does **not**
+establish is the identity of a provider project or branch: the tuple is not a
+Neon branch, project or compute-endpoint identifier. Neon branches are
+copy-on-write forks, so a branch shares its parent's `system_identifier` and
+database OIDs; the same is true of a physical copy. A route that the operator
+permits (the same hostname, or a declared alias) and that presents the same
+database name, OID and identifier therefore has an *indistinguishable*
+signature, and these checks cannot prove it is the original target.
+Branch/endpoint separation consequently rests on the *static* check above — an
+undeclared different host is refused before any connection is opened, and a
+declared alias is the operator's explicit assertion that both routes reach the
+same endpoint. The application queries no provider API to confirm that
+assertion. There is no implicit `-pooler` suffix heuristic and no wildcard.
 
 **When the identifier is unreadable, the check fails closed.** PostgreSQL
 documents that a hardened installation may revoke `EXECUTE` on
@@ -620,10 +638,23 @@ rather than reasoned about.
 | `tests/test_db_migration.py`, `test_alembic_*.py`, `test_day5_alembic_authority.py`, `test_migration_identity_separation.py`, `test_leg_exposure.py` | SQLite chain, FK behavior, identity separation (**including the 16-target §8.1 URL contract: accepted pair, same-login, different database, different endpoint, declared alias, alias port mismatch, Neon pooled route, SQLite and CockroachDB migration targets, blank/malformed URLs, malformed alias configuration, no-password-in-errors, and the configured-identity binding — migration login must be `STRIKENOVA_MIGRATOR_ROLE`, runtime login must be `STRIKENOVA_RUNTIME_ROLE` when set, blank role name refused, unset runtime role not constrained**), exposure idempotency | 198 passed (regression suite total) |
 | `PostgreSQL compatibility` suite (9 modules: compatibility, importer, failure injection, large rehearsal, hardening, Day 5/6) | disposable PG 16.16 schemas built only through `python -m app.migrate upgrade head` | 122 passed |
 | `.github/workflows/issue145-application-pg16.yml` (`application-integration`) | the integration and regression suites above on a pinned `postgres@sha256:3950ad…` 16.16 service, exact `server_version_num = 160016` gate, evidence upload, cleanup | see PR #151 checks |
-| `.github/workflows/postgres-compatibility.yml` (`postgres-compatibility`) | the 9-module compatibility suite on the same pinned `postgres@sha256:3950ad…` 16.16 **service container**, `server_version_num = 160016` gate, `compatibility|122|…` JUnit gate, evidence upload, cleanup | see PR #151 checks |
+| `.github/workflows/postgres-compatibility.yml` (`postgres-compatibility`) | the 9-module compatibility suite on the same pinned `postgres@sha256:3950ad…` 16.16 **service container**, `server_version_num = 160016` gate, JUnit gate for the compatibility suite (minimum 122 passes), evidence upload, cleanup | see PR #151 checks |
 | `.github/workflows/strikenova-status-gate.yml` (`status-gate`) | **no PostgreSQL service and no database suite**: verifies the status tracker, master plan and execution protocol exist and that the tracker's recorded master-plan SHA matches the plan's current Git revision | see PR #151 checks |
-| `.github/workflows/issue145-application-pg16.yml` (`restart-runtime-reconnect`) | **isolated restart job, no `services:` block**, so it never restarts or mutates the shared service container: fetches the SHA-256-pinned 16.16 PGDG build for Ubuntu 24.04, matches `postgres --version` against `^postgres \(PostgreSQL\) 16\.16([[:space:]]|$)`, fails when `ISSUE145_PG_BINDIR` is unset, runs `tests/test_issue145_pg_restart.py`, and gates its JUnit XML with a minimum of 5 passes — a skip fails the job | see PR #151 checks |
+| `.github/workflows/issue145-application-pg16.yml` (`restart-runtime-reconnect`) | **isolated restart job, no `services:` block**, so it never restarts or mutates the shared service container: fetches the SHA-256-pinned 16.16 PGDG build for Ubuntu 24.04, matches `postgres --version` against a 16.16 version pattern anchored to whitespace or end-of-line (the exact pattern is quoted below the table), fails when `ISSUE145_PG_BINDIR` is unset, runs `tests/test_issue145_pg_restart.py`, and gates its JUnit XML with a minimum of 5 passes — a skip fails the job | see PR #151 checks |
 | `scripts/pytest_gate.py` | gates **all four** suites independently: integration, migration/SQLite regression, PostgreSQL compatibility, and the restart/reconnection module. The JUnit XML report and the recorded pytest exit status are authoritative; the text log is diagnostic only. The job fails on a missing or non-zero recorded exit status, a missing/malformed JUnit report (including a DOCTYPE), an inconsistent report (counter/summary vs testcases), any failure, error or skip, and fewer passes than the declared minimum. The minimums are floors, not exact counts, so a suite that silently stops collecting is still caught by the structure checks | 80 / 181 / 122 / 5 minimums; negative controls in `TestPytestGate` |
+
+The gate arguments are quoted here rather than in the table, because a
+Markdown table treats `|` as a cell separator even inside a code span:
+
+```text
+--suite "integration|80|issue145-application.xml|issue145-application.rc"
+--suite "regression|181|issue145-regression.xml|issue145-regression.rc"
+--suite "compatibility|122|postgres-compatibility.xml|postgres-compatibility.rc"
+--suite "restart|5|issue145-restart.xml|issue145-restart.rc"
+```
+
+Each is an argument to `scripts/pytest_gate.py`. The `postgres --version`
+pattern used by the restart job is quoted in point 2 below for the same reason.
 
 Three evidence classes are kept distinct:
 
@@ -684,13 +715,20 @@ passed to `scripts/pytest_gate.py`.
 * The endpoint-equivalence proof covers same-host URLs and explicitly
 declared aliases only, and comma-separated migration host lists are refused
 rather than proven host by host. After preflight, every new migration
-  connection re-checks the proven identity, so a reconnect cannot silently land
-  on an unproven cluster. The identity is proven by the cluster's
-  `system_identifier` plus the database name and `pg_database` OID, all of
-  which survive a restart; the postmaster start time is diagnostic and is never
-  compared as identity. A revoked or absent `pg_control_system()` fails closed
-  with the one grant that restores it — there is no weaker fallback to
-  accidentally accept. `system_identifier` does not distinguish Neon branches
+  connection re-checks the proven identity, so a reconnect whose observed
+  signature differs, whose identifier is unreadable, or whose endpoint is
+  outside the configured host-equivalence policy is refused before it can run a
+  protected statement. That refusal is bounded by what the signature can prove:
+  a target reached through the same permitted hostname or a declared alias that
+  also preserves the database name, `pg_database` OID and `system_identifier`
+  (a physical copy, or a copy-on-write fork) presents an indistinguishable
+  signature and is therefore not detected. The identity is proven by the
+  cluster's `system_identifier` plus the database name and `pg_database` OID,
+  all of which survive a restart; the postmaster start time is diagnostic and
+  is never compared as identity. A revoked or absent `pg_control_system()`
+  fails closed with the one grant that restores it — there is no weaker
+  fallback to accidentally accept. `system_identifier` does not distinguish
+  Neon branches
   (a branch is a copy-on-write fork of the same cluster, so it shares the
   identifier and database OIDs); branch and endpoint separation is enforced by
   the static host/alias check instead, and no provider API is queried, so
