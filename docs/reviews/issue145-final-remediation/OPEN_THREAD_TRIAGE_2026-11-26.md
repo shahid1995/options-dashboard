@@ -10,15 +10,15 @@
 
 ## 1. Executive summary
 
-* The live inventory is **44 review threads: 20 resolved, 24 open**. Of the 24 open threads, **4 are marked outdated by GitHub**, 14 were authored by CodeRabbit and 10 by OpenCodeReview (`github-actions`). This matches the inventory the PR description reports, and the four `PRRT_kwDOT2Lkpc67ym*` identifiers supplied as an initial cross-check are still present and still open (and outdated).
-* **No Critical or High severity defect is confirmed at the head.** Every workflow on `479c7a1` that is supposed to decide the database work is green, and each gate minimum is currently satisfied with real counts (integration 83/80, regression 198/181, restart 5/5, compatibility 122/122).
+* The live inventory is **44 review threads: 20 resolved, 24 open**. Of the 24 open threads, **4 are marked outdated by GitHub**, 14 were authored by CodeRabbit and 10 by OpenCodeReview (`github-actions`). The PR description's overall totals (44 / 20 / 24) are correct, but its per-file workflow breakdown is not (§9). The four `PRRT_kwDOT2Lkpc67ym*` identifiers supplied as an initial cross-check are still present and still open (and outdated).
+* **No Critical or High severity finding was confirmed among the 24 open review threads examined in this triage.** This is a scope qualification, not a repository-wide security assessment. Every workflow on `479c7a1` that is supposed to decide the database work is green, and each gate minimum is currently satisfied with real counts (integration 83/80, regression 198/181, restart 5/5, compatibility 122/122).
 * **Five findings are ALREADY ADDRESSED by code at the head** and can be closed on evidence: the SQL-composition findings in the disposable-PostgreSQL fixture (`7ym7s`, `7ym7w`), the lease/control protocol-version mismatch (`7yqxK`), the time-zone-sensitive postmaster start time (`70wTv`), and the query-form endpoint preservation in `_derived_url` (`70wUI`).
 * **Four findings are STALE/OUTDATED** because the thresholds and parser they describe no longer exist (`7ym7O`, `7ym7c`, `7ym7h`, `7ym7l`). The stated maintainability trade-off in `7ym7O`/`7ym7c` is real but is an accepted design decision documented in the gate docstring, not a defect.
 * **One finding is a FALSE POSITIVE**: `68QJ3B` claims `not suite.minimum > 0` parses as `(not suite.minimum) > 0`. A local AST parse proves the parse is `not (> 0)`, so negative and zero minima are both rejected.
 * **Two Medium-severity, genuinely valid findings survive**, both in the SQLite target-equivalence validator: `%20` decoding (`68Ql-9`) and `?mode=` without `?uri=true` (`68Ql_C`). Both were reproduced against SQLAlchemy 2.0.43 with the real function body extracted from `app/db.py`.
 * **One Medium design residual is confirmed and already documented**: `68Ql_F`. The target proof cannot separate a physical copy / copy-on-write fork that preserves database name, `pg_database` OID and `system_identifier`. The runbook now says so; the remaining gap is that the compensating control is weaker than §10 implies (see §8).
 * Remaining open findings are **Low or Informational**, and almost all are confined to the disposable test harness or to test fidelity — not to application runtime.
-* Two documentation/description issues are reported but not fixed here: an overstatement in §10 of the runbook, and an undercount of workflow findings in the PR description.
+* Three documentation/description issues are reported but not fixed here: an overstatement in §10 of the runbook (§8), a same-target-identity overstatement in the `app/db.py` source docstrings and comment (§8.1), and an undercount of workflow findings in the PR description (§9).
 
 ---
 
@@ -152,7 +152,7 @@ Dispositions are exactly one of VALID / PARTIALLY VALID / FALSE POSITIVE / ALREA
 
 ## 6. High-priority findings and why they matter
 
-No Critical or High finding is confirmed. The two Medium-severity items that warrant remediation are:
+No Critical or High severity finding was confirmed among the 24 open review threads examined in this triage. The two Medium-severity items that warrant remediation are:
 
 1. **`68Ql-9` — SQLite URI path decoding.** The validator is the only thing standing between an operator and a migration applied to the wrong local file. It currently treats a percent-encoded plain path and a decoded URI as the same target, and treats a genuinely identical pair (`journal notes.db` vs its URI form) as different. This is fail-*open* in the first direction, which matters because the SQLite path hands Alembic the runtime engine: a mismatched migration URL is then silently ignored and the wrong file is migrated. Reachability is local development/test only; production is PostgreSQL.
 2. **`68Ql_C` — `?mode=` without `?uri=true`.** Same class and same consequence: a URL that opens a disk file is given the identity of an in-memory database. A "separate" migration target is therefore accepted.
@@ -242,6 +242,38 @@ Two sentences overstate the static check's strength.
 > `configured hosts and declared aliases.`
 
 Both are documentation-accuracy changes only. They do not alter the implementation, which already behaves as the corrected wording describes. Per the task, **the runbook was not edited**.
+
+### 8.1 Application-source documentation inconsistency — same target-identity limitation
+
+**Type:** documentation/specification inconsistency in application source. It is **not** a separate executable defect and **not** an additional open review thread.
+
+**Locations at head `479c7a1` (`options-dashboard-project/backend/app/db.py`):**
+
+| Location | Current wording |
+|---|---|
+| `1018–1032` — `_logical_target_identity()` docstring | "… so all three survive a restart, a crash recovery and a Neon compute suspend/wake, while a different cluster (different `system_identifier`, generated by `initdb`) or a different database in the same cluster (different name and OID) still differs." |
+| `1051–1065` — `_verify_logical_target()` docstring | "two connections that report the same `system_identifier`, database name and `pg_database` OID are served by one cluster and one database." |
+| `1119–1121` — comment above the `system_identifier` comparison at line `1122` | "two connections served by one cluster read the same initdb-generated system_identifier, and any other cluster has a different one." |
+
+**Why the wording overstates the proof.** `system_identifier` is written into `pg_control` when `initdb` creates a data directory, and `pg_database` OIDs are ordinary rows in that directory. A physical copy (`pg_basebackup`, a filesystem or volume copy) or a copy-on-write fork (a provider branch or snapshot, a filesystem snapshot clone) carries `pg_control` and the `pg_database` rows across verbatim. A target created that way therefore reports the *same* database name, `pg_database` OID and `system_identifier` as its source, even though it is a different data directory that will diverge on first write. The three statements are accurate for a cluster produced by its own `initdb` run; they are not accurate as stated for a cluster produced by copying one, so "any other cluster has a different one" and "are served by one cluster and one database" claim more than the tuple can establish. The `_logical_target_identity()` docstring is the weakest of the three because it attributes the identifier to `initdb`; the `_verify_logical_target()` docstring and the line-1122 comment carry the overstatement without that qualification.
+
+**Why this is a documentation/specification inconsistency, not a separate executable defect.** The comparison logic is correct and fail-closed for what it can observe: a differing identifier, a differing database name or OID, an unreadable identifier, or an endpoint outside the configured host-equivalence policy is refused before protected work begins, and the error paths fail closed with SQLSTATE `45004`. The code does not *rely* on the stronger claim — it compares an observed signature and rejects mismatches. The overstatement lives in the human-readable description of what that comparison means, which is exactly the residual already triaged as `PRRT_kwDOT2Lkpc68Ql_F` (PARTIALLY VALID, Medium). This subsection records the omission that the earlier report did not cover: the limitation is acknowledged in the corrected runbook but still contradicted by the application source's own docstrings and comment.
+
+**Correction direction (not authorised by this task; not made).** Qualify all three passages so they match the already-corrected runbook (`docs/ADR-017-018-IMPLEMENTATION-RUNBOOK.md:234–236`, which states that the identifier "is not by itself a proof of a *different* cluster, because a physical copy or copy-on-write fork of a data directory preserves it", and `:250–263`, "What the server-side proof does and does not establish"). Suggested wording, adapted to the source context:
+
+> The tuple is a restart-stable observed database signature, not a globally unique provider-target identity. Independently initialized clusters normally have different system identifiers, but physical copies and copy-on-write forks may preserve the identifier and database OIDs. Matching values establish equality of the observed signature under the configured host policy; they do not prove provider project or branch identity.
+
+For the line-1122 comment, the same correction would read: two connections served by one cluster read the same initdb-generated `system_identifier`; a *differing* identifier therefore refuses the connection, but a matching one does not prove the target is the original rather than a copy that preserved it.
+
+**Three distinct claims that must not be conflated:**
+
+1. **Equality of the observed identity signature.** Matching `(current_database(), pg_database.oid, system_identifier)` across the migration and runtime connections, and on every later reconnection, is what the code actually checks.
+2. **Rejection of a different signature or an out-of-policy endpoint.** A differing identifier, name or OID is refused, as is an endpoint that `_same_endpoint()` (`app/db.py:699–714`) does not admit — an identical `host:port` or an explicitly declared alias group. That is a string/declaration comparison and says nothing about the server behind an admitted host.
+3. **Proof of provider project or branch identity.** The tuple is not a Neon project, branch or compute-endpoint identifier, and no provider API is queried. This is the claim the three source passages currently imply and the one they must stop implying.
+
+**Relationship to §8 and to thread `PRRT_kwDOT2Lkpc68Ql_F`.** This is the same underlying limitation that §8 records for the operator-facing runbook and that `68Ql_F` raises for the target proof. It is cross-referenced here, **not** counted as an additional open review thread, and it changes no classification or priority in §5: the inventory remains 24 open threads. The distinction between the two documentation issues is location and register — §8 concerns the runbook, which already states the copy limitation but still overstates the static host check; §8.1 concerns the developer-facing docstrings and comment in `app/db.py`, which still assert the stronger, incorrect claim.
+
+**Status:** the source-documentation change is **not authorised by this task and was not made**. `app/db.py` is unmodified at `479c7a1`, and no test, workflow, migration, configuration or governance document was changed.
 
 ---
 
