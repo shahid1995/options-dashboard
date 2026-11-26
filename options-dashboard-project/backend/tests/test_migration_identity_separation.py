@@ -930,3 +930,188 @@ class TestSingleIdentityBackwardCompatibility:
 
         src = inspect.getsource(db_module.init_db)
         assert "_run_alembic_migrations(" in src
+
+
+class TestSqliteEffectiveTargetIdentity:
+    """ADR-017: SQLite identity is what the driver opens, not the URL text.
+
+    Every expectation here is derived from a real connection to the URL under
+    test: ``PRAGMA database_list`` reports the file SQLite actually opened, and
+    two independent engines establish whether an in-memory database is really
+    shared. The helper's own normalization is never used as the oracle.
+    """
+
+    @staticmethod
+    def _identity(url):
+        from app.db import _sqlite_target_identity
+
+        return _sqlite_target_identity(url)
+
+    @staticmethod
+    def _driver_target(url):
+        """(kind, realpath) of the database the pinned driver really opens."""
+        from sqlalchemy import create_engine, text
+
+        engine = create_engine(url)
+        try:
+            with engine.connect() as conn:
+                path = conn.execute(text("PRAGMA database_list")).one()[2]
+        finally:
+            engine.dispose()
+        if path == "":
+            return ("memory", None)
+        return ("file", os.path.realpath(path))
+
+    def _assert_identity_matches_driver(self, url):
+        identity = self._identity(url)
+        kind, path = self._driver_target(url)
+        assert identity[1] == kind, f"{url}: identity {identity} is not {kind}"
+        if kind == "file":
+            assert identity[0] == path, (
+                f"{url}: identity names {identity[0]!r} but the driver opened {path!r}"
+            )
+
+    def test_identity_matches_the_database_the_driver_opens(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        for url in (
+            "sqlite:///plain.db",
+            "sqlite:///journal%20notes.db",
+            "sqlite:///file:journal%20notes.db?uri=true",
+            "sqlite:///space notes.db",
+            "sqlite:///file:space%20notes.db?uri=true",
+            "sqlite:///file:memory-mode.db?mode=memory&uri=true",
+            "sqlite:///file:mode-rwc.db?mode=rwc&uri=true",
+            "sqlite:///:memory:",
+            "sqlite:///",
+        ):
+            self._assert_identity_matches_driver(url)
+
+    def test_percent_encoded_ordinary_name_differs_from_uri_decoded_name(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        literal = self._identity("sqlite:///journal%20notes.db")
+        decoded = self._identity("sqlite:///file:journal%20notes.db?uri=true")
+        # Both identities agree with what the driver really opens ...
+        self._assert_identity_matches_driver("sqlite:///journal%20notes.db")
+        self._assert_identity_matches_driver(
+            "sqlite:///file:journal%20notes.db?uri=true"
+        )
+        # ... and those are two different files.
+        assert "%20" in literal[0] and " " not in literal[0]
+        assert " " in decoded[0] and "%20" not in decoded[0]
+        assert literal != decoded
+
+    def test_ordinary_path_with_spaces_equals_the_equivalent_uri(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        plain = self._identity("sqlite:///space notes.db")
+        uri = self._identity("sqlite:///file:space%20notes.db?uri=true")
+        assert plain == uri
+        assert self._driver_target("sqlite:///space notes.db") == self._driver_target(
+            "sqlite:///file:space%20notes.db?uri=true"
+        )
+
+    def test_mode_and_cache_are_inert_outside_uri_mode(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        # The driver ignores mode/cache without a URI filename: it opens a file.
+        assert self._driver_target("sqlite:///ignored.db?mode=memory")[0] == "file"
+        assert self._identity("sqlite:///ignored.db?mode=memory") == self._identity(
+            "sqlite:///ignored.db"
+        )
+        assert self._identity(
+            "sqlite:///ignored.db?cache=shared"
+        ) == self._identity("sqlite:///ignored.db")
+        # With file: + uri=true the same options are effective.
+        assert (
+            self._driver_target("sqlite:///file:x.db?mode=memory&uri=true")[0]
+            == "memory"
+        )
+        assert self._identity("sqlite:///file:x.db?mode=memory&uri=true")[1] == "memory"
+
+    def test_shared_in_memory_is_shared_and_private_is_not(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        from sqlalchemy import create_engine, text
+
+        def sees_table(url, table):
+            engine = create_engine(url)
+            try:
+                with engine.connect() as conn:
+                    found = conn.execute(
+                        text(
+                            "SELECT count(*) FROM sqlite_master "
+                            "WHERE type='table' AND name=:t"
+                        ),
+                        {"t": table},
+                    ).scalar()
+                return bool(found)
+            finally:
+                engine.dispose()
+
+        shared = "sqlite:///file:shared-room?mode=memory&cache=shared&uri=true"
+        private = "sqlite:///file:private-room?mode=memory&cache=private&uri=true"
+        # Real behaviour: a shared-cache in-memory database is the same database
+        # across connections, a private one is not.
+        writer = create_engine(shared)
+        try:
+            with writer.connect() as conn:
+                conn.execute(text("CREATE TABLE shared_probe (x integer)"))
+                conn.commit()
+                assert sees_table(shared, "shared_probe")
+        finally:
+            writer.dispose()
+        writer = create_engine(private)
+        try:
+            with writer.connect() as conn:
+                conn.execute(text("CREATE TABLE private_probe (x integer)"))
+                conn.commit()
+                assert not sees_table(private, "private_probe")
+        finally:
+            writer.dispose()
+
+        shared_identity = self._identity(shared)
+        private_identity = self._identity(private)
+        assert shared_identity[1] == "memory" and private_identity[1] == "memory"
+        assert shared_identity != private_identity
+        assert self._identity(shared) == shared_identity
+
+    def test_repeated_or_malformed_query_parameters_fail_closed(self):
+        from app._migration_lease import LeaseError
+
+        import pytest
+
+        for url in (
+            "sqlite:///file:x.db?mode=memory&mode=rwc&uri=true",
+            "sqlite:///file:x.db?cache=shared&cache=private&uri=true",
+            "sqlite:///file:x.db?uri=true&uri=true",
+            "sqlite:///x.db?uri=maybe",
+            "sqlite:///file:x.db?mode=sideways&uri=true",
+            "sqlite:///file:x.db?cache=other&uri=true",
+            # ?uri=true without a file: name makes SQLite skip URI processing.
+            "sqlite:///x.db?uri=true",
+            # A file: name without ?uri=true is a literal filename.
+            "sqlite:///file:x.db",
+        ):
+            with pytest.raises(LeaseError):
+                self._identity(url)
+
+    def test_default_and_relative_paths_follow_the_working_directory(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        assert self._identity("sqlite:///./relative.db") == (
+            os.path.realpath(tmp_path / "relative.db"),
+            "file",
+            None,
+        )
+        absolute = "sqlite:////tmp/absolute-identity.db"
+        assert self._identity(absolute) == (
+            os.path.realpath("/tmp/absolute-identity.db"),
+            "file",
+            None,
+        )
+        # The default URL and the bare sqlite:/// form name one database.
+        from app.db import _DEFAULT_DB_PATH
+
+        assert self._identity(None) == (os.path.realpath(_DEFAULT_DB_PATH), "file", None)

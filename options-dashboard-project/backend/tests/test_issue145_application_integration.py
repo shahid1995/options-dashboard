@@ -369,6 +369,88 @@ def test_two_concurrent_startups_serialize_and_backfill_exactly_once(pg_topology
         raise AssertionError(f"backfill at head was not idempotent/exact: {counts}")
 
 
+def _observe_lease_lock(
+    prov: support.Provisioned, backend_pid: int | None = None
+) -> tuple[bool, bool, bool]:
+    """Prove from a second session that the lease row lock is really held.
+
+    A relation-OID entry in ``pg_locks`` is only the ACCESS SHARE lock taken by
+    the observing SELECT itself, so it cannot show row-level locking. Asking an
+    independent session for the same row with ``FOR UPDATE NOWAIT`` can: the
+    lock is held by the protected transaction exactly when that attempt is
+    refused with ``lock_not_available`` (SQLSTATE 55P03). The advisory migration
+    guard is probed the same way, with ``pg_try_advisory_xact_lock``, and when
+    ``backend_pid`` is given the guard lock must also be listed as granted for
+    *that* backend, so the lock is proven to belong to the session under test
+    rather than to some other activity in the database.
+    """
+    with psycopg.connect(prov.migrator_url) as observer:
+        owned_row = observer.execute(
+            "SELECT owner_token_hash IS NOT NULL "
+            "  FROM migration_internal.migration_lease "
+            " WHERE lease_name = 'migration-lease'"
+        ).fetchone()
+        guard_row = observer.execute(
+            "SELECT pg_try_advisory_xact_lock(hashtextextended("
+            "'strikenova:migration_internal:migration_guard', 0))"
+        ).fetchone()
+        guard_owner = None
+        if backend_pid is not None:
+            guard_owner = observer.execute(
+                "SELECT count(*) FROM pg_locks "
+                " WHERE pid = %s AND locktype = 'advisory' AND granted",
+                (backend_pid,),
+            ).fetchone()
+        observer.rollback()
+        row_locked = False
+        try:
+            observer.execute(
+                "SELECT 1 FROM migration_internal.migration_lease "
+                " WHERE lease_name = 'migration-lease' FOR UPDATE NOWAIT"
+            ).fetchone()
+        except psycopg.errors.LockNotAvailable:
+            row_locked = True
+        observer.rollback()
+    owned = bool(owned_row and owned_row[0])
+    guard_locked = not bool(guard_row and guard_row[0])
+    if backend_pid is not None and not (guard_owner and guard_owner[0]):
+        # The guard is held, but not by the connection running this step.
+        guard_locked = False
+    return (owned, row_locked, guard_locked)
+
+
+def _assert_lease_enter_is_first_statement(
+    transactions: list[dict], *, users: list[str]
+) -> None:
+    """Prove MigrationLease.enter() is the first SQL of every protected transaction.
+
+    ``transactions`` holds one bucket per DBAPI-level transaction, in execution
+    order, each with the statements that ran inside it. A transaction that
+    enters the lease must open with that entry: any statement executed before
+    it - including an unrelated SELECT that a wrapper might add - would sit at
+    index 0 and fail here.
+    """
+    lease_transactions = [
+        tx
+        for tx in transactions
+        if any("lease_enter_v1" in statement for statement in tx["statements"])
+    ]
+    # One DDL transaction (its enter pair) plus one transaction per user.
+    if len(lease_transactions) != 1 + len(users):
+        raise AssertionError(
+            "expected the DDL transaction and one transaction per user to enter "
+            f"the lease, got {len(lease_transactions)}: "
+            f"{[tx['statements'][:2] for tx in lease_transactions]}"
+        )
+    for tx in lease_transactions:
+        first = tx["statements"][0]
+        if "lease_enter_v1" not in first:
+            raise AssertionError(
+                "a protected transaction executed SQL before "
+                f"MigrationLease.enter(): {first!r}"
+            )
+
+
 def _assert_protected_backfill_trace(
     events: list[dict], *, migrator_role: str, users: list[str]
 ) -> None:
@@ -431,9 +513,19 @@ def _assert_protected_backfill_trace(
                 f"{event['event']} for {event['user']} ran as "
                 f"{event['current_user']}, not {migrator_role}"
             )
-        if event["lease_locks"] < 1:
+        if not event["lease_owned"]:
             raise AssertionError(
-                f"{event['event']} for {event['user']} lost the lease row lock"
+                f"{event['event']} for {event['user']}: the lease row is unowned"
+            )
+        if not event["lease_row_locked"]:
+            raise AssertionError(
+                f"{event['event']} for {event['user']}: an independent session "
+                "could take the lease row lock, so it was not held"
+            )
+        if not event["lease_guard_locked"]:
+            raise AssertionError(
+                f"{event['event']} for {event['user']}: the advisory migration "
+                "guard was not held"
             )
 
 
@@ -442,30 +534,60 @@ def test_backfill_uses_migrator_identity_and_per_user_transactions(pg_ready, mon
     support.seed_legacy_users(pg_ready.admin_database_url, users=3)
 
     import app.services.leg_exposure as leg
+    from sqlalchemy import event as sa_event
 
-    # One ordered trace of every lease-protected step of this startup. An event
-    # is appended only after the wrapped call has run, so no entry can describe
-    # SQL that has not executed yet, and the list order is the execution order
-    # (startup is single-threaded).
+    # ---- B1: capture every SQL statement, grouped by its transaction --------
+    #
+    # SQLAlchemy's "begin" hook fires when the DBAPI-level transaction opens
+    # (before its first statement) and "before_cursor_execute" fires for every
+    # statement the application sends. The observation path therefore issues no
+    # SQL and cannot reorder anything: an unrelated statement placed ahead of
+    # MigrationLease.enter() becomes index 0 of its bucket and fails below.
+    transactions: list[dict] = []
+
+    def _transaction_opened(conn):  # noqa: ANN001 - SQLAlchemy hook signature
+        transactions.append({"statements": []})
+
+    def _statement_executed(conn, cursor, statement, parameters, context, executemany):
+        if not transactions:
+            transactions.append({"statements": []})
+        transactions[-1]["statements"].append(statement)
+
+    # The lease, the DDL and the backfill all run on the dedicated migration
+    # engine that _migration_engine() builds per call, so every engine it
+    # returns is instrumented before use.
+    real_migration_engine = db_module._migration_engine
+
+    def traced_migration_engine():
+        engine_ = real_migration_engine()
+        sa_event.listen(engine_, "begin", _transaction_opened)
+        sa_event.listen(engine_, "before_cursor_execute", _statement_executed)
+        return engine_
+
+    monkeypatch.setattr(db_module, "_migration_engine", traced_migration_engine)
+
+    # ---- one ordered trace of every lease-protected step -------------------
     events: list[dict] = []
 
     def record(executor, *, event: str, user: str | None) -> None:
         row = executor.execute(
-            db_module.text(
-                "SELECT current_user, txid_current(), "
-                " (SELECT count(*) FROM pg_locks l "
-                "   WHERE l.pid = pg_backend_pid() "
-                "     AND l.relation = 'migration_internal.migration_lease'::regclass "
-                "     AND l.granted) AS lease_locks"
-            )
+            db_module.text("SELECT current_user, txid_current(), pg_backend_pid()")
         ).one()
+        owned, row_locked, guard_locked = _observe_lease_lock(
+            pg_ready, backend_pid=int(row[2])
+        )
         events.append(
             {
                 "event": event,
                 "user": user,
                 "current_user": row[0],
                 "txid": int(row[1]),
-                "lease_locks": int(row[2]),
+                "lease_owned": owned,
+                "lease_row_locked": row_locked,
+                "lease_guard_locked": guard_locked,
+                # Retained so the trace helper keeps one simple invariant: the
+                # lease is owned and locked, proven from a second session.
+                "lease_locks": int(owned and row_locked and guard_locked),
             }
         )
 
@@ -503,6 +625,18 @@ def test_backfill_uses_migrator_identity_and_per_user_transactions(pg_ready, mon
     _assert_protected_backfill_trace(
         events, migrator_role=pg_ready.migrator_role, users=users
     )
+    _assert_lease_enter_is_first_statement(transactions, users=users)
+
+    # Control: with no protected transaction open, the same probe reports the
+    # row and guard as free, so the True values above are discriminating.
+    _, row_locked_after, guard_locked_after = _observe_lease_lock(pg_ready)
+    if row_locked_after or guard_locked_after:
+        raise AssertionError(
+            "the lease-lock probe reports a lock outside a protected "
+            "transaction, so it cannot prove anything inside one"
+        )
+
+
 
 
 def test_backfill_failure_rolls_back_user_and_releases_lease(pg_ready, monkeypatch):

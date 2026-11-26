@@ -1249,14 +1249,26 @@ _SQLITE_CACHES = frozenset({"shared", "private"})
 def _sqlite_target_identity(url: str | None) -> tuple[str, str, str | None]:
     """Canonical identity of the SQLite database a URL really opens.
 
-    Path equality alone is not target equality: ``?mode=memory`` turns a
-    file-shaped name into a *shared in-memory* database, ``?mode=rwc`` is the
-    ordinary file mode, and a ``file:`` name is only a URI when ``?uri=true``
-    is present. The returned identity distinguishes those cases. Ambiguous or
-    unsupported combinations are refused instead of being treated as the same
-    target, and two ordinary file URLs for the same path still compare equal.
+    Identity is what the pinned driver resolves, not what the URL text says.
+    Verified against SQLAlchemy 2.0.43 / SQLite 3.45.1 with ``PRAGMA
+    database_list``:
+
+    * ``sqlite:///journal%20notes.db`` opens a file whose name contains the
+      literal ``%20``; ``sqlite:///file:journal%20notes.db?uri=true`` has SQLite
+      decode the URI and opens ``journal notes.db``. Those are different files.
+    * SQLite only interprets ``mode``/``cache`` when ``uri=true`` *and* the name
+      is a ``file:`` URI. Without both, the driver opens the literal path and
+      the options are inert, so they must not change identity.
+    * A ``file:`` name without ``?uri=true`` is a plain filename, and
+      ``?uri=true`` without a ``file:`` name makes SQLite skip URI processing;
+      both are refused as ambiguous instead of guessed at.
+
+    The returned identity distinguishes file databases from private/shared
+    in-memory databases, and two ordinary file URLs for the same path still
+    compare equal.
     """
     from sqlalchemy.engine import make_url
+    from urllib.parse import unquote
 
     if not url:
         return (os.path.realpath(_DEFAULT_DB_PATH), "file", None)
@@ -1270,7 +1282,17 @@ def _sqlite_target_identity(url: str | None) -> tuple[str, str, str | None]:
         raise _config_error(
             f"expected a SQLite URL, got the {parsed.get_backend_name()!r} dialect"
         )
-    query = {str(key).lower(): str(value) for key, value in (parsed.query or {}).items()}
+    query: dict[str, str] = {}
+    for key, value in (parsed.query or {}).items():
+        name = str(key).lower()
+        if not isinstance(value, str):
+            # SQLAlchemy represents a repeated parameter as a tuple; stringifying
+            # it would invent a meaning the driver never sees.
+            raise _config_error(
+                f"the SQLite query parameter {name!r} repeats; refusing an "
+                "ambiguous target"
+            )
+        query[name] = value
     database = parsed.database or ""
     uri_value = query.get("uri")
     if uri_value is None:
@@ -1292,18 +1314,55 @@ def _sqlite_target_identity(url: str | None) -> tuple[str, str, str | None]:
             "ambiguous target"
         )
     if uri:
-        database = database[len("file:") :]
-    mode = query.get("mode", "memory" if database in ("", ":memory:") else "rwc")
-    if mode not in _SQLITE_MODES:
-        raise _config_error(f"unsupported SQLite mode {mode!r}")
-    cache = query.get("cache")
-    if cache is not None and cache not in _SQLITE_CACHES:
-        raise _config_error(f"unsupported SQLite cache {cache!r}")
+        # SQLite URI processing: the driver decodes the filename, so ``%20`` in
+        # a URI is a space while the same text outside a URI is literal.
+        database = unquote(database[len("file:"):])
+
+    declared_mode = query.get("mode")
+    if declared_mode is not None and declared_mode not in _SQLITE_MODES:
+        raise _config_error(f"unsupported SQLite mode {declared_mode!r}")
+    declared_cache = query.get("cache")
+    if declared_cache is not None and declared_cache not in _SQLITE_CACHES:
+        raise _config_error(f"unsupported SQLite cache {declared_cache!r}")
+
+    default_mode = "memory" if database in ("", ":memory:") else "rwc"
+    # The driver honours these two only for a URI filename; otherwise the URL
+    # text is inert and the database is the literal path.
+    mode = (declared_mode or default_mode) if uri else default_mode
+    cache = declared_cache if uri else None
+
     if mode == "memory":
         return (database or ":memory:", "memory", cache)
     if not database:
         raise _config_error("a file-mode SQLite URL must name a database file")
     return (os.path.realpath(database), "file", None)
+
+
+def _sqlite_declares_inert_memory(url: str | None) -> bool:
+    """True when a URL asks for ``mode=memory`` the driver would not honour.
+
+    Verified against the pinned driver: ``?mode=memory`` only takes effect for a
+    ``file:`` URI name with ``?uri=true``. Everywhere else SQLite opens the
+    literal path, so a URL that declares an in-memory database silently names a
+    file instead - the opposite of the declared target.
+    """
+    from sqlalchemy.engine import make_url
+
+    if not url:
+        return False
+    try:
+        parsed = make_url(url)
+    except Exception:  # noqa: BLE001 - identity validation reports parse errors
+        return False
+    if parsed.get_backend_name() != "sqlite":
+        return False
+    query = {str(key).lower(): value for key, value in (parsed.query or {}).items()}
+    mode = query.get("mode")
+    if not isinstance(mode, str) or mode.lower() != "memory":
+        return False
+    uri_value = query.get("uri")
+    uri = isinstance(uri_value, str) and uri_value.lower() in {"true", "1", "yes"}
+    return not (uri and (parsed.database or "").startswith("file:"))
 
 
 def _assert_sqlite_migration_target(
@@ -1318,6 +1377,14 @@ def _assert_sqlite_migration_target(
     """
     if not (migration_url or "").lower().startswith("sqlite"):
         return migration_url
+    for candidate in (runtime_url, migration_url):
+        if _sqlite_declares_inert_memory(candidate):
+            raise _config_error(
+                "a separate SQLite migration URL is not supported: ?mode=memory "
+                "has no effect without ?uri=true on a file: database name, so "
+                "the driver would open a file while the URL appears to name an "
+                "in-memory database"
+            )
     if _sqlite_target_identity(runtime_url) != _sqlite_target_identity(migration_url):
         raise _config_error(
             "a separate SQLite migration URL is not supported: Alembic is given "
