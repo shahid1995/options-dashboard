@@ -369,6 +369,30 @@ def test_two_concurrent_startups_serialize_and_backfill_exactly_once(pg_topology
         raise AssertionError(f"backfill at head was not idempotent/exact: {counts}")
 
 
+def _guard_lock_granted(observer, backend_pid: int) -> bool:
+    """True only when *backend_pid* holds the exact migration-guard lock.
+
+    PostgreSQL stores the one-bigint advisory-lock form in ``pg_locks`` as
+    ``classid`` = the high 32 bits, ``objid`` = the low 32 bits (both unsigned)
+    and ``objsubid = 1``; the two-integer form uses ``objsubid = 2``. Counting
+    every granted advisory lock of a backend (the earlier probe) accepts any
+    unrelated advisory lock as evidence, so the components are derived from the
+    very expression the lease uses (``lease_mod.GUARD_SQL``) and compared
+    exactly.
+    """
+    key = observer.execute(f"SELECT {lease_mod.GUARD_SQL}").fetchone()[0]
+    classid = (key >> 32) & 0xFFFFFFFF
+    objid = key & 0xFFFFFFFF
+    row = observer.execute(
+        "SELECT count(*) FROM pg_locks "
+        " WHERE pid = %s AND locktype = 'advisory' AND objsubid = 1 "
+        "   AND granted "
+        "   AND classid::bigint = %s AND objid::bigint = %s",
+        (backend_pid, classid, objid),
+    ).fetchone()
+    return bool(row and row[0])
+
+
 def _observe_lease_lock(
     prov: support.Provisioned, backend_pid: int | None = None
 ) -> tuple[bool, bool, bool]:
@@ -381,8 +405,8 @@ def _observe_lease_lock(
     refused with ``lock_not_available`` (SQLSTATE 55P03). The advisory migration
     guard is probed the same way, with ``pg_try_advisory_xact_lock``, and when
     ``backend_pid`` is given the guard lock must also be listed as granted for
-    *that* backend, so the lock is proven to belong to the session under test
-    rather than to some other activity in the database.
+    *that* backend under the exact guard key, so the lock is proven to belong to
+    the session under test rather than to some other activity in the database.
     """
     with psycopg.connect(prov.migrator_url) as observer:
         owned_row = observer.execute(
@@ -396,11 +420,7 @@ def _observe_lease_lock(
         ).fetchone()
         guard_owner = None
         if backend_pid is not None:
-            guard_owner = observer.execute(
-                "SELECT count(*) FROM pg_locks "
-                " WHERE pid = %s AND locktype = 'advisory' AND granted",
-                (backend_pid,),
-            ).fetchone()
+            guard_owner = _guard_lock_granted(observer, backend_pid)
         observer.rollback()
         row_locked = False
         try:
@@ -413,10 +433,70 @@ def _observe_lease_lock(
         observer.rollback()
     owned = bool(owned_row and owned_row[0])
     guard_locked = not bool(guard_row and guard_row[0])
-    if backend_pid is not None and not (guard_owner and guard_owner[0]):
-        # The guard is held, but not by the connection running this step.
+    if backend_pid is not None and not guard_owner:
+        # The guard is held, but not by the connection running this step under
+        # the exact migration-guard key.
         guard_locked = False
     return (owned, row_locked, guard_locked)
+
+
+class _StatementTrace:
+    """SQL statement buckets keyed by the physical connection that ran them.
+
+    SQLAlchemy fires ``begin``/``commit``/``rollback`` for the connection whose
+    DBAPI transaction opens or ends, and ``before_cursor_execute`` for the
+    connection executing the statement, so keying buckets by the DBAPI
+    connection keeps two interleaved transactions apart: a statement from
+    another physical connection has no bucket to land in. A pooled connection
+    that begins another transaction starts a fresh bucket and therefore cannot
+    inherit a previous transaction's statements. The callbacks issue no SQL, so
+    they cannot reorder what they observe.
+    """
+
+    def __init__(self) -> None:
+        self.transactions: list[dict] = []
+        self._active: dict[int, dict] = {}
+
+    @staticmethod
+    def _dbapi(conn):  # noqa: ANN001 - SQLAlchemy event argument
+        return conn.connection.dbapi_connection
+
+    def _opened(self, conn):  # noqa: ANN001 - SQLAlchemy event argument
+        dbapi = self._dbapi(conn)
+        bucket = {
+            "connection": id(dbapi),
+            # Holding the connection keeps its id from being reused by a later
+            # object, so an association can never be silently reassigned.
+            "connection_ref": dbapi,
+            "statements": [],
+        }
+        self.transactions.append(bucket)
+        self._active[bucket["connection"]] = bucket
+
+    def _ended(self, conn):  # noqa: ANN001 - SQLAlchemy event argument
+        self._active.pop(id(self._dbapi(conn)), None)
+
+    def _executed(
+        self, conn, cursor, statement, parameters, context, executemany
+    ):  # noqa: ANN001 - SQLAlchemy event arguments
+        dbapi = self._dbapi(conn)
+        key = id(dbapi)
+        bucket = self._active.get(key)
+        if bucket is None:
+            bucket = {"connection": key, "connection_ref": dbapi, "statements": []}
+            self.transactions.append(bucket)
+            self._active[key] = bucket
+        bucket["statements"].append(
+            {"sql": statement, "connection": key, "parameters": parameters}
+        )
+
+    def instrument(self, engine_) -> None:  # noqa: ANN001 - SQLAlchemy engine
+        from sqlalchemy import event
+
+        event.listen(engine_, "begin", self._opened)
+        event.listen(engine_, "before_cursor_execute", self._executed)
+        event.listen(engine_, "commit", self._ended)
+        event.listen(engine_, "rollback", self._ended)
 
 
 def _assert_lease_enter_is_first_statement(
@@ -424,16 +504,19 @@ def _assert_lease_enter_is_first_statement(
 ) -> None:
     """Prove MigrationLease.enter() is the first SQL of every protected transaction.
 
-    ``transactions`` holds one bucket per DBAPI-level transaction, in execution
-    order, each with the statements that ran inside it. A transaction that
+    ``transactions`` holds one bucket per DBAPI-level transaction on the
+    connections the trace observed, in execution order, each with the
+    statements (and the connection that ran them) inside it. A transaction that
     enters the lease must open with that entry: any statement executed before
     it - including an unrelated SELECT that a wrapper might add - would sit at
-    index 0 and fail here.
+    index 0 and fail here. Every bucket is also required to be single-
+    connection, so a statement from another physical connection can never be
+    credited to this transaction.
     """
     lease_transactions = [
         tx
         for tx in transactions
-        if any("lease_enter_v1" in statement for statement in tx["statements"])
+        if any("lease_enter_v1" in statement["sql"] for statement in tx["statements"])
     ]
     # One DDL transaction (its enter pair) plus one transaction per user.
     if len(lease_transactions) != 1 + len(users):
@@ -442,13 +525,61 @@ def _assert_lease_enter_is_first_statement(
             f"the lease, got {len(lease_transactions)}: "
             f"{[tx['statements'][:2] for tx in lease_transactions]}"
         )
-    for tx in lease_transactions:
-        first = tx["statements"][0]
-        if "lease_enter_v1" not in first:
+    traced_users: list[str] = []
+    for index, tx in enumerate(lease_transactions):
+        statements = tx["statements"]
+        connections = {statement["connection"] for statement in statements}
+        if connections != {tx["connection"]}:
+            raise AssertionError(
+                "statements from another physical connection were attributed to "
+                f"this transaction: {connections} vs {tx['connection']}"
+            )
+        enters = [
+            position
+            for position, statement in enumerate(statements)
+            if "lease_enter_v1" in statement["sql"]
+        ]
+        if enters[0] != 0:
             raise AssertionError(
                 "a protected transaction executed SQL before "
-                f"MigrationLease.enter(): {first!r}"
+                f"MigrationLease.enter(): {statements[0]['sql']!r}"
             )
+        if len(enters) != 2:
+            raise AssertionError(
+                "every protected transaction must enter the lease at its start "
+                f"and again before commit, got {len(enters)} entries: "
+                f"{[s['sql'][:60] for s in statements]}"
+            )
+        between = statements[enters[0] + 1 : enters[1]]
+        if not between:
+            raise AssertionError(
+                "nothing ran between the two lease entries, so the pre-commit "
+                f"entry is not protecting completed work: {[s['sql'][:60] for s in statements]}"
+            )
+        if index == 0:
+            # The first protected transaction is the guarded migration/DDL one.
+            continue
+        rendered = " ".join(
+            f"{statement['sql']} {statement['parameters']!r}" for statement in between
+        )
+        owners = [user for user in users if user in rendered]
+        if len(owners) != 1:
+            raise AssertionError(
+                "the backfill between the two lease entries is not attributable "
+                f"to exactly one user: {owners} in {rendered[:400]}"
+            )
+        if not any(
+            "strategy_leg_exposures" in statement["sql"] for statement in between
+        ):
+            raise AssertionError(
+                f"{owners[0]}: the completed backfill does not sit between the two "
+                "lease entries"
+            )
+        traced_users.append(owners[0])
+    if sorted(traced_users) != sorted(users) or len(set(traced_users)) != len(users):
+        raise AssertionError(
+            f"expected one protected transaction per user {users}, got {traced_users}"
+        )
 
 
 def _assert_protected_backfill_trace(
@@ -534,24 +665,14 @@ def test_backfill_uses_migrator_identity_and_per_user_transactions(pg_ready, mon
     support.seed_legacy_users(pg_ready.admin_database_url, users=3)
 
     import app.services.leg_exposure as leg
-    from sqlalchemy import event as sa_event
 
-    # ---- B1: capture every SQL statement, grouped by its transaction --------
+    # ---- B1: capture every SQL statement per physical connection -----------
     #
-    # SQLAlchemy's "begin" hook fires when the DBAPI-level transaction opens
-    # (before its first statement) and "before_cursor_execute" fires for every
-    # statement the application sends. The observation path therefore issues no
-    # SQL and cannot reorder anything: an unrelated statement placed ahead of
-    # MigrationLease.enter() becomes index 0 of its bucket and fails below.
-    transactions: list[dict] = []
-
-    def _transaction_opened(conn):  # noqa: ANN001 - SQLAlchemy hook signature
-        transactions.append({"statements": []})
-
-    def _statement_executed(conn, cursor, statement, parameters, context, executemany):
-        if not transactions:
-            transactions.append({"statements": []})
-        transactions[-1]["statements"].append(statement)
+    # Each bucket belongs to one DBAPI transaction on one connection, so an
+    # unrelated statement placed ahead of MigrationLease.enter() becomes index 0
+    # of its bucket and fails below, while a statement from another connection
+    # can never be attributed to this transaction.
+    trace = _StatementTrace()
 
     # The lease, the DDL and the backfill all run on the dedicated migration
     # engine that _migration_engine() builds per call, so every engine it
@@ -560,8 +681,7 @@ def test_backfill_uses_migrator_identity_and_per_user_transactions(pg_ready, mon
 
     def traced_migration_engine():
         engine_ = real_migration_engine()
-        sa_event.listen(engine_, "begin", _transaction_opened)
-        sa_event.listen(engine_, "before_cursor_execute", _statement_executed)
+        trace.instrument(engine_)
         return engine_
 
     monkeypatch.setattr(db_module, "_migration_engine", traced_migration_engine)
@@ -625,7 +745,7 @@ def test_backfill_uses_migrator_identity_and_per_user_transactions(pg_ready, mon
     _assert_protected_backfill_trace(
         events, migrator_role=pg_ready.migrator_role, users=users
     )
-    _assert_lease_enter_is_first_statement(transactions, users=users)
+    _assert_lease_enter_is_first_statement(trace.transactions, users=users)
 
     # Control: with no protected transaction open, the same probe reports the
     # row and guard as free, so the True values above are discriminating.
@@ -637,6 +757,119 @@ def test_backfill_uses_migrator_identity_and_per_user_transactions(pg_ready, mon
         )
 
 
+
+
+def test_statement_trace_keeps_interleaved_connections_separate(pg):
+    """The trace associates statements with their own connection transaction."""
+    from sqlalchemy import create_engine, text
+
+    trace = _StatementTrace()
+    url = db_module.normalize_database_url(pg.migrator_url)
+    first = create_engine(url)
+    second = create_engine(url)
+    trace.instrument(first)
+    trace.instrument(second)
+    try:
+        with first.connect() as a:
+            a.execute(text("SELECT 'first-a'"))
+            with second.connect() as b:
+                b.execute(text("SELECT 'second-a'"))
+                a.execute(text("SELECT 'first-b'"))
+                a.commit()
+                b.execute(text("SELECT 'second-b'"))
+                b.commit()
+            # The pooled connection is reused: a new transaction must get a new
+            # bucket instead of appending to the committed one.
+            a.execute(text("SELECT 'first-after-commit'"))
+            a.commit()
+    finally:
+        first.dispose()
+        second.dispose()
+
+    def composed(bucket):
+        return " ".join(statement["sql"] for statement in bucket["statements"])
+
+    buckets = trace.transactions
+    if len(buckets) != 3:
+        raise AssertionError(
+            "expected three transactions (two interleaved, one after commit), "
+            f"got {[composed(bucket) for bucket in buckets]}"
+        )
+    for bucket in buckets:
+        connections = {statement["connection"] for statement in bucket["statements"]}
+        if connections != {bucket["connection"]}:
+            raise AssertionError(
+                "a bucket mixed statements from several physical connections: "
+                f"{connections} vs {bucket['connection']}"
+            )
+    first_bucket, second_bucket, reused_bucket = buckets
+    if "first-a" not in composed(first_bucket) or "first-b" not in composed(
+        first_bucket
+    ):
+        raise AssertionError(f"the first connection lost its statements: {composed(first_bucket)}")
+    if "second-" in composed(first_bucket):
+        raise AssertionError(
+            f"another connection's statement leaked into the first transaction: {composed(first_bucket)}"
+        )
+    if "second-a" not in composed(second_bucket) or "second-b" not in composed(
+        second_bucket
+    ):
+        raise AssertionError(
+            f"the second connection lost its statements: {composed(second_bucket)}"
+        )
+    if "first-" in composed(second_bucket):
+        raise AssertionError(
+            f"another connection's statement leaked into the second transaction: {composed(second_bucket)}"
+        )
+    if composed(reused_bucket).strip() != "SELECT 'first-after-commit'":
+        raise AssertionError(
+            "a reused connection inherited its previous transaction's bucket: "
+            f"{composed(reused_bucket)}"
+        )
+    if reused_bucket["connection"] != first_bucket["connection"]:
+        raise AssertionError(
+            "the post-commit transaction did not run on the same pooled connection, "
+            "so the reuse case was not exercised"
+        )
+
+
+def test_guard_lock_check_requires_the_exact_migration_guard_key(pg):
+    """An unrelated advisory lock must not satisfy the guard-ownership probe."""
+    unrelated = psycopg.connect(pg.migrator_url)
+    holder = psycopg.connect(pg.migrator_url)
+    observer = psycopg.connect(pg.migrator_url)
+    try:
+        unrelated_pid = unrelated.execute("SELECT pg_backend_pid()").fetchone()[0]
+        unrelated.execute(
+            "SELECT pg_advisory_xact_lock("
+            "hashtextextended('issue145:unrelated-advisory-lock', 0))"
+        )
+        # Control: the weaker "any granted advisory lock" count the earlier
+        # probe used is satisfied by this unrelated lock ...
+        naive = observer.execute(
+            "SELECT count(*) FROM pg_locks "
+            " WHERE pid = %s AND locktype = 'advisory' AND granted",
+            (unrelated_pid,),
+        ).fetchone()[0]
+        if not naive:
+            raise AssertionError(
+                "control failed: the unrelated advisory lock is not visible in pg_locks"
+            )
+        # ... so only exact-key attribution can tell the difference.
+        if _guard_lock_granted(observer, unrelated_pid):
+            raise AssertionError(
+                "an unrelated advisory lock satisfied the migration-guard check"
+            )
+        # Positive control: a session holding the exact guard key is detected.
+        holder_pid = holder.execute("SELECT pg_backend_pid()").fetchone()[0]
+        holder.execute(f"SELECT pg_advisory_xact_lock({lease_mod.GUARD_SQL})")
+        if not _guard_lock_granted(observer, holder_pid):
+            raise AssertionError(
+                "the exact migration-guard advisory lock was not detected"
+            )
+    finally:
+        for connection in (unrelated, holder, observer):
+            connection.close()
 
 
 def test_backfill_failure_rolls_back_user_and_releases_lease(pg_ready, monkeypatch):
