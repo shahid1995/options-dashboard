@@ -1259,13 +1259,22 @@ def _sqlite_target_identity(url: str | None) -> tuple[str, str, str | None]:
     * SQLite only interprets ``mode``/``cache`` when ``uri=true`` *and* the name
       is a ``file:`` URI. Without both, the driver opens the literal path and
       the options are inert, so they must not change identity.
-    * A ``file:`` name without ``?uri=true`` is a plain filename, and
-      ``?uri=true`` without a ``file:`` name makes SQLite skip URI processing;
-      both are refused as ambiguous instead of guessed at.
+    * Query keys are case-sensitive. SQLAlchemy 2.0.43 coerces the literal key
+      ``uri`` into ``sqlite3.connect(uri=True)`` and hands every other option
+      to SQLite verbatim, and SQLite itself matches ``mode``/``cache``
+      case-sensitively. ``?URI=true`` therefore leaves URI processing off
+      (the driver opens a file literally named ``file:...``) and ``?MODE=`` /
+      ``?CACHE=`` are inert. Lower-casing keys would make the helper report a
+      database the driver never opens.
+    * A ``file:`` name without the exact ``?uri=true`` key is a plain filename,
+      and ``?uri=true`` without a ``file:`` name makes SQLite skip URI
+      processing; both are refused as ambiguous instead of guessed at.
 
     The returned identity distinguishes file databases from private/shared
     in-memory databases, and two ordinary file URLs for the same path still
-    compare equal.
+    compare equal. A private in-memory identity is intentionally *not* a
+    claim that two connections share one database: :func:`_assert_sqlite_migration_target`
+    refuses such a target.
     """
     from sqlalchemy.engine import make_url
     from urllib.parse import unquote
@@ -1284,7 +1293,10 @@ def _sqlite_target_identity(url: str | None) -> tuple[str, str, str | None]:
         )
     query: dict[str, str] = {}
     for key, value in (parsed.query or {}).items():
-        name = str(key).lower()
+        # Keys keep their exact spelling: the driver only honours ``uri``,
+        # ``mode`` and ``cache`` as written, so folding case here would report
+        # a target the driver never opens.
+        name = str(key)
         if not isinstance(value, str):
             # SQLAlchemy represents a repeated parameter as a tuple; stringifying
             # it would invent a meaning the driver never sees.
@@ -1310,8 +1322,8 @@ def _sqlite_target_identity(url: str | None) -> tuple[str, str, str | None]:
         )
     if database.startswith("file:") and not uri:
         raise _config_error(
-            "a SQLite file: database name requires ?uri=true; refusing an "
-            "ambiguous target"
+            "a SQLite file: database name requires the exact query key "
+            "?uri=true; refusing an ambiguous target"
         )
     if uri:
         # SQLite URI processing: the driver decodes the filename, so ``%20`` in
@@ -1339,12 +1351,18 @@ def _sqlite_target_identity(url: str | None) -> tuple[str, str, str | None]:
 
 
 def _sqlite_declares_inert_memory(url: str | None) -> bool:
-    """True when a URL asks for ``mode=memory`` the driver would not honour.
+    """True when a URL asks for an in-memory database the driver will not open.
 
-    Verified against the pinned driver: ``?mode=memory`` only takes effect for a
-    ``file:`` URI name with ``?uri=true``. Everywhere else SQLite opens the
-    literal path, so a URL that declares an in-memory database silently names a
-    file instead - the opposite of the declared target.
+    Verified against the pinned driver: an in-memory target only exists for the
+    exact ``mode=memory`` key on a ``file:`` URI name with the exact ``uri``
+    key set to true. Everywhere else SQLite opens a file, so a URL whose query
+    still reads as a memory request silently names a file instead - the
+    opposite of the declared target.
+
+    The spelling check is deliberately case-insensitive even though the driver
+    is not: ``?MODE=memory`` is *ignored* by the driver (SQLite matches query
+    parameter names case-sensitively), so it is exactly as misleading as
+    ``?mode=memory`` without ``uri`` and is refused for the same reason.
     """
     from sqlalchemy.engine import make_url
 
@@ -1356,13 +1374,21 @@ def _sqlite_declares_inert_memory(url: str | None) -> bool:
         return False
     if parsed.get_backend_name() != "sqlite":
         return False
-    query = {str(key).lower(): value for key, value in (parsed.query or {}).items()}
-    mode = query.get("mode")
-    if not isinstance(mode, str) or mode.lower() != "memory":
+    options = {str(key): value for key, value in (parsed.query or {}).items()}
+    declares_memory = any(
+        key.lower() == "mode" and isinstance(value, str) and value.lower() == "memory"
+        for key, value in options.items()
+    )
+    if not declares_memory:
         return False
-    uri_value = query.get("uri")
+    # Only the exact keys the driver reads can make that declaration effective.
+    uri_value = options.get("uri")
     uri = isinstance(uri_value, str) and uri_value.lower() in {"true", "1", "yes"}
-    return not (uri and (parsed.database or "").startswith("file:"))
+    return not (
+        options.get("mode") == "memory"
+        and uri
+        and (parsed.database or "").startswith("file:")
+    )
 
 
 def _assert_sqlite_migration_target(
@@ -1380,12 +1406,29 @@ def _assert_sqlite_migration_target(
     for candidate in (runtime_url, migration_url):
         if _sqlite_declares_inert_memory(candidate):
             raise _config_error(
-                "a separate SQLite migration URL is not supported: ?mode=memory "
-                "has no effect without ?uri=true on a file: database name, so "
-                "the driver would open a file while the URL appears to name an "
+                "a separate SQLite migration URL is not supported: the URL "
+                "declares an in-memory database the driver would not open (an "
+                "exact ?mode=memory key is only honoured on a file: database "
+                "name with the exact ?uri=true key), so the driver would "
+                "silently use a file while the URL appears to name an "
                 "in-memory database"
             )
-    if _sqlite_target_identity(runtime_url) != _sqlite_target_identity(migration_url):
+    runtime_identity = _sqlite_target_identity(runtime_url)
+    migration_identity = _sqlite_target_identity(migration_url)
+    for identity in (runtime_identity, migration_identity):
+        if identity[1] == "memory" and identity[2] != "shared":
+            # A private in-memory database is per connection: the engine may
+            # open several physical connections (one per pooled worker), each
+            # with its own empty database, so no stable migration target can
+            # be proven. The shared-cache form is the only in-memory target the
+            # driver actually shares between connections.
+            raise _config_error(
+                "a private in-memory SQLite target is not supported: every "
+                "physical connection opens its own database, so the migration "
+                "target cannot be the runtime database; use a file target or "
+                "a file:...?mode=memory&cache=shared&uri=true target"
+            )
+    if runtime_identity != migration_identity:
         raise _config_error(
             "a separate SQLite migration URL is not supported: Alembic is given "
             "the runtime SQLite engine, so the configured migration target must "

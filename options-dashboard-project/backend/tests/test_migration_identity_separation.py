@@ -937,8 +937,15 @@ class TestSqliteEffectiveTargetIdentity:
 
     Every expectation here is derived from a real connection to the URL under
     test: ``PRAGMA database_list`` reports the file SQLite actually opened, and
-    two independent engines establish whether an in-memory database is really
+    independent engines establish whether an in-memory database is really
     shared. The helper's own normalization is never used as the oracle.
+
+    The pinned driver (SQLAlchemy 2.0.43 / SQLite 3.45.1) reads the query keys
+    exactly as written: only ``uri`` reaches ``sqlite3.connect(uri=True)`` and
+    SQLite matches ``mode``/``cache`` case-sensitively, so case-variant keys are
+    inert. Identity mirrors that, and the migration-target policy refuses a
+    private in-memory target rather than treating one URL string as one shared
+    database.
     """
 
     @staticmethod
@@ -946,6 +953,26 @@ class TestSqliteEffectiveTargetIdentity:
         from app.db import _sqlite_target_identity
 
         return _sqlite_target_identity(url)
+
+    @staticmethod
+    def _assert_target_refused(url, migration_url=None):
+        """Call the policy layer and return the refusal message it raised."""
+        from app._migration_lease import LeaseError
+
+        import pytest
+
+        from app.db import _assert_sqlite_migration_target
+
+        with pytest.raises(LeaseError) as exc:
+            _assert_sqlite_migration_target(url, migration_url or url)
+        assert exc.value.sqlstate == "45004"
+        return str(exc.value)
+
+    @staticmethod
+    def _assert_target_accepted(url, migration_url=None):
+        from app.db import _assert_sqlite_migration_target
+
+        return _assert_sqlite_migration_target(url, migration_url or url)
 
     @staticmethod
     def _driver_target(url):
@@ -1029,6 +1056,165 @@ class TestSqliteEffectiveTargetIdentity:
             == "memory"
         )
         assert self._identity("sqlite:///file:x.db?mode=memory&uri=true")[1] == "memory"
+
+    def test_the_uri_key_is_case_sensitive(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        # SQLAlchemy coerces only the literal key ``uri``; ``URI`` is not it, so
+        # the driver opens a *file* literally named ``file:upper-uri.db`` (the
+        # query string is dropped because URI processing stayed off).
+        upper = "sqlite:///file:upper-uri.db?URI=true"
+        assert self._driver_target(upper) == (
+            "file",
+            os.path.realpath("file:upper-uri.db"),
+        )
+        # Identity must not claim the URI-decoded ``upper-uri.db`` instead.
+        message = self._assert_target_refused(upper)
+        assert "requires the exact query key" in message
+        assert self._identity("sqlite:///file:lower-uri.db?uri=true") == (
+            os.path.realpath("lower-uri.db"),
+            "file",
+            None,
+        )
+        self._assert_identity_matches_driver("sqlite:///file:lower-uri.db?uri=true")
+        # Outside a file: name the same key is simply an ordinary file URL:
+        # the driver ignores the whole query, exactly as identity reports.
+        self._assert_identity_matches_driver("sqlite:///plain-uri.db?URI=true")
+
+    def test_case_variant_mode_is_inert_and_refused(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        # SQLite matches query parameter names case-sensitively, so ``MODE`` is
+        # passed through and ignored: the driver opens the named file.
+        url = "sqlite:///file:MODE-case.db?MODE=memory&uri=true"
+        assert self._driver_target(url) == (
+            "file",
+            os.path.realpath("MODE-case.db"),
+        )
+        identity = self._identity(url)
+        assert identity == (os.path.realpath("MODE-case.db"), "file", None)
+        assert identity == self._identity("sqlite:///file:MODE-case.db?uri=true")
+        # A URL that reads as a memory request the driver will not honour is
+        # refused rather than silently resolved to the file the driver opens.
+        message = self._assert_target_refused(url)
+        assert "in-memory database the driver would not open" in message
+        # Without uri=true the whole query is dropped by the driver.
+        plain = "sqlite:///MODE-case2.db?MODE=memory"
+        assert self._driver_target(plain) == (
+            "file",
+            os.path.realpath("MODE-case2.db"),
+        )
+        self._assert_identity_matches_driver(plain)
+        self._assert_target_refused(plain)
+
+    def test_case_variant_cache_does_not_share_a_memory_database(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        from sqlalchemy import create_engine, text
+
+        url = "sqlite:///file:cache-case?mode=memory&CACHE=shared&uri=true"
+        # ``CACHE`` is not the key SQLite reads, so the database is private:
+        # two independent physical connections are two different databases.
+        assert self._driver_target(url)[0] == "memory"
+        assert self._identity(url) == ("cache-case", "memory", None)
+        writer = create_engine(url)
+        try:
+            with writer.connect() as conn:
+                conn.execute(text("CREATE TABLE case_probe (x integer)"))
+                conn.commit()
+            reader = create_engine(url)
+            try:
+                with reader.connect() as conn:
+                    seen = conn.execute(
+                        text(
+                            "SELECT count(*) FROM sqlite_master "
+                            "WHERE type='table' AND name='case_probe'"
+                        )
+                    ).scalar()
+            finally:
+                reader.dispose()
+        finally:
+            writer.dispose()
+        assert not seen, "an upper-case CACHE=shared must not share a memory database"
+        message = self._assert_target_refused(url)
+        assert "private in-memory SQLite target is not supported" in message
+
+    def test_mixed_case_duplicate_parameters_follow_the_driver(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        # The exact key decides; the upper-case spelling is inert, in either
+        # order, because SQLite reads only ``mode``.
+        memory_first = "sqlite:///file:mix-a.db?mode=memory&MODE=rwc&uri=true"
+        assert self._driver_target(memory_first)[0] == "memory"
+        assert self._identity(memory_first) == ("mix-a.db", "memory", None)
+        file_first = "sqlite:///file:mix-b.db?mode=rwc&MODE=memory&uri=true"
+        assert self._driver_target(file_first) == (
+            "file",
+            os.path.realpath("mix-b.db"),
+        )
+        assert self._identity(file_first) == (
+            os.path.realpath("mix-b.db"),
+            "file",
+            None,
+        )
+        # The memory-looking spelling still fails closed instead of being
+        # silently normalised into the exact key.
+        self._assert_target_refused(file_first)
+
+    def test_named_private_memory_is_not_a_shared_target(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        from sqlalchemy import create_engine, text
+
+        url = "sqlite:///file:private-room-regression?mode=memory&cache=private&uri=true"
+        # Two independent physical connections opened with the *identical* URL
+        # are two different databases: the URL string proves nothing.
+        writer = create_engine(url)
+        try:
+            with writer.connect() as conn:
+                conn.execute(text("CREATE TABLE private_probe (x integer)"))
+                conn.commit()
+            reader = create_engine(url)
+            try:
+                with reader.connect() as conn:
+                    seen = conn.execute(
+                        text(
+                            "SELECT count(*) FROM sqlite_master "
+                            "WHERE type='table' AND name='private_probe'"
+                        )
+                    ).scalar()
+            finally:
+                reader.dispose()
+        finally:
+            writer.dispose()
+        assert not seen, "a private in-memory database is per physical connection"
+
+        # Identity still reports the declared target ...
+        assert self._identity(url) == (
+            "private-room-regression",
+            "memory",
+            "private",
+        )
+        # ... but the policy refuses it, so identical strings are never accepted
+        # as one shared migration target. This is the negative control: an
+        # implementation that accepted private memory would pass no assertion
+        # here.
+        message = self._assert_target_refused(url)
+        assert "private in-memory SQLite target is not supported" in message
+        # The bare :memory: target has the same defect and is refused too.
+        assert self._identity("sqlite:///:memory:") == (":memory:", "memory", None)
+        self._assert_target_refused("sqlite:///:memory:")
+        # Only the shared-cache form is genuinely shared, and it stays accepted.
+        shared = "sqlite:///file:private-room-regression?mode=memory&cache=shared&uri=true"
+        assert self._identity(shared) == (
+            "private-room-regression",
+            "memory",
+            "shared",
+        )
+        assert self._assert_target_accepted(shared) == shared
 
     def test_shared_in_memory_is_shared_and_private_is_not(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
