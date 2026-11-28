@@ -1301,3 +1301,57 @@ class TestSqliteEffectiveTargetIdentity:
         from app.db import _DEFAULT_DB_PATH
 
         assert self._identity(None) == (os.path.realpath(_DEFAULT_DB_PATH), "file", None)
+
+    def test_private_memory_runtime_is_refused_with_a_sqlite_migration_url(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        private = "sqlite:///file:runtime-private?mode=memory&uri=true"
+        assert self._identity(private) == ("runtime-private", "memory", None)
+        message = self._assert_target_refused(private, private)
+        assert "private in-memory SQLite target is not supported" in message
+
+    def test_private_memory_runtime_is_refused_with_a_non_sqlite_migration_url(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        private = "sqlite:///file:runtime-private?mode=memory&uri=true"
+        # A non-PostgreSQL, non-SQLite dialect never needs a real connection:
+        # the runtime target is refused before the migration URL is examined.
+        migration = "mysql+pymysql://migrator:pw@db.example:3306/options"
+        message = self._assert_target_refused(private, migration)
+        assert "private in-memory SQLite target is not supported" in message
+
+    def test_bare_memory_runtime_is_refused_with_a_non_sqlite_migration_url(self):
+        runtime = "sqlite:///:memory:"
+        assert self._identity(runtime) == (":memory:", "memory", None)
+        migration = "mysql+pymysql://migrator:pw@db.example:3306/options"
+        message = self._assert_target_refused(runtime, migration)
+        assert "private in-memory SQLite target is not supported" in message
+
+    def test_file_backed_runtime_policy_is_unchanged(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        file_url = "sqlite:///runtime-file.db"
+        assert self._identity(file_url) == (
+            os.path.realpath("runtime-file.db"),
+            "file",
+            None,
+        )
+        assert self._assert_target_accepted(file_url) == file_url
+        # A non-SQLite migration URL is still returned unchanged for a file target.
+        migration = "mysql+pymysql://migrator:pw@db.example:3306/options"
+        assert self._assert_target_accepted(file_url, migration) == migration
+        # A different SQLite file is still refused: the single-identity policy
+        # that predates the runtime-target fix is untouched.
+        message = self._assert_target_refused(file_url, "sqlite:///other.db")
+        assert "separate SQLite migration URL is not supported" in message
+
+    def test_shared_cache_memory_runtime_remains_accepted(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        shared = "sqlite:///file:runtime-shared?mode=memory&cache=shared&uri=true"
+        assert self._identity(shared) == ("runtime-shared", "memory", "shared")
+        assert self._assert_target_accepted(shared) == shared
+        # A shared-cache memory target is genuinely shared, so the non-SQLite
+        # migration URL early return is still allowed.
+        migration = "mysql+pymysql://migrator:pw@db.example:3306/options"
+        assert self._assert_target_accepted(shared, migration) == migration

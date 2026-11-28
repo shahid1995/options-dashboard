@@ -1400,7 +1400,26 @@ def _assert_sqlite_migration_target(
     naming a *different* SQLite file would silently migrate the runtime file
     while the configured target stayed untouched. SQLite keeps the historical
     single-identity behaviour, which means one database only.
+
+    A private in-memory runtime target is refused *before* the migration URL's
+    dialect is considered: the engine can open several physical connections,
+    each with its own empty database, so no migration target can be proven to
+    be the runtime database. Only the shared-cache form, which the driver
+    really shares between connections, is an acceptable in-memory target.
     """
+    runtime_is_sqlite = (runtime_url or "").lower().startswith("sqlite")
+    runtime_identity = _sqlite_target_identity(runtime_url) if runtime_is_sqlite else None
+    if (
+        runtime_identity is not None
+        and runtime_identity[1] == "memory"
+        and runtime_identity[2] != "shared"
+    ):
+        raise _config_error(
+            "a private in-memory SQLite target is not supported: every "
+            "physical connection opens its own database, so the migration "
+            "target cannot be the runtime database; use a file target or "
+            "a file:...?mode=memory&cache=shared&uri=true target"
+        )
     if not (migration_url or "").lower().startswith("sqlite"):
         return migration_url
     for candidate in (runtime_url, migration_url):
@@ -1413,21 +1432,19 @@ def _assert_sqlite_migration_target(
                 "silently use a file while the URL appears to name an "
                 "in-memory database"
             )
-    runtime_identity = _sqlite_target_identity(runtime_url)
+    if runtime_identity is None:
+        runtime_identity = _sqlite_target_identity(runtime_url)
     migration_identity = _sqlite_target_identity(migration_url)
-    for identity in (runtime_identity, migration_identity):
-        if identity[1] == "memory" and identity[2] != "shared":
-            # A private in-memory database is per connection: the engine may
-            # open several physical connections (one per pooled worker), each
-            # with its own empty database, so no stable migration target can
-            # be proven. The shared-cache form is the only in-memory target the
-            # driver actually shares between connections.
-            raise _config_error(
-                "a private in-memory SQLite target is not supported: every "
-                "physical connection opens its own database, so the migration "
-                "target cannot be the runtime database; use a file target or "
-                "a file:...?mode=memory&cache=shared&uri=true target"
-            )
+    if migration_identity[1] == "memory" and migration_identity[2] != "shared":
+        # The migration URL names a private in-memory database: each physical
+        # connection would open its own empty database, so the migration could
+        # never touch the runtime database.
+        raise _config_error(
+            "a private in-memory SQLite target is not supported: every "
+            "physical connection opens its own database, so the migration "
+            "target cannot be the runtime database; use a file target or "
+            "a file:...?mode=memory&cache=shared&uri=true target"
+        )
     if runtime_identity != migration_identity:
         raise _config_error(
             "a separate SQLite migration URL is not supported: Alembic is given "
