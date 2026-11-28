@@ -1,0 +1,322 @@
+name: Issue #145 - ADR-017/018 application integration (PostgreSQL 16.16)
+
+# Runs the REAL application migration path against a disposable, isolated
+# PostgreSQL 16.16 service container:
+#   * app.db.init_db() / concurrent startup, Alembic under the lease
+#   * per-user backfill as the migration identity, kill and failure recovery
+#   * python -m app.migrate upgrade / bootstrap-lease / barrier / protocol
+#   * ADR-018 privilege boundary (runtime vs migrator vs owner)
+#
+# No persistent volume, no provider credential, no Neon connection and no
+# production or staging database is contacted. The suite provisions and drops
+# its own uniquely named databases and roles.
+#
+# The job fails when any assertion fails or any test is skipped: pytest's exit
+# status and log are preserved in a side file and validated by
+# scripts/pytest_gate.py for BOTH suites (integration and regression).
+
+# PR #146 targets ``feat/strikenova-day35-portfolio-intelligence``, so that base
+# branch is listed explicitly: a pull_request workflow filtered on ``main``
+# never runs for this PR. Pushes to the implementation branch and to the
+# dedicated test branch run the same job.
+on:
+  push:
+    branches:
+      - issue-145-fix
+      - test/issue145-application-pg16
+  pull_request:
+    branches:
+      - feat/strikenova-day35-portfolio-intelligence
+  workflow_dispatch:
+
+concurrency:
+  # One run per workflow + ref: a newer push to the same branch or PR cancels
+  # the stale run instead of stacking another PostgreSQL service container.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  application-integration:
+    name: PostgreSQL 16.16 application lease integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        # Pinned digest of postgres:16.16 (the acceptance version).
+        image: postgres@sha256:3950ad7c3148ca2175ef1b6c36c9efbf78957ae8fbe8b3a5d7c35af50500382f
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+          POSTGRES_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}-issue145
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    defaults:
+      run:
+        working-directory: options-dashboard-project/backend
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          # Key the pip cache on both dependency declarations so a changed
+          # requirement invalidates it; no secrets or database state are cached.
+          cache: pip
+          cache-dependency-path: |
+            options-dashboard-project/backend/requirements.lock
+            options-dashboard-project/backend/requirements-py313.lock
+            options-dashboard-project/backend/requirements.txt
+            options-dashboard-project/backend/requirements-dev.txt
+
+      - name: Install backend dependencies
+        run: |
+          # Binary-only installs (no sdist build scripts run) and an exact pip
+          # pin: the workflow never executes package build code, and the
+          # installer version is reproducible.
+          python -m pip install --upgrade --only-binary :all: "pip==26.3"
+          # requirements.lock is the full resolved closure of requirements.txt
+          # + requirements-dev.txt for CPython 3.12/Linux x86_64, with every
+          # version pinned and every file of that version hashed. Hash-checking
+          # mode makes pip refuse any artifact it did not verify, and it fails
+          # closed if the lock and the requirements files ever diverge.
+          python -m pip install --only-binary :all: --require-hashes \
+            -r requirements.lock
+
+      - name: Configure disposable PostgreSQL connection
+        env:
+          PG_SERVICE_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}-issue145
+        run: |
+          echo "::add-mask::$PG_SERVICE_PASSWORD"
+          printf 'ISSUE145_PG_ADMIN_URL=postgresql://postgres:%s@127.0.0.1:5432/postgres\n' "$PG_SERVICE_PASSWORD" >> "$GITHUB_ENV"
+
+      - name: Require PostgreSQL 16.16 exactly
+        run: |
+          python - <<'PY'
+          import os
+          import psycopg
+
+          with psycopg.connect(os.environ["ISSUE145_PG_ADMIN_URL"]) as conn:
+              banner = conn.execute("SHOW server_version").fetchone()[0]
+              num = int(conn.execute("SHOW server_version_num").fetchone()[0])
+              sysid = conn.execute(
+                  "SELECT system_identifier FROM pg_control_system()"
+              ).fetchone()[0]
+          print("server_version:", banner)
+          print("server_version_num:", num)
+          print("system_identifier:", sysid)
+          if num != 160016:
+              raise SystemExit(f"expected PostgreSQL 16.16 (160016), got {num}")
+          PY
+
+      - name: ADR-017/018 application integration tests
+        env:
+          STRIKENOVA_ENV: ""
+        run: |
+          set +e
+          python -m pytest -q \
+              tests/test_issue145_application_integration.py \
+              --junitxml=issue145-application.xml > issue145-application.log 2>&1
+          rc=$?
+          echo "$rc" > issue145-application.rc
+          exit 0
+
+      - name: Migration and SQLite regression suite
+        env:
+          STRIKENOVA_ENV: ""
+        run: |
+          set +e
+          python -m pytest -q \
+              tests/test_migration_serialization.py \
+              tests/test_db_migration.py \
+              tests/test_migration_identity_separation.py \
+              tests/test_alembic_migrations.py \
+              tests/test_alembic_single_head.py \
+              tests/test_alembic_env_resolution.py \
+              tests/test_day5_alembic_authority.py \
+              tests/test_leg_exposure.py \
+              --junitxml=issue145-regression.xml > issue145-regression.log 2>&1
+          rc=$?
+          echo "$rc" > issue145-regression.rc
+          exit 0
+
+      - name: Gate on the actual test results
+        if: always()
+        run: |
+          set -uo pipefail
+          for stem in issue145-application issue145-regression; do
+            rc=$(cat "$stem.rc" 2>/dev/null || echo "missing")
+            echo "===== $stem (exit $rc) ====="
+            tail -n 60 "$stem.log" 2>/dev/null || echo "no log produced"
+          done
+          # Both suites are gated independently and fail closed on a missing
+          # or non-zero exit code, a missing/malformed/inconsistent JUnit
+          # report, a failed/errored/skipped test, or fewer passes than the
+          # declared minimum. The JUnit XML is the only count source; the text
+          # logs above are diagnostics and cannot override it.
+          python scripts/pytest_gate.py \
+            --suite "integration|80|issue145-application.xml|issue145-application.rc" \
+            --suite "regression|181|issue145-regression.xml|issue145-regression.rc"
+
+      - name: Drop leftover test databases and roles
+        if: always()
+        run: |
+          python - <<'PY'
+          import os
+          import psycopg
+
+          try:
+              with psycopg.connect(os.environ["ISSUE145_PG_ADMIN_URL"], autocommit=True) as conn:
+                  dbs = [r[0] for r in conn.execute(
+                      "SELECT datname FROM pg_database WHERE datname LIKE 'sn145\\_%'"
+                  )]
+                  for db in dbs:
+                      conn.execute(
+                          "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                          "WHERE datname = %s AND pid <> pg_backend_pid()", (db,)
+                      )
+                      conn.execute(f'DROP DATABASE IF EXISTS "{db}"')
+                  roles = [r[0] for r in conn.execute(
+                      "SELECT rolname FROM pg_roles WHERE rolname LIKE 'sn145\\_%'"
+                  )]
+                  for role in roles:
+                      conn.execute(f'DROP ROLE IF EXISTS "{role}"')
+                  print(f"cleanup: dropped {len(dbs)} database(s), {len(roles)} role(s)")
+          except Exception as exc:  # noqa: BLE001 - cleanup must not mask results
+              print(f"cleanup skipped: {type(exc).__name__}")
+          PY
+
+      - name: Upload sanitized evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue145-application-pg16-evidence
+          path: |
+            options-dashboard-project/backend/issue145-application.log
+            options-dashboard-project/backend/issue145-application.xml
+            options-dashboard-project/backend/issue145-regression.log
+            options-dashboard-project/backend/issue145-regression.xml
+            options-dashboard-project/backend/issue145-application.rc
+            options-dashboard-project/backend/issue145-regression.rc
+            options-dashboard-project/backend/scripts/pytest_gate.py
+          if-no-files-found: warn
+          retention-days: 14
+
+  # Isolated restart job. It deliberately has NO ``services:`` block: it must
+  # own the PostgreSQL binaries and the data directory it restarts, and must
+  # never restart or mutate the service container the three suites above share.
+  #
+  # The binaries are the exact 16.16 PGDG build for Ubuntu 24.04 (the same
+  # build the local proof used), fetched from the stable PGDG pool and pinned by
+  # SHA-256. The job asserts the exact server version, so a different build
+  # fails instead of being silently accepted, and the gate below fails on any
+  # skip — an unset ISSUE145_PG_BINDIR can never turn the required restart
+  # proof into a skipped test.
+  restart-runtime-reconnect:
+    name: PostgreSQL 16.16 restart and runtime-pool reconnection
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    env:
+      PG16_DEB_URL: https://apt.postgresql.org/pub/repos/apt/pool/main/p/postgresql-16/postgresql-16_16.16-1.pgdg24.04+1_amd64.deb
+      PG16_DEB_SHA256: 5f5d9933de23e7501bb484c8ae6d3bbef787b1fa3692529055b90280443deffa
+
+    defaults:
+      run:
+        working-directory: options-dashboard-project/backend
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            options-dashboard-project/backend/requirements.lock
+            options-dashboard-project/backend/requirements.txt
+            options-dashboard-project/backend/requirements-dev.txt
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade --only-binary :all: "pip==26.3"
+          python -m pip install --only-binary :all: --require-hashes \
+            -r requirements.lock
+
+      - name: Fetch exact PostgreSQL 16.16 binaries
+        run: |
+          set -euo pipefail
+          deb="$RUNNER_TEMP/postgresql-16.deb"
+          curl -fsSL --retry 3 --retry-delay 2 -o "$deb" "$PG16_DEB_URL"
+          echo "$PG16_DEB_SHA256  $deb" | sha256sum --check --strict -
+          root="$RUNNER_TEMP/pg16"
+          mkdir -p "$root"
+          dpkg-deb -x "$deb" "$root"
+          # postgres, initdb and pg_ctl all live in this one package; libpq5 is
+          # the only runtime dependency a stock ubuntu-24.04 image may lack.
+          sudo apt-get install -y --no-install-recommends libpq5
+          bindir="$root/usr/lib/postgresql/16/bin"
+          for tool in postgres initdb pg_ctl; do
+            test -x "$bindir/$tool" || { echo "::error::missing $tool in $bindir"; exit 1; }
+          done
+          version="$("$bindir/postgres" --version)"
+          echo "$version"
+          if ! printf '%s\n' "$version" |
+              grep -Eq '^postgres \(PostgreSQL\) 16\.16([[:space:]]|$)'; then
+            echo "::error::expected PostgreSQL 16.16, got: $version"
+            exit 1
+          fi
+          echo "ISSUE145_PG_BINDIR=$bindir" >> "$GITHUB_ENV"
+
+      - name: Require the restart binary directory
+        run: |
+          # A missing value would make the module skip; fail before pytest can.
+          : "${ISSUE145_PG_BINDIR:?ISSUE145_PG_BINDIR must be set; the restart proof must not be skipped}"
+
+      - name: Real restart and runtime-pool reconnection tests
+        env:
+          STRIKENOVA_ENV: ""
+        run: |
+          set +e
+          python -m pytest -q \
+              tests/test_issue145_pg_restart.py \
+              --junitxml=issue145-restart.xml > issue145-restart.log 2>&1
+          rc=$?
+          echo "$rc" > issue145-restart.rc
+          exit 0
+
+      - name: Gate on the actual restart results
+        if: always()
+        run: |
+          set -uo pipefail
+          rc=$(cat issue145-restart.rc 2>/dev/null || echo "missing")
+          echo "===== issue145-restart (exit $rc) ====="
+          tail -n 60 issue145-restart.log 2>/dev/null || echo "no log produced"
+          python scripts/pytest_gate.py \
+            --suite "restart|5|issue145-restart.xml|issue145-restart.rc"
+
+      - name: Upload sanitized evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue145-restart-pg16-evidence
+          path: |
+            options-dashboard-project/backend/issue145-restart.log
+            options-dashboard-project/backend/issue145-restart.xml
+            options-dashboard-project/backend/issue145-restart.rc
+          if-no-files-found: warn
+          retention-days: 14

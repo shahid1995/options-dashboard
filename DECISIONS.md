@@ -26,7 +26,15 @@ new migrations require independent evidence of a schema-contract gap. Evidence:
 `docs/PHASE_10_1A_DATABASE_MIGRATIONS.md`, `backend/alembic/`,
 `backend/tests/test_day5_alembic_authority.py`.
 
-## ADR-003 · Database portability with CockroachDB production target · Accepted
+## ADR-003 · Database portability with CockroachDB production target · Superseded by ADR-019
+
+> **Superseded (ADR-019, accepted on `main` in PR #148, 2026-11-20).**
+> CockroachDB is **retired**; the accepted strategic production database is
+> **Neon PostgreSQL** (PostgreSQL 16). Neon provisioning and production cutover
+> are separate authorized work and are **not** complete. The historical
+> CockroachDB evidence cited below is retained as historical record and is not
+> active target configuration. ADR-017/018 (the row-lock migration lease) is
+> PostgreSQL-only; `app/db.py` refuses an unleased CockroachDB migration path.
 
 The backend stays portable: SQLite for local development, PostgreSQL-compatible
 CI (service container), CockroachDB validated as the production runtime
@@ -34,14 +42,23 @@ CI (service container), CockroachDB validated as the production runtime
 Evidence: `docs/architecture/COCKROACH_RUNTIME_VALIDATION.md`,
 `docs/architecture/COCKROACH_LIVE_COMPATIBILITY_VALIDATION.md`,
 `backend/tests/test_cockroachdb_compat.py`, CI `PostgreSQL compatibility`.
+(Historical.)
 
-## ADR-004 · Railway superseded; production topology is Vercel/Render/CockroachDB · Accepted
+## ADR-004 · Railway superseded; production topology is Vercel/Render/Neon PostgreSQL · Superseded database target (ADR-019)
+
+> **Database target superseded (ADR-019, accepted on `main` in PR #148).** The
+> topology is frontend on **Vercel**, backend on **Render**, strategic production
+> database **Neon PostgreSQL** — not CockroachDB Cloud. Neither the Neon
+> instance nor any live role/grant configuration exists as part of this work;
+> no Render or Neon change is authorized here. The CockroachDB wording below is
+> historical.
 
 Railway was an early staging experiment (see `docs/RAILWAY_INFRASTRUCTURE_AUDIT.md`,
 2026-08-31 — historical). Current topology: frontend on **Vercel**, backend on
 **Render**, production database on **CockroachDB Cloud**. Evidence:
 `docs/architecture/VERCEL_STAGING_DEPLOYMENT.md`,
 `docs/architecture/RENDER_STAGING_DEPLOYMENT.md`, `frontend/vercel.json`.
+(Historical database target.)
 
 ## ADR-005 · BYOB broker architecture · Accepted
 
@@ -301,6 +318,19 @@ Render, redeploy, verify, then downgrade the runtime credential's grants).
 
 ## ADR-017 · Migration serialization via transactional lease lock · Accepted
 
+> **Superseded in part (2026-11-21, Issue #145).** The founder approved the
+> ADR-017/018 lease protocol (`docs/ADR-017-018-POSTGRES-LEASE-DESIGN.md`,
+> commit `ae2226e`), which retires the renewal thread described below. The
+> implemented protocol is a PostgreSQL row-lock lease with a 256-bit owner
+> token (only its SHA-256 hash stored), a versioned `SECURITY DEFINER`
+> function set in `migration_internal`, an authoritative `lease_protocol`
+> control row, a transaction-scoped cross-version advisory guard, a deployment
+> barrier, and `python -m app.migrate` as the only supported migration path.
+> A bare `alembic upgrade head` against PostgreSQL now fails closed. The
+> operating contract, runbook and measured TTL are recorded in
+> `docs/ADR-017-018-IMPLEMENTATION-RUNBOOK.md`. The historical decision text
+> below is retained for provenance.
+
 Context: every application instance runs `init_db() -> alembic upgrade head`
 during startup (Render free plan has no release command, so migrations cannot
 be moved to a deploy step without changing the deployment model). Two
@@ -327,8 +357,10 @@ Decision:
   (TTL >= 2) configurations. A crashed holder stops renewing;
   waiters take over the expired lease and re-run the idempotent chain, so a
   wedged holder can never block recovery permanently.
-* Waiters poll up to `MIGRATION_LOCK_WAIT_SECONDS` (default 900) and then
-  FAIL CLOSED (LeaseLockUnavailable) rather than race concurrent DDL.
+* *(Retired 2026-11-21)* Waiters polled up to `MIGRATION_LOCK_WAIT_SECONDS`
+  (default 900) and then failed closed. The implemented lease replaces this
+  with a monotonic admission budget (`MIGRATION_LEASE_WAIT_SECONDS`, default
+  180 s) over retryable SQLSTATEs only (`45002`, `55P03`, `40001`, `40P01`).
 * Lock lifecycle emits structured credential-free logs: acquisition started,
   acquired (incl. takeover flag), already-current observation, released.
 

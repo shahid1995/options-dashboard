@@ -1,5 +1,15 @@
 name: PostgreSQL compatibility
 
+# Credentials here are disposable and scoped to a single CI run. The PostgreSQL
+# service is an ephemeral container on a GitHub-hosted runner with no persistent
+# volume; the password is derived from the run id and attempt and dies with the
+# runner. It cannot reach Neon, Render, staging or production.
+#
+# The runner's own container-init line echoes the service env before any step
+# runs, so the value is not treated as a persistent secret. Every value a step
+# could print is masked as soon as it is derived, and no static password is
+# committed.
+
 on:
   push:
     paths:
@@ -10,17 +20,23 @@ on:
       - "options-dashboard-project/backend/**"
       - ".github/workflows/postgres-compatibility.yml"
 
+permissions:
+  contents: read
+
 jobs:
   postgres-compatibility:
     name: Backend PostgreSQL compatibility
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     services:
       postgres:
-        image: postgres:16
+        # Pinned digest of postgres:16.16 so the compatibility suites build
+        # their schemas on the acceptance version (server_version_num 160016).
+        image: postgres@sha256:3950ad7c3148ca2175ef1b6c36c9efbf78957ae8fbe8b3a5d7c35af50500382f
         env:
           POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
+          POSTGRES_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}-pgcompat
           POSTGRES_DB: strikenova_test
         ports:
           - 5432:5432
@@ -38,26 +54,124 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Configure disposable PostgreSQL credentials
+        run: |
+          # Derive the run-scoped credential from the default runner identity so
+          # the literal never lands in a step's env block, then mask it before
+          # any step can print it. The service container uses the same value.
+          pg_password="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-pgcompat"
+          echo "::add-mask::${pg_password}"
+          {
+            echo "ISSUE145_PG_ADMIN_URL=postgresql://postgres:${pg_password}@127.0.0.1:5432/postgres"
+            echo "TEST_DATABASE_URL=postgresql+psycopg://postgres:${pg_password}@127.0.0.1:5432/strikenova_test"
+          } >> "$GITHUB_ENV"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
 
       - name: Install backend dependencies
-        run: python -m pip install --upgrade pip && python -m pip install -r requirements-dev.txt
+        run: |
+          # Binary-only installs (no sdist build scripts run) and an exact pip
+          # pin. requirements-py313.lock is the full hash-locked closure for
+          # CPython 3.13/Linux x86_64 — this job keeps 3.13 coverage, so it
+          # installs the 3.13 sibling of requirements.lock rather than the
+          # unpinned requirements files.
+          python -m pip install --upgrade --only-binary :all: "pip==26.3"
+          python -m pip install --only-binary :all: --require-hashes \
+            -r requirements-py313.lock
 
+      - name: Require PostgreSQL 16.16 exactly
+        run: |
+          python - <<'PY'
+          import os
+          import psycopg
+
+          with psycopg.connect(os.environ["ISSUE145_PG_ADMIN_URL"]) as conn:
+              banner = conn.execute("SHOW server_version").fetchone()[0]
+              num = int(conn.execute("SHOW server_version_num").fetchone()[0])
+          print("server_version:", banner)
+          if num != 160016:
+              raise SystemExit(f"expected PostgreSQL 16.16 (160016), got {num}")
+          PY
+
+      # The suites below build their schemas through
+      # ``python -m app.migrate upgrade head`` against disposable, uniquely
+      # named databases/roles provisioned from ISSUE145_PG_ADMIN_URL. The
+      # admin URL is used only to CREATE/DROP those resources and to seed the
+      # import fixtures: no test engine connects as the cluster superuser.
+      # The exit status is captured first and the step ends with `exit 0` only
+      # so the gate step below can always run; the gate is what decides the
+      # job outcome.
       - name: Run PostgreSQL compatibility and migration safety tests
-        env:
-          TEST_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/strikenova_test
-        run: >-
-          python -m pytest -q
-          tests/test_postgres_compatibility.py
-          tests/test_sqlite_postgres_migration.py
-          tests/test_migrate_sqlite_to_postgres.py
-          tests/test_rehearsal_ci_database.py
-          tests/test_migration_hardening.py
-          tests/test_migration_failure_injection.py
-          tests/test_migration_large_rehearsal.py
-          tests/test_day5_alembic_authority.py
-          tests/test_day6_performance_baseline.py
-          tests/test_migration_rehearsal_postgres.py
+        run: |
+          set +e
+          python -m pytest -q -rs \
+              tests/test_postgres_compatibility.py \
+              tests/test_sqlite_postgres_migration.py \
+              tests/test_migrate_sqlite_to_postgres.py \
+              tests/test_rehearsal_ci_database.py \
+              tests/test_migration_hardening.py \
+              tests/test_migration_failure_injection.py \
+              tests/test_migration_large_rehearsal.py \
+              tests/test_day5_alembic_authority.py \
+              tests/test_day6_performance_baseline.py \
+              --junitxml=postgres-compatibility.xml > postgres-compatibility.log 2>&1
+          echo "$?" > postgres-compatibility.rc
+          exit 0
+
+      # A suite that skipped everything would also exit 0. This gate fails the
+      # job on a non-zero pytest status, a missing/malformed/inconsistent JUnit
+      # report, on any failure/error/skip, or when the passing count is lower
+      # than the declared minimum. The JUnit XML is the only count source; the
+      # text log above is diagnostics and cannot override it.
+      - name: Gate on the actual test results (no false green)
+        if: always()
+        run: |
+          set -uo pipefail
+          rc=$(cat postgres-compatibility.rc 2>/dev/null || echo missing)
+          echo "pytest exit status: $rc"
+          tail -n 40 postgres-compatibility.log 2>/dev/null || echo "no log produced"
+          python scripts/pytest_gate.py \
+            --suite "compatibility|122|postgres-compatibility.xml|postgres-compatibility.rc"
+
+      - name: Upload sanitized evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: postgres-compatibility-evidence
+          path: |
+            options-dashboard-project/backend/postgres-compatibility.log
+            options-dashboard-project/backend/postgres-compatibility.xml
+            options-dashboard-project/backend/postgres-compatibility.rc
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Drop leftover test databases and roles
+        if: always()
+        run: |
+          python - <<'PY'
+          import os
+          import psycopg
+
+          try:
+              with psycopg.connect(os.environ["ISSUE145_PG_ADMIN_URL"], autocommit=True) as conn:
+                  dbs = [r[0] for r in conn.execute(
+                      "SELECT datname FROM pg_database WHERE datname LIKE 'sn145\\_%'"
+                  )]
+                  for db in dbs:
+                      conn.execute(
+                          "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                          "WHERE datname = %s AND pid <> pg_backend_pid()", (db,)
+                      )
+                      conn.execute(f'DROP DATABASE IF EXISTS "{db}"')
+                  roles = [r[0] for r in conn.execute(
+                      "SELECT rolname FROM pg_roles WHERE rolname LIKE 'sn145\\_%'"
+                  )]
+                  for role in roles:
+                      conn.execute(f'DROP ROLE IF EXISTS "{role}"')
+                  print(f"cleanup: dropped {len(dbs)} database(s), {len(roles)} role(s)")
+          except Exception as exc:  # noqa: BLE001 - cleanup must not mask results
+              print(f"cleanup skipped: {type(exc).__name__}")
+          PY

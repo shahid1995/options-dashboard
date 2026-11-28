@@ -1,747 +1,988 @@
-"""ADR-017: migration serialization (transactional lease lock).
+"""ADR-017 migration lease — DB-free contract tests.
 
-Only one process may execute the migration chain at a time. These tests are
-hermetic: every database interaction is mocked at the module boundary, there
-are no module reloads, no global metadata mutation, and no test-order
-dependence. Real-database behavior is proven separately on disposable
-infrastructure (documented in ADR-017).
+The behavioural proof against PostgreSQL 16.16 lives in
+``test_issue145_application_integration.py``. These tests pin the properties
+that must hold without a database: token handling, SQL shape, SQLSTATE retry
+classification, configuration validation, fail-closed identity rules and the
+retirement of the renewal-thread design.
 """
-import uuid
-import datetime as _dt
-from unittest.mock import MagicMock, patch
+
+from __future__ import annotations
+
+import inspect
+import logging
+import math
+import pathlib
+import subprocess
+import sys
+from typing import ClassVar
+from unittest.mock import patch
 
 import pytest
 from pydantic import ValidationError
 
-import app._migration_lock as mlock
 import app.db as db_module
+from app import _migration_lease as lease
 from app.config import Settings
+from tests import issue145_pg_support as support
 
 
-# ---------------------------------------------------------------- helpers
-class _FakeCursor:
-    """Records statements; controllable rowcount/rows for acquire paths."""
-
-    def __init__(self, state):
-        self._state = state
-        self.rowcount = 0
-
-    def execute(self, stmt, params=None):
-        self._state["stmts"].append(stmt)
-        s = stmt.lower()
-        if "select locked_by" in s:
-            self._state["last_select"] = (self._state["held_by"], self._state["expires_at"])
-        elif "update _migration_lock set locked_by" in s and "expires_at <" in s:
-            held, _ = self._state.get("last_select", (None, None))
-            free_or_expired = held is None or self._state["expired"]
-            self.rowcount = 1 if free_or_expired else 0
-            if self.rowcount:
-                # record the ACTUAL owner token from the statement params
-                self._state["held_by"] = params[0]
-                self._state["expires_at"] = None
-        elif "update _migration_lock set locked_by = null" in s:
-            self.rowcount = 1 if self._state["held_by"] == params[0] else 0
-            if self.rowcount:
-                self._state["held_by"] = None
-        elif "update _migration_lock set expires_at" in s:
-            self.rowcount = 1 if self._state["held_by"] == params[1] else 0
-
-    def fetchone(self):
-        return self._state.get("last_select", (None, None))
+class _FakeOrig(Exception):
+    def __init__(self, sqlstate):
+        super().__init__("boom")
+        self.sqlstate = sqlstate
 
 
-class _FakeConn:
-    def __init__(self, state):
-        self.state = state
-
-    def cursor(self):
-        return _FakeCursor(self.state)
-
-    def commit(self):
-        pass
-
-    def rollback(self):
-        pass
-
-    def close(self):
-        pass
+class _FakeDBAPIError(Exception):
+    def __init__(self, sqlstate):
+        super().__init__("wrapped")
+        self.orig = _FakeOrig(sqlstate)
 
 
-def _fresh_state(owner="me", held_by=None, expired=False):
-    past = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=30)
-    return {
-        "owner": owner,
-        "held_by": held_by,
-        # an expired lease is represented by a genuinely past deadline
-        # (tz-aware, matching what CRDB returns for TIMESTAMPTZ)
-        "expires_at": past if (held_by and expired) else None,
-        "expired": expired,
-        "stmts": [],
-    }
+class TestOwnerCredentials:
+    def test_token_is_256_bits_of_hex(self):
+        token = lease.generate_token()
+        assert len(token) == 64
+        int(token, 16)
+        assert token != lease.generate_token()
+
+    def test_fingerprint_is_the_first_12_hex_of_the_hash(self):
+        token = lease.generate_token()
+        assert lease.fingerprint(token) == lease.token_hash(token)[:12]
+        assert len(lease.fingerprint(token)) == 12
+
+    def test_token_hash_matches_documented_sha256(self):
+        import hashlib
+
+        token = "a" * 64
+        assert lease.token_hash(token) == hashlib.sha256(token.encode()).hexdigest()
+
+    def test_lease_object_never_exposes_the_token(self):
+        guard = lease.MigrationLease(object(), token="b" * 64)  # type: ignore[arg-type]
+        assert "b" * 64 not in repr(guard)
+        assert guard.fingerprint == lease.fingerprint("b" * 64)
 
 
-# ------------------------------------------------- acquire / release
-class TestLeaseAcquire:
-    def test_acquire_on_free_lock(self):
-        state = _fresh_state()
-        with patch.object(mlock, "_connect", return_value=_FakeConn(state)):
-            acquired, took_over = mlock.try_acquire("postgresql://x", "me")
-        assert acquired is True
-        assert took_over is False
-        assert state["held_by"] == "me"
+class TestProtocolSql:
+    def test_functions_are_security_definer_with_fixed_search_path(self):
+        for sql in lease.FUNCTION_SQL:
+            assert "SECURITY DEFINER" in sql
+            assert "SET search_path = pg_catalog" in sql
 
-    def test_acquire_denied_while_other_holds_unexpired_lease(self):
-        state = _fresh_state(held_by="other")
-        with patch.object(mlock, "_connect", return_value=_FakeConn(state)):
-            acquired, took_over = mlock.try_acquire("postgresql://x", "me")
-        assert (acquired, took_over) == (False, False)
-        assert state["held_by"] == "other"
+    def test_every_worker_function_takes_the_cross_version_guard(self):
+        for sql in (lease.ACQUIRE_SQL, lease.ENTER_SQL, lease.RELEASE_SQL):
+            assert "hashtextextended('strikenova:migration_internal:migration_guard', 0)" in sql
+            assert "pg_advisory_xact_lock" in sql
+            assert sql.index("migration_guard") < sql.index("FOR UPDATE")
 
-    def test_takeover_of_expired_lease(self):
-        state = _fresh_state(held_by="ghost", expired=True)
-        with patch.object(mlock, "_connect", return_value=_FakeConn(state)):
-            acquired, took_over = mlock.try_acquire("postgresql://x", "me")
-        assert (acquired, took_over) == (True, True)
-        assert state["held_by"] == "me"
-
-    def test_release_only_by_holder(self):
-        state = _fresh_state(held_by="me")
-        with patch.object(mlock, "_connect", return_value=_FakeConn(state)):
-            assert mlock.release("postgresql://x", "me") is True
-            state["held_by"] = "someone-else"
-            assert mlock.release("postgresql://x", "me") is False
-
-    def test_owner_token_shape_is_host_pid_uuid(self):
-        owner = f"host-{uuid.uuid4().hex[:4]}:4242:{uuid.uuid4().hex[:8]}"
-        assert owner.count(":") == 2
-        assert len(owner.split(":")[2]) == 8
-
-
-# ------------------------------------------------- wait / fail-closed
-class TestWaitBehavior:
-    def test_wait_returns_immediately_when_free(self):
-        state = _fresh_state()
-        with patch.object(mlock, "_connect", return_value=_FakeConn(state)):
-            assert mlock.wait_for_release("postgresql://x") is False
-
-    def test_wait_detects_expired_lease(self):
-        state = _fresh_state(held_by="ghost", expired=True)
-        with patch.object(mlock, "_connect", return_value=_FakeConn(state)):
-            assert mlock.wait_for_release("postgresql://x") is True
-
-    def test_fail_closed_after_wait_budget(self):
-        state = _fresh_state(held_by="other")
-        with patch.object(mlock, "_connect", return_value=_FakeConn(state)), patch.object(
-            mlock.time, "sleep"
-        ), patch.object(mlock.time, "monotonic", side_effect=[0, 10_000]):
-            with pytest.raises(mlock.LeaseLockUnavailable):
-                mlock.wait_for_release("postgresql://x", max_wait_seconds=5)
-
-    def test_error_message_has_no_credentials(self):
-        state = _fresh_state(held_by="other")
-        with patch.object(mlock, "_connect", return_value=_FakeConn(state)), patch.object(
-            mlock.time, "sleep"
-        ), patch.object(mlock.time, "monotonic", side_effect=[0, 10_000]):
-            with pytest.raises(mlock.LeaseLockUnavailable) as ei:
-                mlock.wait_for_release(
-                    "postgresql://user:supersecret@h/db", max_wait_seconds=5
-                )
-        assert "supersecret" not in str(ei.value)
-        assert "postgresql://" not in str(ei.value)
-
-
-# ------------------------------------------------- serialized flow
-class TestSerializedExecution:
-    @staticmethod
-    def _cfg():
-        cfg = MagicMock()
-        cfg.get_main_option.return_value = "postgresql://x/db"
-        return cfg
-
-    def test_single_instance_runs_upgrade_once_and_releases(self):
-        cfg, command = self._cfg(), MagicMock()
-        state = _fresh_state(owner="holder")
-        with patch.object(mlock, "_connect", return_value=_FakeConn(state)), patch(
-            "alembic.script.ScriptDirectory.from_config"
-        ) as sd:
-            sd.return_value.get_current_head.return_value = None  # version check skipped
-            db_module._execute_serialized(cfg, command, MagicMock())
-        assert command.upgrade.call_count == 1
-        assert state["held_by"] is None  # released
-
-    def test_lock_released_after_migration_failure(self):
-        cfg, command = self._cfg(), MagicMock()
-        command.upgrade.side_effect = RuntimeError("boom")
-        state = _fresh_state(owner="holder")
-        logger = MagicMock()
-        with patch.object(mlock, "_connect", return_value=_FakeConn(state)), patch(
-            "alembic.script.ScriptDirectory.from_config"
-        ) as sd:
-            sd.return_value.get_current_head.return_value = None
-            with pytest.raises(RuntimeError):
-                db_module._execute_serialized(cfg, command, logger)
-        assert state["held_by"] is None  # released despite failure
-
-    def test_waiter_takes_over_expired_lease_then_runs(self):
-        cfg, command = self._cfg(), MagicMock()
-        state = _fresh_state(held_by="ghost", expired=True, owner="waiter")
-        with patch.object(mlock, "_connect", return_value=_FakeConn(state)), patch(
-            "alembic.script.ScriptDirectory.from_config"
-        ) as sd:
-            sd.return_value.get_current_head.return_value = None
-            db_module._execute_serialized(cfg, command, MagicMock())
-        assert command.upgrade.call_count == 1
-        assert state["held_by"] is None
-
-    def test_second_instance_observes_already_current_and_skips_ddl(self):
-        """Waiter acquires a freed lock, sees chain at head, still calls upgrade (no-op)."""
-        cfg, command = self._cfg(), MagicMock()
-        state = _fresh_state(owner="waiter")
-        with patch.object(mlock, "_connect", return_value=_FakeConn(state)), patch(
-            "alembic.script.ScriptDirectory.from_config"
-        ) as sd, patch.object(mlock, "read_alembic_version", return_value="d46aa0000001"):
-            sd.return_value.get_current_head.return_value = "d46aa0000001"
-            logger = MagicMock()
-            db_module._execute_serialized(cfg, command, logger)
-        assert command.upgrade.call_count == 1
-        # structured 'already current' diagnostic emitted
-        assert any(
-            "migration already current" in str(c) for c in logger.info.call_args_list
-        )
-
-    def test_lock_acquired_once_per_instance(self):
-        cfg, command = self._cfg(), MagicMock()
-        state = _fresh_state(owner="solo")
-        with patch.object(mlock, "_connect", return_value=_FakeConn(state)), patch(
-            "alembic.script.ScriptDirectory.from_config"
-        ) as sd:
-            sd.return_value.get_current_head.return_value = None
-            db_module._execute_serialized(cfg, command, MagicMock())
-        acquires = [
-            s for s in state["stmts"] if "set locked_by" in s.lower() and "expires_at <" in s.lower()
-        ]
-        assert len(acquires) == 1
-
-    def test_logs_never_contain_url_or_credentials(self):
-        cfg, command = self._cfg(), MagicMock()
-        command.upgrade.side_effect = RuntimeError("migration boom")
-        state = _fresh_state(owner="holder")
-        logger = MagicMock()
-        with patch.object(mlock, "_connect", return_value=_FakeConn(state)), patch(
-            "alembic.script.ScriptDirectory.from_config"
-        ) as sd:
-            sd.return_value.get_current_head.return_value = None
-            with pytest.raises(RuntimeError):
-                db_module._execute_serialized(cfg, command, logger)
-        for call in logger.info.call_args_list + logger.warning.call_args_list:
-            assert "postgresql://x/db" not in str(call)
-
-    def test_renewer_thread_extends_holder_lease(self):
-        state = _fresh_state(held_by="me", owner="me")
-        renewer = mlock.LeaseRenewer("postgresql://x", "me", 30)
-        renewer._stop = MagicMock()
-        renewer._stop.wait.side_effect = [False, True]  # one loop, then stop
-        with patch.object(mlock, "_connect", return_value=_FakeConn(state)):
-            renewer._run()
-        # renew statement issued against holder's own row
-        assert any(
-            "update _migration_lock set expires_at" in s.lower() for s in state["stmts"]
-        )
-
-    def test_renewal_interval_is_ttl_third_floored_at_one_second(self):
-        """Documented renewal rule (module docstring / ADR-017): the renewer
-        waits max(1.0, ttl/3) between renewals — strictly below the TTL so an
-        alive holder never leaves an expiry gap a waiter could misread as a
-        crash, with a 1s floor so tiny TTLs still renew at a sane cadence.
-        Verified behaviorally against the wait interval the renewer sleeps
-        for, never by inspecting source text."""
-        for ttl, expected in ((30, 10.0), (120, 40.0), (2, 1.0)):
-            renewer = mlock.LeaseRenewer("postgresql://x", "me", ttl)
-            state = _fresh_state(held_by="me", owner="me")
-            renewer._stop = MagicMock()
-            renewer._stop.wait.side_effect = [False, True]  # single loop
-            with patch.object(mlock, "_connect", return_value=_FakeConn(state)):
-                renewer._run()
-            actual = renewer._stop.wait.call_args_list[0].args[0]
-            if actual != expected:
-                raise AssertionError(
-                    f"ttl={ttl}: expected wait({expected}), got {actual}"
-                )
-
-
-# ------------------------------------------------- cold bootstrap retry
-class TestBootstrapRetry:
-    def test_ensure_lock_table_retries_serialization_conflicts(self):
-        """Simultaneous cold starts can hit CRDB 40001 during bootstrap DDL;
-        creation must retry and converge instead of crashing the child."""
-        attempts = {"n": 0}
-
-        class FlakyCursor:
-            def execute(self, stmt, params=None):
-                attempts["n"] += 1
-                if attempts["n"] <= 2:  # first two statements conflict
-                    raise Exception("40001: restart transaction")
-
-        class FlakyConn:
-            def cursor(self):
-                return FlakyCursor()
-
-            def commit(self):
-                pass
-
-            def rollback(self):
-                pass
-
-        conn = FlakyConn()
-        with patch.object(mlock.time, "sleep"):
-            mlock._ensure_lock_table(conn)  # must not raise
-        assert attempts["n"] == 4  # CREATE fails twice, third CREATE + INSERT succeed
-
-    def test_ensure_lock_table_gives_up_after_budget(self):
-        class AlwaysConflictCursor:
-            def execute(self, stmt, params=None):
-                raise Exception("40001: restart transaction")
-
-        class AlwaysConflictConn:
-            def cursor(self):
-                return AlwaysConflictCursor()
-
-            def commit(self):
-                pass
-
-            def rollback(self):
-                pass
-
-        with patch.object(mlock.time, "sleep"), pytest.raises(Exception, match="40001"):
-            mlock._ensure_lock_table(AlwaysConflictConn(), max_retries=3)
-
-
-# ------------------------------------------------- identity rules
-class TestIdentityRules:
-    def test_lock_uses_migration_url_when_set(self):
-        s = Settings(
-            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
-            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
-        )
-        with patch("app.db.settings", s):
-            assert (
-                db_module._migration_lock_url()
-                == "postgresql+psycopg://migrator:pw@h:26257/app"
+    def test_no_function_reads_an_ownership_guc(self):
+        for sql in lease.FUNCTION_SQL:
+            lowered = sql.lower()
+            assert "app.migration" not in lowered
+            assert "strikenova.lease_token" not in lowered
+            assert "session_authorization" not in lowered
+            assert lowered.count("current_setting(") == lowered.count(
+                "current_setting('lock_timeout')"
             )
 
-    def test_lock_falls_back_to_runtime_url_when_unset(self):
-        s = Settings(DATABASE_URL="postgresql://runtime:pw@h:26257/app")
-        with patch("app.db.settings", s):
-            assert db_module._migration_lock_url() == (
-                "postgresql+psycopg://runtime:pw@h:26257/app"
-            )
+    def test_enter_checks_readiness_and_refreshes_expiry(self):
+        sql = lease.ENTER_SQL
+        assert "v_boot <> 'ready'" in sql
+        assert "45005" in sql
+        assert "expires_at = v_exp" in sql
 
-    def test_runtime_identity_not_used_for_ddl_when_separated(self):
-        s = Settings(
-            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
-            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
-        )
-        with patch("app.db.settings", s):
-            assert db_module._migration_engine_url() != str(db_module.engine.url)
+    def test_acquire_is_the_only_ownership_transfer(self):
+        assert "owner_token_hash  = v_hash" in lease.ACQUIRE_SQL
+        assert "owner_token_hash  = v_hash" not in lease.ENTER_SQL
+        assert lease.RELEASE_SQL.index(
+            "owner_token_hash <> v_hash"
+        ) < lease.RELEASE_SQL.index("owner_token_hash  = NULL")
 
+    def test_release_is_not_gated_on_barrier_or_readiness(self):
+        assert "barrier_state" not in lease.RELEASE_SQL
+        assert "bootstrap_state" not in lease.RELEASE_SQL
 
-# ------------------------------------------------- migration target rules
-class TestMigrationTargetSerialization:
-    """The SQLite bypass in _run_alembic_migrations must be decided by the
-    MIGRATION TARGET (the resolved migration URL), not by the runtime
-    engine. Otherwise a SQLite runtime + non-SQLite migration identity
-    would run server-backed migrations without ADR-017 serialization."""
+    def test_revoke_set_covers_public_and_runtime_role(self):
+        assert len(lease.REVOKE_SQL) == 8
+        assert any("FROM PUBLIC" in s for s in lease.REVOKE_SQL)
+        assert any("{runtime_role}" in s for s in lease.REVOKE_SQL)
 
-    def _patch_db(self, runtime_url, migration_url):
-        s = Settings(
-            DATABASE_URL=runtime_url,
-            STRIKENOVA_MIGRATION_DATABASE_URL=migration_url,
-        )
-        return patch.object(db_module, "settings", s)
-
-    def _run_startup_migration(self, runtime_url, migration_url):
-        """Drive _run_alembic_migrations hermetically through COHERENT
-        Settings: the real resolver decides the migration target and the
-        separation flag exactly as in production. The runtime engine is a
-        MagicMock (nothing real is touched) and _execute_serialized is a
-        mock, so no database is ever contacted. Returns the mocks plus the
-        connectable observed INSIDE the patched context (identity
-        comparisons are meaningless after exit). Pass migration_url="" for
-        the single-identity model."""
-        from unittest.mock import MagicMock as _M
-
-        fake_engine = _M(name="runtime-engine")
-        fake_engine.url = runtime_url
-        serialized = _M(name="_execute_serialized")
-        direct = _M(name="direct_upgrade")
-        cfg = _M(name="alembic_cfg")
-        cfg.attributes = {}  # real dict so get()/[] stores are observable
-        observed = {}
-        with patch.object(
-            db_module, "settings",
-            Settings(DATABASE_URL=runtime_url, STRIKENOVA_MIGRATION_DATABASE_URL=migration_url or ""),
-        ), patch.object(
-            db_module, "engine", fake_engine
-        ), patch.object(
-            db_module, "_execute_serialized", serialized
-        ), patch(
-            "alembic.command.upgrade", direct
-        ), patch(
-            "alembic.config.Config", return_value=cfg
-        ):
-            db_module._run_alembic_migrations()
-            observed["connectable"] = cfg.attributes.get("connectable")
-            observed["engine"] = fake_engine
-        return serialized, direct, cfg, observed
-
-    def test_sqlite_runtime_with_nonsqlite_migration_target_serializes(self):
-        serialized, direct, _, observed = self._run_startup_migration(
-            "sqlite:///C:/tmp/runtime.db",
-            "cockroachdb+psycopg://migrator:pw@h:26257/strikenova?sslmode=require",
-        )
-        if serialized.call_count != 1:
-            raise AssertionError(
-                "non-SQLite migration target must be serialized via "
-                f"_execute_serialized, got calls={serialized.call_count}"
-            )
-        if direct.called:
-            raise AssertionError("direct SQLite path must NOT be taken for a non-SQLite target")
-        if observed["connectable"] is not None:
-            raise AssertionError(
-                "separated identities must not reuse the runtime engine as connectable"
-            )
-
-    def test_sqlite_target_takes_the_direct_path_even_with_nonsqlite_runtime(self):
-        serialized, direct, _, observed = self._run_startup_migration(
-            "postgresql://runtime:pw@h:26257/app",
-            "sqlite:///C:/tmp/migration.db",
-        )
-        if serialized.called:
-            raise AssertionError("SQLite migration target must bypass serialization")
-        if direct.call_count != 1:
-            raise AssertionError(
-                f"SQLite target must migrate directly once, got {direct.call_count}"
-            )
-        if observed["connectable"] is not None:
-            raise AssertionError(
-                "separated identities must not reuse the runtime engine as connectable"
-            )
-
-    def test_single_identity_sqlite_still_takes_the_direct_path(self):
-        serialized, direct, _, observed = self._run_startup_migration(
-            "sqlite:///C:/tmp/single.db", ""
-        )
-        if serialized.called:
-            raise AssertionError("historical single-identity SQLite behavior changed")
-        if direct.call_count != 1:
-            raise AssertionError(
-                f"SQLite direct path must be preserved, got {direct.call_count}"
-            )
-        if observed["connectable"] is not observed["engine"]:
-            raise AssertionError(
-                "single-identity startup must reuse the runtime engine connectable"
-            )
-
-    def test_single_identity_nonsqlite_serializes_and_reuses_engine(self):
-        serialized, direct, _, observed = self._run_startup_migration(
-            "postgresql://runtime:pw@h:26257/app", ""
-        )
-        if serialized.call_count != 1:
-            raise AssertionError("non-SQLite single-identity startup must serialize")
-        if direct.called:
-            raise AssertionError("direct SQLite path must not run for server targets")
-        if observed["connectable"] is not observed["engine"]:
-            raise AssertionError(
-                "single-identity startup must reuse the runtime engine connectable"
-            )
+    def test_protocol_objects_are_not_version_suffixed(self):
+        assert lease.PROTOCOL_TABLE == "migration_internal.lease_protocol"
+        assert lease.LEASE_TABLE == "migration_internal.migration_lease"
 
 
-# ------------------------------------------------- blank URL semantics
-class TestBlankUrlSemantics:
-    """None, "" and whitespace-only values mean UNSET for every URL source
-    (explicit sqlalchemy.url, STRIKENOVA_MIGRATION_DATABASE_URL,
-    DATABASE_URL); nonblank values are stripped before normalization. The
-    lock URL shares the resolver's semantics exactly and never diverges."""
+class TestSqlstateHandling:
+    @pytest.mark.parametrize("state", ["45002", "55P03", "40001", "40P01"])
+    def test_transient_states_are_retryable(self, state):
+        assert state in lease.RETRYABLE_SQLSTATES
 
-    WS = "   "
+    @pytest.mark.parametrize("state", ["45001", "45004", "45005", "45006"])
+    def test_terminal_states_are_not_retryable(self, state):
+        assert state not in lease.RETRYABLE_SQLSTATES
 
-    def test_blank_migration_url_falls_back_to_runtime(self):
-        s = Settings(
-            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
-            STRIKENOVA_MIGRATION_DATABASE_URL="",
-        )
-        with patch("app.db.settings", s):
-            assert db_module.resolve_migration_database_url() == (
-                "postgresql+psycopg://runtime:pw@h:26257/app"
-            )
-
-    def test_whitespace_migration_url_falls_back_to_runtime(self):
-        s = Settings(
-            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
-            STRIKENOVA_MIGRATION_DATABASE_URL=self.WS,
-        )
-        with patch("app.db.settings", s):
-            assert db_module.resolve_migration_database_url() == (
-                "postgresql+psycopg://runtime:pw@h:26257/app"
-            )
-
-    def test_blank_explicit_url_falls_through_to_migration_url(self):
-        s = Settings(
-            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
-            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
-        )
-        with patch("app.db.settings", s):
-            assert db_module.resolve_migration_database_url("") == (
-                "postgresql+psycopg://migrator:pw@h:26257/app"
-            )
-
-    def test_whitespace_explicit_url_falls_through_to_migration_url(self):
-        s = Settings(
-            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
-            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
-        )
-        with patch("app.db.settings", s):
-            assert db_module.resolve_migration_database_url(self.WS) == (
-                "postgresql+psycopg://migrator:pw@h:26257/app"
-            )
-
-    def test_tab_only_explicit_url_is_unset(self):
-        s = Settings(
-            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
-            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
-        )
-        with patch("app.db.settings", s):
-            assert db_module.resolve_migration_database_url("\t") == (
-                "postgresql+psycopg://migrator:pw@h:26257/app"
-            )
-
-    @pytest.mark.parametrize(
-        "placeholder",
-        ["driver://user:pw@h/db", " driver://user:pw@h/db", "\tdriver://user:pw@h/db"],
-    )
-    def test_whitespace_prefixed_placeholder_is_not_a_real_url(self, placeholder):
-        """alembic.ini ships ``driver://...`` as a placeholder; env.py must
-        never return it (decorated with whitespace or not) — it falls through
-        to the migration/runtime URL as if unset."""
-        s = Settings(
-            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
-            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
-        )
-        with patch("app.db.settings", s):
-            resolved = db_module.resolve_migration_database_url(placeholder)
-        if resolved.startswith("driver://"):
-            raise AssertionError(
-                f"alembic placeholder leaked as a real URL: {placeholder!r}"
-            )
-        if resolved != "postgresql+psycopg://migrator:pw@h:26257/app":
-            raise AssertionError(
-                f"placeholder did not fall through to the migration URL: {resolved}"
-            )
-
-    def test_blank_runtime_url_falls_back_to_sqlite(self):
-        s = Settings(DATABASE_URL="", STRIKENOVA_MIGRATION_DATABASE_URL=None)
-        with patch("app.db.settings", s):
-            url = db_module.resolve_migration_database_url()
-        assert url.startswith("sqlite:///"), url
-        assert url.endswith("paper_journal.db"), url
-
-    def test_whitespace_runtime_url_falls_back_to_sqlite(self):
-        s = Settings(DATABASE_URL=self.WS, STRIKENOVA_MIGRATION_DATABASE_URL=None)
-        with patch("app.db.settings", s):
-            url = db_module.resolve_migration_database_url()
-        assert url.startswith("sqlite:///"), url
-        assert url.endswith("paper_journal.db"), url
-
-    def test_nonblank_urls_are_stripped_before_normalization(self):
-        s = Settings(
-            DATABASE_URL="  postgresql://runtime:pw@h:26257/app  ",
-            STRIKENOVA_MIGRATION_DATABASE_URL="  cockroachdb+psycopg://migrator:pw@h:26257/strikenova?sslmode=require  ",
-        )
-        with patch("app.db.settings", s):
-            assert db_module.resolve_migration_database_url() == (
-                "cockroachdb+psycopg://migrator:pw@h:26257/strikenova?sslmode=require"
-            )
-            assert db_module._migration_engine_url() == (
-                "cockroachdb+psycopg://migrator:pw@h:26257/strikenova?sslmode=require"
-            )
-            assert db_module._migration_lock_url() == (
-                "cockroachdb+psycopg://migrator:pw@h:26257/strikenova?sslmode=require"
-            )
-
-    def test_explicit_url_is_stripped(self):
-        s = Settings(
-            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
-            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
-        )
-        with patch("app.db.settings", s):
-            assert db_module.resolve_migration_database_url(
-                "  cockroachdb+psycopg://explicit:pw@h:26257/strikenova  "
-            ) == "cockroachdb+psycopg://explicit:pw@h:26257/strikenova"
-
-    @pytest.mark.parametrize(
-        "migration_url",
-        [
-            "postgresql://migrator:pw@h:26257/app",  # normal
-            "",  # blank
-            "   ",  # whitespace
-            None,  # unset
-        ],
-    )
-    def test_lock_url_never_diverges_from_migration_url(self, migration_url):
-        """Lock URL == engine URL under normal AND blank configurations:
-        the lock travels with the migration identity and shares the exact
-        blank-value semantics of the resolver."""
-        s = Settings(
-            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
-            STRIKENOVA_MIGRATION_DATABASE_URL=migration_url,
-        )
-        with patch("app.db.settings", s):
-            expected = db_module._migration_engine_url()
-            assert db_module._migration_lock_url() == expected
+    def test_sqlstate_is_read_from_the_driver_exception(self):
+        assert lease.sqlstate_of(_FakeDBAPIError("45002")) == "45002"
+        assert lease.sqlstate_of(RuntimeError("no state")) is None
 
 
-# ------------------------------------------------- config contract
-class TestMigrationLockTtlValidation:
-    """The renewal interval max(1.0, TTL/3) is only strictly below the TTL
-    when TTL >= 2; smaller/zero/negative values could make a live holder's
-    lease appear expired, so the configuration boundary rejects them."""
+class TestConfigurationValidation:
+    @pytest.mark.parametrize("ttl", [0, -1, 86400.5])
+    def test_invalid_lease_ttl_is_rejected(self, ttl):
+        with pytest.raises(ValidationError, match="MIGRATION_LEASE_TTL_SECONDS"):
+            Settings(DATABASE_URL="postgresql://r@h/db", MIGRATION_LEASE_TTL_SECONDS=ttl)
 
-    @pytest.mark.parametrize("ttl", [1, 0, -1, -120])
-    def test_ttl_below_two_is_rejected(self, ttl):
-        with pytest.raises(ValidationError, match="MIGRATION_LOCK_TTL_SECONDS"):
+    @pytest.mark.parametrize("lock_timeout", [0, -1, 600001])
+    def test_invalid_lock_timeout_is_rejected(self, lock_timeout):
+        with pytest.raises(ValidationError, match="MIGRATION_LEASE_LOCK_TIMEOUT_MS"):
             Settings(
-                DATABASE_URL="postgresql://runtime:pw@h:26257/app",
-                MIGRATION_LOCK_TTL_SECONDS=ttl,
+                DATABASE_URL="postgresql://r@h/db",
+                MIGRATION_LEASE_LOCK_TIMEOUT_MS=lock_timeout,
             )
 
-    @pytest.mark.parametrize("ttl", [2, 3, 120, 900])
-    def test_ttl_of_two_or_more_is_accepted(self, ttl):
-        s = Settings(
-            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
-            MIGRATION_LOCK_TTL_SECONDS=ttl,
+    def test_defaults_are_bounded_and_consistent(self):
+        s = Settings(DATABASE_URL="postgresql://r@h/db")
+        assert s.MIGRATION_LEASE_TTL_SECONDS == 300
+        assert s.MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS == 150000
+        assert 1 <= s.MIGRATION_LEASE_LOCK_TIMEOUT_MS <= 600000
+        assert s.MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS < (
+            s.MIGRATION_LEASE_TTL_SECONDS * 1000
         )
-        if s.MIGRATION_LOCK_TTL_SECONDS != ttl:
-            raise AssertionError(
-                f"expected TTL {ttl} to be accepted, got {s.MIGRATION_LOCK_TTL_SECONDS}"
-            )
 
-
-class TestAlembicCliUrlPrecedence:
-    """ADR-016 identity separation must hold for standalone CLI migrations
-    too (PR #107 review): alembic env.py resolves its URL through
-    app.db.resolve_migration_database_url with precedence
-    explicit sqlalchemy.url > STRIKENOVA_MIGRATION_DATABASE_URL >
-    DATABASE_URL > SQLite fallback."""
-
-    def test_explicit_url_wins_over_both_env_urls(self):
-        s = Settings(
-            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
-            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
-        )
-        with patch("app.db.settings", s):
-            assert db_module.resolve_migration_database_url(
-                "postgresql://explicit:pw@h:26257/app"
-            ) == "postgresql+psycopg://explicit:pw@h:26257/app"
-
-    def test_migration_url_beats_runtime_url(self):
-        s = Settings(
-            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
-            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
-        )
-        with patch("app.db.settings", s):
-            assert db_module.resolve_migration_database_url() == (
-                "postgresql+psycopg://migrator:pw@h:26257/app"
-            )
-
-    def test_falls_back_to_runtime_url_when_migration_url_absent(self):
-        s = Settings(DATABASE_URL="postgresql://runtime:pw@h:26257/app")
-        with patch("app.db.settings", s):
-            assert db_module.resolve_migration_database_url() == (
-                "postgresql+psycopg://runtime:pw@h:26257/app"
-            )
-
-    def test_blank_migration_url_is_treated_as_absent(self):
-        s = Settings(
-            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
-            STRIKENOVA_MIGRATION_DATABASE_URL="   ",
-        )
-        with patch("app.db.settings", s):
-            assert db_module.resolve_migration_database_url() == (
-                "postgresql+psycopg://runtime:pw@h:26257/app"
-            )
-
-    def test_blank_explicit_url_falls_through_to_migration_url(self):
-        s = Settings(
-            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
-            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
-        )
-        with patch("app.db.settings", s):
-            assert db_module.resolve_migration_database_url("   ") == (
-                "postgresql+psycopg://migrator:pw@h:26257/app"
-            )
-
-    def test_sqlite_fallback_when_nothing_set(self):
-        s = Settings(DATABASE_URL=None, STRIKENOVA_MIGRATION_DATABASE_URL=None)
-        with patch("app.db.settings", s):
-            url = db_module.resolve_migration_database_url()
-        assert url.startswith("sqlite:///"), url
-        assert url.endswith("paper_journal.db")
-
-    def test_explicit_cockroach_url_is_preserved(self):
-        s = Settings(
-            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
-            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
-        )
-        with patch("app.db.settings", s):
-            assert db_module.resolve_migration_database_url(
-                "cockroachdb+psycopg://migrator:pw@h:26257/strikenova?sslmode=require"
-            ) == "cockroachdb+psycopg://migrator:pw@h:26257/strikenova?sslmode=require"
-
-    def test_migration_url_is_normalized_like_the_startup_path(self):
-        s = Settings(
-            DATABASE_URL="postgresql://runtime:pw@h:26257/app",
-            STRIKENOVA_MIGRATION_DATABASE_URL="postgresql://migrator:pw@h:26257/app",
-        )
-        with patch("app.db.settings", s):
-            assert db_module.resolve_migration_database_url() == (
-                db_module._migration_engine_url()
-            )
-
-
-class TestConfigContract:
-    def test_lock_settings_exist_with_defaults(self):
-        s = Settings(DATABASE_URL="postgresql://runtime:pw@h:26257/app")
-        assert s.MIGRATION_LOCK_TTL_SECONDS == 120
-        assert s.MIGRATION_LOCK_WAIT_SECONDS == 900
-
-    def test_ttl_and_wait_are_plain_fields(self):
+    def test_statement_timeout_below_the_ttl_is_accepted(self):
         s = Settings(
             DATABASE_URL="postgresql://r@h/db",
-            MIGRATION_LOCK_TTL_SECONDS=60,
-            MIGRATION_LOCK_WAIT_SECONDS=300,
+            MIGRATION_LEASE_TTL_SECONDS=300,
+            MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS=299999,
         )
-        assert (s.MIGRATION_LOCK_TTL_SECONDS, s.MIGRATION_LOCK_WAIT_SECONDS) == (60, 300)
+        assert s.MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS == 299999
+
+    def test_statement_timeout_equal_to_the_ttl_is_rejected(self):
+        with pytest.raises(ValidationError, match="strictly below"):
+            Settings(
+                DATABASE_URL="postgresql://r@h/db",
+                MIGRATION_LEASE_TTL_SECONDS=300,
+                MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS=300000,
+            )
+
+    def test_statement_timeout_above_the_ttl_is_rejected(self):
+        with pytest.raises(ValidationError, match="strictly below"):
+            Settings(
+                DATABASE_URL="postgresql://r@h/db",
+                MIGRATION_LEASE_TTL_SECONDS=300,
+                MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS=300001,
+            )
+
+    @pytest.mark.parametrize("timeout", [0, -1, -150000])
+    def test_non_positive_statement_timeout_is_rejected(self, timeout):
+        with pytest.raises(
+            ValidationError, match="MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS must be positive"
+        ):
+            Settings(
+                DATABASE_URL="postgresql://r@h/db",
+                MIGRATION_BACKFILL_STATEMENT_TIMEOUT_MS=timeout,
+            )
+
+    @pytest.mark.parametrize("ttl", [0, -1, 0.0005])
+    def test_non_positive_ttl_is_rejected_by_the_cross_field_rule_too(self, ttl):
+        with pytest.raises(ValidationError):
+            Settings(DATABASE_URL="postgresql://r@h/db", MIGRATION_LEASE_TTL_SECONDS=ttl)
 
 
-# ------------------------------------------------- SQLite skip
-class TestSqliteSkip:
-    def test_sqlite_target_skips_locking_entirely(self):
-        """SQLite runs upgrade directly: no lease lock, no serialized executor."""
-        import sqlalchemy
+class TestFailClosedIdentityRules:
+    RUNTIME = "postgresql://runtime:pw@h:5432/app"
+    MIGRATOR = "postgresql://migrator:pw@h:5432/app"
+    # ADR-018 §8.1 names both identities, so the URL logins must be exactly
+    # these roles and not merely different from each other.
+    ROLES = {"STRIKENOVA_MIGRATOR_ROLE": "migrator", "STRIKENOVA_RUNTIME_ROLE": "runtime"}
 
-        fake_engine = sqlalchemy.create_engine("sqlite://")
-        with patch.object(db_module, "engine", fake_engine), patch(
-            "alembic.config.Config"
-        ), patch("alembic.command.upgrade") as upgrade, patch.object(
-            db_module, "_execute_serialized"
-        ) as serialized:
+    def test_postgres_runtime_requires_a_migration_url(self, monkeypatch):
+        monkeypatch.setattr(
+            db_module,
+            "settings",
+            Settings(DATABASE_URL=self.RUNTIME, **self.ROLES),
+        )
+        with pytest.raises(lease.LeaseError) as exc:
+            db_module.assert_guarded_migration_configuration()
+        assert exc.value.sqlstate == "45004"
+
+    def test_equal_identities_are_refused(self, monkeypatch):
+        monkeypatch.setattr(
+            db_module,
+            "settings",
+            Settings(
+                DATABASE_URL=self.RUNTIME,
+                STRIKENOVA_MIGRATION_DATABASE_URL=self.RUNTIME,
+                **self.ROLES,
+            ),
+        )
+        with pytest.raises(lease.LeaseError) as exc:
+            db_module.assert_guarded_migration_configuration()
+        assert exc.value.sqlstate == "45004"
+
+    def test_separated_identities_are_accepted(self, monkeypatch):
+        monkeypatch.setattr(
+            db_module,
+            "settings",
+            Settings(
+                DATABASE_URL=self.RUNTIME,
+                STRIKENOVA_MIGRATION_DATABASE_URL=self.MIGRATOR,
+                **self.ROLES,
+            ),
+        )
+        url = db_module.assert_guarded_migration_configuration()
+        assert url.startswith("postgresql+psycopg://migrator")
+
+    def test_sqlite_needs_no_separate_identity(self, monkeypatch):
+        monkeypatch.setattr(
+            db_module, "settings", Settings(DATABASE_URL="sqlite:///local.db")
+        )
+        assert db_module.assert_guarded_migration_configuration().startswith("sqlite")
+
+
+class TestRetiredDesign:
+    def test_renewal_thread_module_is_gone(self):
+        with pytest.raises(ImportError):
+            import app._migration_lock  # noqa: F401
+
+    def test_no_renewer_thread_or_legacy_api_remains(self):
+        source = inspect.getsource(db_module)
+        for forbidden in (
+            "LeaseRenewer",
+            "try_acquire",
+            "wait_for_release",
+            "_execute_serialized",
+            "MIGRATION_LOCK_TTL_SECONDS",
+        ):
+            assert forbidden not in source
+
+    def test_backfill_does_not_commit_inside_the_per_user_helper(self):
+        from app.services import leg_exposure
+
+        source = inspect.getsource(leg_exposure.backfill_exposures)
+        assert "db.commit()" not in source
+        assert "db.flush()" in source
+
+    def test_sqlite_startup_still_runs_migrations_and_backfill(self, hermetic_init_db):
+        hermetic_init_db()
+        from sqlalchemy import text
+
+        with db_module.engine.connect() as conn:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table'")
+                )
+            }
+        assert {
+            "positions",
+            "paper_orders",
+            "strategy_leg_exposures",
+            "alembic_version",
+        } <= tables
+
+    def test_sqlite_never_touches_the_postgres_guarded_path(
+        self, hermetic_init_db, monkeypatch
+    ):
+        calls = []
+
+        def forbidden(*args, **kwargs):  # pragma: no cover - must not run
+            calls.append(args)
+            raise AssertionError("SQLite startup must not enter the lease path")
+
+        monkeypatch.setattr(db_module, "_run_guarded_migrations", forbidden)
+        hermetic_init_db()
+        assert calls == []
+
+
+class TestPytestGate:
+    """The CI gate must decide from JUnit XML, never from untrusted log text."""
+
+    SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "pytest_gate.py"
+
+    @staticmethod
+    def _suite_xml(*, tests=22, failures=0, errors=0, skipped=0, listed=None):
+        listed = tests if listed is None else listed
+        cases = []
+        for index in range(listed):
+            child = ""
+            if index < failures:
+                child = '<failure message="boom"/>'
+            elif index < failures + errors:
+                child = '<error message="boom"/>'
+            elif index < failures + errors + skipped:
+                child = "<skipped/>"
+            cases.append(
+                f'<testcase classname="tests.x" name="case{index}">{child}</testcase>'
+            )
+        return (
+            f'<testsuite name="unit" tests="{tests}" failures="{failures}" '
+            f'errors="{errors}" skipped="{skipped}">' + "".join(cases) + "</testsuite>"
+        )
+
+    def _run(self, tmp_path, xml_text, *, rc="0", minimum=22, log_text=None):
+        xml = tmp_path / "suite.xml"
+        if xml_text is not None:
+            xml.write_text(xml_text, encoding="utf-8")
+        rc_file = tmp_path / "suite.rc"
+        if rc is not None:
+            rc_file.write_text(rc, encoding="utf-8")
+        if log_text is not None:
+            (tmp_path / "suite.log").write_text(log_text, encoding="utf-8")
+        return subprocess.run(
+            [
+                sys.executable,
+                str(self.SCRIPT),
+                "--suite",
+                f"unit|{minimum}|{xml}|{rc_file}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    def test_real_junit_report_passes(self, tmp_path):
+        result = self._run(tmp_path, self._suite_xml())
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "unit: 22 passed" in result.stdout
+
+    def test_fabricated_log_failure_cannot_override_junit(self, tmp_path):
+        """A later summary-shaped failure line in the log is not acceptance evidence."""
+        result = self._run(
+            tmp_path,
+            self._suite_xml(),
+            log_text="22 passed in 9.00s\n999999 failed in 0.01s\n",
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "unit: 22 passed" in result.stdout
+
+    def test_fabricated_log_pass_cannot_override_failing_junit(self, tmp_path):
+        """A green log line cannot mask a failure recorded by pytest itself."""
+        result = self._run(
+            tmp_path,
+            self._suite_xml(tests=22, failures=1),
+            log_text="999999 passed in 0.01s\n22 passed in 9.00s\n",
+        )
+        assert result.returncode == 1
+        assert "failed/errored" in result.stdout
+
+    def test_skipped_junit_fails(self, tmp_path):
+        result = self._run(tmp_path, self._suite_xml(tests=22, skipped=22))
+        assert result.returncode == 1
+        assert "skipped" in result.stdout
+
+    def test_missing_xml_fails(self, tmp_path):
+        result = self._run(tmp_path, None)
+        assert result.returncode == 1
+        assert "no JUnit XML report" in result.stdout
+
+    def test_malformed_xml_fails(self, tmp_path):
+        result = self._run(tmp_path, "<testsuite")
+        assert result.returncode == 1
+        assert "not well-formed" in result.stdout
+
+    def test_doctype_is_rejected(self, tmp_path):
+        result = self._run(
+            tmp_path,
+            '<!DOCTYPE testsuite [<!ENTITY x "y">]>' + self._suite_xml(),
+        )
+        assert result.returncode == 1
+        assert "DOCTYPE/ENTITY" in result.stdout
+
+    def test_wrong_root_fails(self, tmp_path):
+        result = self._run(tmp_path, "<html/>")
+        assert result.returncode == 1
+        assert "expected <testsuite> or <testsuites>" in result.stdout
+
+    def test_declared_count_must_match_listed_testcases(self, tmp_path):
+        """A report claiming 22 tests but listing one is inconsistent."""
+        result = self._run(tmp_path, self._suite_xml(tests=22, listed=1))
+        assert result.returncode == 1
+        assert "lists 1 <testcase>" in result.stdout
+
+    def test_testcase_markers_must_match_counters(self, tmp_path):
+        """A failure element with a zero failure counter is inconsistent."""
+        xml = (
+            '<testsuite name="unit" tests="2" failures="0" errors="0" skipped="0">'
+            '<testcase classname="t" name="a"/>'
+            '<testcase classname="t" name="b"><failure message="boom"/></testcase>'
+            "</testsuite>"
+        )
+        result = self._run(tmp_path, xml)
+        assert result.returncode == 1
+        assert "counters do not match" in result.stdout
+
+    def test_error_status_in_junit_fails(self, tmp_path):
+        result = self._run(tmp_path, self._suite_xml(tests=2, errors=1))
+        assert result.returncode == 1
+        assert "failed/errored" in result.stdout
+
+    def test_non_zero_exit_code_fails(self, tmp_path):
+        result = self._run(tmp_path, self._suite_xml(), rc="1")
+        assert result.returncode == 1
+        assert "pytest exited 1" in result.stdout
+
+    def test_missing_exit_code_fails(self, tmp_path):
+        result = self._run(tmp_path, self._suite_xml(), rc=None)
+        assert result.returncode == 1
+        assert "no recorded pytest exit code" in result.stdout
+
+    def test_unreadable_exit_code_fails(self, tmp_path):
+        result = self._run(tmp_path, self._suite_xml(), rc="not-a-number")
+        assert result.returncode == 1
+        assert "unreadable pytest exit code" in result.stdout
+
+    def test_low_pass_count_fails(self, tmp_path):
+        result = self._run(tmp_path, self._suite_xml(tests=21), minimum=22)
+        assert result.returncode == 1
+        assert "only 21 test(s) passed" in result.stdout
+
+    def test_multiple_testsuites_are_summed(self, tmp_path):
+        xml = (
+            "<testsuites>"
+            + self._suite_xml(tests=11)
+            + self._suite_xml(tests=11)
+            + "</testsuites>"
+        )
+        result = self._run(tmp_path, xml)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "unit: 22 passed" in result.stdout
+
+    def test_regression_suite_is_gated_independently(self, tmp_path):
+        """A green integration report must not mask a broken regression one."""
+        integration = tmp_path / "integration.xml"
+        integration.write_text(self._suite_xml(), encoding="utf-8")
+        integration_rc = tmp_path / "integration.rc"
+        integration_rc.write_text("0", encoding="utf-8")
+        regression = tmp_path / "regression.xml"
+        regression.write_text(
+            self._suite_xml(tests=141, skipped=141), encoding="utf-8"
+        )
+        regression_rc = tmp_path / "regression.rc"
+        regression_rc.write_text("0", encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(self.SCRIPT),
+                "--suite",
+                f"integration|22|{integration}|{integration_rc}",
+                "--suite",
+                f"regression|141|{regression}|{regression_rc}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 1
+        assert "integration: 22 passed" in result.stdout
+        assert "regression" in result.stdout
+        assert "skipped" in result.stdout
+
+
+class TestLeaseWaitValidation:
+    """The admission budget must be a finite positive duration."""
+
+    @pytest.mark.parametrize("wait", [float("nan"), float("inf"), 0, -1, 86400.5])
+    def test_invalid_wait_is_rejected(self, wait):
+        with pytest.raises(ValidationError, match="MIGRATION_LEASE_WAIT_SECONDS"):
+            Settings(
+                DATABASE_URL="postgresql://r@h/db",
+                MIGRATION_LEASE_WAIT_SECONDS=wait,
+            )
+
+    def test_explicit_lease_waits_are_also_validated(self):
+        for wait in (float("nan"), float("inf"), 0.0, -1.0):
+            with pytest.raises(lease.LeaseError) as exc:
+                lease.MigrationLease(object(), wait_seconds=wait)  # type: ignore[arg-type]
+            assert exc.value.sqlstate == "45004"
+        with pytest.raises(lease.LeaseError) as exc:
+            lease.MigrationLease(object(), ttl_seconds=float("nan"))  # type: ignore[arg-type]
+        assert exc.value.sqlstate == "45004"
+
+
+class TestAcquisitionBudget:
+    def test_an_exhausted_budget_starts_no_attempt(self, monkeypatch):
+        class _NeverConnects:
+            calls = 0
+
+            def connect(self):  # pragma: no cover - must never run
+                self.calls += 1
+                raise AssertionError("acquire() connected after the deadline")
+
+        engine = _NeverConnects()
+        guard = lease.MigrationLease(engine, wait_seconds=0.05)  # type: ignore[arg-type]
+        clock = iter([0.0, 10.0])  # deadline is 0.05s; the next read is 10s
+        monkeypatch.setattr(lease.time, "monotonic", lambda: next(clock))
+        with pytest.raises(lease.LeaseError) as exc:
+            guard.acquire()
+        assert exc.value.sqlstate == "45002"
+        assert "wait budget was already exhausted" in str(exc.value)
+        assert engine.calls == 0
+
+    def test_backoff_stays_bounded_for_very_high_attempts(self, monkeypatch):
+        """The exponent is capped before `2 ** n`, and delay never exceeds 2 s."""
+        monkeypatch.setattr(lease.random, "random", lambda: 0.0)
+        assert lease._retry_delay(1) == pytest.approx(0.1)
+        monkeypatch.setattr(lease.random, "random", lambda: 1.0)
+        for attempt in (10_000, 10**9):
+            delay = lease._retry_delay(attempt)
+            assert math.isfinite(delay)
+            assert 0.1 <= delay <= 2.0
+
+    def test_connection_checkout_past_the_deadline_executes_no_sql(self, monkeypatch):
+        """A checkout that consumed the budget must not run lease SQL."""
+        clock = [0.0]
+        executed: list[tuple] = []
+
+        class _Conn:
+            def execute(self, *args, **_kwargs):  # pragma: no cover - must not run
+                executed.append(args)
+                raise AssertionError("lease SQL ran after the admission deadline")
+
+            def begin(self):
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+        class _Checkout:
+            def __enter__(self):
+                clock[0] += 10.0  # the checkout consumed the 0.05s budget
+                return _Conn()
+
+            def __exit__(self, *_exc):
+                return False
+
+        class _Engine:
+            def connect(self):
+                return _Checkout()
+
+        monkeypatch.setattr(lease.time, "monotonic", lambda: clock[0])
+        guard = lease.MigrationLease(_Engine(), wait_seconds=0.05)  # type: ignore[arg-type]
+        with pytest.raises(lease.LeaseError):
+            guard.acquire()
+        assert executed == []
+
+    def test_transient_lock_conflict_retries_and_acquires(self, monkeypatch):
+        """A 55P03 conflict still retries once, jitters once and succeeds."""
+        from sqlalchemy.exc import DBAPIError
+
+        sleeps: list[float] = []
+        calls = {"count": 0}
+
+        class _Row:
+            out_owner_fingerprint = "f" * 12
+            out_expires_at = None
+            out_generation = 1
+
+        class _Result:
+            def one(self):
+                return _Row()
+
+        class _Conn:
+            def begin(self):
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def execute(self, *_args, **_kwargs):
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    raise DBAPIError("SELECT lease", {}, _FakeOrig("55P03"))
+                return _Result()
+
+        class _Checkout:
+            def __enter__(self):
+                return _Conn()
+
+            def __exit__(self, *_exc):
+                return False
+
+        class _Engine:
+            def connect(self):
+                return _Checkout()
+
+        monkeypatch.setattr(lease.time, "sleep", sleeps.append)
+        guard = lease.MigrationLease(_Engine(), wait_seconds=5)  # type: ignore[arg-type]
+        state = guard.acquire()
+        assert state.generation == 1
+        assert calls["count"] == 2
+        assert len(sleeps) == 1
+        assert 0 < sleeps[0] <= 2.0
+
+
+class TestGuardedMigrationCleanup:
+    @staticmethod
+    def _engine(disposed):
+        class _Engine:
+            def dispose(self):
+                disposed.append(True)
+
+        return _Engine()
+
+    def test_preflight_failure_disposes_without_release(self, monkeypatch):
+        disposed: list[bool] = []
+        released: list[bool] = []
+        monkeypatch.setattr(
+            db_module, "_migration_engine", lambda: self._engine(disposed)
+        )
+        monkeypatch.setattr(
+            lease,
+            "preflight",
+            lambda engine: (_ for _ in ()).throw(
+                lease.LeaseError("45005", "protocol row missing")
+            ),
+        )
+        monkeypatch.setattr(
+            lease.MigrationLease,
+            "release",
+            lambda self: released.append(True),
+        )
+        with pytest.raises(lease.LeaseError):
+            db_module._run_guarded_migrations(object(), object(), logging.getLogger("t"))
+        assert disposed == [True]
+        assert released == []
+
+    def test_acquisition_failure_disposes_without_release(self, monkeypatch):
+        disposed: list[bool] = []
+        released: list[bool] = []
+        monkeypatch.setattr(
+            db_module, "_migration_engine", lambda: self._engine(disposed)
+        )
+        monkeypatch.setattr(lease, "preflight", lambda engine: None)
+        monkeypatch.setattr(
+            lease.MigrationLease,
+            "acquire",
+            lambda self: (_ for _ in ()).throw(
+                lease.LeaseError("45002", "lease held by another owner")
+            ),
+        )
+        monkeypatch.setattr(
+            lease.MigrationLease,
+            "release",
+            lambda self: released.append(True),
+        )
+        with pytest.raises(lease.LeaseError):
+            db_module._run_guarded_migrations(object(), object(), logging.getLogger("t"))
+        assert disposed == [True]
+        assert released == []
+
+    def test_release_failure_still_disposes_and_propagates(self, monkeypatch):
+        """A release error with no earlier exception must not skip disposal."""
+        disposed: list[bool] = []
+
+        class _Conn:
+            def exec_driver_sql(self, *_args, **_kwargs):
+                return None
+
+            def commit(self):
+                return None
+
+            def begin(self):
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+        class _Engine:
+            def connect(self):
+                return _Conn()
+
+            def dispose(self):
+                disposed.append(True)
+
+        def _release(_self):
+            raise RuntimeError("release boom")
+
+        monkeypatch.setattr(db_module, "_migration_engine", lambda: _Engine())
+        monkeypatch.setattr(lease, "preflight", lambda engine: None)
+        monkeypatch.setattr(lease.MigrationLease, "acquire", lambda self: None)
+        monkeypatch.setattr(lease.MigrationLease, "enter", lambda self, conn: None)
+        monkeypatch.setattr(lease.MigrationLease, "release", _release)
+        monkeypatch.setattr(db_module, "_set_owner_role", lambda conn: None)
+        monkeypatch.setattr(db_module, "_reset_owner_role", lambda conn: None)
+        monkeypatch.setattr(
+            db_module, "apply_migrator_backfill_grants", lambda conn: 0
+        )
+        monkeypatch.setattr(
+            db_module, "apply_migrator_privilege_restrictions", lambda conn: 0
+        )
+        monkeypatch.setattr(
+            db_module, "_verify_application_privileges", lambda conn: None
+        )
+
+        class _Command:
+            def upgrade(self, _cfg, _revision):
+                return None
+
+        class _Config:
+            attributes: dict = {}
+
+        with pytest.raises(RuntimeError, match="release boom"):
+            db_module._run_guarded_migrations(
+                _Config(), _Command(), logging.getLogger("t")
+            )
+        assert disposed == [True]
+
+
+class TestSqliteMigrationTarget:
+    def test_a_separate_sqlite_migration_url_is_refused(self, monkeypatch, tmp_path):
+        runtime = tmp_path / "runtime.db"
+        other = tmp_path / "other.db"
+        settings_obj = Settings(
+            DATABASE_URL=f"sqlite:///{runtime}",
+            STRIKENOVA_MIGRATION_DATABASE_URL=f"sqlite:///{other}",
+        )
+        with patch("app.db.settings", settings_obj), pytest.raises(
+            lease.LeaseError
+        ) as exc:
             db_module._run_alembic_migrations()
-        upgrade.assert_called_once()
-        serialized.assert_not_called()
+        assert exc.value.sqlstate == "45004"
+        assert "separate SQLite migration URL is not supported" in str(exc.value)
+        assert not other.exists(), "Alembic must not migrate a different SQLite file"
+
+    def test_the_same_sqlite_target_is_accepted(self, monkeypatch, tmp_path):
+        runtime = tmp_path / "runtime.db"
+        settings_obj = Settings(
+            DATABASE_URL=f"sqlite:///{runtime}",
+            STRIKENOVA_MIGRATION_DATABASE_URL=f"sqlite:///{runtime}",
+        )
+        with patch("app.db.settings", settings_obj):
+            resolved = db_module.assert_guarded_migration_configuration()
+        assert resolved.startswith("sqlite:///")
+
+    def test_default_file_mode_and_explicit_rwc_are_the_same_target(
+        self, tmp_path
+    ):
+        runtime = tmp_path / "runtime.db"
+        settings_obj = Settings(
+            DATABASE_URL=f"sqlite:///{runtime}",
+            STRIKENOVA_MIGRATION_DATABASE_URL=f"sqlite:///{runtime}?mode=rwc",
+        )
+        with patch("app.db.settings", settings_obj):
+            resolved = db_module.assert_guarded_migration_configuration()
+        assert resolved.startswith("sqlite:///")
+
+    def test_a_file_target_and_a_memory_mode_of_the_same_name_are_refused(
+        self, tmp_path
+    ):
+        runtime = tmp_path / "runtime.db"
+        settings_obj = Settings(
+            DATABASE_URL=f"sqlite:///{runtime}",
+            STRIKENOVA_MIGRATION_DATABASE_URL=f"sqlite:///{runtime}?mode=memory",
+        )
+        with patch("app.db.settings", settings_obj), pytest.raises(
+            lease.LeaseError
+        ) as exc:
+            db_module.assert_guarded_migration_configuration()
+        assert exc.value.sqlstate == "45004"
+        assert "separate SQLite migration URL is not supported" in str(exc.value)
+
+    def test_uri_mode_memory_database_is_distinct_from_a_file(self, tmp_path):
+        runtime = tmp_path / "runtime.db"
+        settings_obj = Settings(
+            DATABASE_URL=f"sqlite:///{runtime}",
+            STRIKENOVA_MIGRATION_DATABASE_URL=(
+                "sqlite:///file:shared-memdb?mode=memory&cache=shared&uri=true"
+            ),
+        )
+        with patch("app.db.settings", settings_obj), pytest.raises(
+            lease.LeaseError
+        ) as exc:
+            db_module.assert_guarded_migration_configuration()
+        assert exc.value.sqlstate == "45004"
+        assert "separate SQLite migration URL is not supported" in str(exc.value)
+
+    def test_identical_uri_mode_memory_databases_are_accepted(self):
+        url = "sqlite:///file:shared-memdb?mode=memory&cache=shared&uri=true"
+        settings_obj = Settings(
+            DATABASE_URL=url, STRIKENOVA_MIGRATION_DATABASE_URL=url
+        )
+        with patch("app.db.settings", settings_obj):
+            resolved = db_module.assert_guarded_migration_configuration()
+        assert "mode=memory" in resolved
+
+    def test_unsupported_sqlite_mode_is_refused(self, tmp_path):
+        runtime = tmp_path / "runtime.db"
+        settings_obj = Settings(
+            DATABASE_URL=f"sqlite:///{runtime}",
+            STRIKENOVA_MIGRATION_DATABASE_URL=f"sqlite:///{runtime}?mode=wal",
+        )
+        with patch("app.db.settings", settings_obj), pytest.raises(
+            lease.LeaseError
+        ) as exc:
+            db_module.assert_guarded_migration_configuration()
+        assert "unsupported SQLite mode" in str(exc.value)
+
+    def test_uri_true_without_a_file_name_is_refused(self, tmp_path):
+        runtime = tmp_path / "runtime.db"
+        settings_obj = Settings(
+            DATABASE_URL=f"sqlite:///{runtime}",
+            STRIKENOVA_MIGRATION_DATABASE_URL=f"sqlite:///{runtime}?uri=true",
+        )
+        with patch("app.db.settings", settings_obj), pytest.raises(
+            lease.LeaseError
+        ) as exc:
+            db_module.assert_guarded_migration_configuration()
+        assert "requires a file: database name" in str(exc.value)
 
 
-class TestNoCrossTestPollution:
-    def test_module_engine_is_a_real_engine(self):
-        import sqlalchemy
+class TestConnectionTargetOverrides:
+    ROLES: ClassVar[dict[str, str]] = {
+        "STRIKENOVA_MIGRATOR_ROLE": "migrator",
+        "STRIKENOVA_RUNTIME_ROLE": "runtime",
+    }
 
-        assert isinstance(db_module.engine, sqlalchemy.Engine)
+    def _assert_refused(self, runtime, migration, fragment):
+        settings_obj = Settings(
+            DATABASE_URL=runtime,
+            STRIKENOVA_MIGRATION_DATABASE_URL=migration,
+            **self.ROLES,
+        )
+        with patch("app.db.settings", settings_obj), pytest.raises(
+            lease.LeaseError
+        ) as exc:
+            db_module.assert_guarded_migration_configuration()
+        assert exc.value.sqlstate == "45004"
+        assert fragment in str(exc.value)
+        for secret in ("runtime-secret", "migrator-secret", "postgresql://"):
+            assert secret not in str(exc.value)
+
+    def test_query_user_override_is_refused(self):
+        self._assert_refused(
+            "postgresql://runtime:runtime-secret@db.example:5432/app?user=migrator",
+            "postgresql://migrator:migrator-secret@db.example:5432/app",
+            "connection query parameter",
+        )
+
+    def test_query_dbname_override_is_refused(self):
+        self._assert_refused(
+            "postgresql://runtime:runtime-secret@db.example:5432/app",
+            "postgresql://migrator:migrator-secret@db.example:5432/app?dbname=elsewhere",
+            "connection query parameter",
+        )
+
+    def test_multi_host_migration_url_is_refused(self):
+        self._assert_refused(
+            "postgresql://runtime:runtime-secret@db.example:5432/app",
+            "postgresql://migrator:migrator-secret@db.example,other.example:5432/app",
+            "names multiple hosts",
+        )
+
+    def test_unrelated_connection_options_are_preserved(self):
+        settings_obj = Settings(
+            DATABASE_URL=(
+                "postgresql://runtime:runtime-secret@db.example:5432/app?sslmode=require"
+            ),
+            STRIKENOVA_MIGRATION_DATABASE_URL=(
+                "postgresql://migrator:migrator-secret@db.example:5432/app"
+                "?application_name=issue145"
+            ),
+            **self.ROLES,
+        )
+        with patch("app.db.settings", settings_obj):
+            resolved = db_module.assert_guarded_migration_configuration()
+        assert "sslmode=require" not in resolved  # migration URL keeps its own options
+        assert "application_name=issue145" in resolved
+
+
+class TestDisposableHarnessUrls:
+    def test_admin_query_parameters_cannot_override_derived_targets(self):
+        from sqlalchemy.engine import make_url
+
+        admin = (
+            "postgresql://admin:pw@db.example:5432/postgres"
+            "?dbname=postgres&user=admin&sslmode=require"
+        )
+        prov = support.Provisioned(admin, "sn145_probe", support.TOPOLOGY_A)
+        migrator = make_url(prov.migrator_url)
+        assert migrator.database == "sn145_probe"
+        assert migrator.username == prov.migrator_role
+        assert migrator.password == prov.migrator_password
+        assert migrator.query.get("sslmode") == "require"
+        assert "dbname" not in migrator.query
+        assert "user" not in migrator.query
+        admin_db = make_url(prov.admin_database_url)
+        assert admin_db.database == "sn145_probe"
+        assert "dbname" not in admin_db.query
+
+    def test_query_form_endpoint_is_preserved_when_deriving(self):
+        """A URL whose endpoint lives in the query must keep that endpoint."""
+        from sqlalchemy.engine import make_url
+
+        admin = (
+            "postgresql://admin:pw@/postgres"
+            "?host=db.internal&port=6543&sslmode=require"
+        )
+        prov = support.Provisioned(admin, "sn145_query_host", support.TOPOLOGY_A)
+        migrator = make_url(prov.migrator_url)
+        assert migrator.query.get("host") == "db.internal"
+        assert migrator.query.get("port") == "6543"
+        assert migrator.query.get("sslmode") == "require"
+        assert migrator.database == "sn145_query_host"
+        admin_db = make_url(prov.admin_database_url)
+        assert admin_db.query.get("host") == "db.internal"
+        assert admin_db.query.get("port") == "6543"
+
+    def test_authority_endpoint_survives_derivation(self):
+        from sqlalchemy.engine import make_url
+
+        admin = "postgresql://admin:pw@db.internal:6543/postgres?sslmode=require"
+        prov = support.Provisioned(admin, "sn145_authority", support.TOPOLOGY_B)
+        migrator = make_url(prov.migrator_url)
+        assert migrator.host == "db.internal"
+        assert migrator.port == 6543
+        assert migrator.query.get("sslmode") == "require"
+
+    def test_service_indirection_is_refused_before_provisioning(self):
+        """A service can redirect the endpoint; refuse instead of guessing."""
+        admin = "postgresql://admin:pw@/postgres?service=production"
+        prov = support.Provisioned(admin, "sn145_service", support.TOPOLOGY_A)
+        with pytest.raises(ValueError, match="unsupported connection"):
+            _ = prov.migrator_url
+
+    def test_failed_provisioning_drops_only_the_resources_it_created(
+        self, monkeypatch
+    ):
+        dropped: list[str] = []
+        monkeypatch.setattr(support, "require_pg16_16", lambda url: None)
+
+        class _Conn:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def execute(self, *_args, **_kwargs):
+                return None
+
+        calls = {"count": 0}
+
+        def _connect(*_args, **_kwargs):
+            calls["count"] += 1
+            if calls["count"] >= 2:
+                raise RuntimeError("acl step failed")
+            return _Conn()
+
+        monkeypatch.setattr(support.psycopg, "connect", _connect)
+        monkeypatch.setattr(
+            support, "drop", lambda prov: dropped.append(prov.database)
+        )
+        with pytest.raises(RuntimeError, match="acl step failed"):
+            support.provision(
+                "postgresql://admin@db.internal/postgres",
+                topology=support.TOPOLOGY_A,
+            )
+        assert len(dropped) == 1
+        assert dropped[0].startswith("sn145_")
