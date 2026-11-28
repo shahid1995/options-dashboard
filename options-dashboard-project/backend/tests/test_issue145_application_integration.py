@@ -512,6 +512,9 @@ def _assert_lease_enter_is_first_statement(
     index 0 and fail here. Every bucket is also required to be single-
     connection, so a statement from another physical connection can never be
     credited to this transaction.
+
+    The second ``lease_enter_v1`` must be the last captured SQL statement in
+    the transaction before commit - no diagnostic or wrapper SQL may follow it.
     """
     lease_transactions = [
         tx
@@ -549,6 +552,14 @@ def _assert_lease_enter_is_first_statement(
                 "every protected transaction must enter the lease at its start "
                 f"and again before commit, got {len(enters)} entries: "
                 f"{[s['sql'][:60] for s in statements]}"
+            )
+        # The second lease_enter_v1 must be the last SQL statement in the transaction
+        second_enter_pos = enters[1]
+        if second_enter_pos != len(statements) - 1:
+            raise AssertionError(
+                f"the second MigrationLease.enter() must be the last SQL "
+                f"statement in the transaction before commit, got position {second_enter_pos} "
+                f"of {len(statements) - 1} possible, last statement: {statements[second_enter_pos + 1 if second_enter_pos + 1 < len(statements) else second_enter_pos]['sql']!r}"
             )
         between = statements[enters[0] + 1 : enters[1]]
         if not between:
@@ -689,19 +700,39 @@ def test_backfill_uses_migrator_identity_and_per_user_transactions(pg_ready, mon
     # ---- one ordered trace of every lease-protected step -------------------
     events: list[dict] = []
 
-    def record(executor, *, event: str, user: str | None) -> None:
-        row = executor.execute(
-            db_module.text("SELECT current_user, txid_current(), pg_backend_pid()")
-        ).one()
+    # Snapshot per physical DBAPI connection, captured once after the first
+    # lease entry and replayed by the pre-commit entry.
+    snapshots: dict[int, tuple[str, int, int]] = {}
+
+    def record(
+        executor,
+        *,
+        event: str,
+        user: str | None,
+        snapshot: tuple[str, int, int] | None = None,
+    ) -> tuple[str, int, int]:
+        """Append one event; issue SQL only when no snapshot is supplied.
+
+        The snapshot is captured right after the first ``MigrationLease.enter``
+        and cached per connection. The second entry replays it instead of
+        querying again, so the pre-commit ``lease_enter_v1`` remains the last
+        SQL statement the protected connection executes before COMMIT.
+        """
+        if snapshot is None:
+            row = executor.execute(
+                db_module.text("SELECT current_user, txid_current(), pg_backend_pid()")
+            ).one()
+            snapshot = (row[0], int(row[1]), int(row[2]))
+        current_user, txid, backend_pid = snapshot
         owned, row_locked, guard_locked = _observe_lease_lock(
-            pg_ready, backend_pid=int(row[2])
+            pg_ready, backend_pid=backend_pid
         )
         events.append(
             {
                 "event": event,
                 "user": user,
-                "current_user": row[0],
-                "txid": int(row[1]),
+                "current_user": current_user,
+                "txid": txid,
                 "lease_owned": owned,
                 "lease_row_locked": row_locked,
                 "lease_guard_locked": guard_locked,
@@ -710,6 +741,7 @@ def test_backfill_uses_migrator_identity_and_per_user_transactions(pg_ready, mon
                 "lease_locks": int(owned and row_locked and guard_locked),
             }
         )
+        return snapshot
 
     real_backfill = leg.backfill_exposures
 
@@ -725,7 +757,16 @@ def test_backfill_uses_migrator_identity_and_per_user_transactions(pg_ready, mon
         # The real entry runs first: the wrapper must not slip a statement in
         # ahead of the first-statement-of-the-transaction contract proven here.
         state = real_enter(self, conn)
-        record(conn, event="enter", user=None)
+        key = id(conn.connection.dbapi_connection)
+        cached = snapshots.pop(key, None)
+        if cached is None:
+            # First entry: capture the transaction snapshot with SQL, then keep
+            # it for the pre-commit entry.
+            snapshots[key] = record(conn, event="enter", user=None)
+        else:
+            # Second (pre-commit) entry: append from the cached snapshot only.
+            # No SQL may follow on the protected connection before COMMIT.
+            record(conn, event="enter", user=None, snapshot=cached)
         return state
 
     monkeypatch.setattr(MigrationLease, "enter", traced_enter)
